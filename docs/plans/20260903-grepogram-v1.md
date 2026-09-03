@@ -216,12 +216,12 @@ FTS and vec virtual tables cannot carry FK constraints, so `db.delete_chat(conn,
 - Create: `grepogram/__init__.py`, `grepogram/py.typed`
 - Create: `tests/__init__.py`, `tests/conftest.py`, `tests/test_smoke.py`
 
-- [ ] `pyproject.toml`: project `grepogram`, `requires-python = ">=3.12,<3.13"`, deps `telethon`, `mcp>=1.2`, `sqlite-vec`, `snowballstemmer`, `typer`, `tomli-w`; optional extra `dense = ["sentence-transformers", "torch"]`; dependency group `dev` = `pytest`, `pytest-asyncio`, `pytest-cov`, `ruff`, `mypy`; scripts `grepogram = "grepogram.cli:app"`, `grepogram-mcp = "grepogram.mcp:main"`; ruff (line-length 100, rules E,F,I,UP,B) and mypy `strict = true`; pytest `markers = ["slow"]`, `addopts = "-m 'not slow'"`, `asyncio_mode = "auto"`
-- [ ] `.python-version` = `3.12`; `uv sync --all-extras --all-groups` succeeds on this Mac (CI later uses `--group dev` only)
-- [ ] `.gitignore` (`.venv/`, `__pycache__/`, `*.egg-info`, `.mypy_cache`, `.ruff_cache`, `.pytest_cache`, `.coverage`), MIT `LICENSE`, README stub with one-paragraph description
-- [ ] `tests/conftest.py`: `tmp_home` fixture setting `GREPOGRAM_HOME` to a `tmp_path` subdir and `GREPOGRAM_FAKE_MODELS=1`
-- [ ] write `tests/test_smoke.py`: `import grepogram`; `sqlite3` can `enable_load_extension` + load `sqlite_vec` (fails fast on an unsupported interpreter)
-- [ ] run `uv run pytest`, `uv run ruff check .`, `uv run mypy grepogram` — must pass before task 2
+- [x] `pyproject.toml`: project `grepogram`, `requires-python = ">=3.12,<3.13"`, deps `telethon`, `mcp>=1.2,<2` (mcp 2.x renamed `FastMCP` to `MCPServer`; the MCP contract targets the 1.x API), `sqlite-vec`, `snowballstemmer`, `typer`, `tomli-w`; optional extra `dense = ["sentence-transformers", "torch"]`; dependency group `dev` = `pytest`, `pytest-asyncio`, `pytest-cov`, `ruff`, `mypy`; scripts `grepogram = "grepogram.cli:app"`, `grepogram-mcp = "grepogram.mcp:main"`; ruff (line-length 100, rules E,F,I,UP,B) and mypy `strict = true`; pytest `markers = ["slow"]`, `addopts = "-m 'not slow'"`, `asyncio_mode = "auto"`
+- [x] `.python-version` = `3.12`; `uv sync --all-extras --all-groups` succeeds on this Mac (CI later uses `--group dev` only)
+- [x] `.gitignore` (`.venv/`, `__pycache__/`, `*.egg-info`, `.mypy_cache`, `.ruff_cache`, `.pytest_cache`, `.coverage`), MIT `LICENSE`, README stub with one-paragraph description
+- [x] `tests/conftest.py`: `tmp_home` fixture setting `GREPOGRAM_HOME` to a `tmp_path` subdir and `GREPOGRAM_FAKE_MODELS=1`
+- [x] write `tests/test_smoke.py`: `import grepogram`; `sqlite3` can `enable_load_extension` + load `sqlite_vec` (fails fast on an unsupported interpreter)
+- [x] run `uv run pytest`, `uv run ruff check .`, `uv run mypy grepogram` — must pass before task 2
 
 ### Task 2: Paths, config and logging
 
