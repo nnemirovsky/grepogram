@@ -254,10 +254,10 @@ FTS and vec virtual tables cannot carry FK constraints, so `db.delete_chat(conn,
 - Create: `grepogram/cli.py`
 - Create: `tests/test_cli.py`
 
-- [ ] `cli.py`: typer `app` with `--version`, `config path` (prints resolved paths), `config init` (writes `TEMPLATE` unless the file exists, 0600), `--verbose` flag wiring `setup_logging`; sub-apps `sources`/`config` registered now, further commands added in later tasks
-- [ ] `_open_db()` helper: `connect` + `migrate`, and `_load()` returning `(paths, cfg, conn)` for commands
-- [ ] write tests with `typer.testing.CliRunner`: `--version`; `config path` respects `GREPOGRAM_HOME`; `config init` writes 0600 and refuses to overwrite; unknown command exits non-zero
-- [ ] run tests — must pass before task 5
+- [x] `cli.py`: typer `app` with `--version`, `config path` (prints resolved paths), `config init` (writes `TEMPLATE` unless the file exists, 0600), `--verbose` flag wiring `setup_logging`; sub-apps `sources`/`config` registered now, further commands added in later tasks
+- [x] `_open_db()` helper: `connect` + `migrate`, and `_load()` returning `(paths, cfg, conn)` for commands
+- [x] write tests with `typer.testing.CliRunner`: `--version`; `config path` respects `GREPOGRAM_HOME`; `config init` writes 0600 and refuses to overwrite; unknown command exits non-zero
+- [x] run tests — must pass before task 5
 
 ### Task 5: Telegram client wrapper and `auth`
 
