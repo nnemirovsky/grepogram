@@ -518,3 +518,53 @@ def test_get_messages_ordering_since_and_topic(conn: sqlite3.Connection) -> None
     assert [m.msg_id for m in db.get_messages(conn, 1, topic_id=7)] == [10, 30]
     assert [m.msg_id for m in db.get_messages(conn, 1, since_msg_id=11, topic_id=7)] == [30]
     assert db.get_messages(conn, 3) == []
+
+
+def test_get_discussion_chat(conn: sqlite3.Connection) -> None:
+    db.upsert_chat(conn, _chat(1, type="channel"))
+    assert db.get_discussion_chat(conn, 1) is None
+    db.upsert_chat(conn, _chat(2, discussion_of=1))
+    db.upsert_chat(conn, _chat(3, discussion_of=7))
+    discussion = db.get_discussion_chat(conn, 1)
+    assert discussion is not None
+    assert (discussion.id, discussion.discussion_of) == (2, 1)
+    assert db.get_discussion_chat(conn, 2) is None
+
+
+def test_get_topic_messages_groups_and_orders(conn: sqlite3.Connection) -> None:
+    db.upsert_chat(conn, _chat(1))
+    db.upsert_chat(conn, _chat(2))
+    db.upsert_messages(
+        conn,
+        [
+            _message(1, 30, topic_id=7),
+            _message(1, 10, topic_id=7),
+            _message(1, 20, topic_id=9),
+            _message(1, 40),
+            _message(1, 50, topic_id=11),
+            _message(2, 15, topic_id=7),
+        ],
+    )
+    grouped = db.get_topic_messages(conn, 1, [9, 7, 7, 12])
+    assert {topic: [m.msg_id for m in rows] for topic, rows in grouped.items()} == {
+        7: [10, 30],
+        9: [20],
+    }
+    assert all(m.chat_id == 1 for rows in grouped.values() for m in rows)
+    assert db.get_topic_messages(conn, 1, []) == {}
+    assert db.get_topic_messages(conn, 3, [7]) == {}
+
+
+def test_get_topic_messages_batches_long_topic_lists(conn: sqlite3.Connection) -> None:
+    db.upsert_chat(conn, _chat(1))
+    db.upsert_messages(
+        conn,
+        [_message(1, 1, topic_id=1), _message(1, 2, topic_id=600), _message(1, 3, topic_id=1001)],
+    )
+    assert len(range(1, 1002)) > 2 * db.IN_BATCH
+    grouped = db.get_topic_messages(conn, 1, range(1, 1002))
+    assert {topic: [m.msg_id for m in rows] for topic, rows in grouped.items()} == {
+        1: [1],
+        600: [2],
+        1001: [3],
+    }

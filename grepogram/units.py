@@ -1,23 +1,32 @@
 """Search units: the conversation-sized chunks that get indexed and embedded.
 
 Single messages are too small to embed and too many to store as vectors, so search runs over
-*units*: time windows of a chat (this module), reply threads and channel posts (added later in
-the same module). A unit's ``text`` is one rendered line per message —
-``[YYYY-MM-DD HH:MM] name: text`` — with a ``[photo]``-style placeholder for media without a
-caption, and its ``msg_ids`` keep the mapping back to the original messages for deep links.
+*units*: time windows of a chat, reply threads and channel posts. A unit's ``text`` is one
+rendered line per message — ``[YYYY-MM-DD HH:MM] name: text`` — with a ``[photo]``-style
+placeholder for media without a caption, and its ``msg_ids`` keep the mapping back to the
+original messages for deep links.
 
-Everything here is a pure function over :class:`~grepogram.models.MessageRow` lists: no database,
-no Telegram. :func:`cut_windows` walks one ``(chat, topic)`` in chronological order and starts a
-new window after a pause longer than ``window_gap_min`` minutes, or once the open window holds
-``window_max_msgs`` messages or ``window_max_chars`` characters of rendered text. Forum chats are
-split into topics first with :func:`group_by_topic`.
+The builders are functions over :class:`~grepogram.models.MessageRow` lists; only the channel
+side touches the database, to read a post's comments. :func:`cut_windows` walks one
+``(chat, topic)`` in chronological order and starts a new window after a pause longer than
+``window_gap_min`` minutes, or once the open window holds ``window_max_msgs`` messages or
+``window_max_chars`` characters of rendered text; forum chats are split into topics first with
+:func:`group_by_topic`. :func:`build_threads` follows ``reply_to_msg_id`` from every root (a
+replied-to message with no parent in the chat) and caps a thread at ``thread_max_msgs``
+messages, continuing in further units that repeat the root. :func:`build_posts` makes one
+``post`` per channel message and, when comments are synced, a ``thread`` of the post with its
+comments read from the linked discussion chat. :func:`units_for_chat` picks the builders for a
+chat's kind.
 """
 
 import datetime as dt
-from collections.abc import Iterable, Sequence
+import sqlite3
+from collections import deque
+from collections.abc import Iterable, Iterator, Sequence
 from dataclasses import dataclass, field
 
-from grepogram.models import MessageRow, UnitKind, UnitRow, UnitsCfg
+from grepogram import db
+from grepogram.models import ChatRow, Config, MessageRow, UnitKind, UnitRow, UnitsCfg
 
 UNKNOWN_SENDER = "unknown"
 EMPTY_PLACEHOLDER = "[empty]"
@@ -154,3 +163,184 @@ def group_by_topic(messages: Iterable[MessageRow]) -> dict[int | None, list[Mess
     for msg in messages:
         groups.setdefault(msg.topic_id, []).append(msg)
     return groups
+
+
+# --- threads ---------------------------------------------------------------------------------
+
+
+class _ReplyIndex:
+    """Reply graph of one chat: which messages are present and who replied to whom."""
+
+    def __init__(self, messages: Iterable[MessageRow]) -> None:
+        self.by_id = {msg.msg_id: msg for msg in messages}
+        self.children: dict[int, list[MessageRow]] = {}
+        for msg in self.by_id.values():
+            parent = self.parent_of(msg)
+            if parent is not None:
+                self.children.setdefault(parent, []).append(msg)
+
+    def parent_of(self, msg: MessageRow) -> int | None:
+        """The message ``msg`` replies to, when that message is in the chat and not itself."""
+        parent = msg.reply_to_msg_id
+        if parent is None or parent == msg.msg_id or parent not in self.by_id:
+            return None
+        return parent
+
+    def is_root(self, msg: MessageRow) -> bool:
+        return msg.msg_id in self.children and self.parent_of(msg) is None
+
+    def roots(self) -> list[MessageRow]:
+        """Messages that head a thread — replied to, with no parent in the chat — in date order."""
+        return [msg for msg in chronological(self.by_id.values()) if self.is_root(msg)]
+
+    def top_of(self, msg_id: int) -> MessageRow | None:
+        """The message at the top of ``msg_id``'s reply chain; ``None`` for an unknown id."""
+        msg = self.by_id.get(msg_id)
+        if msg is None:
+            return None
+        seen = {msg_id}
+        while (parent := self.parent_of(msg)) is not None and parent not in seen:
+            seen.add(parent)
+            msg = self.by_id[parent]
+        return msg
+
+    def descendants(self, root_id: int) -> list[MessageRow]:
+        """Every reply below ``root_id`` (breadth-first), returned in chronological order."""
+        seen = {root_id}
+        queue = deque([root_id])
+        found: list[MessageRow] = []
+        while queue:
+            for child in self.children.get(queue.popleft(), ()):
+                if child.msg_id not in seen:
+                    seen.add(child.msg_id)
+                    found.append(child)
+                    queue.append(child.msg_id)
+        return chronological(found)
+
+
+def thread_chunks(
+    root: MessageRow, replies: Sequence[MessageRow], cap: int
+) -> Iterator[list[MessageRow]]:
+    """``[root, *replies]`` split into pieces of at most ``cap`` messages, root repeated in each.
+
+    A root without replies yields nothing: a thread needs at least one reply.
+    """
+    step = max(cap - 1, 1)
+    for start in range(0, len(replies), step):
+        yield [root, *replies[start : start + step]]
+
+
+def build_threads(
+    messages: Iterable[MessageRow],
+    cfg: UnitsCfg,
+    chat_id: int,
+    roots: Iterable[int] | None = None,
+) -> list[UnitRow]:
+    """Cut the reply chains of one chat into ``thread`` units.
+
+    A thread starts at a root — a message with at least one reply whose own parent is not among
+    ``messages`` (a reply to a deleted or unfetched message counts as a root) — and holds the root
+    followed by every descendant reachable over ``reply_to_msg_id``, chronologically. A thread
+    longer than ``thread_max_msgs`` continues in further units that repeat the root as their
+    first message, so ``msg_ids[0]`` names the root in every piece; the unit carries the root's
+    ``topic_id``. ``roots`` limits the result to the threads headed by those message ids.
+    """
+    index = _ReplyIndex(messages)
+    wanted = None if roots is None else set(roots)
+    units: list[UnitRow] = []
+    for root in index.roots():
+        if wanted is not None and root.msg_id not in wanted:
+            continue
+        for chunk in thread_chunks(root, index.descendants(root.msg_id), cfg.thread_max_msgs):
+            units.append(build_unit("thread", chunk, chat_id, root.topic_id))
+    return units
+
+
+def thread_roots(messages: Iterable[MessageRow], msg_ids: Iterable[int]) -> set[int]:
+    """Ids of the thread roots the given messages belong to, as root or as reply.
+
+    Walks up ``reply_to_msg_id`` from each message; a message whose chain ends in something
+    nobody replied to heads no thread and contributes nothing. An incremental rebuild uses this
+    to find the threads a batch of new or edited messages touches.
+    """
+    index = _ReplyIndex(messages)
+    roots: set[int] = set()
+    for msg_id in msg_ids:
+        top = index.top_of(msg_id)
+        if top is not None and index.is_root(top):
+            roots.add(top.msg_id)
+    return roots
+
+
+# --- posts -----------------------------------------------------------------------------------
+
+
+def build_posts(
+    conn: sqlite3.Connection,
+    messages: Iterable[MessageRow],
+    chat: ChatRow,
+    comments: bool,
+    cfg: UnitsCfg,
+) -> list[UnitRow]:
+    """One ``post`` unit per channel message, plus a ``thread`` for every post with comments.
+
+    Comments are stored under the linked discussion chat (``chats.discussion_of = chat.id``)
+    with ``topic_id`` = the post id and are read from there when ``comments`` is set. The thread
+    belongs to the channel and lists only the post in ``msg_ids`` — comment ids live in the
+    discussion chat's id space and would not open from a channel link — while its text carries
+    the post followed by its comments in order and ``date_end`` reaches the last comment. Long
+    comment threads are split at ``thread_max_msgs`` messages like reply threads, each piece
+    repeating the post.
+    """
+    posts = chronological(messages)
+    units = [build_unit("post", [post], chat.id) for post in posts]
+    discussion = db.get_discussion_chat(conn, chat.id) if comments else None
+    if discussion is None or not posts:
+        return units
+    by_post = db.get_topic_messages(conn, discussion.id, [post.msg_id for post in posts])
+    for post in posts:
+        replies = chronological(by_post.get(post.msg_id, []))
+        for chunk in thread_chunks(post, replies, cfg.thread_max_msgs):
+            units.append(_post_thread(post, chunk, chat.id))
+    return units
+
+
+def _post_thread(post: MessageRow, chunk: Sequence[MessageRow], chat_id: int) -> UnitRow:
+    return UnitRow(
+        chat_id=chat_id,
+        kind="thread",
+        msg_id_start=post.msg_id,
+        msg_id_end=post.msg_id,
+        msg_ids=[post.msg_id],
+        date_start=post.date,
+        date_end=max(msg.date for msg in chunk),
+        text="\n".join(render_line(msg) for msg in chunk),
+    )
+
+
+# --- per chat --------------------------------------------------------------------------------
+
+
+def comments_enabled(cfg: Config, chat: ChatRow) -> bool:
+    """Whether the source that pulled ``chat`` in asks for channel comments."""
+    return any(source.id == chat.source_id and source.comments for source in cfg.sources)
+
+
+def units_for_chat(
+    conn: sqlite3.Connection, messages: Iterable[MessageRow], chat: ChatRow, cfg: Config
+) -> list[UnitRow]:
+    """Every unit of ``chat`` over ``messages``, chosen by the chat's kind.
+
+    Channels get posts, plus post threads when their source has ``comments`` on. Everything
+    else — private chats, groups, forums and the discussion chats of channels alike — gets
+    windows per topic followed by reply threads.
+    """
+    if chat.type == "channel" and chat.discussion_of is None:
+        return build_posts(conn, messages, chat, comments_enabled(cfg, chat), cfg.units)
+    messages = list(messages)
+    windows = [
+        window
+        for topic_id, group in group_by_topic(messages).items()
+        for window in cut_windows(group, cfg.units, chat.id, topic_id)
+    ]
+    return windows + build_threads(messages, cfg.units, chat.id)

@@ -20,6 +20,7 @@ from grepogram.models import ChatRow, MessageRow, UserRow
 from grepogram.paths import Paths
 
 BUSY_TIMEOUT_MS = 5000
+IN_BATCH = 500
 FTS_TOKENIZE = "unicode61 remove_diacritics 2"
 VEC_TABLE = "unit_vec"
 META_SCHEMA_VERSION = "schema_version"
@@ -299,6 +300,14 @@ def get_chat(conn: sqlite3.Connection, chat_id: int) -> ChatRow | None:
     return None if row is None else _chat_row(row)
 
 
+def get_discussion_chat(conn: sqlite3.Connection, channel_id: int) -> ChatRow | None:
+    """The discussion group linked to a channel (``discussion_of = channel_id``), if stored."""
+    row = conn.execute(
+        "SELECT * FROM chats WHERE discussion_of = ? ORDER BY id LIMIT 1", (channel_id,)
+    ).fetchone()
+    return None if row is None else _chat_row(row)
+
+
 def list_chats(conn: sqlite3.Connection, source_id: str | None = None) -> list[ChatRow]:
     """All chats (or those pulled in by one source) ordered by id."""
     if source_id is None:
@@ -416,6 +425,28 @@ def get_messages(
         params.append(topic_id)
     sql += " ORDER BY msg_id"
     return [_message_row(row) for row in conn.execute(sql, params)]
+
+
+def get_topic_messages(
+    conn: sqlite3.Connection, chat_id: int, topic_ids: Iterable[int]
+) -> dict[int, list[MessageRow]]:
+    """Messages of a chat grouped by ``topic_id`` for the given topics, each in ``msg_id`` order.
+
+    One query per :data:`IN_BATCH` topics rather than one per topic — a channel rebuild reads the
+    comments of every post this way. Topics without messages are absent from the result.
+    """
+    grouped: dict[int, list[MessageRow]] = {}
+    ids = list(dict.fromkeys(topic_ids))
+    for start in range(0, len(ids), IN_BATCH):
+        chunk = ids[start : start + IN_BATCH]
+        marks = ", ".join("?" * len(chunk))
+        rows = conn.execute(
+            f"SELECT * FROM messages WHERE chat_id = ? AND topic_id IN ({marks}) ORDER BY msg_id",
+            [chat_id, *chunk],
+        )
+        for row in rows:
+            grouped.setdefault(int(row["topic_id"]), []).append(_message_row(row))
+    return grouped
 
 
 def get_message(conn: sqlite3.Connection, chat_id: int, msg_id: int) -> MessageRow | None:

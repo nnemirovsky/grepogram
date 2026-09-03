@@ -348,11 +348,11 @@ FTS and vec virtual tables cannot carry FK constraints, so `db.delete_chat(conn,
 - Modify: `grepogram/units.py`
 - Create: `tests/test_units_threads.py`
 
-- [ ] `build_threads(messages, cfg.units, chat_id) -> list[UnitRow]`: reply graph, roots, BFS descendants in chronological order, cap with continuation units
-- [ ] `build_posts(conn, messages, chat, comments: bool) -> list[UnitRow]`: one `post` per channel message; with comments → `thread` = post text + comments read from the discussion chat (`chats.discussion_of = chat.id`)
-- [ ] `units_for_chat(conn, messages, chat, cfg) -> list[UnitRow]` choosing windows+threads for chats/groups, posts(+threads) for channels; discussion chats themselves (`discussion_of` set) get windows+threads like any group
-- [ ] write tests: linear chain, branching replies, reply to missing message (treated as root), cap + continuation, channel posts with and without comments (comments in a separate chat row)
-- [ ] run tests — must pass before task 12
+- [x] `build_threads(messages, cfg.units, chat_id) -> list[UnitRow]`: reply graph, roots, BFS descendants in chronological order, cap with continuation units
+- [x] `build_posts(conn, messages, chat, comments: bool, cfg.units) -> list[UnitRow]`: one `post` per channel message; with comments → `thread` = post text + comments read from the discussion chat (`chats.discussion_of = chat.id`), owned by the channel with `msg_ids = [post id]`, capped at `thread_max_msgs` like reply threads
+- [x] `units_for_chat(conn, messages, chat, cfg) -> list[UnitRow]` choosing windows+threads for chats/groups, posts(+threads) for channels; discussion chats themselves (`discussion_of` set) get windows+threads like any group
+- [x] write tests: linear chain, branching replies, reply to missing message (treated as root), cap + continuation, channel posts with and without comments (comments in a separate chat row)
+- [x] run tests — must pass before task 12
 
 ### Task 12: Incremental unit maintenance wired into sync
 
