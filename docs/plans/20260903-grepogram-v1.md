@@ -436,13 +436,13 @@ FTS and vec virtual tables cannot carry FK constraints, so `db.delete_chat(conn,
 - Create: `grepogram/embed.py`
 - Create: `tests/test_embed.py`, `tests/test_embed_slow.py`
 
-- [ ] `Embedder` Protocol (`name: str`, `dim: int`, `embed(texts: list[str]) -> list[list[float]]`, `embed_query(text) -> list[float]`); `ModelUnavailable(Exception)`
-- [ ] `FakeEmbedder(dim=8)`: deterministic token-hash bag-of-words vectors, L2-normalized — similar texts land close
-- [ ] `BgeM3Embedder(model_id, device)`: lazy `sentence_transformers` import; `device="auto"` → `mps` if `torch.backends.mps.is_available()` else `cpu` (one-time WARN); fp16 on mps; `model.max_seq_length = 512`; `batch_size=32`, `normalize_embeddings=True`; import/download failure → `ModelUnavailable(reason)`
-- [ ] `load_embedder(cfg) -> Embedder` (`GREPOGRAM_FAKE_MODELS=1` → fake, for tests and CI)
-- [ ] write tests: fake determinism and normalization; nearer texts have higher cosine; `load_embedder` raises `ModelUnavailable` when the import fails; device selection logic — both via stub modules injected into `sys.modules['torch']` / `sys.modules['sentence_transformers']` so the tests pass without the `dense` extra
-- [ ] `tests/test_embed_slow.py` (`slow`): real bge-m3 embeds a RU and an EN paraphrase closer than an unrelated sentence, cosine above a threshold (catches fp16 collapse on MPS)
-- [ ] run tests — must pass before task 19
+- [x] `Embedder` Protocol (`name: str`, `dim: int`, `embed(texts: list[str]) -> list[list[float]]`, `embed_query(text) -> list[float]`); `ModelUnavailable(Exception)`
+- [x] `FakeEmbedder(dim=256)`: deterministic token-hash bag-of-words vectors, L2-normalized — similar texts land close (default dim raised from 8 to 256: with 8 buckets the ~300 stems of the search fixture collide so much that the paraphrase unit ranks 14th of 27; a tiny built-in RU/EN lexicon maps `ВНЖ` / `residence permit` to one feature so the dense side can bridge the fixture's synonym pair)
+- [x] `BgeM3Embedder(model_id, device)`: lazy `sentence_transformers` import; `device="auto"` → `mps` if `torch.backends.mps.is_available()` else `cpu` (one-time WARN); fp16 on mps; `model.max_seq_length = 512`; `batch_size=32`, `normalize_embeddings=True`; import/download failure → `ModelUnavailable(reason)`
+- [x] `load_embedder(cfg) -> Embedder` (`GREPOGRAM_FAKE_MODELS=1` → fake, for tests and CI)
+- [x] write tests: fake determinism and normalization; nearer texts have higher cosine; `load_embedder` raises `ModelUnavailable` when the import fails; device selection logic — both via stub modules injected into `sys.modules['torch']` / `sys.modules['sentence_transformers']` so the tests pass without the `dense` extra
+- [x] `tests/test_embed_slow.py` (`slow`): real bge-m3 embeds a RU and an EN paraphrase closer than an unrelated sentence, cosine above a threshold (catches fp16 collapse on MPS)
+- [x] run tests — must pass before task 19
 
 ### Task 19: Dense indexing and KNN
 

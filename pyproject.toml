@@ -58,7 +58,16 @@ python_version = "3.12"
 strict = true
 
 [[tool.mypy.overrides]]
-module = ["sqlite_vec", "snowballstemmer", "telethon", "telethon.*"]
+module = [
+    "sqlite_vec",
+    "snowballstemmer",
+    "telethon",
+    "telethon.*",
+    "sentence_transformers",
+    "sentence_transformers.*",
+    "torch",
+    "torch.*",
+]
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]
