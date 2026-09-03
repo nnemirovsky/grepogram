@@ -1,11 +1,11 @@
 """Command-line interface: ``grepogram <command>``.
 
 Commands print plain text to stdout and diagnostics to stderr; logging goes to stderr and the log
-file. ``config`` and ``sources`` are sub-apps; later tasks add ``sync``, ``search`` and ``embed``
-and fill in the ``sources`` commands.
+file. ``config`` and ``sources`` are sub-apps; later tasks add ``sync``, ``search`` and ``embed``.
 """
 
 import asyncio
+import datetime as dt
 import logging
 import sqlite3
 from collections.abc import Sequence
@@ -15,7 +15,7 @@ import typer
 from telethon import TelegramClient
 from telethon import errors as tg_errors
 
-from grepogram import __version__, config, db, dialogs, tg
+from grepogram import __version__, config, db, dialogs, sources, tg
 from grepogram.config import TEMPLATE, ConfigError
 from grepogram.dialogs import Match
 from grepogram.log import setup_logging
@@ -133,6 +133,115 @@ def _print_table(headers: Sequence[str], rows: Sequence[Sequence[str]]) -> None:
     for line in (headers, *rows):
         cells = [cell.ljust(w) for cell, w in zip(line, widths, strict=True)]
         typer.echo("  ".join(cells).rstrip())
+
+
+@sources_app.command("add")
+def sources_add(
+    target: Annotated[
+        str,
+        typer.Argument(
+            help="Chat id (as printed by `grepogram dialogs`), @username, t.me link, "
+            "folder:<name>, or a chat / folder title (fuzzy)."
+        ),
+    ],
+    since: Annotated[
+        str | None,
+        typer.Option("--since", help="Skip history before this date (YYYY-MM-DD) on first sync."),
+    ] = None,
+    comments: Annotated[
+        bool, typer.Option("--comments", help="Channels only: also index the discussion threads.")
+    ] = False,
+) -> None:
+    """Add a folder or chat to the indexed sources and save the config; needs a session."""
+    paths = Paths.from_env()
+    cfg = _load_config(paths)
+    _require_api_keys(cfg, paths)
+    try:
+        parsed = sources.parse_target(target)
+        tg.ensure_session_mode(paths)
+        client = tg.make_client(cfg, paths)
+        added = asyncio.run(_add_source(client, cfg, parsed, since, comments))
+    except (sources.SourceError, tg.AuthRequired) as exc:
+        fail(str(exc))
+    except (tg_errors.RPCError, ConnectionError) as exc:
+        fail(f"telegram error: {exc}")
+    config.save(added.config, paths)
+    if added.folder is not None:
+        what = f"folder {added.title!r} with {len(added.dialogs)} chats"
+    else:
+        chat = added.dialogs[0]
+        what = f"{chat.type} {chat.title!r} (id {chat.id})"
+    typer.echo(f"added {added.source.id}: {what}")
+    typer.echo("next: grepogram sync")
+
+
+async def _add_source(
+    client: TelegramClient, cfg: Config, target: sources.Target, since: str | None, comments: bool
+) -> sources.Added:
+    async with tg.connected(client):
+        catalog = dialogs.DialogCatalog(client)
+        return await sources.add_source(cfg, target, catalog, since=since, comments=comments)
+
+
+@sources_app.command("ls")
+def sources_ls() -> None:
+    """List configured sources with their indexed chats and sync state (offline)."""
+    _, cfg, conn = _load()
+    try:
+        statuses = sources.sources_status(cfg, conn)
+    finally:
+        conn.close()
+    if not statuses:
+        typer.echo("no sources configured; add one with: grepogram sources add <target>")
+        return
+    rows: list[tuple[str, ...]] = []
+    for status in statuses:
+        if not status.chats:
+            rows.append((status.source_id, "-", "-", "-", "-", "0", "never", "not synced yet"))
+        for chat in status.chats:
+            rows.append(
+                (
+                    status.source_id,
+                    str(chat.id),
+                    chat.type,
+                    chat.title or "-",
+                    f"@{chat.username}" if chat.username else "-",
+                    str(chat.message_count),
+                    _when(chat.last_sync_at),
+                    "unavailable" if chat.unavailable else "ok",
+                )
+            )
+    _print_table(
+        ("source", "id", "type", "title", "username", "messages", "last sync", "status"), rows
+    )
+
+
+@sources_app.command("rm")
+def sources_rm(
+    target: Annotated[
+        str,
+        typer.Argument(
+            help="Source id from `sources ls`, folder name, chat id, @username or a fuzzy title."
+        ),
+    ],
+) -> None:
+    """Remove a source and delete its chats' messages and index data (offline)."""
+    paths, cfg, conn = _load()
+    try:
+        removed = sources.remove_source(cfg, conn, sources.parse_target(target))
+    except sources.SourceError as exc:
+        fail(str(exc))
+    finally:
+        conn.close()
+    if removed.source is not None:
+        config.save(removed.config, paths)
+    typer.echo(f"removed {removed.source_id} ({len(removed.chat_ids)} chats deleted)")
+
+
+def _when(timestamp: int | None) -> str:
+    if timestamp is None:
+        return "never"
+    return dt.datetime.fromtimestamp(timestamp, dt.UTC).astimezone().strftime("%Y-%m-%d %H:%M")
 
 
 @config_app.command("path")

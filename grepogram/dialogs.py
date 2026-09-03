@@ -283,13 +283,17 @@ class DialogCatalog:
         assert self._folders is not None
         return self._folders
 
-    async def entity(self, dialog_id: int) -> Any:
-        """The raw entity behind a dialog id, falling back to ``client.get_entity``."""
+    async def entity(self, key: int | str) -> Any:
+        """The raw entity behind a marked id or ``@username``.
+
+        Dialog ids are served from the memo; anything else goes through ``client.get_entity``,
+        which raises ``ValueError`` (or a Telethon error) when Telegram does not know the peer.
+        """
         if self._dialogs is None:
             await self._load()
-        if dialog_id in self._entities:
-            return self._entities[dialog_id]
-        return await self._client.get_entity(dialog_id)
+        if isinstance(key, int) and key in self._entities:
+            return self._entities[key]
+        return await self._client.get_entity(key)
 
     def invalidate(self) -> None:
         """Forget the memo so the next call re-reads dialogs and folders from Telegram."""

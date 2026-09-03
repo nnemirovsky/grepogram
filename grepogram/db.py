@@ -424,6 +424,12 @@ def get_message(conn: sqlite3.Connection, chat_id: int, msg_id: int) -> MessageR
     return None if row is None else _message_row(row)
 
 
+def message_counts(conn: sqlite3.Connection) -> dict[int, int]:
+    """Stored messages per chat id; chats without messages are absent."""
+    rows = conn.execute("SELECT chat_id, COUNT(*) AS n FROM messages GROUP BY chat_id")
+    return {int(row["chat_id"]): int(row["n"]) for row in rows}
+
+
 # --- row mapping -----------------------------------------------------------------------------
 
 

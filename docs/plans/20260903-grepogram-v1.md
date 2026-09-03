@@ -295,13 +295,13 @@ FTS and vec virtual tables cannot carry FK constraints, so `db.delete_chat(conn,
 - Modify: `grepogram/cli.py`
 - Create: `tests/test_sources.py`
 
-- [ ] `parse_target(str) -> Target`: numeric id, `@username`, `https://t.me/<name>` / `t.me/c/<id>`, `folder:<name>`, otherwise `fuzzy:<text>`
-- [ ] `add_source(cfg, target, catalog)`: fuzzy/`folder:` resolved through `dialogs.match` (ambiguous → `AmbiguousTarget` listing candidates); duplicates rejected; `remove_source(cfg, conn, target)` removes the entry and calls `db.delete_chat` for every chat with that `source_id`
-- [ ] `resolve_sources(cfg, client, conn) -> list[ChatRow]`: for each source produce chats (folder → members, chat → entity) and `upsert_chat` with `source_id`, `type`, `title`, `username`, `is_forum`; returns resolved rows; unresolvable source → WARN and skip
-- [ ] `sources_status(cfg, conn) -> list[SourceStatus]` (source id, resolved chats with title/type/message count/`last_sync_at`/`unavailable`) — shared by `sources ls` and the MCP `sources` tool
-- [ ] `sources add|ls|rm` CLI commands
-- [ ] write tests: `parse_target` table; add/remove/duplicate/ambiguous; `remove_source` deletes chat data; `resolve_sources` with `FakeClient` for a folder source and a DM source; `sources_status` counts
-- [ ] run tests — must pass before task 8
+- [x] `parse_target(str) -> Target`: numeric id, `@username`, `https://t.me/<name>` / `t.me/c/<id>`, `folder:<name>`, otherwise `fuzzy:<text>`
+- [x] `add_source(cfg, target, catalog)`: fuzzy/`folder:` resolved through `dialogs.match` (ambiguous → `AmbiguousTarget` listing candidates); duplicates rejected; `remove_source(cfg, conn, target)` removes the entry and calls `db.delete_chat` for every chat with that `source_id`
+- [x] `resolve_sources(cfg, client, conn) -> list[ChatRow]`: for each source produce chats (folder → members, chat → entity) and `upsert_chat` with `source_id`, `type`, `title`, `username`, `is_forum`; returns resolved rows; unresolvable source → WARN and skip
+- [x] `sources_status(cfg, conn) -> list[SourceStatus]` (source id, resolved chats with title/type/message count/`last_sync_at`/`unavailable`) — shared by `sources ls` and the MCP `sources` tool
+- [x] `sources add|ls|rm` CLI commands
+- [x] write tests: `parse_target` table; add/remove/duplicate/ambiguous; `remove_source` deletes chat data; `resolve_sources` with `FakeClient` for a folder source and a DM source; `sources_status` counts
+- [x] run tests — must pass before task 8
 
 ### Task 8: Message mapping
 

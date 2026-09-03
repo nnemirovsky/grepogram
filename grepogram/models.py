@@ -210,8 +210,10 @@ class SyncReport:
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class ChatStatus:
+    id: int
     title: str | None
     type: ChatType
+    username: str | None = None
     message_count: int
     last_sync_at: int | None
     unavailable: bool
