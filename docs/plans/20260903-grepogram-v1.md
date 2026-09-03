@@ -336,11 +336,11 @@ FTS and vec virtual tables cannot carry FK constraints, so `db.delete_chat(conn,
 - Create: `grepogram/units.py`
 - Create: `tests/test_units_windows.py`
 
-- [ ] `render_line(msg) -> str` (`[YYYY-MM-DD HH:MM] name: text`, media placeholder when text empty)
-- [ ] `cut_windows(messages, cfg.units, chat_id, topic_id) -> list[UnitRow]`: chronological, cut on gap/count/chars rules; `msg_ids` JSON, `msg_id_start/end`, `date_start/end`, `text`
-- [ ] `group_by_topic(messages)` for forum chats (`topic_id` None for non-forum)
-- [ ] write tests: gap cut, count cut, char cut, single message, empty input, topic grouping, placeholder rendering, deterministic output
-- [ ] run tests — must pass before task 11
+- [x] `render_line(msg) -> str` (`[YYYY-MM-DD HH:MM] name: text`, media placeholder when text empty)
+- [x] `cut_windows(messages, cfg.units, chat_id, topic_id) -> list[UnitRow]`: chronological, cut on gap/count/chars rules; `msg_ids` JSON, `msg_id_start/end`, `date_start/end`, `text`
+- [x] `group_by_topic(messages)` for forum chats (`topic_id` None for non-forum)
+- [x] write tests: gap cut, count cut, char cut, single message, empty input, topic grouping, placeholder rendering, deterministic output
+- [x] run tests — must pass before task 11
 
 ### Task 11: Thread and post builders
 
