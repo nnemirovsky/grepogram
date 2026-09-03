@@ -242,11 +242,11 @@ FTS and vec virtual tables cannot carry FK constraints, so `db.delete_chat(conn,
 - Create: `grepogram/db.py`
 - Create: `tests/test_db.py`
 
-- [ ] `db.py`: `connect(paths | ":memory:") -> sqlite3.Connection` with `check_same_thread=False`, `PRAGMA journal_mode=WAL`, `busy_timeout=5000`, `foreign_keys=ON`, `row_factory=sqlite3.Row`, `sqlite_vec.load`
-- [ ] `migrate(conn)`: versioned migrations list (`meta.schema_version`); v1 creates `meta`, `chats`, `users`, `messages` (surrogate `id`, `UNIQUE(chat_id, msg_id)`, FK cascade, indexes), `units` (FK cascade, index), `msg_fts`, `unit_fts` exactly as in Technical Details; `ensure_vec_table(conn, dim, drop=False)` creates `unit_vec` later and records `embed_dim` in `meta`
-- [ ] typed accessors used by later tasks: `upsert_chat`, `get_chat`, `list_chats`, `delete_chat` (fts + vec rows by rowid, then `chats` row → cascade), `upsert_users`, `upsert_messages(batch)` using `ON CONFLICT(chat_id, msg_id) DO UPDATE SET …` (never `INSERT OR REPLACE`) and returning affected `messages.id`s, `get_messages(chat_id, since_msg_id=None, topic_id=None)`, `get_message`, `set_meta/get_meta`
-- [ ] write tests: fresh migrate creates all tables/indexes; migrate twice is a no-op; `ensure_vec_table` creates `vec0` with the given dim and refuses a different dim unless `drop=True`; upsert updates in place and **preserves `messages.id` across an edit**; `delete_chat` cascades to messages/units and removes fts/vec rows; connection usable from a second thread
-- [ ] run tests — must pass before task 4
+- [x] `db.py`: `connect(paths | ":memory:") -> sqlite3.Connection` with `check_same_thread=False`, `PRAGMA journal_mode=WAL`, `busy_timeout=5000`, `foreign_keys=ON`, `row_factory=sqlite3.Row`, `sqlite_vec.load`
+- [x] `migrate(conn)`: versioned migrations list (`meta.schema_version`); v1 creates `meta`, `chats`, `users`, `messages` (surrogate `id`, `UNIQUE(chat_id, msg_id)`, FK cascade, indexes), `units` (FK cascade, index), `msg_fts`, `unit_fts` exactly as in Technical Details; `ensure_vec_table(conn, dim, drop=False)` creates `unit_vec` later and records `embed_dim` in `meta`
+- [x] typed accessors used by later tasks: `upsert_chat`, `get_chat`, `list_chats`, `delete_chat` (fts + vec rows by rowid, then `chats` row → cascade), `upsert_users`, `upsert_messages(batch)` using `ON CONFLICT(chat_id, msg_id) DO UPDATE SET …` (never `INSERT OR REPLACE`) and returning affected `messages.id`s, `get_messages(chat_id, since_msg_id=None, topic_id=None)`, `get_message`, `set_meta/get_meta`
+- [x] write tests: fresh migrate creates all tables/indexes; migrate twice is a no-op; `ensure_vec_table` creates `vec0` with the given dim and refuses a different dim unless `drop=True`; upsert updates in place and **preserves `messages.id` across an edit**; `delete_chat` cascades to messages/units and removes fts/vec rows; connection usable from a second thread
+- [x] run tests — must pass before task 4
 
 ### Task 4: CLI skeleton
 

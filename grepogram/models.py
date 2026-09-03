@@ -113,6 +113,13 @@ class ChatRow:
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
+class UserRow:
+    id: int
+    display_name: str | None = None
+    username: str | None = None
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
 class MessageRow:
     id: int | None = None
     chat_id: int
