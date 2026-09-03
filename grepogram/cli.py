@@ -1,17 +1,19 @@
 """Command-line interface: ``grepogram <command>``.
 
 Commands print plain text to stdout and diagnostics to stderr; logging goes to stderr and the log
-file. ``config`` and ``sources`` are sub-apps; later tasks add ``auth``, ``dialogs``, ``sync``,
-``search`` and ``embed`` and fill in the ``sources`` commands.
+file. ``config`` and ``sources`` are sub-apps; later tasks add ``dialogs``, ``sync``, ``search``
+and ``embed`` and fill in the ``sources`` commands.
 """
 
+import asyncio
 import logging
 import sqlite3
 from typing import Annotated, NoReturn
 
 import typer
+from telethon import errors as tg_errors
 
-from grepogram import __version__, config, db
+from grepogram import __version__, config, db, tg
 from grepogram.config import TEMPLATE, ConfigError
 from grepogram.log import setup_logging
 from grepogram.models import Config
@@ -45,6 +47,45 @@ def main(
     ] = False,
 ) -> None:
     setup_logging(Paths.from_env(), logging.DEBUG if verbose else logging.INFO)
+
+
+@app.command()
+def auth() -> None:
+    """Sign in to Telegram (phone, login code, optional 2FA password) and store the session."""
+    paths = Paths.from_env()
+    try:
+        cfg = config.load(paths)
+    except ConfigError as exc:
+        fail(str(exc))
+    if cfg.telegram.api_id == 0 or not cfg.telegram.api_hash:
+        fail(
+            f"[telegram] api_id and api_hash are not set in {paths.config_file}: create an "
+            "application at https://my.telegram.org/apps and fill them in "
+            "(run `grepogram config init` first if the file does not exist)"
+        )
+    tg.prepare_session(paths)
+    client = tg.make_client(cfg, paths)
+    try:
+        name = asyncio.run(
+            tg.login(client, phone=_ask_phone, code=_ask_code, password=_ask_password)
+        )
+    except (tg.AuthRequired, tg_errors.RPCError, ConnectionError, RuntimeError) as exc:
+        fail(f"sign-in failed: {exc}")
+    tg.ensure_session_mode(paths)
+    typer.echo(f"signed in as {name}")
+    typer.echo(f"session stored at {paths.session_file}")
+
+
+def _ask_phone() -> str:
+    return str(typer.prompt("Phone number in international format (e.g. +5491112345678)"))
+
+
+def _ask_code() -> str:
+    return str(typer.prompt("Login code sent by Telegram"))
+
+
+def _ask_password() -> str:
+    return str(typer.prompt("Two-step verification password", hide_input=True))
 
 
 @config_app.command("path")

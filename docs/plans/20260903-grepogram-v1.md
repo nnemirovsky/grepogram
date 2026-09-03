@@ -266,12 +266,12 @@ FTS and vec virtual tables cannot carry FK constraints, so `db.delete_chat(conn,
 - Modify: `grepogram/cli.py`
 - Create: `tests/test_tg.py`, `tests/fakes.py`
 
-- [ ] `tg.py`: `make_client(cfg, paths) -> TelegramClient` (session at `paths.session_file`, `flood_sleep_threshold` from config, `device_model="grepogram"`); `ensure_session_mode(paths)` asserts the session file exists (clear `SessionMissing` error otherwise) then chmods 0600
-- [ ] `AuthRequired(Exception)` with hint text `run: grepogram auth`; `wrap_auth_errors()` async context manager mapping `AuthKeyUnregisteredError`, `SessionRevokedError`, `UserDeactivatedError`, and `client.is_user_authorized() is False` to `AuthRequired`
-- [ ] `auth` CLI command: phone → code → optional 2FA password via `client.start(...)` callbacks; prints account name on success; refuses when `api_id == 0` with instructions pointing to my.telegram.org and `grepogram config init`
-- [ ] `tests/fakes.py`: `FakeClient` (async `get_dialogs`, `iter_messages`, `get_entity`, `__call__` for raw requests such as `GetDialogFiltersRequest`/`GetFullChannelRequest`) driven by dict fixtures — reused by tasks 6–9
-- [ ] write tests: error mapping table-driven; `auth` refuses without `api_id`; `ensure_session_mode` sets 0600 on an existing file and raises `SessionMissing` (not `FileNotFoundError`) when absent
-- [ ] run tests — must pass before task 6
+- [x] `tg.py`: `make_client(cfg, paths) -> TelegramClient` (session at `paths.session_file`, `flood_sleep_threshold` from config, `device_model="grepogram"`); `ensure_session_mode(paths)` asserts the session file exists (clear `SessionMissing` error otherwise) then chmods 0600
+- [x] `AuthRequired(Exception)` with hint text `run: grepogram auth`; `wrap_auth_errors()` async context manager mapping `AuthKeyUnregisteredError`, `SessionRevokedError`, `UserDeactivatedError`, and `client.is_user_authorized() is False` to `AuthRequired`
+- [x] `auth` CLI command: phone → code → optional 2FA password via `client.start(...)` callbacks; prints account name on success; refuses when `api_id == 0` with instructions pointing to my.telegram.org and `grepogram config init`
+- [x] `tests/fakes.py`: `FakeClient` (async `get_dialogs`, `iter_messages`, `get_entity`, `__call__` for raw requests such as `GetDialogFiltersRequest`/`GetFullChannelRequest`) driven by dict fixtures — reused by tasks 6–9
+- [x] write tests: error mapping table-driven; `auth` refuses without `api_id`; `ensure_session_mode` sets 0600 on an existing file and raises `SessionMissing` (not `FileNotFoundError`) when absent
+- [x] run tests — must pass before task 6
 
 ### Task 6: Dialog listing, folders and fuzzy matching
 
