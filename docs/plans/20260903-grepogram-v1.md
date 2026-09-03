@@ -409,11 +409,11 @@ FTS and vec virtual tables cannot carry FK constraints, so `db.delete_chat(conn,
 - Create: `grepogram/filters.py`
 - Create: `tests/test_filters.py`
 
-- [ ] `parse_when(s: str, now) -> int`: ISO date (`2025-06-01`), ISO month (`2025-06`), ISO datetime, relative `7d`/`3w`/`6m`/`1y`; `ValueError` with the accepted grammar otherwise
-- [ ] `resolve_chats(conn, cfg, specs: list[str]) -> set[int]`: numeric ids, `@username`, `folder:<name>`/folder names (via `chats.source_id`), fuzzy `chats.title` (substring, then `SequenceMatcher` ≥ 0.6); unknown → `UnknownChat` listing indexed titles
-- [ ] `resolve_filters(conn, cfg, chats, since, until, now) -> Filters`
-- [ ] write tests: `parse_when` table incl. errors; `resolve_chats` for each spec kind and the unknown path; `resolve_filters` composes correctly
-- [ ] run tests — must pass before task 17
+- [x] `parse_when(s: str, now) -> int`: ISO date (`2025-06-01`), ISO month (`2025-06`), ISO datetime, relative `7d`/`3w`/`6m`/`1y`; `ValueError` with the accepted grammar otherwise
+- [x] `resolve_chats(conn, cfg, specs: list[str]) -> set[int]`: numeric ids, `@username`, `folder:<name>`/folder names (via `chats.source_id`), fuzzy `chats.title` (substring, then `SequenceMatcher` ≥ 0.6); unknown → `UnknownChat` listing indexed titles
+- [x] `resolve_filters(conn, cfg, chats, since, until, now) -> Filters`
+- [x] write tests: `parse_when` table incl. errors; `resolve_chats` for each spec kind and the unknown path; `resolve_filters` composes correctly
+- [x] run tests — must pass before task 17
 
 ### Task 17: Lexical search end-to-end and `search` CLI (first usable milestone)
 
