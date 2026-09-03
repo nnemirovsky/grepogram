@@ -464,12 +464,12 @@ FTS and vec virtual tables cannot carry FK constraints, so `db.delete_chat(conn,
 - Create: `grepogram/rerank.py`
 - Create: `tests/test_rerank.py`, `tests/test_rerank_slow.py`
 
-- [ ] `Reranker` Protocol (`score(query, texts) -> list[float]`); `FakeReranker` (token-overlap score)
-- [ ] `BgeReranker(model_id, device)`: lazy `sentence_transformers.CrossEncoder`, same device logic as the embedder, `max_length=512`, `ModelUnavailable` on import/download failure
-- [ ] `load_reranker(cfg)` honouring `GREPOGRAM_FAKE_MODELS=1`
-- [ ] write tests: fake ordering; loader failure via `sys.modules` stubs; device selection
-- [ ] `tests/test_rerank_slow.py` (`slow`): real reranker ranks the relevant RU unit above a distractor
-- [ ] run tests — must pass before task 21
+- [x] `Reranker` Protocol (`score(query, texts) -> list[float]`); `FakeReranker` (token-overlap score)
+- [x] `BgeReranker(model_id, device)`: lazy `sentence_transformers.CrossEncoder`, same device logic as the embedder, `max_length=512`, `ModelUnavailable` on import/download failure
+- [x] `load_reranker(cfg)` honouring `GREPOGRAM_FAKE_MODELS=1`
+- [x] write tests: fake ordering; loader failure via `sys.modules` stubs; device selection
+- [x] `tests/test_rerank_slow.py` (`slow`): real reranker ranks the relevant RU unit above a distractor
+- [x] run tests — must pass before task 21
 
 ### Task 21: RRF fusion, dedup and hybrid search
 
