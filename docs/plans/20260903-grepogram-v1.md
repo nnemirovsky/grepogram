@@ -397,11 +397,11 @@ FTS and vec virtual tables cannot carry FK constraints, so `db.delete_chat(conn,
 - Create: `grepogram/links.py`
 - Create: `tests/test_links.py`
 
-- [ ] `message_url(chat: ChatRow, msg_id, topic_id=None) -> Link(url, fallback_url | None)` per the link rules (public/private supergroup+channel, forum topics, user/bot with fallback, legacy group)
-- [ ] `strip_channel_prefix(chat_id)` (`-1001234 → 1234`)
-- [ ] `open_link(link)` → `subprocess.run(["open", url])` (macOS), returns url; non-darwin → `NotImplementedError` with message
-- [ ] write tests: table over all chat types × with/without username × forum; `open_link` uses a monkeypatched runner
-- [ ] run tests — must pass before task 16
+- [x] `message_url(chat: ChatRow, msg_id, topic_id=None) -> Link(url, fallback_url | None)` per the link rules (public/private supergroup+channel, forum topics, user/bot with fallback, legacy group)
+- [x] `strip_channel_prefix(chat_id)` (`-1001234 → 1234`)
+- [x] `open_link(link)` → `subprocess.run(["open", url])` (macOS), returns url; non-darwin → `NotImplementedError` with message
+- [x] write tests: table over all chat types × with/without username × forum; `open_link` uses a monkeypatched runner
+- [x] run tests — must pass before task 16
 
 ### Task 16: Filter resolution and date parsing
 
