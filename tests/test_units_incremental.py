@@ -572,8 +572,15 @@ async def _run(
         return await sync.sync_all(client, conn, cfg, paths, SyncBudget())
 
 
-def test_unit_rebuild_is_the_default_sync_hook() -> None:
-    assert sync.CHAT_SYNCED_HOOKS == [units.rebuild_for_chat]
+def test_on_chat_synced_rebuilds_units(conn: sqlite3.Connection, chat: ChatRow) -> None:
+    ids = db.upsert_messages(conn, [_msg(1, 0), _msg(2, 1, reply_to=1), _msg(3, 60)])
+    sync.on_chat_synced(conn, chat, CFG, ids)
+    assert [(u.kind, u.msg_ids) for u in db.get_units(conn, chat.id)] == [
+        ("window", [1, 2]),
+        ("window", [3]),
+        ("thread", [1, 2]),
+    ]
+    assert _stored(conn, chat.id) == _expected(conn, chat)
 
 
 async def test_sync_all_produces_window_and_thread_units(

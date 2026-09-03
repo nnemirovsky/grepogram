@@ -599,7 +599,7 @@ async def test_sync_all_resolves_sources_and_runs_hooks(
     )
     seen: list[tuple[int, list[int]]] = []
     monkeypatch.setattr(
-        sync, "CHAT_SYNCED_HOOKS", [lambda c, chat, cfg, ids: seen.append((chat.id, ids))]
+        sync, "on_chat_synced", lambda c, chat, cfg, ids: seen.append((chat.id, ids))
     )
     report = await _run(client, conn, paths, _cfg(ARG_SOURCE, NEWS_SOURCE, ALICE_SOURCE))
     assert report.new == 5

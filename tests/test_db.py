@@ -672,6 +672,18 @@ def test_delete_units_by_id(conn: sqlite3.Connection) -> None:
     assert [u.id for u in db.get_units(conn, 1)] == [ids[1]]
 
 
+def test_get_units_by_ids_spans_chats_and_batches(conn: sqlite3.Connection) -> None:
+    db.upsert_chat(conn, _chat(1))
+    db.upsert_chat(conn, _chat(2))
+    ids = db.insert_units(conn, [_unit(1, [i]) for i in range(1, 601)])
+    (other,) = db.insert_units(conn, [_unit(2, [1], kind="thread")])
+    assert db.get_units_by_ids(conn, []) == []
+    rows = db.get_units_by_ids(conn, [other, ids[5], ids[5], 999_999, ids[0]])
+    assert [(u.chat_id, u.msg_ids) for u in rows] == [(1, [1]), (1, [6]), (2, [1])]
+    assert rows[2].kind == "thread"
+    assert [u.id for u in db.get_units_by_ids(conn, reversed(ids))] == ids
+
+
 def test_open_window_is_the_last_window_of_the_topic(conn: sqlite3.Connection) -> None:
     db.upsert_chat(conn, _chat(1))
     assert db.open_window(conn, 1, None) is None

@@ -2,9 +2,9 @@
 
 :func:`sync_all` is the one entry point every caller (CLI ``sync``, MCP ``sync``, auto-sync in
 ``search``) goes through: it takes the cross-process :class:`SyncLock`, re-resolves the configured
-sources, syncs chats in ``last_sync_at`` order until the :class:`SyncBudget` runs out, and calls
-the :data:`CHAT_SYNCED_HOOKS` — the unit rebuild, and the indexing steps registered by later
-modules — for every chat that changed. :func:`sync_chat` fetches one chat: new messages after
+sources, syncs chats in ``last_sync_at`` order until the :class:`SyncBudget` runs out, and runs
+:func:`on_chat_synced` — the unit rebuild followed by the lexical index — for every chat that
+changed. :func:`sync_chat` fetches one chat: new messages after
 ``last_msg_id`` in batches, then a re-fetch of the newest messages for edits and reactions, plus
 channel comments stored under the linked discussion chat.
 
@@ -32,7 +32,7 @@ from typing import Any, Self
 from telethon import errors, utils
 from telethon.tl import functions, types
 
-from grepogram import db, dialogs, tg, units
+from grepogram import db, dialogs, index, tg, units
 from grepogram.config import ConfigError
 from grepogram.dialogs import entity_username
 from grepogram.models import (
@@ -743,20 +743,20 @@ def _refresh(conn: sqlite3.Connection, chat: ChatRow) -> ChatRow:
 # --- all chats -------------------------------------------------------------------------------
 
 
-ChatSyncedHook = Callable[[sqlite3.Connection, ChatRow, Config, list[int]], object]
-
-CHAT_SYNCED_HOOKS: list[ChatSyncedHook] = [units.rebuild_for_chat]
-"""Called as ``hook(conn, chat, cfg, new_msg_ids)`` — ``messages.id`` rowids of the inserted and
-edited rows — after each chat with changes, in order; the indexer registers itself after the unit
-rebuild."""
-
-
 def on_chat_synced(
     conn: sqlite3.Connection, chat: ChatRow, cfg: Config, new_msg_ids: list[int]
 ) -> None:
-    """Run every registered hook for a chat whose messages changed."""
-    for hook in CHAT_SYNCED_HOOKS:
-        hook(conn, chat, cfg, new_msg_ids)
+    """Bring the derived data of a chat up to date after these ``messages.id`` rows changed.
+
+    ``new_msg_ids`` are the rowids of the inserted and edited rows. The step is one ordered
+    function rather than a list of independent hooks because the indexer needs what the unit
+    rebuild returns: :func:`~grepogram.units.rebuild_for_chat` first, then
+    :func:`~grepogram.index.index_chat` over the same messages and the rebuild's
+    :class:`~grepogram.units.UnitDelta`. Embedding the dirty units is not per chat — it runs
+    once at the end of :func:`sync_all` when an embedder is given.
+    """
+    delta = units.rebuild_for_chat(conn, chat, cfg, new_msg_ids)
+    index.index_chat(conn, chat, new_msg_ids, delta)
 
 
 async def sync_all(

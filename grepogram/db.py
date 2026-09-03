@@ -543,6 +543,16 @@ def get_units(
     return [_unit_row(row) for row in conn.execute(sql, params)]
 
 
+def get_units_by_ids(conn: sqlite3.Connection, ids: Iterable[int]) -> list[UnitRow]:
+    """Units by id (any chat) in id order; ids that are not stored are skipped."""
+    found: dict[int, UnitRow] = {}
+    for chunk in _chunks(ids):
+        rows = conn.execute(f"SELECT * FROM units WHERE id IN ({_marks(chunk)})", chunk)
+        for row in rows:
+            found[int(row["id"])] = _unit_row(row)
+    return [found[unit_id] for unit_id in sorted(found)]
+
+
 def insert_units(conn: sqlite3.Connection, units: Iterable[UnitRow]) -> list[int]:
     """Insert units and return their ids in order; a fresh :class:`UnitRow` is ``dirty``."""
     ids: list[int] = []

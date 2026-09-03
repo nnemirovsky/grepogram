@@ -325,7 +325,7 @@ FTS and vec virtual tables cannot carry FK constraints, so `db.delete_chat(conn,
 - [x] `sync_chat(client, conn, chat, source, budget) -> SyncedChat(new_msg_ids)`: incremental `iter_messages(min_id, reverse=True, offset_date=since on first run)`, batches of 500 via `upsert_messages`, `last_msg_id` + `last_sync_at` update, then edit re-fetch of `edit_refetch` newest messages
 - [x] channel comments (`comments=true`): resolve `linked_chat_id` via `GetFullChannelRequest`, upsert the discussion chat (`discussion_of`, same `source_id`), fetch `iter_messages(channel, reply_to=post.id)` for new posts and store under the discussion chat id; `MsgIdInvalidError` → skip post
 - [x] error handling: `ChannelPrivateError` / `ChatAdminRequiredError` / `ChannelInvalidError` → `unavailable=1` and continue; `migrated_to` → new chat row linked; `FloodWaitError` beyond threshold → stop this chat, report; `AuthRequired` propagates
-- [x] `sync_all(client, conn, cfg, paths, budget, embedder=None) -> SyncReport`: `resolve_sources` → chats ordered by `last_sync_at ASC` (never-synced first) → `sync_chat` until budget expires → per synced chat call `on_chat_synced(conn, chat, cfg, new_msg_ids)` hook (unit rebuild + indexing are wired in tasks 12/14; `embedder` used in task 19) — hook is a module-level callable list so this task's tests do not depend on later tasks
+- [x] `sync_all(client, conn, cfg, paths, budget, embedder=None) -> SyncReport`: `resolve_sources` → chats ordered by `last_sync_at ASC` (never-synced first) → `sync_chat` until budget expires → per synced chat call `on_chat_synced(conn, chat, cfg, new_msg_ids)` (unit rebuild + indexing are wired in tasks 12/14; `embedder` used in task 19) — a module-level function this task's tests monkeypatch so they do not depend on later tasks
 - [x] `sync [--budget S]` CLI command printing the report
 - [x] write tests with `FakeClient`: first run stores all messages; second run fetches only `> last_msg_id`; edit re-fetch updates text and keeps `messages.id`; budget expiry leaves `chats_remaining`; private chat marked unavailable; comment with the same numeric id as a channel post does not overwrite it (different `chat_id`, different urls); lock contention raises `SyncInProgress`
 - [x] run tests — must pass before task 10
@@ -362,7 +362,7 @@ FTS and vec virtual tables cannot carry FK constraints, so `db.delete_chat(conn,
 
 - [x] `db.py`: `get_units`, `insert_units`, `delete_units(ids)`, `open_window(chat_id, topic_id)`, `threads_touching(chat_id, msg_ids)`, `mark_dirty`
 - [x] `rebuild_for_chat(conn, chat, cfg, new_msg_ids) -> UnitDelta(inserted_ids, deleted_ids)`: delete open window(s) and re-cut from their `msg_id_start` with new messages; find thread roots reachable from new messages, delete those threads and rebuild; channels: add posts for new messages; all new/changed units `dirty=1`
-- [x] register `rebuild_for_chat` on the `sync_all` hook (replacing the stub) so a sync produces units — hooks are called as `hook(conn, chat, cfg, new_msg_ids)` (the `cfg` argument was added: the rebuild needs `cfg.units` and the sources' `comments` flags)
+- [x] `sync.on_chat_synced(conn, chat, cfg, new_msg_ids)` calls `rebuild_for_chat` (replacing the stub) so a sync produces units (the `cfg` argument was added: the rebuild needs `cfg.units` and the sources' `comments` flags)
 - [x] write tests: property — syncing messages in two halves yields the same unit set as one pass; edit to a message inside a closed window does not re-cut (documented v1 limitation) but marks its thread dirty if any; a `FakeClient` sync end-to-end produces window units
 - [x] run tests — must pass before task 13
 
@@ -385,11 +385,11 @@ FTS and vec virtual tables cannot carry FK constraints, so `db.delete_chat(conn,
 - Modify: `grepogram/sync.py`
 - Create: `tests/test_index_lexical.py`
 
-- [ ] `index_messages(conn, message_ids)`: `DELETE FROM msg_fts WHERE rowid=?` then insert with explicit `rowid = messages.id` (`raw`, `stemmed`, `chat_id`, `date`), skipping empty text
-- [ ] `index_units(conn, delta: UnitDelta)`: `DELETE FROM unit_fts WHERE rowid=?` for deleted ids, insert with `rowid = units.id` (`chat_id`, `date_start`); also calls `delete_unit_vectors(conn, deleted_ids)` (no-op until `unit_vec` exists — implemented in task 19, stubbed here)
-- [ ] `index_chat(conn, chat, message_ids, delta)` registered on the `sync_all` hook after `rebuild_for_chat`
-- [ ] write tests: stemmed match finds inflected form; `chat_id` filter through UNINDEXED column as plain `AND`; deleted units disappear from `unit_fts`; re-index is idempotent; `EXPLAIN QUERY PLAN` for the delete shows a rowid lookup, not a scan
-- [ ] run tests — must pass before task 15
+- [x] `index_messages(conn, message_ids)`: `DELETE FROM msg_fts WHERE rowid=?` then insert with explicit `rowid = messages.id` (`raw`, `stemmed`, `chat_id`, `date`), skipping empty text
+- [x] `index_units(conn, delta: UnitDelta)`: `DELETE FROM unit_fts WHERE rowid=?` for deleted ids, insert with `rowid = units.id` (`chat_id`, `date_start`); also calls `delete_unit_vectors(conn, deleted_ids)` (a no-op while `unit_vec` does not exist, a rowid delete once it does — already the real implementation, task 19 only adds tests with vectors present)
+- [x] `index_chat(conn, chat, message_ids, delta)` called by `sync.on_chat_synced` right after `rebuild_for_chat` with the `UnitDelta` it returns — the per-chat step is one ordered function, not a hook list, because the indexer needs the rebuild's return value; task 19's `embed_dirty_units` runs once at the end of `sync_all`, not per chat
+- [x] write tests: stemmed match finds inflected form; `chat_id` filter through UNINDEXED column as plain `AND`; deleted units disappear from `unit_fts`; re-index is idempotent; `EXPLAIN QUERY PLAN` for the delete shows a rowid lookup, not a scan
+- [x] run tests — must pass before task 15
 
 ### Task 15: Deep links
 
@@ -452,7 +452,7 @@ FTS and vec virtual tables cannot carry FK constraints, so `db.delete_chat(conn,
 
 - [ ] `ensure_embedding_space(conn, embedder, reembed: bool)`: compares `meta.embed_model/embed_dim`; mismatch → `EmbeddingSpaceMismatch` unless `reembed`, which calls `ensure_vec_table(drop=True)`, clears `embedded_model`, sets `dirty=1`
 - [ ] `embed_dirty_units(conn, embedder, batch=256, budget=None) -> int`: select `dirty=1`, embed in batches, upsert into `unit_vec` (rowid = unit id, `chat_id`, `date_start`), set `dirty=0`, `embedded_model`
-- [ ] `delete_unit_vectors(conn, ids)` (real implementation replacing task 14's stub; no-op when `unit_vec` is absent) and `db.delete_chat` extended to remove the chat's vectors
+- [ ] `delete_unit_vectors(conn, ids)` (already real since task 14: no-op when `unit_vec` is absent, rowid delete otherwise — verify with vectors present) and `db.delete_chat` extended to remove the chat's vectors
 - [ ] `knn(conn, qvec, filters, k, fanout_max) -> list[tuple[int, float]]`: per-`chat_id` KNN with partition constraint when `len(chat_ids) <= fanout_max`, else one KNN with `k*4` post-filtered; `date_start` metadata constraints; `[]` when `unit_vec` is absent or empty; merged and sorted by distance
 - [ ] `sync_all(..., embedder)` calls `embed_dirty_units` after indexing when an embedder is given; `embed [--reembed]` CLI command; CLI `sync` loads the embedder (warning and skip on `ModelUnavailable`)
 - [ ] write tests (FakeEmbedder): dirty units embedded once; re-run is a no-op; re-cutting the open window removes the old unit's vector and `knn` never returns a rowid absent from `units`; KNN respects chat and date filters in both fan-out branches; `knn` on a DB without `unit_vec` returns `[]`; mismatch raises; `--reembed` rebuilds with new dim
