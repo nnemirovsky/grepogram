@@ -11,7 +11,8 @@ from collections.abc import AsyncIterator, Iterable, Mapping
 from typing import Any
 
 from telethon import errors, utils
-from telethon.tl import custom, types
+from telethon.tl import custom, functions, types
+from telethon.tl.types import messages as tl_messages
 
 FAR_FUTURE = dt.datetime(2100, 1, 1, tzinfo=dt.UTC)
 
@@ -98,6 +99,71 @@ def make_dialog(
     return custom.Dialog(None, dialog, {utils.get_peer_id(entity): entity}, None)
 
 
+def make_folder(
+    folder_id: int,
+    title: str,
+    *,
+    include: Iterable[Any] = (),
+    pinned: Iterable[Any] = (),
+    exclude: Iterable[Any] = (),
+    contacts: bool = False,
+    non_contacts: bool = False,
+    groups: bool = False,
+    broadcasts: bool = False,
+    bots: bool = False,
+    exclude_muted: bool = False,
+    exclude_read: bool = False,
+    exclude_archived: bool = False,
+) -> types.DialogFilter:
+    """A regular folder as returned by ``GetDialogFiltersRequest``.
+
+    Peers may be entities, marked ids or ``InputPeer`` objects (``types.InputPeerSelf()`` for
+    Saved Messages).
+    """
+    return types.DialogFilter(
+        id=folder_id,
+        title=types.TextWithEntities(title, []),
+        pinned_peers=[_input_peer(p) for p in pinned],
+        include_peers=[_input_peer(p) for p in include],
+        exclude_peers=[_input_peer(p) for p in exclude],
+        contacts=contacts or None,
+        non_contacts=non_contacts or None,
+        groups=groups or None,
+        broadcasts=broadcasts or None,
+        bots=bots or None,
+        exclude_muted=exclude_muted or None,
+        exclude_read=exclude_read or None,
+        exclude_archived=exclude_archived or None,
+    )
+
+
+def make_chatlist(
+    folder_id: int,
+    title: str,
+    *,
+    include: Iterable[Any] = (),
+    pinned: Iterable[Any] = (),
+) -> types.DialogFilterChatlist:
+    """A shared folder (chatlist): explicit peers only, no category flags."""
+    return types.DialogFilterChatlist(
+        id=folder_id,
+        title=types.TextWithEntities(title, []),
+        pinned_peers=[_input_peer(p) for p in pinned],
+        include_peers=[_input_peer(p) for p in include],
+    )
+
+
+def _input_peer(peer: Any) -> Any:
+    if isinstance(peer, int):
+        peer = utils.get_peer(peer)
+        if isinstance(peer, types.PeerUser):
+            return types.InputPeerUser(peer.user_id, peer.user_id)
+        if isinstance(peer, types.PeerChat):
+            return types.InputPeerChat(peer.chat_id)
+        return types.InputPeerChannel(peer.channel_id, peer.channel_id)
+    return utils.get_input_peer(peer)
+
+
 def make_message(
     chat_id: int,
     msg_id: int,
@@ -117,8 +183,9 @@ class FakeClient:
     messages; ``comments`` maps ``(channel_id, post_id)`` to the discussion-side messages that
     ``iter_messages(channel, reply_to=post_id)`` returns; ``responses`` maps a raw request class
     to a result, an exception to raise, or a callable taking the request; ``failures`` maps a
-    peer id to an exception ``iter_messages`` raises for that chat. Every method call is recorded
-    in ``calls`` as ``(name, kwargs)``.
+    peer id to an exception ``iter_messages`` raises for that chat; ``folders`` registers a
+    ``GetDialogFiltersRequest`` response (the default "All chats" entry first, like Telegram).
+    Every method call is recorded in ``calls`` as ``(name, kwargs)``.
     """
 
     def __init__(
@@ -130,6 +197,7 @@ class FakeClient:
         comments: Mapping[tuple[int, int], Iterable[types.Message]] | None = None,
         responses: Mapping[type, Any] | None = None,
         failures: Mapping[int, BaseException] | None = None,
+        folders: Iterable[Any] | None = None,
         authorized: bool = True,
         me: types.User | None = None,
         two_factor: bool = False,
@@ -143,6 +211,11 @@ class FakeClient:
         self.messages = {chat_id: _by_id(items) for chat_id, items in (messages or {}).items()}
         self.comments = {key: _by_id(items) for key, items in (comments or {}).items()}
         self.responses = dict(responses or {})
+        if folders is not None:
+            self.responses.setdefault(
+                functions.messages.GetDialogFiltersRequest,
+                tl_messages.DialogFilters(filters=[types.DialogFilterDefault(), *folders]),
+            )
         self.failures = dict(failures or {})
         self.authorized = authorized
         self.me = me

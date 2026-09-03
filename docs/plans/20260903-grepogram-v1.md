@@ -280,13 +280,13 @@ FTS and vec virtual tables cannot carry FK constraints, so `db.delete_chat(conn,
 - Modify: `grepogram/cli.py`
 - Create: `tests/test_dialogs.py`
 
-- [ ] `dialogs.py`: `DialogInfo(id, title, type, username, is_forum, folders: list[str])`; `chat_type(entity)` → `user|bot|group|supergroup|channel`; `peer_id(entity)` as Telethon's marked id (`-100…` for channels/supergroups)
-- [ ] `fetch_folders(client) -> list[FolderInfo]` via `GetDialogFiltersRequest`: handle `DialogFilter` and `DialogFilterChatlist` (skip `DialogFilterDefault`), `title.text`, peers + flags
-- [ ] `DialogCatalog` (in-process memo of `get_dialogs()` + folders, `invalidate()` called by `sources_add`; no on-disk cache): `list_dialogs()`; folder membership via `folder_members(folder, dialogs)` (include ∪ pinned − exclude; flags → filter dialogs by type/contact/muted/unread/archived)
-- [ ] `match(query, dialogs, folders, limit=10)`: case-insensitive substring first, then `difflib.SequenceMatcher` ratio ≥ 0.6; returns dialogs and folders tagged with `kind`
-- [ ] `dialogs "<q>"` CLI command printing matches as a table
-- [ ] write tests: `folder_members` for explicit peers, each category flag, each exclude flag; `match` ordering; memo returns the same list until `invalidate()`; `title.text` handling
-- [ ] run tests — must pass before task 7
+- [x] `dialogs.py`: `DialogInfo(id, title, type, username, is_forum, folders: list[str])`; `chat_type(entity)` → `user|bot|group|supergroup|channel`; `peer_id(entity)` as Telethon's marked id (`-100…` for channels/supergroups)
+- [x] `fetch_folders(client) -> list[FolderInfo]` via `GetDialogFiltersRequest`: handle `DialogFilter` and `DialogFilterChatlist` (skip `DialogFilterDefault`), `title.text`, peers + flags
+- [x] `DialogCatalog` (in-process memo of `get_dialogs()` + folders, `invalidate()` called by `sources_add`; no on-disk cache): `list_dialogs()`; folder membership via `folder_members(folder, dialogs)` (include ∪ pinned − exclude; flags → filter dialogs by type/contact/muted/unread/archived)
+- [x] `match(query, dialogs, folders, limit=10)`: case-insensitive substring first, then `difflib.SequenceMatcher` ratio ≥ 0.6; returns dialogs and folders tagged with `kind`
+- [x] `dialogs "<q>"` CLI command printing matches as a table
+- [x] write tests: `folder_members` for explicit peers, each category flag, each exclude flag; `match` ordering; memo returns the same list until `invalidate()`; `title.text` handling
+- [x] run tests — must pass before task 7
 
 ### Task 7: Sources management and resolution
 

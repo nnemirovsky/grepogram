@@ -1,20 +1,23 @@
 """Command-line interface: ``grepogram <command>``.
 
 Commands print plain text to stdout and diagnostics to stderr; logging goes to stderr and the log
-file. ``config`` and ``sources`` are sub-apps; later tasks add ``dialogs``, ``sync``, ``search``
-and ``embed`` and fill in the ``sources`` commands.
+file. ``config`` and ``sources`` are sub-apps; later tasks add ``sync``, ``search`` and ``embed``
+and fill in the ``sources`` commands.
 """
 
 import asyncio
 import logging
 import sqlite3
+from collections.abc import Sequence
 from typing import Annotated, NoReturn
 
 import typer
+from telethon import TelegramClient
 from telethon import errors as tg_errors
 
-from grepogram import __version__, config, db, tg
+from grepogram import __version__, config, db, dialogs, tg
 from grepogram.config import TEMPLATE, ConfigError
+from grepogram.dialogs import Match
 from grepogram.log import setup_logging
 from grepogram.models import Config
 from grepogram.paths import Paths
@@ -53,16 +56,8 @@ def main(
 def auth() -> None:
     """Sign in to Telegram (phone, login code, optional 2FA password) and store the session."""
     paths = Paths.from_env()
-    try:
-        cfg = config.load(paths)
-    except ConfigError as exc:
-        fail(str(exc))
-    if cfg.telegram.api_id == 0 or not cfg.telegram.api_hash:
-        fail(
-            f"[telegram] api_id and api_hash are not set in {paths.config_file}: create an "
-            "application at https://my.telegram.org/apps and fill them in "
-            "(run `grepogram config init` first if the file does not exist)"
-        )
+    cfg = _load_config(paths)
+    _require_api_keys(cfg, paths)
     tg.prepare_session(paths)
     client = tg.make_client(cfg, paths)
     try:
@@ -86,6 +81,58 @@ def _ask_code() -> str:
 
 def _ask_password() -> str:
     return str(typer.prompt("Two-step verification password", hide_input=True))
+
+
+@app.command("dialogs")
+def dialogs_cmd(
+    query: Annotated[str, typer.Argument(help="Chat title, @username or folder name (fuzzy).")],
+    limit: Annotated[int, typer.Option("--limit", "-n", help="Maximum number of matches.")] = 10,
+) -> None:
+    """Find chats and folders whose name matches QUERY; needs a signed-in session."""
+    paths = Paths.from_env()
+    cfg = _load_config(paths)
+    _require_api_keys(cfg, paths)
+    try:
+        tg.ensure_session_mode(paths)
+        client = tg.make_client(cfg, paths)
+        matches = asyncio.run(_match_dialogs(client, query, limit))
+    except tg.AuthRequired as exc:
+        fail(str(exc))
+    except (tg_errors.RPCError, ConnectionError) as exc:
+        fail(f"telegram error: {exc}")
+    if not matches:
+        typer.echo(f"no dialogs or folders match {query!r}")
+        return
+    rows = [
+        (
+            m.kind,
+            str(m.id),
+            m.dialog.type if m.dialog else "-",
+            m.title,
+            f"@{m.dialog.username}" if m.dialog and m.dialog.username else "-",
+            ", ".join(m.dialog.folders) if m.dialog and m.dialog.folders else "-",
+            f"{m.score:.2f}",
+        )
+        for m in matches
+    ]
+    _print_table(("kind", "id", "type", "title", "username", "folders", "score"), rows)
+
+
+async def _match_dialogs(client: TelegramClient, query: str, limit: int) -> list[Match]:
+    async with tg.connected(client):
+        catalog = dialogs.DialogCatalog(client)
+        found = await catalog.list_dialogs()
+        folders = await catalog.list_folders()
+    return dialogs.match(query, found, folders, limit=limit)
+
+
+def _print_table(headers: Sequence[str], rows: Sequence[Sequence[str]]) -> None:
+    widths = [len(h) for h in headers]
+    for row in rows:
+        widths = [max(w, len(cell)) for w, cell in zip(widths, row, strict=True)]
+    for line in (headers, *rows):
+        cells = [cell.ljust(w) for cell, w in zip(line, widths, strict=True)]
+        typer.echo("  ".join(cells).rstrip())
 
 
 @config_app.command("path")
@@ -124,6 +171,24 @@ def fail(message: str, code: int = 1) -> NoReturn:
     raise typer.Exit(code)
 
 
+def _load_config(paths: Paths) -> Config:
+    """Read the config file (defaults when absent), exiting on a broken one."""
+    try:
+        return config.load(paths)
+    except ConfigError as exc:
+        fail(str(exc))
+
+
+def _require_api_keys(cfg: Config, paths: Paths) -> None:
+    """Exit with setup instructions unless ``[telegram]`` api_id and api_hash are filled in."""
+    if cfg.telegram.api_id == 0 or not cfg.telegram.api_hash:
+        fail(
+            f"[telegram] api_id and api_hash are not set in {paths.config_file}: create an "
+            "application at https://my.telegram.org/apps and fill them in "
+            "(run `grepogram config init` first if the file does not exist)"
+        )
+
+
 def _open_db(paths: Paths) -> sqlite3.Connection:
     """Open the index database and bring its schema up to date."""
     conn = db.connect(paths)
@@ -134,9 +199,9 @@ def _open_db(paths: Paths) -> sqlite3.Connection:
 def _load() -> tuple[Paths, Config, sqlite3.Connection]:
     """Resolve paths, read the config and open the database for a command."""
     paths = Paths.from_env()
+    cfg = _load_config(paths)
     try:
-        cfg = config.load(paths)
         conn = _open_db(paths)
-    except (ConfigError, db.SchemaError) as exc:
+    except db.SchemaError as exc:
         fail(str(exc))
     return paths, cfg, conn
