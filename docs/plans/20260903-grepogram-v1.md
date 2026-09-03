@@ -372,11 +372,11 @@ FTS and vec virtual tables cannot carry FK constraints, so `db.delete_chat(conn,
 - Create: `grepogram/stem.py`
 - Create: `tests/test_stem.py`
 
-- [ ] `tokenize(text) -> list[str]`: NFKC, lowercase, `\w+` (keeps digits and `_`), no stop-word removal
-- [ ] `stem_token(tok)`: Cyrillic → russian Snowball, Latin → english, else identity; `stem_text(text) -> str`
-- [ ] `fts_query(text, op: Literal["AND","OR"]) -> str | None`: stem + quote each token; `None` for no tokens
-- [ ] write tests: Russian inflections map to one stem (`счёт/счета/счетов`), English plurals, mixed-script sentence, punctuation and emoji stripped, digits kept, `fts_query` quoting of tokens containing `-`/`:`, `None` for emoji-only input; generated query is accepted by an in-memory FTS5 table
-- [ ] run tests — must pass before task 14
+- [x] `tokenize(text) -> list[str]`: NFKC, lowercase, `\w+` (keeps digits and `_`), no stop-word removal
+- [x] `stem_token(tok)`: Cyrillic → russian Snowball, Latin → english, else identity; `stem_text(text) -> str`
+- [x] `fts_query(text, op: Literal["AND","OR"]) -> str | None`: stem + quote each token; `None` for no tokens
+- [x] write tests: Russian inflections map to one stem (`счёт/счета/счетов`), English plurals, mixed-script sentence, punctuation and emoji stripped, digits kept, `fts_query` quoting of tokens containing `-`/`:`, `None` for emoji-only input; generated query is accepted by an in-memory FTS5 table
+- [x] run tests — must pass before task 14
 
 ### Task 14: Lexical indexing
 
