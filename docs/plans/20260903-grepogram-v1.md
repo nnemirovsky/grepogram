@@ -422,13 +422,13 @@ FTS and vec virtual tables cannot carry FK constraints, so `db.delete_chat(conn,
 - Modify: `grepogram/cli.py`
 - Create: `tests/test_search_lexical.py`, `tests/fixtures/chat_ru.py`
 
-- [ ] `lexical_units(conn, q, filters, limit)` and `lexical_messages(conn, q, filters, limit)`: `bm25()` ordered ASC and negated into a score, AND→OR fallback, `chat_id`/date as plain `AND` predicates; message hits mapped to containing window with `anchor_msg_id`; `fts_query() is None` → empty list
-- [ ] `build_hit(conn, unit, anchor_msg_id, score, full)` — snippet (anchor ± neighbours ≤ 600 chars), `url`/`fallback_url` via `links.message_url`, `chat` row
-- [ ] `search(conn, cfg, query, filters, k, mode="lexical", full=False) -> SearchResult` (hybrid/dense modes raise `NotImplementedError` until task 21); `index_age_min` computed; empty `fts_query` → empty result with a warning
-- [ ] `search` CLI command with `--chat/--since/--until/--mode/-k/--full/--json` and readable text output (score, chat, date range, url, snippet)
-- [ ] `tests/fixtures/chat_ru.py`: ~60 synthetic Russian/English messages across two chats with reply chains about banks, SIM cards and visas, plus a synonym pair the FakeEmbedder can bridge later
-- [ ] write tests: full pipeline in memory (`upsert → rebuild_for_chat → index_chat → search`): inflected query hits; chat filter excludes other chat; date filter; AND→OR fallback observed; message hit maps to window with correct anchor and url; emoji-only query → warning; CLI JSON output shape
-- [ ] run tests — must pass before task 18
+- [x] `lexical_units(conn, q, filters, limit)` and `lexical_messages(conn, q, filters, limit)`: `bm25()` ordered ASC and negated into a score, AND→OR fallback, `chat_id`/date as plain `AND` predicates; message hits mapped to containing window with `anchor_msg_id`; `fts_query() is None` → empty list; the two lists are fused with `rrf` (pulled forward from task 21: a unit the message list also finds ranks first, and the unit list alone would make the message list redundant)
+- [x] `build_hit(conn, unit, anchor_msg_id, score, full)` — snippet (anchor ± neighbours ≤ 600 chars), `url`/`fallback_url` via `links.message_url`, `chat` row
+- [x] `search(conn, cfg, query, filters, k, mode="lexical", full=False) -> SearchResult` (hybrid/dense modes raise `NotImplementedError` until task 21); `index_age_min` computed; empty `fts_query` → empty result with a warning
+- [x] `search` CLI command with `--chat/--since/--until/--mode/-k/--full/--json` and readable text output (score, chat, date range, url, snippet)
+- [x] `tests/fixtures/chat_ru.py`: ~60 synthetic Russian/English messages across two chats with reply chains about banks, SIM cards and visas, plus a synonym pair the FakeEmbedder can bridge later
+- [x] write tests: full pipeline in memory (`upsert → rebuild_for_chat → index_chat → search`): inflected query hits; chat filter excludes other chat; date filter; AND→OR fallback observed; message hit maps to window with correct anchor and url; emoji-only query → warning; CLI JSON output shape
+- [x] run tests — must pass before task 18
 
 ### Task 18: Embedder protocol with fake and bge-m3 implementations
 
@@ -477,7 +477,7 @@ FTS and vec virtual tables cannot carry FK constraints, so `db.delete_chat(conn,
 - Modify: `grepogram/search.py`, `grepogram/cli.py`
 - Create: `tests/test_search_hybrid.py`
 
-- [ ] `rrf(rankings: list[list[int]], k) -> dict[int, float]`; `dedup(hits, overlap) -> list[Hit]` by `msg_ids` overlap against higher-scored hits
+- [ ] `rrf(rankings: list[list[int]], k) -> dict[int, float]` (exists in `search.py` since task 17, where lexical mode already fuses the unit and message lists; extend its test with the three-list case); `dedup(hits, overlap) -> list[Hit]` by `msg_ids` overlap against higher-scored hits
 - [ ] `search(...)` for `mode="hybrid"|"dense"`: lexical lists + dense list → `rrf` → top `rerank_top` → rerank (when `rerank=True` and a reranker loads) → dedup → top `k`; `ModelUnavailable` or empty/missing `unit_vec` → fall back to lexical with `warnings`; empty `fts_query` in hybrid → dense-only
 - [ ] CLI: `--mode hybrid|dense`, `--no-rerank`; hybrid becomes the default
 - [ ] write tests: `rrf` math on a hand-computed example; `dedup` keeps higher score; hybrid finds the fixture's synonym paraphrase that lexical misses; dense unavailable → lexical result + warning; hybrid on a never-embedded DB → lexical hits + warning, no exception; `rerank=False` skips reranker

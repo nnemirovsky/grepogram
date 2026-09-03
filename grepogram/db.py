@@ -324,6 +324,12 @@ def list_chats(conn: sqlite3.Connection, source_id: str | None = None) -> list[C
     return [_chat_row(row) for row in rows]
 
 
+def last_sync_at(conn: sqlite3.Connection) -> int | None:
+    """When the most recently completed chat sync finished, or ``None`` before the first one."""
+    row = conn.execute("SELECT max(last_sync_at) AS latest FROM chats").fetchone()
+    return None if row["latest"] is None else int(row["latest"])
+
+
 def set_chat_progress(
     conn: sqlite3.Connection, chat_id: int, last_msg_id: int, last_sync_at: int | None
 ) -> None:
@@ -596,6 +602,30 @@ def open_window(conn: sqlite3.Connection, chat_id: int, topic_id: int | None) ->
         "ORDER BY msg_id_end DESC, id DESC LIMIT 1",
         (chat_id, topic_id),
     ).fetchone()
+    return None if row is None else _unit_row(row)
+
+
+def containing_unit(
+    conn: sqlite3.Connection, chat_id: int, msg_id: int, topic_id: int | None
+) -> UnitRow | None:
+    """The window holding ``msg_id`` in ``(chat, topic)``, or a channel's ``post`` unit for it.
+
+    A window is found by its ``msg_id`` range within the topic — the ranges of different topics
+    interleave in a forum or a discussion chat, so the topic is part of the lookup. Channels have
+    no windows, so a post's own unit stands in. ``None`` while the message is in no unit yet.
+    """
+    row = conn.execute(
+        "SELECT * FROM units WHERE kind = 'window' AND chat_id = ? "
+        "AND ? BETWEEN msg_id_start AND msg_id_end AND topic_id IS ? "
+        "ORDER BY msg_id_start DESC LIMIT 1",
+        (chat_id, msg_id, topic_id),
+    ).fetchone()
+    if row is None:
+        row = conn.execute(
+            "SELECT * FROM units WHERE kind = 'post' AND chat_id = ? AND msg_id_start = ? "
+            "ORDER BY id LIMIT 1",
+            (chat_id, msg_id),
+        ).fetchone()
     return None if row is None else _unit_row(row)
 
 

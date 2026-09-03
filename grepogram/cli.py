@@ -1,25 +1,30 @@
 """Command-line interface: ``grepogram <command>``.
 
 Commands print plain text to stdout and diagnostics to stderr; logging goes to stderr and the log
-file. ``config`` and ``sources`` are sub-apps; later tasks add ``search`` and ``embed``.
+file. ``config`` and ``sources`` are sub-apps; ``search --json`` prints the
+:class:`~grepogram.models.SearchResult` and nothing else on stdout. A later task adds ``embed``.
 """
 
 import asyncio
 import datetime as dt
+import json
 import logging
 import sqlite3
 from collections.abc import Sequence
+from dataclasses import asdict
+from enum import StrEnum
 from typing import Annotated, NoReturn
 
 import typer
 from telethon import TelegramClient
 from telethon import errors as tg_errors
 
-from grepogram import __version__, config, db, dialogs, sources, sync, tg
+from grepogram import __version__, config, db, dialogs, filters, search, sources, sync, tg
 from grepogram.config import TEMPLATE, ConfigError
 from grepogram.dialogs import Match
+from grepogram.filters import FilterError
 from grepogram.log import setup_logging
-from grepogram.models import Config, SyncReport
+from grepogram.models import Config, SearchResult, SyncReport
 from grepogram.paths import Paths
 
 HELP = "Local hybrid search over opt-in Telegram chats, exposed to Claude Code through MCP."
@@ -29,6 +34,12 @@ config_app = typer.Typer(help="Show or create the config file.", no_args_is_help
 sources_app = typer.Typer(help="Manage indexed sources (folders and chats).", no_args_is_help=True)
 app.add_typer(config_app, name="config")
 app.add_typer(sources_app, name="sources")
+
+
+class Mode(StrEnum):
+    lexical = "lexical"
+    hybrid = "hybrid"
+    dense = "dense"
 
 
 def _version(value: bool) -> None:
@@ -187,6 +198,91 @@ def _print_report(report: SyncReport) -> None:
         typer.echo(f"chats unavailable: {len(report.unavailable)} ({ids})")
     for warning in report.warnings:
         typer.echo(f"warning: {warning}", err=True)
+
+
+@app.command("search")
+def search_cmd(
+    query: Annotated[
+        str, typer.Argument(help="What to look for; Russian and English words are stemmed.")
+    ],
+    chat: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--chat",
+            "-c",
+            help="Search only these chats: id, @username, folder:<name> or a title (repeatable).",
+        ),
+    ] = None,
+    since: Annotated[
+        str | None,
+        typer.Option("--since", help=f"Skip units starting before this: {filters.WHEN_GRAMMAR}."),
+    ] = None,
+    until: Annotated[
+        str | None,
+        typer.Option("--until", help="Skip units starting after this (same forms, inclusive)."),
+    ] = None,
+    mode: Annotated[
+        Mode,
+        typer.Option(
+            "--mode", help="lexical = BM25 over stems; hybrid and dense need the dense index."
+        ),
+    ] = Mode.lexical,
+    k: Annotated[
+        int | None,
+        typer.Option("-k", "--limit", min=1, help="Number of hits (default: [search] k)."),
+    ] = None,
+    full: Annotated[
+        bool, typer.Option("--full", help="Include each hit's full unit text.")
+    ] = False,
+    as_json: Annotated[
+        bool, typer.Option("--json", help="Print the result as JSON and nothing else.")
+    ] = False,
+) -> None:
+    """Search the indexed chats (offline); every hit carries a link that opens the message."""
+    _, cfg, conn = _load()
+    try:
+        selected = filters.resolve_filters(conn, cfg, chat, since, until)
+        result = search.search(conn, cfg, query, selected, k, mode=mode.value, full=full)
+    except (FilterError, NotImplementedError) as exc:
+        fail(str(exc))
+    finally:
+        conn.close()
+    if as_json:
+        typer.echo(json.dumps(asdict(result), ensure_ascii=False, indent=2))
+        return
+    _print_hits(result, cfg)
+
+
+def _print_hits(result: SearchResult, cfg: Config) -> None:
+    for warning in result.warnings:
+        typer.echo(f"warning: {warning}", err=True)
+    age = result.index_age_min
+    if age is not None and age > cfg.search.auto_sync_after_min:
+        typer.echo(f"note: the index is {age} min old; run: grepogram sync", err=True)
+    if not result.hits:
+        typer.echo("no hits")
+        return
+    for n, hit in enumerate(result.hits, start=1):
+        if n > 1:
+            typer.echo("")
+        title = hit.chat.title or f"chat {hit.chat.id}"
+        typer.echo(
+            f"{n}. {hit.score:.4f}  {hit.kind}  {title}  {_span(hit.date_start, hit.date_end)}"
+        )
+        typer.echo(f"   {hit.url}")
+        if hit.fallback_url:
+            typer.echo(f"   fallback: {hit.fallback_url}")
+        body = hit.snippet if hit.text is None else hit.text
+        for line in body.splitlines():
+            typer.echo(f"   {line}")
+
+
+def _span(start: int, end: int) -> str:
+    first = dt.datetime.fromtimestamp(start, dt.UTC)
+    last = dt.datetime.fromtimestamp(end, dt.UTC)
+    if first.date() == last.date():
+        return f"{first:%Y-%m-%d %H:%M}–{last:%H:%M} UTC"
+    return f"{first:%Y-%m-%d %H:%M} – {last:%Y-%m-%d %H:%M} UTC"
 
 
 @sources_app.command("add")

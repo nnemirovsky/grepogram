@@ -361,6 +361,20 @@ def test_chat_state_setters(conn: sqlite3.Connection) -> None:
     assert db.get_chat(conn, 1) == _chat(1, last_msg_id=99, last_sync_at=2000, migrated_to=-1002)
 
 
+def test_last_sync_at_is_the_latest_completed_sync(conn: sqlite3.Connection) -> None:
+    assert db.last_sync_at(conn) is None
+    db.upsert_chat(conn, _chat(1))
+    db.upsert_chat(conn, _chat(2))
+    assert db.last_sync_at(conn) is None
+    db.set_chat_progress(conn, 1, 10, 500)
+    db.set_chat_progress(conn, 2, 10, None)
+    assert db.last_sync_at(conn) == 500
+    db.set_chat_progress(conn, 2, 20, 900)
+    assert db.last_sync_at(conn) == 900
+    db.set_chat_progress(conn, 2, 20, 300)
+    assert db.last_sync_at(conn) == 500
+
+
 def test_list_chats_orders_by_id_and_filters_by_source(conn: sqlite3.Connection) -> None:
     db.upsert_chat(conn, _chat(3, source_id="folder:B"))
     db.upsert_chat(conn, _chat(-1001, source_id="folder:A"))
@@ -735,6 +749,35 @@ def test_post_units_by_post_id(conn: sqlite3.Connection) -> None:
     assert [u.id for u in db.post_units(conn, 1, [1, 3])] == [ids[0]]
     assert [u.id for u in db.post_units(conn, 1, [2, 1])] == ids[:2]
     assert db.post_units(conn, 1, []) == []
+
+
+def test_containing_unit_by_topic_range_then_post(conn: sqlite3.Connection) -> None:
+    db.upsert_chat(conn, _chat(1))
+    ids = db.insert_units(
+        conn,
+        [
+            _unit(1, [1, 3, 5]),
+            _unit(1, [2, 4, 6], topic_id=7),
+            _unit(1, [1, 2, 3], kind="thread"),
+            _unit(1, [9], kind="post"),
+            _unit(1, [9], kind="thread"),
+        ],
+    )
+
+    def containing(msg_id: int, topic_id: int | None) -> int | None:
+        unit = db.containing_unit(conn, 1, msg_id, topic_id)
+        return None if unit is None else unit.id
+
+    assert containing(3, None) == ids[0]
+    assert containing(4, None) == ids[0]
+    assert containing(4, 7) == ids[1]
+    assert containing(2, 7) == ids[1]
+    assert containing(6, 7) == ids[1]
+    assert containing(3, 8) is None
+    assert containing(9, None) == ids[3]
+    assert containing(9, 7) == ids[3]
+    assert containing(8, None) is None
+    assert db.containing_unit(conn, 2, 1, None) is None
 
 
 def test_mark_dirty(conn: sqlite3.Connection) -> None:
