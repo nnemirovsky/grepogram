@@ -14,6 +14,8 @@ from telethon import errors, utils
 from telethon.tl import custom, functions, types
 from telethon.tl.types import messages as tl_messages
 
+from tests.fixtures import tl
+
 FAR_FUTURE = dt.datetime(2100, 1, 1, tzinfo=dt.UTC)
 
 
@@ -172,8 +174,7 @@ def make_message(
     date: dt.datetime | None = None,
 ) -> types.Message:
     """A minimal text message; ``tests/fixtures/tl.py`` has the richer builders."""
-    when = date or dt.datetime(2025, 1, 1, tzinfo=dt.UTC) + dt.timedelta(minutes=msg_id)
-    return types.Message(id=msg_id, peer_id=utils.get_peer(chat_id), date=when, message=text)
+    return tl.message(chat_id, msg_id, text, date=date)
 
 
 class FakeClient:

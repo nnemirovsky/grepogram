@@ -309,11 +309,11 @@ FTS and vec virtual tables cannot carry FK constraints, so `db.delete_chat(conn,
 - Create: `grepogram/sync.py`
 - Create: `tests/test_sync_map.py`, `tests/fixtures/tl.py`
 
-- [ ] `tests/fixtures/tl.py`: builders creating real Telethon `types.Message` objects **with no client attached** (text, caption+photo, voice, document with filename, reply, forum-topic message, forwarded, service message, reactions, channel post)
-- [ ] `sync.py`: `map_message(msg, chat, names: dict[int, str]) -> MessageRow | None` implementing the mapping rules using raw TL attributes only (service → None; `msg.message`; reply/topic rules; `media_kind`; `media_filename` via `DocumentAttributeFilename`; `fwd_from`; `reactions_total`)
-- [ ] `sender_of(msg, names) -> tuple[int | None, str]` and `collect_users(entities)` building the names map from the peers returned with messages, for the `users` upsert
-- [ ] write tests: one case per fixture kind; forum topic root not treated as a reply; empty-text media message keeps `text=''`; `map_message` works on a message built without a client
-- [ ] run tests — must pass before task 9
+- [x] `tests/fixtures/tl.py`: builders creating real Telethon `types.Message` objects **with no client attached** (text, caption+photo, voice, document with filename, reply, forum-topic message, forwarded, service message, reactions, channel post)
+- [x] `sync.py`: `map_message(msg, chat, names: dict[int, str]) -> MessageRow | None` implementing the mapping rules using raw TL attributes only (service → None; `msg.message`; reply/topic rules; `media_kind`; `media_filename` via `DocumentAttributeFilename`; `fwd_from`; `reactions_total`)
+- [x] `sender_of(msg, names) -> tuple[int | None, str]` and `collect_users(entities)` building the names map from the peers returned with messages, for the `users` upsert
+- [x] write tests: one case per fixture kind; forum topic root not treated as a reply; empty-text media message keeps `text=''`; `map_message` works on a message built without a client
+- [x] run tests — must pass before task 9
 
 ### Task 9: Incremental sync with budget and lock
 
