@@ -17,6 +17,11 @@ messages, continuing in further units that repeat the root. :func:`build_posts` 
 ``post`` per channel message and, when comments are synced, a ``thread`` of the post with its
 comments read from the linked discussion chat. :func:`units_for_chat` picks the builders for a
 chat's kind.
+
+:func:`rebuild_for_chat` keeps the stored units in step with a sync: it re-cuts the open window
+of every touched ``(chat, topic)``, rebuilds the reply threads reachable from the changed
+messages and the post units of changed channel posts, and reports the inserted and deleted unit
+ids as a :class:`UnitDelta` for the indexer.
 """
 
 import datetime as dt
@@ -344,3 +349,187 @@ def units_for_chat(
         for window in cut_windows(group, cfg.units, chat.id, topic_id)
     ]
     return windows + build_threads(messages, cfg.units, chat.id)
+
+
+# --- incremental maintenance -----------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class UnitDelta:
+    """Unit ids a rebuild inserted and deleted; the indexer keeps FTS and vectors in step."""
+
+    inserted_ids: list[int] = field(default_factory=list)
+    deleted_ids: list[int] = field(default_factory=list)
+
+
+def rebuild_for_chat(
+    conn: sqlite3.Connection, chat: ChatRow, cfg: Config, new_msg_ids: Iterable[int]
+) -> UnitDelta:
+    """Bring the units of ``chat`` up to date after the rows with these ``messages.id`` changed.
+
+    ``new_msg_ids`` are what a sync reports: inserted and edited rows alike. Windows: for every
+    touched ``(chat, topic)`` the open window — the last one — is deleted and re-cut from its
+    ``msg_id_start`` over everything stored since, so a message that continues it joins it and
+    one after a long pause starts the next. Closed windows are never re-cut: an edit to a
+    message inside one does not reach that window's text (a v1 limitation), though it still
+    rebuilds the reply thread the message belongs to. Threads: every thread reachable from a
+    changed message — walking up ``reply_to_msg_id`` to the root — is rebuilt with all its
+    replies. Channels: the ``post`` units (and post threads, when comments are on) of the changed
+    posts are rebuilt. Units whose content did not change keep their row and embedding; the
+    rest are deleted and re-inserted dirty. Everything happens in one transaction.
+    """
+    changed = [m for m in db.get_messages_by_ids(conn, new_msg_ids) if m.chat_id == chat.id]
+    if not changed:
+        return UnitDelta()
+    with db.transaction(conn):
+        if chat.type == "channel" and chat.discussion_of is None:
+            return _rebuild_posts(conn, chat, cfg, changed)
+        return _rebuild_conversation(conn, chat, cfg, changed)
+
+
+def _rebuild_conversation(
+    conn: sqlite3.Connection, chat: ChatRow, cfg: Config, changed: list[MessageRow]
+) -> UnitDelta:
+    stale: list[UnitRow] = []
+    fresh: list[UnitRow] = []
+    for topic_id, group in group_by_topic(changed).items():
+        old, new = _recut_open_window(conn, chat, cfg.units, topic_id, group)
+        stale += old
+        fresh += new
+    old, new = _rebuild_threads(conn, chat, cfg.units, changed)
+    return _apply(conn, stale + old, fresh + new)
+
+
+def _rebuild_posts(
+    conn: sqlite3.Connection, chat: ChatRow, cfg: Config, changed: list[MessageRow]
+) -> UnitDelta:
+    post_ids = [post.msg_id for post in changed]
+    stale = db.post_units(conn, chat.id, post_ids) + db.threads_touching(conn, chat.id, post_ids)
+    fresh = build_posts(conn, changed, chat, comments_enabled(cfg, chat), cfg.units)
+    return _apply(conn, stale, fresh)
+
+
+def _recut_open_window(
+    conn: sqlite3.Connection,
+    chat: ChatRow,
+    cfg: UnitsCfg,
+    topic_id: int | None,
+    changed: Sequence[MessageRow],
+) -> tuple[list[UnitRow], list[UnitRow]]:
+    """The open window of ``(chat, topic)`` and its replacements, cut over the messages since
+    its start; nothing when every changed message sits inside a closed window."""
+    window = db.open_window(conn, chat.id, topic_id)
+    start = None if window is None else window.msg_id_start
+    if start is not None and all(msg.msg_id < start for msg in changed):
+        return [], []
+    messages = db.get_messages_in_topic(conn, chat.id, topic_id, since_msg_id=start)
+    stale = [] if window is None else [window]
+    return stale, cut_windows(messages, cfg, chat.id, topic_id)
+
+
+def _rebuild_threads(
+    conn: sqlite3.Connection, chat: ChatRow, cfg: UnitsCfg, changed: Sequence[MessageRow]
+) -> tuple[list[UnitRow], list[UnitRow]]:
+    """The thread units the changed messages belong to and their rebuilt replacements."""
+    threads = _thread_members(conn, chat.id, changed)
+    touched = [msg.msg_id for msg in changed] + list(threads)
+    stale = db.threads_touching(conn, chat.id, touched)
+    fresh = [
+        unit
+        for root_id, members in threads.items()
+        for unit in build_threads(members, cfg, chat.id, roots=[root_id])
+    ]
+    return stale, fresh
+
+
+def _thread_members(
+    conn: sqlite3.Connection, chat_id: int, changed: Sequence[MessageRow]
+) -> dict[int, list[MessageRow]]:
+    """Root id → root and every reply below it, for each thread a changed message belongs to."""
+    threads: dict[int, list[MessageRow]] = {}
+    for top in _chain_tops(conn, chat_id, changed):
+        replies = _descendants(conn, chat_id, top.msg_id)
+        if replies:
+            threads[top.msg_id] = [top, *replies]
+    return threads
+
+
+def _chain_tops(
+    conn: sqlite3.Connection, chat_id: int, changed: Sequence[MessageRow]
+) -> list[MessageRow]:
+    """Where each changed message's reply chain ends: the ancestor whose parent is not stored.
+
+    Chains climb level by level in batched lookups, with the same parent rule as
+    :class:`_ReplyIndex` (a reply to itself or to an unstored message has no parent). A chain
+    that reaches a message another chain already passed stops there — the first chain carries
+    on to the shared top — and a reply cycle therefore yields no top at all.
+    """
+    visited = {msg.msg_id for msg in changed}
+    frontier = list(changed)
+    tops: list[MessageRow] = []
+    while frontier:
+        wanted = {p for msg in frontier if (p := _parent_id(msg)) is not None}
+        parents = db.get_messages_by_msg_id(conn, chat_id, wanted)
+        climbing: list[MessageRow] = []
+        for msg in frontier:
+            parent_id = _parent_id(msg)
+            parent = None if parent_id is None else parents.get(parent_id)
+            if parent is None:
+                tops.append(msg)
+            elif parent.msg_id not in visited:
+                visited.add(parent.msg_id)
+                climbing.append(parent)
+        frontier = climbing
+    return tops
+
+
+def _parent_id(msg: MessageRow) -> int | None:
+    parent = msg.reply_to_msg_id
+    return None if parent is None or parent == msg.msg_id else parent
+
+
+def _descendants(conn: sqlite3.Connection, chat_id: int, root_id: int) -> list[MessageRow]:
+    """Every reply below ``root_id``, breadth-first over stored replies."""
+    seen = {root_id}
+    frontier = [root_id]
+    found: list[MessageRow] = []
+    while frontier:
+        level = [
+            reply for reply in db.get_replies(conn, chat_id, frontier) if reply.msg_id not in seen
+        ]
+        seen.update(reply.msg_id for reply in level)
+        found += level
+        frontier = [reply.msg_id for reply in level]
+    return found
+
+
+def _apply(
+    conn: sqlite3.Connection, stale: Sequence[UnitRow], fresh: Sequence[UnitRow]
+) -> UnitDelta:
+    """Replace ``stale`` with ``fresh`` in the database, keeping rows whose content is unchanged.
+
+    A rebuilt unit identical to a stored one (same kind, topic, messages, dates and text — a
+    reaction count changing on a message inside it, say) keeps its id and its embedding.
+    """
+    kept: dict[tuple[object, ...], UnitRow] = {}
+    for unit in {unit.id: unit for unit in stale}.values():
+        kept.setdefault(_content_key(unit), unit)
+    to_insert: list[UnitRow] = []
+    for unit in fresh:
+        if kept.pop(_content_key(unit), None) is None:
+            to_insert.append(unit)
+    deleted = [unit.id for unit in kept.values() if unit.id is not None]
+    inserted = db.insert_units(conn, to_insert)
+    db.delete_units(conn, deleted)
+    return UnitDelta(inserted_ids=inserted, deleted_ids=deleted)
+
+
+def _content_key(unit: UnitRow) -> tuple[object, ...]:
+    return (
+        unit.kind,
+        unit.topic_id,
+        tuple(unit.msg_ids),
+        unit.date_start,
+        unit.date_end,
+        unit.text,
+    )

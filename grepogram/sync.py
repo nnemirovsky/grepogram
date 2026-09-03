@@ -3,10 +3,10 @@
 :func:`sync_all` is the one entry point every caller (CLI ``sync``, MCP ``sync``, auto-sync in
 ``search``) goes through: it takes the cross-process :class:`SyncLock`, re-resolves the configured
 sources, syncs chats in ``last_sync_at`` order until the :class:`SyncBudget` runs out, and calls
-the :data:`CHAT_SYNCED_HOOKS` (unit rebuild and indexing, registered by later modules) for every
-chat that changed. :func:`sync_chat` fetches one chat: new messages after ``last_msg_id`` in
-batches, then a re-fetch of the newest messages for edits and reactions, plus channel comments
-stored under the linked discussion chat.
+the :data:`CHAT_SYNCED_HOOKS` — the unit rebuild, and the indexing steps registered by later
+modules — for every chat that changed. :func:`sync_chat` fetches one chat: new messages after
+``last_msg_id`` in batches, then a re-fetch of the newest messages for edits and reactions, plus
+channel comments stored under the linked discussion chat.
 
 :func:`map_message` reads raw TL attributes only — ``msg.message``, ``msg.media``,
 ``msg.reply_to``, ``msg.fwd_from``, ``msg.reactions``, ``msg.from_id``, ``msg.post``, ``msg.date``,
@@ -32,7 +32,7 @@ from typing import Any, Self
 from telethon import errors, utils
 from telethon.tl import functions, types
 
-from grepogram import db, dialogs, tg
+from grepogram import db, dialogs, tg, units
 from grepogram.config import ConfigError
 from grepogram.dialogs import entity_username
 from grepogram.models import (
@@ -743,17 +743,20 @@ def _refresh(conn: sqlite3.Connection, chat: ChatRow) -> ChatRow:
 # --- all chats -------------------------------------------------------------------------------
 
 
-ChatSyncedHook = Callable[[sqlite3.Connection, ChatRow, list[int]], None]
+ChatSyncedHook = Callable[[sqlite3.Connection, ChatRow, Config, list[int]], object]
 
-CHAT_SYNCED_HOOKS: list[ChatSyncedHook] = []
-"""Called as ``hook(conn, chat, new_msg_ids)`` after each chat with changes; the unit builder
-and the indexer append themselves here."""
+CHAT_SYNCED_HOOKS: list[ChatSyncedHook] = [units.rebuild_for_chat]
+"""Called as ``hook(conn, chat, cfg, new_msg_ids)`` — ``messages.id`` rowids of the inserted and
+edited rows — after each chat with changes, in order; the indexer registers itself after the unit
+rebuild."""
 
 
-def on_chat_synced(conn: sqlite3.Connection, chat: ChatRow, new_msg_ids: list[int]) -> None:
+def on_chat_synced(
+    conn: sqlite3.Connection, chat: ChatRow, cfg: Config, new_msg_ids: list[int]
+) -> None:
     """Run every registered hook for a chat whose messages changed."""
     for hook in CHAT_SYNCED_HOOKS:
-        hook(conn, chat, new_msg_ids)
+        hook(conn, chat, cfg, new_msg_ids)
 
 
 async def sync_all(
@@ -820,7 +823,7 @@ async def _sync_chats(
         new += synced.new
         for part in (synced, synced.discussion):
             if part is not None and part.new_msg_ids:
-                on_chat_synced(conn, part.chat, part.new_msg_ids)
+                on_chat_synced(conn, part.chat, cfg, part.new_msg_ids)
         if synced.discussion is not None:
             new += synced.discussion.new
         if synced.unavailable:

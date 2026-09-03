@@ -1,3 +1,4 @@
+import dataclasses
 import sqlite3
 import threading
 from pathlib import Path
@@ -6,7 +7,7 @@ import pytest
 import sqlite_vec
 
 from grepogram import db
-from grepogram.models import ChatRow, MessageRow, UserRow
+from grepogram.models import ChatRow, MessageRow, UnitRow, UserRow
 from grepogram.paths import Paths
 
 TABLES = {"meta", "chats", "users", "messages", "units", "msg_fts", "unit_fts"}
@@ -568,3 +569,166 @@ def test_get_topic_messages_batches_long_topic_lists(conn: sqlite3.Connection) -
         600: [2],
         1001: [3],
     }
+
+
+def test_get_messages_in_topic_treats_none_as_a_filter(conn: sqlite3.Connection) -> None:
+    db.upsert_chat(conn, _chat(1))
+    db.upsert_messages(
+        conn,
+        [
+            _message(1, 10, topic_id=7),
+            _message(1, 20),
+            _message(1, 30, topic_id=7),
+            _message(1, 40),
+        ],
+    )
+    assert [m.msg_id for m in db.get_messages_in_topic(conn, 1, None)] == [20, 40]
+    assert [m.msg_id for m in db.get_messages_in_topic(conn, 1, 7)] == [10, 30]
+    assert [m.msg_id for m in db.get_messages_in_topic(conn, 1, 7, since_msg_id=30)] == [30]
+    assert [m.msg_id for m in db.get_messages_in_topic(conn, 1, None, since_msg_id=21)] == [40]
+    assert db.get_messages_in_topic(conn, 1, 8) == []
+
+
+def test_get_messages_by_ids_spans_chats_and_batches(conn: sqlite3.Connection) -> None:
+    db.upsert_chat(conn, _chat(1))
+    db.upsert_chat(conn, _chat(2))
+    ids = db.upsert_messages(conn, [_message(1, i) for i in range(1, 601)])
+    (other,) = db.upsert_messages(conn, [_message(2, 1)])
+    assert db.get_messages_by_ids(conn, []) == []
+    rows = db.get_messages_by_ids(conn, [other, ids[5], ids[5], 999_999, ids[0]])
+    assert [(m.chat_id, m.msg_id) for m in rows] == [(1, 1), (1, 6), (2, 1)]
+    assert [m.id for m in db.get_messages_by_ids(conn, reversed(ids))] == ids
+
+
+def test_get_messages_by_msg_id_is_per_chat(conn: sqlite3.Connection) -> None:
+    db.upsert_chat(conn, _chat(1))
+    db.upsert_chat(conn, _chat(2))
+    db.upsert_messages(conn, [_message(1, 10), _message(1, 20), _message(2, 10)])
+    found = db.get_messages_by_msg_id(conn, 1, [10, 30, 10])
+    assert set(found) == {10}
+    assert found[10].chat_id == 1 and found[10].text == "message 10"
+    assert db.get_messages_by_msg_id(conn, 3, [10]) == {}
+
+
+def test_get_replies_orders_by_msg_id_and_stays_in_chat(conn: sqlite3.Connection) -> None:
+    db.upsert_chat(conn, _chat(1))
+    db.upsert_chat(conn, _chat(2))
+    db.upsert_messages(
+        conn,
+        [
+            _message(1, 1),
+            _message(1, 2, reply_to_msg_id=1),
+            _message(1, 3, reply_to_msg_id=2),
+            _message(1, 4, reply_to_msg_id=1),
+            _message(2, 5, reply_to_msg_id=1),
+        ],
+    )
+    assert [m.msg_id for m in db.get_replies(conn, 1, [1])] == [2, 4]
+    assert [m.msg_id for m in db.get_replies(conn, 1, [2, 1])] == [2, 3, 4]
+    assert db.get_replies(conn, 1, [9]) == []
+    assert db.get_replies(conn, 1, []) == []
+
+
+def _unit(chat_id: int, msg_ids: list[int], **overrides: object) -> UnitRow:
+    fields: dict[str, object] = {
+        "chat_id": chat_id,
+        "kind": "window",
+        "msg_id_start": min(msg_ids),
+        "msg_id_end": max(msg_ids),
+        "msg_ids": msg_ids,
+        "date_start": 100,
+        "date_end": 200,
+        "text": "unit text",
+    }
+    fields.update(overrides)
+    return UnitRow(**fields)  # type: ignore[arg-type]
+
+
+def test_insert_and_get_units_roundtrip(conn: sqlite3.Connection) -> None:
+    db.upsert_chat(conn, _chat(1))
+    db.upsert_chat(conn, _chat(2))
+    window = _unit(1, [3, 1, 2], topic_id=5)
+    thread = _unit(1, [1, 4], kind="thread", dirty=False, embedded_model="m")
+    ids = db.insert_units(conn, [window, thread, _unit(2, [9])])
+    assert ids == [1, 2, 3]
+    stored = db.get_units(conn, 1)
+    assert stored == [
+        dataclasses.replace(window, id=1),
+        dataclasses.replace(thread, id=2),
+    ]
+    assert stored[0].dirty is True and stored[1].dirty is False
+    assert conn.execute("SELECT msg_ids FROM units WHERE id = 1").fetchone()[0] == "[3,1,2]"
+    assert [u.id for u in db.get_units(conn, 1, kind="thread")] == [2]
+    assert db.get_units(conn, 3) == []
+    assert db.insert_units(conn, []) == []
+
+
+def test_delete_units_by_id(conn: sqlite3.Connection) -> None:
+    db.upsert_chat(conn, _chat(1))
+    ids = db.insert_units(conn, [_unit(1, [1]), _unit(1, [2]), _unit(1, [3])])
+    db.delete_units(conn, [ids[0], ids[2], 999])
+    assert [u.id for u in db.get_units(conn, 1)] == [ids[1]]
+    db.delete_units(conn, [])
+    assert [u.id for u in db.get_units(conn, 1)] == [ids[1]]
+
+
+def test_open_window_is_the_last_window_of_the_topic(conn: sqlite3.Connection) -> None:
+    db.upsert_chat(conn, _chat(1))
+    assert db.open_window(conn, 1, None) is None
+    ids = db.insert_units(
+        conn,
+        [
+            _unit(1, [5, 6]),
+            _unit(1, [1, 2]),
+            _unit(1, [7, 8], kind="thread"),
+            _unit(1, [3], topic_id=9),
+            _unit(1, [9, 10], topic_id=9, kind="post"),
+        ],
+    )
+    general = db.open_window(conn, 1, None)
+    assert general is not None and general.id == ids[0] and general.msg_ids == [5, 6]
+    topic = db.open_window(conn, 1, 9)
+    assert topic is not None and topic.id == ids[3]
+    assert db.open_window(conn, 1, 4) is None
+    assert db.open_window(conn, 2, None) is None
+
+
+def test_threads_touching_matches_any_listed_message(conn: sqlite3.Connection) -> None:
+    db.upsert_chat(conn, _chat(1))
+    db.upsert_chat(conn, _chat(2))
+    ids = db.insert_units(
+        conn,
+        [
+            _unit(1, [1, 2, 3], kind="thread"),
+            _unit(1, [1, 7], kind="thread"),
+            _unit(1, [1, 2, 3]),
+            _unit(1, [12], kind="post"),
+            _unit(1, [20, 21], kind="thread"),
+            _unit(2, [1, 2], kind="thread"),
+        ],
+    )
+    assert [u.id for u in db.threads_touching(conn, 1, [1])] == ids[:2]
+    assert [u.id for u in db.threads_touching(conn, 1, [7, 12])] == [ids[1]]
+    assert [u.id for u in db.threads_touching(conn, 1, [2, 21])] == [ids[0], ids[4]]
+    assert [u.id for u in db.threads_touching(conn, 1, range(1, 1001))] == [ids[0], ids[1], ids[4]]
+    assert db.threads_touching(conn, 1, [99]) == []
+    assert db.threads_touching(conn, 1, []) == []
+
+
+def test_post_units_by_post_id(conn: sqlite3.Connection) -> None:
+    db.upsert_chat(conn, _chat(1))
+    ids = db.insert_units(
+        conn, [_unit(1, [1], kind="post"), _unit(1, [2], kind="post"), _unit(1, [1], kind="thread")]
+    )
+    assert [u.id for u in db.post_units(conn, 1, [1, 3])] == [ids[0]]
+    assert [u.id for u in db.post_units(conn, 1, [2, 1])] == ids[:2]
+    assert db.post_units(conn, 1, []) == []
+
+
+def test_mark_dirty(conn: sqlite3.Connection) -> None:
+    db.upsert_chat(conn, _chat(1))
+    ids = db.insert_units(conn, [_unit(1, [1], dirty=False), _unit(1, [2], dirty=False)])
+    db.mark_dirty(conn, [ids[1], 999])
+    assert [u.dirty for u in db.get_units(conn, 1)] == [False, True]
+    db.mark_dirty(conn, [])
+    assert [u.dirty for u in db.get_units(conn, 1)] == [False, True]

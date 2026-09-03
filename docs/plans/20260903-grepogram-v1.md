@@ -325,7 +325,7 @@ FTS and vec virtual tables cannot carry FK constraints, so `db.delete_chat(conn,
 - [x] `sync_chat(client, conn, chat, source, budget) -> SyncedChat(new_msg_ids)`: incremental `iter_messages(min_id, reverse=True, offset_date=since on first run)`, batches of 500 via `upsert_messages`, `last_msg_id` + `last_sync_at` update, then edit re-fetch of `edit_refetch` newest messages
 - [x] channel comments (`comments=true`): resolve `linked_chat_id` via `GetFullChannelRequest`, upsert the discussion chat (`discussion_of`, same `source_id`), fetch `iter_messages(channel, reply_to=post.id)` for new posts and store under the discussion chat id; `MsgIdInvalidError` → skip post
 - [x] error handling: `ChannelPrivateError` / `ChatAdminRequiredError` / `ChannelInvalidError` → `unavailable=1` and continue; `migrated_to` → new chat row linked; `FloodWaitError` beyond threshold → stop this chat, report; `AuthRequired` propagates
-- [x] `sync_all(client, conn, cfg, paths, budget, embedder=None) -> SyncReport`: `resolve_sources` → chats ordered by `last_sync_at ASC` (never-synced first) → `sync_chat` until budget expires → per synced chat call `on_chat_synced(conn, chat, new_msg_ids)` hook (unit rebuild + indexing are wired in tasks 12/14; `embedder` used in task 19) — hook is a module-level callable list so this task's tests do not depend on later tasks
+- [x] `sync_all(client, conn, cfg, paths, budget, embedder=None) -> SyncReport`: `resolve_sources` → chats ordered by `last_sync_at ASC` (never-synced first) → `sync_chat` until budget expires → per synced chat call `on_chat_synced(conn, chat, cfg, new_msg_ids)` hook (unit rebuild + indexing are wired in tasks 12/14; `embedder` used in task 19) — hook is a module-level callable list so this task's tests do not depend on later tasks
 - [x] `sync [--budget S]` CLI command printing the report
 - [x] write tests with `FakeClient`: first run stores all messages; second run fetches only `> last_msg_id`; edit re-fetch updates text and keeps `messages.id`; budget expiry leaves `chats_remaining`; private chat marked unavailable; comment with the same numeric id as a channel post does not overwrite it (different `chat_id`, different urls); lock contention raises `SyncInProgress`
 - [x] run tests — must pass before task 10
@@ -360,11 +360,11 @@ FTS and vec virtual tables cannot carry FK constraints, so `db.delete_chat(conn,
 - Modify: `grepogram/units.py`, `grepogram/db.py`, `grepogram/sync.py`
 - Create: `tests/test_units_incremental.py`
 
-- [ ] `db.py`: `get_units`, `insert_units`, `delete_units(ids)`, `open_window(chat_id, topic_id)`, `threads_touching(chat_id, msg_ids)`, `mark_dirty`
-- [ ] `rebuild_for_chat(conn, chat, cfg, new_msg_ids) -> UnitDelta(inserted_ids, deleted_ids)`: delete open window(s) and re-cut from their `msg_id_start` with new messages; find thread roots reachable from new messages, delete those threads and rebuild; channels: add posts for new messages; all new/changed units `dirty=1`
-- [ ] register `rebuild_for_chat` on the `sync_all` hook (replacing the stub) so a sync produces units
-- [ ] write tests: property — syncing messages in two halves yields the same unit set as one pass; edit to a message inside a closed window does not re-cut (documented v1 limitation) but marks its thread dirty if any; a `FakeClient` sync end-to-end produces window units
-- [ ] run tests — must pass before task 13
+- [x] `db.py`: `get_units`, `insert_units`, `delete_units(ids)`, `open_window(chat_id, topic_id)`, `threads_touching(chat_id, msg_ids)`, `mark_dirty`
+- [x] `rebuild_for_chat(conn, chat, cfg, new_msg_ids) -> UnitDelta(inserted_ids, deleted_ids)`: delete open window(s) and re-cut from their `msg_id_start` with new messages; find thread roots reachable from new messages, delete those threads and rebuild; channels: add posts for new messages; all new/changed units `dirty=1`
+- [x] register `rebuild_for_chat` on the `sync_all` hook (replacing the stub) so a sync produces units — hooks are called as `hook(conn, chat, cfg, new_msg_ids)` (the `cfg` argument was added: the rebuild needs `cfg.units` and the sources' `comments` flags)
+- [x] write tests: property — syncing messages in two halves yields the same unit set as one pass; edit to a message inside a closed window does not re-cut (documented v1 limitation) but marks its thread dirty if any; a `FakeClient` sync end-to-end produces window units
+- [x] run tests — must pass before task 13
 
 ### Task 13: Stemmer, tokenizer and FTS query builder
 

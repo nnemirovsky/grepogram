@@ -9,14 +9,15 @@ Every writing function is atomic on its own and commits when it finishes, unless
 already open — wrap several calls in ``with transaction(conn):`` to commit them together.
 """
 
+import json
 import re
 import sqlite3
-from collections.abc import Iterable, Iterator
+from collections.abc import Iterable, Iterator, Sequence
 from contextlib import contextmanager
 
 import sqlite_vec
 
-from grepogram.models import ChatRow, MessageRow, UserRow
+from grepogram.models import ChatRow, MessageRow, UnitKind, UnitRow, UserRow
 from grepogram.paths import Paths
 
 BUSY_TIMEOUT_MS = 5000
@@ -101,6 +102,12 @@ _MESSAGE_UPSERT = """
         media_kind = excluded.media_kind,
         media_filename = excluded.media_filename,
         reactions_total = excluded.reactions_total
+    RETURNING id"""
+
+_UNIT_INSERT = """
+    INSERT INTO units(chat_id, topic_id, kind, msg_id_start, msg_id_end, msg_ids,
+                      date_start, date_end, text, dirty, embedded_model)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     RETURNING id"""
 
 
@@ -436,17 +443,75 @@ def get_topic_messages(
     comments of every post this way. Topics without messages are absent from the result.
     """
     grouped: dict[int, list[MessageRow]] = {}
-    ids = list(dict.fromkeys(topic_ids))
-    for start in range(0, len(ids), IN_BATCH):
-        chunk = ids[start : start + IN_BATCH]
-        marks = ", ".join("?" * len(chunk))
+    for chunk in _chunks(topic_ids):
         rows = conn.execute(
-            f"SELECT * FROM messages WHERE chat_id = ? AND topic_id IN ({marks}) ORDER BY msg_id",
+            "SELECT * FROM messages WHERE chat_id = ? "
+            f"AND topic_id IN ({_marks(chunk)}) ORDER BY msg_id",
             [chat_id, *chunk],
         )
         for row in rows:
             grouped.setdefault(int(row["topic_id"]), []).append(_message_row(row))
     return grouped
+
+
+def get_messages_in_topic(
+    conn: sqlite3.Connection,
+    chat_id: int,
+    topic_id: int | None,
+    since_msg_id: int | None = None,
+) -> list[MessageRow]:
+    """Messages of one topic in ``msg_id`` order, from ``since_msg_id`` (inclusive).
+
+    Unlike :func:`get_messages`, ``topic_id=None`` is a filter here — the messages outside any
+    topic (a plain chat, or a forum's General topic) — not the absence of one, so cutting
+    windows never mixes them with a topic's.
+    """
+    sql = "SELECT * FROM messages WHERE chat_id = ? AND topic_id IS ?"
+    params: list[int | None] = [chat_id, topic_id]
+    if since_msg_id is not None:
+        sql += " AND msg_id >= ?"
+        params.append(since_msg_id)
+    sql += " ORDER BY msg_id"
+    return [_message_row(row) for row in conn.execute(sql, params)]
+
+
+def get_messages_by_ids(conn: sqlite3.Connection, ids: Iterable[int]) -> list[MessageRow]:
+    """Rows by ``messages.id`` (any chat) in id order; ids that are not stored are skipped."""
+    found: dict[int, MessageRow] = {}
+    for chunk in _chunks(ids):
+        rows = conn.execute(f"SELECT * FROM messages WHERE id IN ({_marks(chunk)})", chunk)
+        for row in rows:
+            found[int(row["id"])] = _message_row(row)
+    return [found[row_id] for row_id in sorted(found)]
+
+
+def get_messages_by_msg_id(
+    conn: sqlite3.Connection, chat_id: int, msg_ids: Iterable[int]
+) -> dict[int, MessageRow]:
+    """Messages of one chat keyed by ``msg_id``; ids that are not stored are absent."""
+    found: dict[int, MessageRow] = {}
+    for chunk in _chunks(msg_ids):
+        rows = conn.execute(
+            f"SELECT * FROM messages WHERE chat_id = ? AND msg_id IN ({_marks(chunk)})",
+            [chat_id, *chunk],
+        )
+        for row in rows:
+            found[int(row["msg_id"])] = _message_row(row)
+    return found
+
+
+def get_replies(
+    conn: sqlite3.Connection, chat_id: int, parent_ids: Iterable[int]
+) -> list[MessageRow]:
+    """Messages of a chat that reply to any of ``parent_ids``, in ``msg_id`` order."""
+    found: list[MessageRow] = []
+    for chunk in _chunks(parent_ids):
+        rows = conn.execute(
+            f"SELECT * FROM messages WHERE chat_id = ? AND reply_to_msg_id IN ({_marks(chunk)})",
+            [chat_id, *chunk],
+        )
+        found.extend(_message_row(row) for row in rows)
+    return sorted(found, key=lambda msg: msg.msg_id)
 
 
 def get_message(conn: sqlite3.Connection, chat_id: int, msg_id: int) -> MessageRow | None:
@@ -460,6 +525,120 @@ def message_counts(conn: sqlite3.Connection) -> dict[int, int]:
     """Stored messages per chat id; chats without messages are absent."""
     rows = conn.execute("SELECT chat_id, COUNT(*) AS n FROM messages GROUP BY chat_id")
     return {int(row["chat_id"]): int(row["n"]) for row in rows}
+
+
+# --- units -----------------------------------------------------------------------------------
+
+
+def get_units(
+    conn: sqlite3.Connection, chat_id: int, kind: UnitKind | None = None
+) -> list[UnitRow]:
+    """Units of a chat, optionally of one kind, in id order."""
+    sql = "SELECT * FROM units WHERE chat_id = ?"
+    params: list[int | str] = [chat_id]
+    if kind is not None:
+        sql += " AND kind = ?"
+        params.append(kind)
+    sql += " ORDER BY id"
+    return [_unit_row(row) for row in conn.execute(sql, params)]
+
+
+def insert_units(conn: sqlite3.Connection, units: Iterable[UnitRow]) -> list[int]:
+    """Insert units and return their ids in order; a fresh :class:`UnitRow` is ``dirty``."""
+    ids: list[int] = []
+    with transaction(conn):
+        for unit in units:
+            row = conn.execute(
+                _UNIT_INSERT,
+                (
+                    unit.chat_id,
+                    unit.topic_id,
+                    unit.kind,
+                    unit.msg_id_start,
+                    unit.msg_id_end,
+                    json.dumps(unit.msg_ids, separators=(",", ":")),
+                    unit.date_start,
+                    unit.date_end,
+                    unit.text,
+                    int(unit.dirty),
+                    unit.embedded_model,
+                ),
+            ).fetchone()
+            ids.append(int(row["id"]))
+    return ids
+
+
+def delete_units(conn: sqlite3.Connection, ids: Iterable[int]) -> None:
+    """Delete units by id; their FTS and vector rows are the indexer's to drop by the same ids."""
+    with transaction(conn):
+        for chunk in _chunks(ids):
+            conn.execute(f"DELETE FROM units WHERE id IN ({_marks(chunk)})", chunk)
+
+
+def open_window(conn: sqlite3.Connection, chat_id: int, topic_id: int | None) -> UnitRow | None:
+    """The last window of ``(chat, topic)`` — the one further messages may still extend.
+
+    Windows are cut in message order, so the one reaching the highest ``msg_id`` is the last;
+    ``topic_id=None`` addresses the messages outside any topic.
+    """
+    row = conn.execute(
+        "SELECT * FROM units WHERE chat_id = ? AND kind = 'window' AND topic_id IS ? "
+        "ORDER BY msg_id_end DESC, id DESC LIMIT 1",
+        (chat_id, topic_id),
+    ).fetchone()
+    return None if row is None else _unit_row(row)
+
+
+def threads_touching(
+    conn: sqlite3.Connection, chat_id: int, msg_ids: Iterable[int]
+) -> list[UnitRow]:
+    """Thread units of a chat whose ``msg_ids`` include any of ``msg_ids``, in id order."""
+    found: dict[int, UnitRow] = {}
+    for chunk in _chunks(msg_ids):
+        rows = conn.execute(
+            "SELECT units.* FROM units WHERE chat_id = ? AND kind = 'thread' AND EXISTS ("
+            "SELECT 1 FROM json_each(units.msg_ids) "
+            f"WHERE json_each.value IN ({_marks(chunk)}))",
+            [chat_id, *chunk],
+        )
+        for row in rows:
+            found[int(row["id"])] = _unit_row(row)
+    return [found[unit_id] for unit_id in sorted(found)]
+
+
+def post_units(conn: sqlite3.Connection, chat_id: int, post_ids: Iterable[int]) -> list[UnitRow]:
+    """The ``post`` units of a channel for the given post ids, in id order."""
+    found: dict[int, UnitRow] = {}
+    for chunk in _chunks(post_ids):
+        rows = conn.execute(
+            "SELECT * FROM units WHERE chat_id = ? AND kind = 'post' "
+            f"AND msg_id_start IN ({_marks(chunk)})",
+            [chat_id, *chunk],
+        )
+        for row in rows:
+            found[int(row["id"])] = _unit_row(row)
+    return [found[unit_id] for unit_id in sorted(found)]
+
+
+def mark_dirty(conn: sqlite3.Connection, ids: Iterable[int]) -> None:
+    """Flag units for (re-)embedding."""
+    with transaction(conn):
+        for chunk in _chunks(ids):
+            conn.execute(f"UPDATE units SET dirty = 1 WHERE id IN ({_marks(chunk)})", chunk)
+
+
+# --- helpers ---------------------------------------------------------------------------------
+
+
+def _chunks(ids: Iterable[int]) -> Iterator[list[int]]:
+    """Distinct ``ids`` in slices of :data:`IN_BATCH`, the most one ``IN (…)`` list carries."""
+    distinct = list(dict.fromkeys(ids))
+    for start in range(0, len(distinct), IN_BATCH):
+        yield distinct[start : start + IN_BATCH]
+
+
+def _marks(chunk: Sequence[object]) -> str:
+    return ", ".join("?" * len(chunk))
 
 
 # --- row mapping -----------------------------------------------------------------------------
@@ -497,4 +676,21 @@ def _message_row(row: sqlite3.Row) -> MessageRow:
         media_kind=row["media_kind"],
         media_filename=row["media_filename"],
         reactions_total=row["reactions_total"],
+    )
+
+
+def _unit_row(row: sqlite3.Row) -> UnitRow:
+    return UnitRow(
+        id=row["id"],
+        chat_id=row["chat_id"],
+        topic_id=row["topic_id"],
+        kind=row["kind"],
+        msg_id_start=row["msg_id_start"],
+        msg_id_end=row["msg_id_end"],
+        msg_ids=json.loads(row["msg_ids"]),
+        date_start=row["date_start"],
+        date_end=row["date_end"],
+        text=row["text"],
+        dirty=bool(row["dirty"]),
+        embedded_model=row["embedded_model"],
     )
