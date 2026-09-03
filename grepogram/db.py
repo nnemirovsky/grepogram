@@ -309,8 +309,9 @@ def list_chats(conn: sqlite3.Connection, source_id: str | None = None) -> list[C
 
 
 def set_chat_progress(
-    conn: sqlite3.Connection, chat_id: int, last_msg_id: int, last_sync_at: int
+    conn: sqlite3.Connection, chat_id: int, last_msg_id: int, last_sync_at: int | None
 ) -> None:
+    """Record fetch progress; ``last_sync_at`` stays ``None`` while a first sync is incomplete."""
     with transaction(conn):
         conn.execute(
             "UPDATE chats SET last_msg_id = ?, last_sync_at = ? WHERE id = ?",

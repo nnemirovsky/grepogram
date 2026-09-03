@@ -1,7 +1,7 @@
 """Command-line interface: ``grepogram <command>``.
 
 Commands print plain text to stdout and diagnostics to stderr; logging goes to stderr and the log
-file. ``config`` and ``sources`` are sub-apps; later tasks add ``sync``, ``search`` and ``embed``.
+file. ``config`` and ``sources`` are sub-apps; later tasks add ``search`` and ``embed``.
 """
 
 import asyncio
@@ -15,11 +15,11 @@ import typer
 from telethon import TelegramClient
 from telethon import errors as tg_errors
 
-from grepogram import __version__, config, db, dialogs, sources, tg
+from grepogram import __version__, config, db, dialogs, sources, sync, tg
 from grepogram.config import TEMPLATE, ConfigError
 from grepogram.dialogs import Match
 from grepogram.log import setup_logging
-from grepogram.models import Config
+from grepogram.models import Config, SyncReport
 from grepogram.paths import Paths
 
 HELP = "Local hybrid search over opt-in Telegram chats, exposed to Claude Code through MCP."
@@ -133,6 +133,60 @@ def _print_table(headers: Sequence[str], rows: Sequence[Sequence[str]]) -> None:
     for line in (headers, *rows):
         cells = [cell.ljust(w) for cell, w in zip(line, widths, strict=True)]
         typer.echo("  ".join(cells).rstrip())
+
+
+@app.command("sync")
+def sync_cmd(
+    budget: Annotated[
+        int | None,
+        typer.Option(
+            "--budget",
+            min=0,
+            help="Stop after this many seconds; unfinished chats resume on the next run.",
+        ),
+    ] = None,
+) -> None:
+    """Fetch new messages from every configured source; needs a signed-in session."""
+    paths, cfg, conn = _load()
+    _require_api_keys(cfg, paths)
+    if not cfg.sources:
+        conn.close()
+        fail("no sources configured; add one with: grepogram sources add <target>")
+    try:
+        tg.ensure_session_mode(paths)
+        client = tg.make_client(cfg, paths)
+        report = asyncio.run(_run_sync(client, conn, cfg, paths, budget))
+    except (tg.AuthRequired, sync.SyncInProgress, ConfigError) as exc:
+        fail(str(exc))
+    except (tg_errors.RPCError, ConnectionError) as exc:
+        fail(f"telegram error: {exc}")
+    finally:
+        conn.close()
+    _print_report(report)
+
+
+async def _run_sync(
+    client: TelegramClient,
+    conn: sqlite3.Connection,
+    cfg: Config,
+    paths: Paths,
+    budget: int | None,
+) -> SyncReport:
+    async with tg.connected(client):
+        return await sync.sync_all(client, conn, cfg, paths, sync.SyncBudget(budget))
+
+
+def _print_report(report: SyncReport) -> None:
+    typer.echo(f"new messages: {report.new}")
+    typer.echo(f"chats synced: {len(report.chats_done)}")
+    if report.chats_remaining:
+        ids = ", ".join(str(chat_id) for chat_id in report.chats_remaining)
+        typer.echo(f"chats remaining: {len(report.chats_remaining)} ({ids}); run sync again")
+    if report.unavailable:
+        ids = ", ".join(str(chat_id) for chat_id in report.unavailable)
+        typer.echo(f"chats unavailable: {len(report.unavailable)} ({ids})")
+    for warning in report.warnings:
+        typer.echo(f"warning: {warning}", err=True)
 
 
 @sources_app.command("add")

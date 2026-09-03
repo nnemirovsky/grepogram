@@ -206,6 +206,7 @@ class SyncReport:
     chats_done: list[int] = field(default_factory=list)
     chats_remaining: list[int] = field(default_factory=list)
     unavailable: list[int] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)

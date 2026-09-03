@@ -344,7 +344,19 @@ class FakeClient:
         if limit is not None:
             selected = selected[: int(limit)]
         for message in selected:
+            self._attach_peers(message)
             yield message
+
+    def _attach_peers(self, message: types.Message) -> None:
+        """Bind the sender and chat entities the way Telethon's ``_finish_init`` does.
+
+        The real client fills ``message.sender`` / ``message.chat`` from the ``users`` and
+        ``chats`` lists Telegram returns with each history chunk; here they come from the
+        entities this client knows. Forward origins stay unbound (``Forward`` needs a client).
+        """
+        if message.sender_id is not None:
+            message._sender = self.entities.get(message.sender_id)
+        message._chat = self.entities.get(message.chat_id)
 
     # --- raw requests ----------------------------------------------------------------------
 
