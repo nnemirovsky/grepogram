@@ -2,11 +2,11 @@
 
 :func:`sync_all` is the one entry point every caller (CLI ``sync``, MCP ``sync``, auto-sync in
 ``search``) goes through: it takes the cross-process :class:`SyncLock`, re-resolves the configured
-sources, syncs chats in ``last_sync_at`` order until the :class:`SyncBudget` runs out, and runs
+sources, syncs chats in ``last_sync_at`` order until the :class:`SyncBudget` runs out, runs
 :func:`on_chat_synced` — the unit rebuild followed by the lexical index — for every chat that
-changed. :func:`sync_chat` fetches one chat: new messages after
-``last_msg_id`` in batches, then a re-fetch of the newest messages for edits and reactions, plus
-channel comments stored under the linked discussion chat.
+changed, and finally embeds the dirty units when an embedder is given. :func:`sync_chat` fetches
+one chat: new messages after ``last_msg_id`` in batches, then a re-fetch of the newest messages
+for edits and reactions, plus channel comments stored under the linked discussion chat.
 
 :func:`map_message` reads raw TL attributes only — ``msg.message``, ``msg.media``,
 ``msg.reply_to``, ``msg.fwd_from``, ``msg.reactions``, ``msg.from_id``, ``msg.post``, ``msg.date``,
@@ -17,6 +17,7 @@ Telethon yields from ``iter_messages``. Display names come from a ``names`` map 
 messages (:func:`peers_of`); the same rows feed the ``users`` upsert.
 """
 
+import asyncio
 import dataclasses
 import datetime as dt
 import fcntl
@@ -35,6 +36,7 @@ from telethon.tl import functions, types
 from grepogram import db, dialogs, index, tg, units
 from grepogram.config import ConfigError
 from grepogram.dialogs import entity_username
+from grepogram.embed import Embedder
 from grepogram.models import (
     ChatRow,
     Config,
@@ -765,7 +767,7 @@ async def sync_all(
     cfg: Config,
     paths: Paths,
     budget: SyncBudget,
-    embedder: object | None = None,
+    embedder: Embedder | None = None,
 ) -> SyncReport:
     """Sync every configured source within ``budget``; the client must be connected.
 
@@ -775,12 +777,39 @@ async def sync_all(
     not finished are reported in ``chats_remaining``. Each chat with changes goes through
     :func:`on_chat_synced`. A flood wait Telegram will not let the client sleep through stops
     the run with a warning; a chat Telegram refuses is reported in ``unavailable``; an
-    unauthorized session raises :class:`~grepogram.tg.AuthRequired`. ``embedder`` is reserved
-    for the dense indexing step wired in later.
+    unauthorized session raises :class:`~grepogram.tg.AuthRequired`.
+
+    With an ``embedder`` the run ends by embedding the dirty units under the same budget and
+    lock (:func:`~grepogram.index.embed_dirty_units`); units the budget leaves unembedded and a
+    changed embedding model become ``warnings`` — the messages are synced either way.
     """
     with SyncLock(paths):
         async with tg.wrap_auth_errors(client):
-            return await _sync_chats(client, conn, cfg, budget)
+            report = await _sync_chats(client, conn, cfg, budget)
+        if embedder is None:
+            return report
+        return await _embed_after_sync(conn, embedder, budget, report)
+
+
+async def _embed_after_sync(
+    conn: sqlite3.Connection, embedder: Embedder, budget: SyncBudget, report: SyncReport
+) -> SyncReport:
+    """Embed what the sync left dirty, off the event loop so the client's keepalives run on."""
+    warnings = list(report.warnings)
+    try:
+        embedded = await asyncio.to_thread(index.embed_dirty_units, conn, embedder, budget=budget)
+    except index.EmbeddingSpaceMismatch as exc:
+        log.warning("dense index not updated: %s", exc)
+        warnings.append(f"dense index not updated: {exc}")
+        return dataclasses.replace(report, warnings=warnings)
+    pending = db.count_dirty_units(conn)
+    if pending:
+        warnings.append(
+            f"{pending} units are not embedded yet (sync budget expired); "
+            "run `grepogram embed` or sync again"
+        )
+    log.info("sync: embedded %d units, %d pending", embedded, pending)
+    return dataclasses.replace(report, warnings=warnings)
 
 
 async def _sync_chats(

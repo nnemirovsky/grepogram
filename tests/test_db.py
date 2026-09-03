@@ -258,6 +258,29 @@ def test_ensure_vec_table_refuses_other_dim_unless_dropped(conn: sqlite3.Connect
     )
 
 
+def test_ensure_vec_table_drop_recreates_even_with_the_same_dim(conn: sqlite3.Connection) -> None:
+    db.ensure_vec_table(conn, 4)
+    conn.execute(
+        "INSERT INTO unit_vec(rowid, chat_id, date_start, embedding) VALUES (1, 1, 1, ?)",
+        (sqlite_vec.serialize_float32([1.0, 0.0, 0.0, 0.0]),),
+    )
+    db.ensure_vec_table(conn, 4, drop=True)
+    assert db.vec_dim(conn) == 4
+    assert conn.execute("SELECT count(*) FROM unit_vec").fetchone()[0] == 0
+    assert db.get_meta(conn, db.META_EMBED_DIM) == "4"
+
+
+def test_has_vectors(conn: sqlite3.Connection) -> None:
+    assert not db.has_vectors(conn)
+    db.ensure_vec_table(conn, 4)
+    assert not db.has_vectors(conn)
+    conn.execute(
+        "INSERT INTO unit_vec(rowid, chat_id, date_start, embedding) VALUES (1, 1, 1, ?)",
+        (sqlite_vec.serialize_float32([1.0, 0.0, 0.0, 0.0]),),
+    )
+    assert db.has_vectors(conn)
+
+
 def test_ensure_vec_table_rejects_bad_dim(conn: sqlite3.Connection) -> None:
     with pytest.raises(ValueError, match="positive"):
         db.ensure_vec_table(conn, 0)
@@ -787,3 +810,22 @@ def test_mark_dirty(conn: sqlite3.Connection) -> None:
     assert [u.dirty for u in db.get_units(conn, 1)] == [False, True]
     db.mark_dirty(conn, [])
     assert [u.dirty for u in db.get_units(conn, 1)] == [False, True]
+
+
+def test_dirty_unit_accessors(conn: sqlite3.Connection) -> None:
+    db.upsert_chat(conn, _chat(1))
+    ids = db.insert_units(conn, [_unit(1, [1]), _unit(1, [2]), _unit(1, [3])])
+    assert db.count_dirty_units(conn) == 3
+    assert [u.id for u in db.get_dirty_units(conn, 2)] == ids[:2]
+    assert [u.id for u in db.get_dirty_units(conn, 2, after_id=ids[0])] == ids[1:]
+    db.set_embedded(conn, ids[:2], "fake")
+    assert db.count_dirty_units(conn) == 1
+    assert [u.id for u in db.get_dirty_units(conn, 10)] == ids[2:]
+    first, second, third = db.get_units_by_ids(conn, ids)
+    assert (first.dirty, first.embedded_model) == (False, "fake")
+    assert (second.dirty, second.embedded_model) == (False, "fake")
+    assert (third.dirty, third.embedded_model) == (True, None)
+    db.reset_embedded(conn)
+    assert db.count_dirty_units(conn) == 3
+    assert all(u.dirty and u.embedded_model is None for u in db.get_units_by_ids(conn, ids))
+    assert not conn.in_transaction

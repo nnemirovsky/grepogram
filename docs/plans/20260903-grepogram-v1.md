@@ -450,13 +450,13 @@ FTS and vec virtual tables cannot carry FK constraints, so `db.delete_chat(conn,
 - Modify: `grepogram/index.py`, `grepogram/db.py`, `grepogram/sync.py`, `grepogram/cli.py`
 - Create: `tests/test_index_dense.py`
 
-- [ ] `ensure_embedding_space(conn, embedder, reembed: bool)`: compares `meta.embed_model/embed_dim`; mismatch → `EmbeddingSpaceMismatch` unless `reembed`, which calls `ensure_vec_table(drop=True)`, clears `embedded_model`, sets `dirty=1`
-- [ ] `embed_dirty_units(conn, embedder, batch=256, budget=None) -> int`: select `dirty=1`, embed in batches, upsert into `unit_vec` (rowid = unit id, `chat_id`, `date_start`), set `dirty=0`, `embedded_model`
-- [ ] `delete_unit_vectors(conn, ids)` (already real since task 14: no-op when `unit_vec` is absent, rowid delete otherwise — verify with vectors present) and `db.delete_chat` extended to remove the chat's vectors
-- [ ] `knn(conn, qvec, filters, k, fanout_max) -> list[tuple[int, float]]`: per-`chat_id` KNN with partition constraint when `len(chat_ids) <= fanout_max`, else one KNN with `k*4` post-filtered; `date_start` metadata constraints; `[]` when `unit_vec` is absent or empty; merged and sorted by distance
-- [ ] `sync_all(..., embedder)` calls `embed_dirty_units` after indexing when an embedder is given; `embed [--reembed]` CLI command; CLI `sync` loads the embedder (warning and skip on `ModelUnavailable`)
-- [ ] write tests (FakeEmbedder): dirty units embedded once; re-run is a no-op; re-cutting the open window removes the old unit's vector and `knn` never returns a rowid absent from `units`; KNN respects chat and date filters in both fan-out branches; `knn` on a DB without `unit_vec` returns `[]`; mismatch raises; `--reembed` rebuilds with new dim
-- [ ] run tests — must pass before task 20
+- [x] `ensure_embedding_space(conn, embedder, reembed: bool)`: compares `meta.embed_model/embed_dim`; mismatch → `EmbeddingSpaceMismatch` unless `reembed`, which calls `ensure_vec_table(drop=True)`, clears `embedded_model`, sets `dirty=1`
+- [x] `embed_dirty_units(conn, embedder, batch=256, budget=None) -> int`: select `dirty=1`, embed in batches, upsert into `unit_vec` (rowid = unit id, `chat_id`, `date_start`), set `dirty=0`, `embedded_model`
+- [x] `delete_unit_vectors(conn, ids)` (already real since task 14: no-op when `unit_vec` is absent, rowid delete otherwise — verify with vectors present) and `db.delete_chat` extended to remove the chat's vectors
+- [x] `knn(conn, qvec, filters, k, fanout_max) -> list[tuple[int, float]]`: per-`chat_id` KNN with partition constraint when `len(chat_ids) <= fanout_max`, else one KNN with `k*4` post-filtered; `date_start` metadata constraints; `[]` when `unit_vec` is absent or empty; merged and sorted by distance
+- [x] `sync_all(..., embedder)` calls `embed_dirty_units` after indexing when an embedder is given; `embed [--reembed]` CLI command; CLI `sync` loads the embedder (warning and skip on `ModelUnavailable`)
+- [x] write tests (FakeEmbedder): dirty units embedded once; re-run is a no-op; re-cutting the open window removes the old unit's vector and `knn` never returns a rowid absent from `units`; KNN respects chat and date filters in both fan-out branches; `knn` on a DB without `unit_vec` returns `[]`; mismatch raises; `--reembed` rebuilds with new dim
+- [x] run tests — must pass before task 20
 
 ### Task 20: Reranker protocol with fake and bge implementations
 

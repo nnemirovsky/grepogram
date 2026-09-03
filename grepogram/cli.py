@@ -2,7 +2,8 @@
 
 Commands print plain text to stdout and diagnostics to stderr; logging goes to stderr and the log
 file. ``config`` and ``sources`` are sub-apps; ``search --json`` prints the
-:class:`~grepogram.models.SearchResult` and nothing else on stdout. A later task adds ``embed``.
+:class:`~grepogram.models.SearchResult` and nothing else on stdout. ``sync`` embeds new units when
+the embedding model loads and only warns when it does not; ``embed`` insists on the model.
 """
 
 import asyncio
@@ -19,9 +20,22 @@ import typer
 from telethon import TelegramClient
 from telethon import errors as tg_errors
 
-from grepogram import __version__, config, db, dialogs, filters, search, sources, sync, tg
+from grepogram import (
+    __version__,
+    config,
+    db,
+    dialogs,
+    embed,
+    filters,
+    index,
+    search,
+    sources,
+    sync,
+    tg,
+)
 from grepogram.config import TEMPLATE, ConfigError
 from grepogram.dialogs import Match
+from grepogram.embed import Embedder, ModelUnavailable
 from grepogram.filters import FilterError
 from grepogram.log import setup_logging
 from grepogram.models import Config, SearchResult, SyncReport
@@ -157,7 +171,7 @@ def sync_cmd(
         ),
     ] = None,
 ) -> None:
-    """Fetch new messages from every configured source; needs a signed-in session."""
+    """Fetch new messages from every configured source and embed them; needs a session."""
     paths, cfg, conn = _load()
     _require_api_keys(cfg, paths)
     if not cfg.sources:
@@ -166,7 +180,8 @@ def sync_cmd(
     try:
         tg.ensure_session_mode(paths)
         client = tg.make_client(cfg, paths)
-        report = asyncio.run(_run_sync(client, conn, cfg, paths, budget))
+        embedder = _optional_embedder(cfg)
+        report = asyncio.run(_run_sync(client, conn, cfg, paths, budget, embedder))
     except (tg.AuthRequired, sync.SyncInProgress, ConfigError) as exc:
         fail(str(exc))
     except (tg_errors.RPCError, ConnectionError) as exc:
@@ -176,15 +191,25 @@ def sync_cmd(
     _print_report(report)
 
 
+def _optional_embedder(cfg: Config) -> Embedder | None:
+    """The configured embedder, or ``None`` with a warning when the model cannot load."""
+    try:
+        return embed.load_embedder(cfg)
+    except ModelUnavailable as exc:
+        typer.echo(f"warning: dense index not updated: {exc}", err=True)
+        return None
+
+
 async def _run_sync(
     client: TelegramClient,
     conn: sqlite3.Connection,
     cfg: Config,
     paths: Paths,
     budget: int | None,
+    embedder: Embedder | None,
 ) -> SyncReport:
     async with tg.connected(client):
-        return await sync.sync_all(client, conn, cfg, paths, sync.SyncBudget(budget))
+        return await sync.sync_all(client, conn, cfg, paths, sync.SyncBudget(budget), embedder)
 
 
 def _print_report(report: SyncReport) -> None:
@@ -198,6 +223,39 @@ def _print_report(report: SyncReport) -> None:
         typer.echo(f"chats unavailable: {len(report.unavailable)} ({ids})")
     for warning in report.warnings:
         typer.echo(f"warning: {warning}", err=True)
+
+
+@app.command("embed")
+def embed_cmd(
+    reembed: Annotated[
+        bool,
+        typer.Option(
+            "--reembed",
+            help="Discard every stored vector and embed all units again with the configured "
+            "model (required after changing [models] embed).",
+        ),
+    ] = False,
+) -> None:
+    """Embed the units the dense index does not hold yet (offline; needs the embedding model)."""
+    paths, cfg, conn = _load()
+    try:
+        try:
+            embedder = embed.load_embedder(cfg)
+        except ModelUnavailable as exc:
+            fail(f"cannot load the embedding model: {exc}")
+        try:
+            with sync.SyncLock(paths):
+                index.ensure_embedding_space(conn, embedder, reembed=reembed)
+                count = index.embed_dirty_units(conn, embedder)
+        except (sync.SyncInProgress, index.EmbeddingSpaceMismatch) as exc:
+            fail(str(exc))
+    finally:
+        conn.close()
+    space = f"({embedder.name}, {embedder.dim}-d)"
+    if count:
+        typer.echo(f"embedded {count} units {space}")
+    else:
+        typer.echo(f"dense index is up to date {space}")
 
 
 @app.command("search")

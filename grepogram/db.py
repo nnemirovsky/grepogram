@@ -219,14 +219,14 @@ def vec_dim(conn: sqlite3.Connection) -> int | None:
 def ensure_vec_table(conn: sqlite3.Connection, dim: int, drop: bool = False) -> None:
     """Create ``unit_vec`` for ``dim``-sized embeddings and record ``embed_dim`` in ``meta``.
 
-    An existing table with the same dimension is kept as is. A different dimension raises
-    :class:`VecDimMismatch` unless ``drop`` is set, in which case every stored vector is discarded
-    and the table is recreated.
+    An existing table with the same dimension is kept as is; a different dimension raises
+    :class:`VecDimMismatch`. With ``drop`` set every stored vector is discarded and the table is
+    recreated whatever its dimension — the clean slate a re-embed starts from.
     """
     if dim <= 0:
         raise ValueError(f"embedding dimension must be positive, got {dim}")
     current = vec_dim(conn)
-    if current == dim:
+    if current == dim and not drop:
         return
     if current is not None and not drop:
         raise VecDimMismatch(
@@ -242,6 +242,13 @@ def ensure_vec_table(conn: sqlite3.Connection, dim: int, drop: bool = False) -> 
             f"embedding FLOAT[{dim}] distance_metric=cosine)"
         )
         set_meta(conn, META_EMBED_DIM, str(dim))
+
+
+def has_vectors(conn: sqlite3.Connection) -> bool:
+    """True when ``unit_vec`` exists and holds at least one vector."""
+    if not has_vec_table(conn):
+        return False
+    return conn.execute(f"SELECT rowid FROM {VEC_TABLE} LIMIT 1").fetchone() is not None
 
 
 # --- meta ------------------------------------------------------------------------------------
@@ -665,6 +672,39 @@ def mark_dirty(conn: sqlite3.Connection, ids: Iterable[int]) -> None:
     with transaction(conn):
         for chunk in _chunks(ids):
             conn.execute(f"UPDATE units SET dirty = 1 WHERE id IN ({_marks(chunk)})", chunk)
+
+
+def get_dirty_units(conn: sqlite3.Connection, limit: int, after_id: int = 0) -> list[UnitRow]:
+    """Up to ``limit`` units flagged for embedding with ``id > after_id``, in id order.
+
+    ``after_id`` lets a caller walk the flagged units slice by slice without rescanning the
+    ones it already cleared.
+    """
+    rows = conn.execute(
+        "SELECT * FROM units WHERE dirty = 1 AND id > ? ORDER BY id LIMIT ?", (after_id, limit)
+    )
+    return [_unit_row(row) for row in rows]
+
+
+def count_dirty_units(conn: sqlite3.Connection) -> int:
+    """How many units still wait for embedding."""
+    return int(conn.execute("SELECT count(*) FROM units WHERE dirty = 1").fetchone()[0])
+
+
+def set_embedded(conn: sqlite3.Connection, ids: Iterable[int], model: str) -> None:
+    """Record that these units were embedded with ``model`` and clear their flag."""
+    with transaction(conn):
+        for chunk in _chunks(ids):
+            conn.execute(
+                f"UPDATE units SET dirty = 0, embedded_model = ? WHERE id IN ({_marks(chunk)})",
+                [model, *chunk],
+            )
+
+
+def reset_embedded(conn: sqlite3.Connection) -> None:
+    """Flag every unit for re-embedding and forget which model embedded it."""
+    with transaction(conn):
+        conn.execute("UPDATE units SET dirty = 1, embedded_model = NULL")
 
 
 # --- helpers ---------------------------------------------------------------------------------
