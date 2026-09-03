@@ -76,7 +76,7 @@ Key decisions and rationale:
 - `~/Library/Application Support/grepogram/index.db`, `~/Library/Application Support/grepogram/sync.lock`
 - `~/Library/Logs/grepogram/grepogram.log` (RotatingFileHandler 5 MB × 3) + stderr
 
-### config.toml (read with stdlib `tomllib`, written with `tomli_w`; `save` is comment-lossy by design — `grepogram config init` writes this annotated template)
+### config.toml (read with stdlib `tomllib`, written with `tomli_w`; `save` is comment-lossy by design — `grepogram config init` writes this annotated template with the `[[sources]]` examples commented out, so a fresh config has no live sources and the template parses to the defaults)
 
 ```toml
 [telegram]
@@ -229,12 +229,12 @@ FTS and vec virtual tables cannot carry FK constraints, so `db.delete_chat(conn,
 - Create: `grepogram/paths.py`, `grepogram/config.py`, `grepogram/log.py`, `grepogram/models.py`
 - Create: `tests/test_config.py`
 
-- [ ] `paths.py`: `Paths` dataclass (`config_file`, `session_file` ending in `.session`, `db_file`, `lock_file`, `log_dir`) built from `GREPOGRAM_HOME` or the macOS defaults; `ensure_dirs()` creates directories 0700
-- [ ] `models.py`: `Source`, `Config` (+ nested `TelegramCfg`, `ModelsCfg`, `SearchCfg`, `UnitsCfg`, `SyncCfg`) with the defaults from Technical Details; `ChatRow`, `MessageRow`, `UnitRow`, `Filters`, `Link`, `Hit`, `MessageView`, `SearchResult`, `SyncReport`, `SourceStatus`/`ChatStatus`
-- [ ] `config.py`: `load(paths) -> Config` via `tomllib` (missing file → defaults; unknown keys → `ConfigError` naming the key), `save(cfg, paths)` via `tomli_w` with mode 0600 (comment-lossy, documented), `TEMPLATE` = the annotated config from Technical Details, `Source.id` = stable string (`folder:Name` / `chat:<value>`)
-- [ ] `log.py`: `setup_logging(paths, level, stderr=True)` — stderr handler + `RotatingFileHandler`; never stdout; helper `redact(text)` used by any log line that could carry message text
-- [ ] write tests: defaults load with no file; round-trip save/load; 0600 mode; unknown key error; `GREPOGRAM_HOME` override; `session_file` ends with `.session`; `TEMPLATE` parses to the defaults; logging never attaches a stdout handler
-- [ ] run tests — must pass before task 3
+- [x] `paths.py`: `Paths` dataclass (`config_file`, `session_file` ending in `.session`, `db_file`, `lock_file`, `log_dir`) built from `GREPOGRAM_HOME` or the macOS defaults; `ensure_dirs()` creates directories 0700
+- [x] `models.py`: `Source`, `Config` (+ nested `TelegramCfg`, `ModelsCfg`, `SearchCfg`, `UnitsCfg`, `SyncCfg`) with the defaults from Technical Details; `ChatRow`, `MessageRow`, `UnitRow`, `Filters`, `Link`, `Hit`, `MessageView`, `SearchResult`, `SyncReport`, `SourceStatus`/`ChatStatus`
+- [x] `config.py`: `load(paths) -> Config` via `tomllib` (missing file → defaults; unknown keys → `ConfigError` naming the key), `save(cfg, paths)` via `tomli_w` with mode 0600 (comment-lossy, documented), `TEMPLATE` = the annotated config from Technical Details, `Source.id` = stable string (`folder:Name` / `chat:<value>`)
+- [x] `log.py`: `setup_logging(paths, level, stderr=True)` — stderr handler + `RotatingFileHandler`; never stdout; helper `redact(text)` used by any log line that could carry message text
+- [x] write tests: defaults load with no file; round-trip save/load; 0600 mode; unknown key error; `GREPOGRAM_HOME` override; `session_file` ends with `.session`; `TEMPLATE` parses to the defaults; logging never attaches a stdout handler
+- [x] run tests — must pass before task 3
 
 ### Task 3: Database layer and schema
 
