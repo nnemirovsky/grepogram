@@ -40,9 +40,14 @@ never change the git identity.
   `msg.edit_date` — never the client-bound helpers (`msg.text`, `msg.file`, `msg.sender`,
   `msg.chat`), so a message built without a client maps exactly like one Telethon yields.
 - Never `async with client` on a Telethon client (it calls `start()` and prompts on stdin); use
-  `tg.connected(client)`. The MCP server builds a fresh client per Telegram-using tool call
-  (`AppState.telegram()`): Telethon caches the authorization check per instance and concurrent
-  calls must never share a connection one of them will close.
+  `tg.connected(client)`. Only `grepogram auth` opens the session file for writing
+  (`tg.make_login_client`); every other client works on an in-memory copy (`tg.make_client` →
+  `tg.load_session`), because two Telethon clients on one session database block each other and
+  fail with `database is locked`. The MCP server builds a fresh client per Telegram-using tool
+  call (`AppState.telegram()`): Telethon caches the authorization check per instance and
+  concurrent calls must never share a connection one of them will close. Syncs in the server go
+  through `AppState.sync_lock`, config writes through `AppState.editing_config()`, and
+  `sources_remove` / `sources rm` take the `SyncLock` like a sync does.
 - `mcp` stays `<2`: `grepogram/mcp.py` targets the 1.x `FastMCP` API (2.x renamed it).
 - Never instantiate `FastMCP` at module level; `mcp.build_server()` runs after `setup_logging()`
   because `FastMCP.__init__` calls `logging.basicConfig`, and `main()` lowers the `mcp` logger to

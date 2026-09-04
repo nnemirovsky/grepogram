@@ -127,7 +127,8 @@ variants, read the thread before concluding, cite a link per claim.
 
 Run `grepogram sync` whenever you want the index current; the MCP `search` tool also refreshes an
 index older than an hour on its own (see below). A `launchd` job or a cron entry calling
-`grepogram sync --budget 300` works fine; only one sync runs at a time.
+`grepogram sync --budget 300` works fine next to a running MCP server: only one sync runs at a
+time, and the two never contend for the session file.
 
 ## CLI reference
 
@@ -142,7 +143,7 @@ diagnostics and logs to stderr and the log file.
 | `grepogram dialogs <query> [-n N]` | find chats and folders of the account whose title, `@username` or folder name matches; prints kind, id, type, title, username, folders, score |
 | `grepogram sources add <target> [--since YYYY-MM-DD] [--comments]` | add a source and save the config; `target` is a chat id, `@username`, `t.me` link, `folder:<name>` or a fuzzy chat / folder title |
 | `grepogram sources ls` | configured sources with their chats, message counts and last sync |
-| `grepogram sources rm <target>` | remove a source and delete its chats' messages and index rows; `target` is a source id as `sources ls` prints it (`folder:<name>`, `chat:@name`, `chat:-100…`), a folder name, a chat id, `@username` or a fuzzy title |
+| `grepogram sources rm <target>` | remove a source and delete its chats' messages and index rows; `target` is a source id as `sources ls` prints it (`folder:<name>`, `chat:@name`, `chat:-100…`), a folder name, a chat id, `@username` or a fuzzy title; refuses while a sync is running |
 | `grepogram sync [--budget S]` | fetch new messages from every source, rebuild units, index and embed; stops cleanly after `S` seconds |
 | `grepogram embed [--reembed]` | embed units the dense index does not hold yet; `--reembed` drops every vector and starts over (needed after changing `[models] embed`); refuses while a sync is running |
 | `grepogram search <query> …` | search the index, see below |
@@ -183,7 +184,7 @@ advisory; the data next to them is valid.
 | `sources` | — | `{sources, index_age_min}`: every configured source with its chats (`id`, `title`, `type`, `username`, `message_count`, `last_sync_at`, `unavailable`) |
 | `dialogs` | `query` | `{query, matches}`: chats and folders of the account matching the name; each match carries `kind`, `id`, `title`, `type`, `username`, `folders`, `score` and `target`, the string to pass to `sources_add` |
 | `sources_add` | `target`, `since=null`, `comments=false` | `{source, kind, title, chats, hint}` after saving the config |
-| `sources_remove` | `target` | `{source_id, removed_chat_ids, config_updated}` after deleting the chats' data; `target` is a source id from `sources` (`folder:<name>`, `chat:<value>`), a folder name, a chat id, `@username` or a fuzzy title |
+| `sources_remove` | `target` | `{source_id, removed_chat_ids, config_updated}` after deleting the chats' data; `target` is a source id from `sources` (`folder:<name>`, `chat:<value>`), a folder name, a chat id, `@username` or a fuzzy title; `error` while a sync is running |
 | `open_message` | `chat_id`, `msg_id` | `{chat_id, msg_id, url, fallback_url, opened}`; opens the message in the Telegram app through `open`; when that fails the result still carries the urls plus `error` and `hint` |
 
 Messages in `thread` and `context` have `msg_id`, `date`, `from_name`, `text` (a `[photo]`-style
@@ -267,7 +268,7 @@ flood_sleep_threshold = 120
 | `sources[].folder` | a Telegram folder by name; its membership (included and pinned chats minus excluded ones, plus category flags) is re-resolved on every sync |
 | `sources[].chat` | one chat: `@username`, `https://t.me/…` link or the id printed by `grepogram dialogs` (Telethon's marked form, `-100…` for channels and supergroups) |
 | `sources[].since` | `YYYY-MM-DD`; history before this date is skipped on the first sync of the chat |
-| `sources[].comments` | channels only: index the comment threads of the linked discussion group as well; on a folder source it applies to every channel in the folder. The discussion group then belongs to the channel — a source that lists the group itself does not index it a second time |
+| `sources[].comments` | channels only: index the comment threads of the linked discussion group as well; on a folder source it applies to every channel in the folder. The comments are stored under the group with the post id attached; a source that lists the group itself (the folder holding both, or a `chat` entry) indexes its whole history on top, and the two share one set of rows |
 
 `GREPOGRAM_HOME=<dir>` puts every file (`config.toml`, `session.session`, `index.db`,
 `sync.lock`, `logs/`) under one directory; the tests use it. `GREPOGRAM_FAKE_MODELS=1` swaps both
@@ -282,7 +283,10 @@ minutes, at `window_max_msgs` messages or at `window_max_chars` characters; ever
 got replies and has no parent in the chat becomes the root of a *thread* (root plus all
 descendants, chronological, capped at `thread_max_msgs` with continuation units that repeat the
 root); every channel message is a *post*, and with `comments = true` a thread of the post with its
-comments. A unit's text is one line per message, `[YYYY-MM-DD HH:MM] name: text`, with
+comments. A discussion group indexed as a chat of its own is one linear conversation: its windows
+run across comments and general talk alike, the way the group reads in Telegram, while the
+channel's post threads give the per-post view. A unit's text is one line per message,
+`[YYYY-MM-DD HH:MM] name: text`, with
 `[photo]` / `[voice]` / `[document: name.pdf]` placeholders for media without a caption. A sync
 re-cuts only the open window of each touched chat and rebuilds only the threads reachable from
 new or edited messages; unchanged units keep their rows and their vectors.
@@ -340,16 +344,25 @@ of 500, then a re-read of the newest `edit_refetch` messages that rewrites only 
 changed (that re-read runs after every sync that finishes the chat's incremental pass, not on
 its first sync or one the budget cut short). A budget stops the run cleanly between batches and
 the report lists `chats_remaining`. A non-blocking file lock keeps two syncs off the same index:
-a CLI `sync`, `embed` or MCP `sync` started while another runs fails at once with
-`SyncInProgress`, and the MCP `search` auto-sync turns that into a warning. Chats Telegram
-refuses (left, kicked, private) are marked `unavailable`, retried on every sync, and cleared when
-they succeed again; a legacy group that was upgraded to a supergroup is followed to its new id.
-When the MCP `search` tool finds the last sync run older than `auto_sync_after_min`, it first
-runs a sync capped at `auto_sync_budget_s` seconds (a flood wait is never slept through for
-longer than the budget has left) and reports `synced: true`; anything that goes wrong with that
-refresh — no session, a running sync, a flood wait — becomes a warning and the search runs on the
-index as it is. A never-synced index is not refreshed automatically — the first `sync` (CLI or
-tool) is explicit.
+a CLI `sync`, `embed`, `sources rm` or MCP `sync` / `sources_remove` started while another sync
+runs fails at once with `SyncInProgress`, and the MCP `search` auto-sync turns that into a
+warning. Inside the MCP server, syncs queue instead: a `search` that finds the index stale while
+another tool call is already syncing waits for it and then searches the fresh index. Chats
+Telegram refuses (left, kicked, private) are marked `unavailable`, retried on every sync, and
+cleared when they succeed again; a legacy group that was upgraded to a supergroup is followed to
+its new id. When the MCP `search` tool finds the last sync run older than `auto_sync_after_min`,
+it first runs a sync capped at `auto_sync_budget_s` seconds (a flood wait is never slept through
+for longer than the budget has left) and reports `synced: true`; anything that goes wrong with
+that refresh — no session, a running sync, a flood wait — becomes a warning and the search runs
+on the index as it is. A never-synced index is not refreshed automatically — the first `sync`
+(CLI or tool) is explicit.
+
+Only `grepogram auth` writes the session file. Every other client — each CLI command and each
+Telegram-using MCP tool call — reads it into memory at start and works on that copy: Telethon
+writes to its session database on nearly every request and commits once a minute, so two clients
+on one file would block each other for the SQLite busy timeout and then fail with `database is
+locked`. A cron `grepogram sync` and the MCP server therefore never get in each other's way, and
+a session created with `grepogram auth` while the server runs is picked up by its next call.
 
 ## Files and privacy
 
@@ -406,12 +419,17 @@ four minutes.
   date". This is what Telethon documents and what the test double implements; it has not yet been
   confirmed against a real long chat. If a first sync pulls the wrong side of the date, please open
   an issue.
-- With `comments = true` the discussion group is the channel's: its content is the comment threads
-  of the channel's posts, and a source that lists the group itself (a folder holding both, or an
-  explicit `chat` entry) does not index its history separately. Drop `comments` to index the group
-  as a chat of its own.
+- With `comments = true` and no source listing the discussion group itself, the group holds only
+  the comment threads of the channel's posts and is removed together with the channel; list the
+  group (in the folder, or as a `chat` entry) to index its whole history as well. The same comments
+  then appear twice in the index — in the channel's post threads and in the group's windows — so a
+  question about a post may surface both.
 - A chat that came in through a folder cannot be removed on its own; remove the folder source or
-  take the chat out of the folder in Telegram.
+  take the chat out of the folder in Telegram. Nor can a channel's discussion group be removed
+  through the channel's source by naming the group; remove the channel's source.
+- Only one session at a time can be written: `grepogram auth` while another client has an
+  uncommitted write open on the session file (a sync in another Telethon-based tool, say) can
+  fail with `database is locked`; grepogram's own clients only read it.
 - `sources add` / `rm` and the MCP tools rewrite `config.toml` without its comments.
 - The MCP contract targets the `mcp` 1.x SDK (`FastMCP`); 2.x renamed the API and is excluded by
   the dependency pin.
