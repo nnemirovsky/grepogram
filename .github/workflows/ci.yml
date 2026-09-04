@@ -18,6 +18,11 @@ env:
   # sentence-transformers) is never installed and no model is ever downloaded
   GREPOGRAM_FAKE_MODELS: "1"
   HF_HUB_OFFLINE: "1"
+  # sqlite-vec is a loadable extension, so the interpreter needs
+  # --enable-loadable-sqlite-extensions. uv prefers a system interpreter over downloading a
+  # managed one, and the macOS runner's /usr/local/bin/python3.12 is the python.org installer
+  # build, which is compiled without it; uv's own managed builds have it on macOS and on Linux.
+  UV_MANAGED_PYTHON: "1"
 
 jobs:
   test:
