@@ -75,9 +75,10 @@ class SessionError(Exception):
 def load_session(paths: Paths) -> MemorySession:
     """A private in-memory copy of the session file: data centre, address, port and auth key.
 
-    The file is opened read-only through Telethon's own ``SQLiteSession`` (so a file from an
-    older Telethon layout is understood) and closed at once; the copy never writes anything
-    back, and the entity cache starts empty — every caller re-reads the dialogs it needs.
+    The file is read through Telethon's own ``SQLiteSession`` (so a file from an older Telethon
+    layout is understood), which opens it read-write and is therefore closed at once; only the
+    values above are taken out and the in-memory copy never writes anything back, and the entity
+    cache starts empty — every caller re-reads the dialogs it needs.
     Raises :class:`SessionError` when SQLite cannot read the file.
     """
     try:
