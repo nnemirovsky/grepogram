@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 from typer.testing import CliRunner
 
-from grepogram import cli, db, filters, search
+from grepogram import cli, config, db, filters, search
 from grepogram.log import shutdown_logging
 from grepogram.models import Config, Filters, MessageRow, SearchCfg, UnitRow
 from grepogram.paths import Paths
@@ -322,6 +322,8 @@ def test_search_on_an_empty_index_warns(conn: sqlite3.Connection) -> None:
     result = search.search(conn, CFG, "DNI", ALL)
     assert result.hits == [] and result.index_age_min is None
     assert result.warnings == [search.NOTHING_INDEXED]
+    unconfigured = search.search(conn, Config(), "DNI", ALL)
+    assert unconfigured.hits == [] and unconfigured.warnings == [search.NO_SOURCES]
 
 
 def test_search_rejects_bad_modes_and_k(conn: sqlite3.Connection, loaded: chat_ru.Loaded) -> None:
@@ -506,8 +508,11 @@ def test_cli_search_on_a_fresh_home_warns(tmp_home: Path) -> None:
     result = runner.invoke(cli.app, ["search", "DNI"])
     assert result.exit_code == 0, result.output
     assert result.stdout == "no hits\n"
-    assert "nothing is indexed yet" in result.stderr
+    assert "no sources are configured" in result.stderr
     as_json = runner.invoke(cli.app, ["search", "DNI", "--json"])
     payload = json.loads(as_json.stdout)
-    assert payload["hits"] == [] and payload["warnings"] == [search.NOTHING_INDEXED]
+    assert payload["hits"] == [] and payload["warnings"] == [search.NO_SOURCES]
     assert payload["index_age_min"] is None
+    config.save(CFG, Paths.from_env())
+    unsynced = runner.invoke(cli.app, ["search", "DNI"])
+    assert unsynced.stdout == "no hits\n" and "nothing is indexed yet" in unsynced.stderr

@@ -68,10 +68,11 @@ log = logging.getLogger(__name__)
 SNIPPET_CHARS = 600
 ELLIPSIS = "…"
 MODES = ("lexical", "hybrid", "dense")
-NOTHING_INDEXED = (
-    "nothing is indexed yet: add a source with `grepogram sources add <target>` "
+NO_SOURCES = (
+    "no sources are configured: add one with `grepogram sources add <target>` "
     "and run `grepogram sync`"
 )
+NOTHING_INDEXED = "nothing is indexed yet: run `grepogram sync`"
 NO_VECTORS = "no units are embedded yet; run `grepogram sync` or `grepogram embed`"
 _OPS: tuple[FtsOp, ...] = ("AND", "OR")
 
@@ -409,8 +410,8 @@ def search(
     fused score), :func:`dedup` drops the near-duplicates at ``dedup_overlap``, and the top
     ``k`` survivors become hits. ``embedder`` and ``reranker`` stand in for the models
     :func:`grepogram.embed.load_embedder` and :func:`grepogram.rerank.load_reranker` would load.
-    An index with no chats yields no hits and a warning; ``index_age_min`` is filled in either
-    way.
+    An index with no chats yields no hits and a warning — that no source is configured, or that
+    the configured ones are not synced yet; ``index_age_min`` is filled in either way.
     """
     if mode not in MODES:
         raise ValueError(f"unknown search mode {mode!r}; expected one of {', '.join(MODES)}")
@@ -421,7 +422,7 @@ def search(
     warnings: list[str] = []
     age = index_age_min(conn, now)
     if not db.list_chats(conn):
-        warnings.append(NOTHING_INDEXED)
+        warnings.append(NOTHING_INDEXED if cfg.sources else NO_SOURCES)
         return SearchResult(hits=[], warnings=warnings, index_age_min=age)
     limit = max(k, cfg.search.rerank_top)
     dense: list[Match] = []

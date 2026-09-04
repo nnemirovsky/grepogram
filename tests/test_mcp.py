@@ -243,6 +243,18 @@ async def test_search_bad_arguments_are_errors(state: tools.AppState) -> None:
 # --- staleness -------------------------------------------------------------------------------
 
 
+async def test_search_on_an_empty_index_names_what_is_missing(
+    bind: Callable[..., tools.AppState],
+) -> None:
+    bind(Config(telegram=KEYS))
+    unconfigured = await tools.search("DNI")
+    assert unconfigured["hits"] == [] and unconfigured["warnings"] == [retrieval.NO_SOURCES]
+    assert unconfigured["synced"] is False and unconfigured["index_age_min"] is None
+    bind()
+    unsynced = await tools.search("DNI")
+    assert unsynced["hits"] == [] and unsynced["warnings"] == [retrieval.NOTHING_INDEXED]
+
+
 async def test_stale_index_is_synced_once_before_searching(
     stale: tools.AppState, fake: FakeClient, conn: sqlite3.Connection
 ) -> None:
