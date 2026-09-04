@@ -12,9 +12,12 @@ every hit and message view passes both on.
 
 :func:`open_link` is the macOS side: ``open <url>`` hands the link to whatever owns the scheme
 (the Telegram app, or a browser that redirects to it). The command runner is injectable so tests
-never launch anything.
+never launch anything, and ``GREPOGRAM_NO_OPEN=1`` (:func:`opening_disabled`) makes
+:func:`open_link` return the url without running anything at all — the test environment sets
+it, so a probe or a smoke test that reaches the real runner still opens nothing on the machine.
 """
 
+import logging
 import re
 import subprocess
 import sys
@@ -22,8 +25,12 @@ from collections.abc import Sequence
 from typing import Protocol
 
 from grepogram.models import ChatRow, Link
+from grepogram.paths import env_flag
+
+log = logging.getLogger(__name__)
 
 OPEN_TIMEOUT_S = 15
+NO_OPEN_ENV = "GREPOGRAM_NO_OPEN"
 _CHANNEL_MARK = re.compile(r"^-100([1-9]\d*)$")  # Telethon's utils.resolve_id rule
 
 
@@ -76,14 +83,24 @@ def run_command(args: Sequence[str]) -> subprocess.CompletedProcess[bytes]:
     return subprocess.run(list(args), capture_output=True, check=False, timeout=OPEN_TIMEOUT_S)
 
 
+def opening_disabled() -> bool:
+    """True when ``GREPOGRAM_NO_OPEN`` is set (``1``, ``true``, ``yes`` or ``on``): links are
+    returned, never opened."""
+    return env_flag(NO_OPEN_ENV)
+
+
 def open_link(link: Link, *, runner: Runner = run_command, platform: str = sys.platform) -> str:
     """Open ``link`` with macOS ``open`` and return the url that worked.
 
     The fallback url is tried when ``open`` rejects the primary one (no application registered
     for its scheme) or hangs past :data:`OPEN_TIMEOUT_S`; :class:`OpenFailed` carries ``open``'s
     stderr (or the timeout) when both fail. Other platforms get ``NotImplementedError`` and the
-    link is left to the caller to display.
+    link is left to the caller to display. With ``GREPOGRAM_NO_OPEN`` set nothing runs and the
+    primary url comes back as it is.
     """
+    if opening_disabled():
+        log.info("%s is set; not opening %s", NO_OPEN_ENV, link.url)
+        return link.url
     if platform != "darwin":
         raise NotImplementedError(f"opening links needs macOS 'open' ({platform}): {link.url}")
     errors: list[str] = []

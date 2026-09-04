@@ -22,12 +22,12 @@ deterministically and without a model download.
 import hashlib
 import logging
 import math
-import os
 import threading
 from collections.abc import Mapping
 from typing import Any, Protocol, runtime_checkable
 
 from grepogram.models import Config
+from grepogram.paths import env_flag
 from grepogram.stem import stem_token, tokenize
 
 log = logging.getLogger(__name__)
@@ -179,7 +179,7 @@ def load_embedder(cfg: Config) -> Embedder:
 
 def fake_models_enabled() -> bool:
     """True when ``GREPOGRAM_FAKE_MODELS`` is ``1``, ``true``, ``yes`` or ``on``."""
-    return os.environ.get(FAKE_MODELS_ENV, "").strip().lower() in {"1", "true", "yes", "on"}
+    return env_flag(FAKE_MODELS_ENV)
 
 
 def resolve_device(device: str) -> str:

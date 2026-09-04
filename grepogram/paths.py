@@ -1,9 +1,11 @@
-"""Filesystem locations used by grepogram.
+"""Filesystem locations used by grepogram, and the environment flags that steer them.
 
 ``GREPOGRAM_HOME=<dir>`` redirects everything under one directory (``config.toml``,
-``session.session``, ``index.db``, ``sync.lock``, ``logs/``); tests rely on this. Without it the
-macOS conventions apply: config and session under ``~/.config/grepogram``, index and lock under
-``~/Library/Application Support/grepogram``, logs under ``~/Library/Logs/grepogram``.
+``config.lock``, ``session.session``, ``index.db``, ``sync.lock``, ``logs/``); tests rely on this.
+Without it the macOS conventions apply: config, its lock and the session under
+``~/.config/grepogram``, index and sync lock under ``~/Library/Application Support/grepogram``,
+logs under ``~/Library/Logs/grepogram``. :func:`env_flag` reads the boolean switches
+(``GREPOGRAM_FAKE_MODELS``, ``GREPOGRAM_NO_OPEN``) the same way everywhere.
 """
 
 import os
@@ -17,6 +19,13 @@ SESSION_SUFFIX = ".session"
 CONFIG_LOCK_NAME = "config.lock"
 LOG_FILE_NAME = "grepogram.log"
 DIR_MODE = 0o700
+_TRUE = frozenset({"1", "true", "yes", "on"})
+
+
+def env_flag(name: str, env: Mapping[str, str] | None = None) -> bool:
+    """Whether the environment variable ``name`` is set to ``1``, ``true``, ``yes`` or ``on``."""
+    env = os.environ if env is None else env
+    return env.get(name, "").strip().lower() in _TRUE
 
 
 @dataclass(frozen=True, slots=True)

@@ -16,7 +16,7 @@ from grepogram import config
 from grepogram.config import TEMPLATE, ConfigError
 from grepogram.log import redact, setup_logging, shutdown_logging
 from grepogram.models import Config, SearchCfg, Source, TelegramCfg
-from grepogram.paths import Paths
+from grepogram.paths import Paths, env_flag
 
 
 @pytest.fixture
@@ -77,6 +77,18 @@ def test_session_file_always_ends_with_session_suffix(tmp_path: Path) -> None:
             lock_file=tmp_path / "sync.lock",
             log_dir=tmp_path / "logs",
         )
+
+
+def test_env_flag_is_true_for_true_values_only(monkeypatch: pytest.MonkeyPatch) -> None:
+    for value in ("1", "true", " Yes ", "ON"):
+        assert env_flag("X", {"X": value})
+    for value in ("", "0", "no", "off", "2"):
+        assert not env_flag("X", {"X": value})
+    assert not env_flag("X", {})
+    monkeypatch.setenv("GREPOGRAM_PROBE_FLAG", "yes")
+    assert env_flag("GREPOGRAM_PROBE_FLAG")
+    monkeypatch.delenv("GREPOGRAM_PROBE_FLAG")
+    assert not env_flag("GREPOGRAM_PROBE_FLAG")
 
 
 def test_ensure_dirs_creates_private_directories(tmp_path: Path) -> None:

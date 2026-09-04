@@ -909,6 +909,7 @@ def test_thread_and_context_read_messages(state: tools.AppState) -> None:
 async def test_open_message_returns_the_url_used(
     state: tools.AppState, conn: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    monkeypatch.delenv(links.NO_OPEN_ENV)
     opened: list[Link] = []
 
     def open_link(link: Link) -> str:
@@ -948,6 +949,8 @@ async def test_open_message_returns_the_url_used(
 async def test_open_message_keeps_the_url_when_open_fails(
     state: tools.AppState, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    monkeypatch.delenv(links.NO_OPEN_ENV)
+
     def broken(link: Link) -> str:
         raise OpenFailed(f"open failed for {link.url}: no application")
 
@@ -968,6 +971,8 @@ async def test_open_message_keeps_the_url_when_open_fails(
 async def test_open_message_reports_a_hung_open_with_the_url(
     state: tools.AppState, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    monkeypatch.delenv(links.NO_OPEN_ENV)
+
     def hung(args: Sequence[str]) -> subprocess.CompletedProcess[bytes]:
         raise subprocess.TimeoutExpired(list(args), links.OPEN_TIMEOUT_S)
 
@@ -978,6 +983,28 @@ async def test_open_message_reports_a_hung_open_with_the_url(
     result = await tools.open_message(ARG, 5)
     assert result["url"] == "https://t.me/arg_chat/5" and result["opened"] is False
     assert "did not finish within" in result["error"] and result["hint"] == tools.OPEN_HINT
+
+
+async def test_open_message_only_returns_the_url_while_opening_is_switched_off(
+    state: tools.AppState, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``GREPOGRAM_NO_OPEN`` — set for every test — keeps the tool from launching anything,
+    and the result says so instead of claiming the message was opened."""
+
+    def never(*args: object, **kwargs: object) -> subprocess.CompletedProcess[bytes]:
+        raise AssertionError(f"open was run: {args}")
+
+    monkeypatch.setattr(subprocess, "run", never)
+    assert await tools.open_message(ARG, 5) == {
+        "chat_id": ARG,
+        "msg_id": 5,
+        "url": "https://t.me/arg_chat/5",
+        "fallback_url": None,
+        "opened": False,
+        "error": tools.NO_OPEN_ERROR,
+        "hint": tools.OPEN_HINT,
+    }
+    assert (await tools.open_message(ARG, 999))["hint"] == tools.MESSAGE_HINT
 
 
 # --- failures --------------------------------------------------------------------------------

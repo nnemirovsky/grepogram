@@ -124,6 +124,7 @@ CHAT_HINT = (
 PICK_HINT = "retry with one of the candidates: an id, @username or folder:<name>"
 MESSAGE_HINT = "chat_id and msg_id come from a hit (chat.id and anchor_msg_id) or a message view"
 OPEN_HINT = "open the url yourself: paste it into a browser or the Telegram app"
+NO_OPEN_ERROR = f"opening links is switched off ({links.NO_OPEN_ENV} is set)"
 NO_SOURCES_HINT = "find chats with dialogs, add them with sources_add, then sync"
 SYNC_NEXT_HINT = "call sync to fetch and index its history"
 
@@ -747,8 +748,9 @@ def sources_remove(target: str) -> ToolResult:
 @guarded_async
 async def open_message(chat_id: int, msg_id: int) -> ToolResult:
     """Open a stored message in the Telegram app on this Mac and return the `url` used
-    (`opened=true`). When the app cannot be launched the result still carries the `url` (and
-    `fallback_url` for private chats) with `error` and `hint`, so the link can be shown instead.
+    (`opened=true`). When the app cannot be launched — or opening is switched off with
+    `GREPOGRAM_NO_OPEN` — the result still carries the `url` (and `fallback_url` for private
+    chats) with `error` and `hint`, so the link can be shown instead.
     """
     state = _app()
     chat = db.get_chat(state.conn, chat_id)
@@ -762,6 +764,9 @@ async def open_message(chat_id: int, msg_id: int) -> ToolResult:
         "url": link.url,
         "fallback_url": link.fallback_url,
     }
+    if links.opening_disabled():
+        result.update(opened=False, error=NO_OPEN_ERROR, hint=OPEN_HINT)
+        return result
     try:
         result["url"] = await asyncio.to_thread(links.open_link, link)
     except (OpenFailed, NotImplementedError) as exc:

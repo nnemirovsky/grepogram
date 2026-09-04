@@ -7,6 +7,15 @@ import pytest
 from grepogram import links
 from grepogram.models import ChatRow, ChatType, Link
 
+
+@pytest.fixture(autouse=True)
+def opening_enabled(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The test environment forbids opening links (``conftest.py``); the ``open_link`` tests
+    inject a recording runner and want the call to reach it. The switch itself is tested with
+    the variable set again."""
+    monkeypatch.delenv(links.NO_OPEN_ENV, raising=False)
+
+
 SUPERGROUP = -1001234567890
 CHANNEL = -1009876543210
 GROUP = -4567
@@ -260,6 +269,33 @@ def test_open_link_defaults_to_the_current_platform() -> None:
     else:
         with pytest.raises(NotImplementedError):
             links.open_link(WEB, runner=runner)
+
+
+@pytest.mark.parametrize("value", ["1", "true", " Yes ", "on"])
+@pytest.mark.parametrize("platform", ["darwin", "linux"])
+def test_open_link_returns_the_url_without_running_anything_when_disabled(
+    monkeypatch: pytest.MonkeyPatch, value: str, platform: str
+) -> None:
+    monkeypatch.setenv(links.NO_OPEN_ENV, value)
+    runner = Recorder()
+    assert links.opening_disabled()
+    assert links.open_link(PRIVATE, runner=runner, platform=platform) == PRIVATE.url
+    assert links.open_link(WEB, runner=runner) == WEB.url
+    assert runner.calls == []
+
+
+@pytest.mark.parametrize("value", [None, "", "0", "no", "off"])
+def test_opening_is_disabled_only_by_a_true_value(
+    monkeypatch: pytest.MonkeyPatch, value: str | None
+) -> None:
+    if value is None:
+        monkeypatch.delenv(links.NO_OPEN_ENV, raising=False)
+    else:
+        monkeypatch.setenv(links.NO_OPEN_ENV, value)
+    assert not links.opening_disabled()
+    runner = Recorder()
+    assert links.open_link(WEB, runner=runner, platform="darwin") == WEB.url
+    assert runner.calls == [["open", WEB.url]]
 
 
 def test_run_command_captures_output_and_never_raises() -> None:
