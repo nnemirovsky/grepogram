@@ -522,11 +522,11 @@ Every tool returns one JSON object (list-shaped results are wrapped as above) an
 - [x] run full suite — must pass before task 25
 
 ### Task 25: Verify acceptance criteria
-- [ ] verify all requirements from Overview are implemented: opt-in sources (folder + any chat type), incremental sync with budget, channel comments in their discussion chat, windows/threads/posts, stemmed FTS5 keyed by rowid, bge-m3 dense over units with vector cleanup, RRF + rerank + dedup, date/chat filters, deep links with fallback, MCP tools + instructions, auto-sync on stale with warnings, degradation without models, stdout hygiene, CLI parity
-- [ ] verify edge cases: forum topics, channel with `comments=true`, private chat becoming unavailable, empty config (`search` reports no sources), model mismatch, concurrent sync lock, never-embedded DB in hybrid mode
-- [ ] run full test suite: `uv run pytest --cov=grepogram && uv run ruff check . && uv run ruff format --check . && uv run mypy grepogram`
-- [ ] run `uv run pytest -m slow` locally
-- [ ] review each module's test file against its public functions; coverage report shows no module below 80%
+- [x] verify all requirements from Overview are implemented: opt-in sources (folder + any chat type), incremental sync with budget, channel comments in their discussion chat, windows/threads/posts, stemmed FTS5 keyed by rowid, bge-m3 dense over units with vector cleanup, RRF + rerank + dedup, date/chat filters, deep links with fallback, MCP tools + instructions, auto-sync on stale with warnings, degradation without models, stdout hygiene, CLI parity
+- [x] verify edge cases: forum topics, channel with `comments=true`, private chat becoming unavailable, empty config (`search` reports no sources), model mismatch, concurrent sync lock, never-embedded DB in hybrid mode
+- [x] run full test suite: `uv run pytest --cov=grepogram && uv run ruff check . && uv run ruff format --check . && uv run mypy grepogram`
+- [x] run `uv run pytest -m slow` locally
+- [x] review each module's test file against its public functions; coverage report shows no module below 80%
 
 ### Task 26: [Final] Update documentation
 - [ ] README: what/why, 5-minute setup (my.telegram.org → `uv tool install` or `uv run` → `grepogram config init` → `grepogram auth` → `grepogram sources add "folder:Argentina"` → `grepogram sync` → `claude mcp add grepogram -s user -- uv run --project <path> grepogram-mcp`), MCP tool list, config reference, how search works (one diagram), privacy notes, roadmap (OCR, voice, documents, export import, prune)
