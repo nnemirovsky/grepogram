@@ -506,11 +506,7 @@ four minutes.
 - A discussion group that is also a forum keeps the two apart: a message's forum topic and the
   post it comments on are separate columns, because a topic root and a channel post are separate
   id spaces that both number from 1. Unlinking, handing the group over or deleting the channel
-  therefore leaves the group's own topics exactly as they are. An index written before this
-  (schema v3 or older) stored a comment's post id in the topic column; the upgrade moves it for
-  every discussion group that is not a forum, and for one that is it flags the affected rows and
-  the channel's posts for a rebuild rather than guess which of the two a number was — those
-  comments are re-read and re-attributed by the next sync of the channel.
+  therefore leaves the group's own topics exactly as they are.
 - A discussion group belongs to the source that brought it in: the folder or `chat` entry listing
   it when one does, and otherwise the source of the channel that links it now — so a group handed
   from one channel to another moves to the new channel's source, and removing the channel it left
@@ -529,15 +525,10 @@ four minutes.
   uncommitted write open on the session file (a sync in another Telethon-based tool, say) can
   fail with `database is locked`; grepogram's own clients only read it.
 - `sources add` / `rm` and the MCP tools rewrite `config.toml` without its comments.
-- An index built with a development version before 2026-09-04 may hold messages no unit or
-  message-index row covers (discussion-group history stored after the channel's comments, batches
-  committed before a flood wait), and units the unit index is missing or holds stale rows for (a
-  run killed between the unit rebuild and the indexing). The schema upgrade to v2 flags every
-  stored message, so the first `grepogram sync` after upgrading rebuilds all units and index rows
-  once — units whose content is unchanged keep their embeddings — and the consistency check every
-  sync runs closes the unit-index gaps, both without a re-download. The upgrade to v3 leaves each
-  channel a single discussion group, keeping the one such an index would have answered with; a
-  channel whose group had changed picks the current one up on its next sync.
+- An index built with a development version from before the first release is not upgraded: the
+  schema changed while there was nothing in the field to carry over, so grepogram refuses such a
+  file instead of transforming rows it cannot interpret. Delete `index.db` and run
+  `grepogram sync` to build it again.
 - The MCP contract targets the `mcp` 1.x SDK (`FastMCP`); 2.x renamed the API and is excluded by
   the dependency pin.
 

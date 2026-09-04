@@ -62,7 +62,19 @@ _V1: tuple[str, ...] = (
         last_sync_at INTEGER,
         unavailable INTEGER DEFAULT 0,
         migrated_to INTEGER)""",
+    # a channel has one discussion group at a time — sync.link_discussion_chat re-points the link
+    # when Telegram reports another group and clears it when the channel loses its own — so
+    # get_discussion_chat has a single row to answer with
+    """CREATE UNIQUE INDEX chats_discussion_of ON chats(discussion_of)
+       WHERE discussion_of IS NOT NULL""",
     "CREATE TABLE users(id INTEGER PRIMARY KEY, display_name TEXT, username TEXT)",
+    # comment_of_chat_id / comment_of_msg_id name the channel post a message is a comment on and
+    # are kept apart from topic_id, which is a forum topic and nothing else: a discussion group
+    # can be a forum, and a forum topic root and a channel post are separate id spaces that both
+    # start at 1, so one column cannot say which of the two a number is. Both are NULL on every
+    # row that is not a comment.
+    # indexed is 0 while the units and the msg_fts row derived from a message are behind it: set
+    # by every insert and update, cleared by the rebuild.
     """CREATE TABLE messages(
         id INTEGER PRIMARY KEY,
         chat_id INTEGER NOT NULL REFERENCES chats(id) ON DELETE CASCADE,
@@ -73,14 +85,21 @@ _V1: tuple[str, ...] = (
         from_name TEXT,
         reply_to_msg_id INTEGER,
         topic_id INTEGER,
+        comment_of_chat_id INTEGER,
+        comment_of_msg_id INTEGER,
         fwd_from TEXT,
         text TEXT NOT NULL DEFAULT '',
         media_kind TEXT,
         media_filename TEXT,
         reactions_total INTEGER DEFAULT 0,
+        indexed INTEGER NOT NULL DEFAULT 0,
         UNIQUE (chat_id, msg_id))""",
     "CREATE INDEX messages_chat_date ON messages(chat_id, date)",
     "CREATE INDEX messages_reply ON messages(chat_id, reply_to_msg_id)",
+    "CREATE INDEX messages_unindexed ON messages(chat_id, id) WHERE indexed = 0",
+    """CREATE INDEX messages_comments
+       ON messages(chat_id, comment_of_chat_id, comment_of_msg_id)
+       WHERE comment_of_chat_id IS NOT NULL""",
     """CREATE TABLE units(
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         chat_id INTEGER NOT NULL REFERENCES chats(id) ON DELETE CASCADE,
@@ -101,63 +120,13 @@ _V1: tuple[str, ...] = (
         raw, stemmed, chat_id UNINDEXED, date_start UNINDEXED, tokenize='{FTS_TOKENIZE}')""",
 )
 
-_V2: tuple[str, ...] = (
-    # 0 while the units and the msg_fts row derived from a message are behind it: set by every
-    # insert and update, cleared by the rebuild; existing rows start at 0 so the first sync after
-    # the upgrade rebuilds everything once and repairs whatever an interrupted run left behind
-    "ALTER TABLE messages ADD COLUMN indexed INTEGER NOT NULL DEFAULT 0",
-    "CREATE INDEX messages_unindexed ON messages(chat_id, id) WHERE indexed = 0",
-)
-
-_V3: tuple[str, ...] = (
-    # a channel has one discussion group at a time: sync.link_discussion_chat re-points the link
-    # when Telegram reports another group and clears it when the channel loses its own, so
-    # get_discussion_chat has a single row to answer with. A database written before that can
-    # hold several rows per channel; it keeps the lowest id, which is the row it used to return
-    """UPDATE chats SET discussion_of = NULL
-       WHERE discussion_of IS NOT NULL
-         AND id <> (SELECT MIN(other.id) FROM chats other
-                    WHERE other.discussion_of = chats.discussion_of)""",
-    """CREATE UNIQUE INDEX chats_discussion_of ON chats(discussion_of)
-       WHERE discussion_of IS NOT NULL""",
-)
-
-_V4: tuple[str, ...] = (
-    # which channel post a message is a comment on, kept apart from topic_id: a discussion group
-    # can be a forum, and a forum topic root and a channel post are separate id spaces that both
-    # start at 1, so one column cannot say which of the two a number is. NULL on every row that
-    # is not a comment
-    "ALTER TABLE messages ADD COLUMN comment_of_chat_id INTEGER",
-    "ALTER TABLE messages ADD COLUMN comment_of_msg_id INTEGER",
-    """CREATE INDEX messages_comments
-       ON messages(chat_id, comment_of_chat_id, comment_of_msg_id)
-       WHERE comment_of_chat_id IS NOT NULL""",
-    # a discussion group that is not a forum has no topics of its own, so every topic_id it holds
-    # is a post of the channel linking it now and moves over unambiguously
-    """UPDATE messages SET comment_of_chat_id = (SELECT discussion_of FROM chats
-                                                 WHERE chats.id = messages.chat_id),
-                           comment_of_msg_id = topic_id,
-                           topic_id = NULL,
-                           indexed = 0
-       WHERE topic_id IS NOT NULL
-         AND chat_id IN (SELECT id FROM chats
-                         WHERE discussion_of IS NOT NULL AND COALESCE(is_forum, 0) = 0)""",
-    # a discussion group that is a forum wrote both meanings into topic_id and nothing in the row
-    # says which is which, so nothing is moved: the rows keep the topic_id they have and are
-    # flagged for a rebuild, and so are the posts of the channel linking them, whose post threads
-    # are therefore cut again without comments. The next sync re-reads those threads (Telegram
-    # reports more replies than are stored as comments) and files them under the new columns
-    """UPDATE messages SET indexed = 0
-       WHERE topic_id IS NOT NULL
-         AND chat_id IN (SELECT id FROM chats
-                         WHERE discussion_of IS NOT NULL AND COALESCE(is_forum, 0) = 1)""",
-    """UPDATE messages SET indexed = 0
-       WHERE chat_id IN (SELECT discussion_of FROM chats
-                         WHERE discussion_of IS NOT NULL AND COALESCE(is_forum, 0) = 1)""",
-)
-
-MIGRATIONS: tuple[tuple[str, ...], ...] = (_V1, _V2, _V3, _V4)
+MIGRATIONS: tuple[tuple[str, ...], ...] = (_V1,)
+"""The schema, one step per version: :data:`SCHEMA_VERSION` is the last of them, and a release
+that has to change the schema of a database in the field appends a step rather than editing one.
+There is no step that transforms rows written by a development build — an index whose version
+this build does not know is rebuilt from Telegram, see :func:`migrate`."""
 SCHEMA_VERSION = len(MIGRATIONS)
+_REBUILD_HINT = "delete index.db and run `grepogram sync` to build it again"
 
 _VEC_DIM_RE = re.compile(r"FLOAT\[(\d+)\]")
 
@@ -336,19 +305,30 @@ def schema_version(conn: sqlite3.Connection) -> int:
     return int(value) if value else 0
 
 
-def migrate(conn: sqlite3.Connection) -> int:
-    """Apply pending migrations and return the schema version now in place.
+def _is_empty(conn: sqlite3.Connection) -> bool:
+    """Whether the database holds no schema objects at all — what :func:`migrate` builds in."""
+    return conn.execute("SELECT 1 FROM sqlite_master LIMIT 1").fetchone() is None
 
-    A database already at :data:`SCHEMA_VERSION` is left untouched; one created by a newer
-    grepogram raises :class:`SchemaError` rather than being downgraded.
+
+def migrate(conn: sqlite3.Connection) -> int:
+    """Apply the steps a database is missing and return the schema version now in place.
+
+    An empty file gets the whole schema; one already at :data:`SCHEMA_VERSION` is left untouched;
+    one below it is walked up by the steps in :data:`MIGRATIONS`. Every other database raises
+    :class:`SchemaError` telling the user to rebuild the index — one written by a newer
+    grepogram, and one holding rows from before the version was recorded. Rows are never
+    transformed on a guess: the index is derived from Telegram and a rebuild costs a sync.
     """
     current = schema_version(conn)
-    if current > SCHEMA_VERSION:
-        raise SchemaError(
-            f"database schema v{current} is newer than this grepogram supports (v{SCHEMA_VERSION})"
-        )
     if current == SCHEMA_VERSION:
         return current
+    if current > SCHEMA_VERSION:
+        raise SchemaError(
+            f"database schema v{current} is newer than this grepogram supports "
+            f"(v{SCHEMA_VERSION}); {_REBUILD_HINT}"
+        )
+    if current == 0 and not _is_empty(conn):
+        raise SchemaError(f"database records no schema version; {_REBUILD_HINT}")
     with transaction(conn):
         for version in range(current + 1, SCHEMA_VERSION + 1):
             for statement in MIGRATIONS[version - 1]:

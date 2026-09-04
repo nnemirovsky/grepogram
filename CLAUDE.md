@@ -57,7 +57,13 @@ never change the git identity.
   `AppState.editing_config()` takes it inside the process-wide lock. Never save a config derived
   from a snapshot read before a network round trip; re-read under the lock and apply the delta
   (`sources.with_source`, drop by id). Lock order is `SyncLock` → `ConfigLock` → thread lock.
-- `messages.indexed` (schema v2) is 0 for a row whose units and `msg_fts` entry are behind: every
+- `db.MIGRATIONS` holds one step per schema version and `_V1` is the whole schema as the code
+  queries it; `db.migrate` creates it on an empty file and refuses every database it cannot
+  reach — a newer version, or rows written before the version was recorded — with a `SchemaError`
+  telling the user to delete `index.db` and sync again. Nothing has shipped, so no step
+  transforms rows: an index is derived from Telegram and a rebuild costs one sync. Change the
+  schema by editing `_V1` until the first release; after it, append a step and leave `_V1` alone.
+- `messages.indexed` is 0 for a row whose units and `msg_fts` entry are behind: every
   `upsert_messages` sets it, `db.mark_unindexed` raises it for a post whose thread grew, and
   `sync.on_chat_synced` clears it after the rebuild. `sync._sync_chats` runs `index_pending` for
   a chat after its fetch whether it returned or raised, and for the chats the run never reached,
@@ -84,7 +90,7 @@ never change the git identity.
   writer, and `messages.indexed` plus `index.repair_unit_index` are what the next run repairs it
   with.
 - A channel has at most one discussion group, and the partial unique index on
-  `chats.discussion_of` (schema v3) is what says so — `db.get_discussion_chat` is a lookup, not a
+  `chats.discussion_of` is what says so — `db.get_discussion_chat` is a lookup, not a
   pick between rows. `db.set_discussion_chat` is the only way the link moves or clears
   (`upsert_chat` COALESCEs the column so re-resolving the group as a source chat never drops it);
   `sync.link_discussion_chat` calls it on every sync with what `GetFullChannelRequest` reports,
@@ -133,7 +139,7 @@ never change the git identity.
   cleared) and runs the same cleanup for every group it unlinks; the group keeps every message it
   holds, its own windows, threads and forum topics among them, and only stops holding *comments*.
 - `messages.topic_id` is a forum topic and nothing else; the post a message comments on is
-  `comment_of_chat_id` / `comment_of_msg_id` (schema v4), NULL on every row that is not a comment.
+  `comment_of_chat_id` / `comment_of_msg_id`, NULL on every row that is not a comment.
   They cannot share a column: a discussion group can be a forum, and a topic root and a channel
   post are separate id spaces that both number from 1, so a group that is both would answer a
   comment read with a topic message and lose real topics to an unlink. Every comment read and

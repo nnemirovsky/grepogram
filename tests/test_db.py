@@ -137,11 +137,11 @@ def test_connection_usable_from_second_thread(conn: sqlite3.Connection) -> None:
 def test_fresh_migrate_creates_schema() -> None:
     connection = db.connect(":memory:")
     assert db.schema_version(connection) == 0
-    assert db.migrate(connection) == db.SCHEMA_VERSION == 4
+    assert db.migrate(connection) == db.SCHEMA_VERSION == 1
     assert TABLES <= _names(connection, "table")
     assert INDEXES <= _names(connection, "index")
-    assert db.schema_version(connection) == 4
-    assert db.get_meta(connection, "schema_version") == "4"
+    assert db.schema_version(connection) == 1
+    assert db.get_meta(connection, "schema_version") == "1"
     assert not db.has_vec_table(connection)
     assert not connection.in_transaction
     messages_sql = connection.execute(
@@ -161,150 +161,41 @@ def test_fresh_migrate_creates_schema() -> None:
 
 def test_migrate_twice_is_noop(conn: sqlite3.Connection) -> None:
     before = _schema(conn)
-    assert db.migrate(conn) == 4
+    assert db.migrate(conn) == 1
     assert _schema(conn) == before
-    assert db.get_meta(conn, "schema_version") == "4"
-
-
-def test_migrate_v1_to_v2_flags_every_stored_message(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A v1 index is upgraded in place, and its rows start unindexed so the first sync after
-    the upgrade rebuilds what an interrupted run may have left without units."""
-    connection = db.connect(":memory:")
-    monkeypatch.setattr(db, "MIGRATIONS", db.MIGRATIONS[:1])
-    monkeypatch.setattr(db, "SCHEMA_VERSION", 1)
-    assert db.migrate(connection) == 1
-    assert "messages_unindexed" not in _names(connection, "index")
-    connection.execute("INSERT INTO chats(id, type) VALUES (1, 'supergroup')")
-    connection.execute("INSERT INTO messages(chat_id, msg_id, date, text) VALUES (1, 1, 10, 'a')")
-    connection.execute("INSERT INTO messages(chat_id, msg_id, date, text) VALUES (1, 2, 20, 'b')")
-    monkeypatch.undo()
-    assert db.migrate(connection) == 4
-    assert db.schema_version(connection) == 4
-    assert "messages_unindexed" in _names(connection, "index")
-    assert db.unindexed_message_ids(connection, 1) == [1, 2]
-    assert not connection.in_transaction
-
-
-def test_migrate_v2_to_v3_leaves_one_discussion_group_per_channel(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A database written before the link was re-pointed can hold several groups for one
-    channel; the upgrade keeps the lowest id, which is the row it used to be answered with."""
-    connection = db.connect(":memory:")
-    monkeypatch.setattr(db, "MIGRATIONS", db.MIGRATIONS[:2])
-    monkeypatch.setattr(db, "SCHEMA_VERSION", 2)
-    assert db.migrate(connection) == 2
-    connection.execute("INSERT INTO chats(id, type) VALUES (1, 'channel')")
-    for group in (-3, -2, -1):
-        connection.execute(
-            "INSERT INTO chats(id, type, discussion_of) VALUES (?, 'supergroup', 1)", (group,)
-        )
-    monkeypatch.undo()
-    assert db.migrate(connection) == 4
-    kept = db.get_discussion_chat(connection, 1)
-    assert kept is not None and kept.id == -3
-    assert [chat.id for chat in db.list_chats(connection) if chat.discussion_of == 1] == [-3]
-
-
-def _at_v3(connection: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Bring a fresh database to v3 and let the caller write pre-v4 rows into it."""
-    monkeypatch.setattr(db, "MIGRATIONS", db.MIGRATIONS[:3])
-    monkeypatch.setattr(db, "SCHEMA_VERSION", 3)
-    assert db.migrate(connection) == 3
-    monkeypatch.undo()
-
-
-def test_migrate_v3_to_v4_moves_the_comments_of_a_plain_discussion_group(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Before v4 a comment kept its post id in ``topic_id``. A discussion group that is not a
-    forum has no topics of its own, so every one of them is a post of the channel linking it and
-    moves to the comment columns unambiguously; the rows are flagged so what was cut from them
-    is cut again."""
-    connection = db.connect(":memory:")
-    _at_v3(connection, monkeypatch)
-    connection.execute("INSERT INTO chats(id, type) VALUES (1, 'channel')")
-    connection.execute(
-        "INSERT INTO chats(id, type, is_forum, discussion_of) VALUES (2, 'supergroup', 0, 1)"
-    )
-    connection.execute("INSERT INTO chats(id, type, is_forum) VALUES (3, 'supergroup', 1)")
-    connection.execute(
-        "INSERT INTO messages(chat_id, msg_id, date, text, topic_id, indexed) "
-        "VALUES (2, 5, 10, 'comment', 10, 1)"
-    )
-    connection.execute(
-        "INSERT INTO messages(chat_id, msg_id, date, text, indexed) VALUES (2, 6, 11, 'talk', 1)"
-    )
-    connection.execute(
-        "INSERT INTO messages(chat_id, msg_id, date, text, topic_id, indexed) "
-        "VALUES (3, 7, 12, 'in a topic', 10, 1)"
-    )
-    assert db.migrate(connection) == 4
-    comment = db.get_message(connection, 2, 5)
-    assert comment is not None
-    assert comment.topic_id is None
-    assert (comment.comment_of_chat_id, comment.comment_of_msg_id) == (1, 10)
-    assert db.stored_comment_post_ids(connection, 2, 1) == [10]
-    assert db.unindexed_message_ids(connection, 2) == [comment.id]
-    forum = db.get_message(connection, 3, 7)
-    assert forum is not None and forum.topic_id == 10
-    assert forum.comment_of_chat_id is None and forum.comment_of_msg_id is None
-    assert db.unindexed_message_ids(connection, 3) == []
-    connection.close()
-
-
-def test_migrate_v3_to_v4_flags_a_forum_discussion_group_instead_of_guessing(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A group that is both a forum and a comment store wrote forum topic roots and channel post
-    ids into the same column, and nothing in the row says which is which. Nothing is moved and
-    nothing is attributed: the rows keep their ``topic_id`` and are flagged, and so are the posts
-    of the channel linking the group, whose post threads are therefore cut again without
-    comments until the next sync re-reads the threads under the new columns.
-    """
-    connection = db.connect(":memory:")
-    _at_v3(connection, monkeypatch)
-    connection.execute("INSERT INTO chats(id, type) VALUES (1, 'channel')")
-    connection.execute(
-        "INSERT INTO chats(id, type, is_forum, discussion_of) VALUES (2, 'supergroup', 1, 1)"
-    )
-    connection.execute(
-        "INSERT INTO messages(chat_id, msg_id, date, text, topic_id, indexed) "
-        "VALUES (2, 5, 10, 'comment or topic message', 10, 1)"
-    )
-    connection.execute(
-        "INSERT INTO messages(chat_id, msg_id, date, text, indexed) VALUES (2, 6, 11, 'talk', 1)"
-    )
-    connection.execute(
-        "INSERT INTO messages(chat_id, msg_id, date, text, indexed) VALUES (1, 10, 12, 'post', 1)"
-    )
-    assert db.migrate(connection) == 4
-    ambiguous = db.get_message(connection, 2, 5)
-    assert ambiguous is not None and ambiguous.topic_id == 10
-    assert ambiguous.comment_of_chat_id is None and ambiguous.comment_of_msg_id is None
-    assert db.stored_comment_post_ids(connection, 2, 1) == []
-    assert db.unindexed_message_ids(connection, 2) == [ambiguous.id]
-    post = db.get_message(connection, 1, 10)
-    assert post is not None
-    assert db.unindexed_message_ids(connection, 1) == [post.id]
-    connection.close()
+    assert db.get_meta(conn, "schema_version") == "1"
 
 
 def test_migrate_refuses_newer_schema(conn: sqlite3.Connection) -> None:
     db.set_meta(conn, "schema_version", str(db.SCHEMA_VERSION + 1))
-    with pytest.raises(db.SchemaError, match="newer"):
+    with pytest.raises(db.SchemaError, match="newer") as excinfo:
         db.migrate(conn)
+    assert "grepogram sync" in str(excinfo.value)
+
+
+def test_migrate_refuses_a_database_without_a_recorded_version() -> None:
+    """No step transforms what a build before the first release wrote: an index that records no
+    version is rebuilt from Telegram, not guessed at in place."""
+    connection = db.connect(":memory:")
+    connection.execute("CREATE TABLE messages(id INTEGER PRIMARY KEY, text TEXT)")
+    assert db.schema_version(connection) == 0
+    with pytest.raises(db.SchemaError, match="no schema version") as excinfo:
+        db.migrate(connection)
+    assert "grepogram sync" in str(excinfo.value)
+    assert _names(connection, "table") == {"messages"}
+    connection.close()
 
 
 def test_migrate_rolls_back_on_failure(monkeypatch: pytest.MonkeyPatch) -> None:
     connection = db.connect(":memory:")
-    monkeypatch.setattr(db, "MIGRATIONS", (db.MIGRATIONS[0][:3] + ("CREATE TABLE ?",)))
+    monkeypatch.setattr(db, "MIGRATIONS", ((*db.MIGRATIONS[0][:3], "CREATE TABLE ?"),))
     monkeypatch.setattr(db, "SCHEMA_VERSION", 1)
     with pytest.raises(sqlite3.OperationalError):
         db.migrate(connection)
     assert _names(connection, "table") == set()
     assert db.schema_version(connection) == 0
     assert not connection.in_transaction
+    connection.close()
 
 
 def test_fts_tables_accept_rowid_keyed_rows_and_unindexed_filters(conn: sqlite3.Connection) -> None:
