@@ -19,6 +19,19 @@ def fake_models(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.fixture(autouse=True)
+def plain_cli_output(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Every assertion on CLI text reads the same words wherever the suite runs.
+
+    Typer prints usage errors and help through rich, and as soon as rich takes the environment
+    for a terminal it styles an option name in pieces — ``--budget`` comes out as ``-`` and
+    ``-budget`` with escape codes between them, and a substring assertion misses it. A local
+    pytest run is not a terminal, GitHub Actions is one to rich, so such a test would fail only
+    there. ``TERM=dumb`` is what rich reads as "no terminal".
+    """
+    monkeypatch.setenv("TERM", "dumb")
+
+
+@pytest.fixture(autouse=True)
 def clean_logging() -> Iterator[None]:
     """Close the file handler every test that configures logging leaves open.
 
