@@ -529,9 +529,9 @@ Every tool returns one JSON object (list-shaped results are wrapped as above) an
 - [x] review each module's test file against its public functions; coverage report shows no module below 80%
 
 ### Task 26: [Final] Update documentation
-- [ ] README: what/why, 5-minute setup (my.telegram.org → `uv tool install` or `uv run` → `grepogram config init` → `grepogram auth` → `grepogram sources add "folder:Argentina"` → `grepogram sync` → `claude mcp add grepogram -s user -- uv run --project <path> grepogram-mcp`), MCP tool list, config reference, how search works (one diagram), privacy notes, roadmap (OCR, voice, documents, export import, prune)
-- [ ] create `CLAUDE.md` for the repo: commands (`uv run pytest`, ruff, mypy), commit convention, "stdout is the MCP protocol", `GREPOGRAM_FAKE_MODELS`, where fixtures live, raw-TL-attributes rule
-- [ ] move this plan to `docs/plans/completed/`
+- [x] README: what/why, 5-minute setup (my.telegram.org → `uv tool install` or `uv run` → `grepogram config init` → `grepogram auth` → `grepogram sources add "folder:Argentina"` → `grepogram sync` → `claude mcp add grepogram -s user -- uv run --project <path> grepogram-mcp`), MCP tool list, config reference, how search works (one diagram), privacy notes, roadmap (OCR, voice, documents, export import, prune)
+- [x] create `CLAUDE.md` for the repo: commands (`uv run pytest`, ruff, mypy), commit convention, "stdout is the MCP protocol", `GREPOGRAM_FAKE_MODELS`, where fixtures live, raw-TL-attributes rule
+- [x] move this plan to `docs/plans/completed/`
 
 ## Post-Completion
 
