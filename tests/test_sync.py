@@ -1,3 +1,4 @@
+import asyncio
 import datetime as dt
 import sqlite3
 import stat
@@ -1673,3 +1674,42 @@ async def test_grown_posts_are_flagged_before_their_threads_are_re_read(
         3: ["post 3", "late comment", "another"],
     }
     assert db.unindexed_message_ids(conn, NEWS_ID) == []
+
+
+async def test_a_cancelled_index_step_joins_its_worker_thread_first() -> None:
+    """Cancelling the tool call must not leave a thread writing after the lock is released.
+
+    ``await asyncio.to_thread(...)`` hands the job to the executor and then suspends, so a
+    cancellation delivered at that suspension abandons the future rather than the job; under an
+    ``anyio`` cancel scope — how the MCP server cancels a call — awaiting anything afterwards
+    raises at once, so the join cannot be an ``await``.
+    """
+    landed: list[str] = []
+
+    def job() -> str:
+        time.sleep(0.2)
+        landed.append("job")
+        return "done"
+
+    async def call() -> None:
+        try:
+            await sync._joined_to_thread(job)
+        finally:
+            landed.append("unwound")
+
+    task = asyncio.create_task(call())
+    await asyncio.sleep(0.05)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert landed == ["job", "unwound"]
+
+
+async def test_joined_to_thread_returns_the_result_and_propagates_failures() -> None:
+    assert await sync._joined_to_thread(lambda: 7) == 7
+
+    def explode() -> int:
+        raise RuntimeError("boom")
+
+    with pytest.raises(RuntimeError, match="boom"):
+        await sync._joined_to_thread(explode)

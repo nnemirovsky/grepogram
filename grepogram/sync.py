@@ -18,9 +18,10 @@ flagged until :func:`on_chat_synced` has rebuilt its units and ``msg_fts`` entry
 :func:`_sync_chats` indexes a chat's pending rows after its fetch whether that returned or raised
 (a flood wait, an RPC error, a cancellation) and, at the end of the run, those of the chats it
 never reached. A run that dies between a commit and the rebuild therefore leaves nothing behind
-that the next run does not pick up (:func:`grepogram.db.unindexed_message_ids`). The rebuild,
-the indexing and the flag are one transaction, so the flag never clears over derived data that is
-not there.
+that the next run does not pick up (:func:`grepogram.db.unindexed_message_ids`). The rebuild, the
+indexing and the flag are one transaction, so the flag never clears over derived data that is not
+there; the worker thread they run on is joined even when the surrounding tool call is cancelled
+(:func:`_joined_to_thread`), so the :class:`SyncLock` outlives every write it covers.
 
 :func:`map_message` reads raw TL attributes only — ``msg.message``, ``msg.media``,
 ``msg.reply_to``, ``msg.fwd_from``, ``msg.reactions``, ``msg.from_id``, ``msg.post``, ``msg.date``,
@@ -35,10 +36,12 @@ import asyncio
 import dataclasses
 import datetime as dt
 import fcntl
+import functools
 import logging
 import math
 import os
 import sqlite3
+import threading
 import time
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
@@ -68,6 +71,7 @@ from grepogram.sources import resolve_sources
 log = logging.getLogger(__name__)
 
 BATCH_SIZE = 500
+JOIN_TIMEOUT = 60.0
 LOCK_MODE = 0o600
 SELF_NAME = "me"
 UNKNOWN_FORWARD = "unknown"
@@ -933,6 +937,38 @@ def on_chat_synced(
         db.mark_indexed(conn, new_msg_ids)
 
 
+async def _joined_to_thread[T](job: Callable[[], T]) -> T:
+    """Run ``job`` on a worker thread and never leave it writing on its own.
+
+    ``await asyncio.to_thread(...)`` submits the job before it suspends, so a cancellation —
+    what an ``anyio`` ``CancelScope`` around an MCP tool call delivers — abandons the future
+    while the thread carries on committing, and the :class:`SyncLock` the caller releases on its
+    way out no longer covers it. The job is shielded from the cancellation and joined through a
+    plain :class:`threading.Event` instead: the wait needs no ``await``, which a cancelled scope
+    would raise out of immediately, and it is bounded, so a thread that hangs stalls the unwind
+    for :data:`JOIN_TIMEOUT` at the most.
+    """
+    finished = threading.Event()
+
+    def run() -> T:
+        try:
+            return job()
+        finally:
+            finished.set()
+
+    future = asyncio.get_running_loop().run_in_executor(None, run)
+    try:
+        return await asyncio.shield(future)
+    except BaseException:
+        if not finished.wait(JOIN_TIMEOUT):
+            log.warning(
+                "a background index job has not finished after %ss; "
+                "the sync lock is released while it runs on",
+                JOIN_TIMEOUT,
+            )
+        raise
+
+
 async def index_pending(conn: sqlite3.Connection, cfg: Config, chat: ChatRow) -> None:
     """Rebuild and index every stored row of ``chat`` — and of its discussion group, when it is
     a channel — that no rebuild has covered yet, off the event loop.
@@ -941,13 +977,15 @@ async def index_pending(conn: sqlite3.Connection, cfg: Config, chat: ChatRow) ->
     an RPC error or a cancellation get their units and ``msg_fts`` entries now, and rows a crash
     left behind get them on the next run. The chat rows are re-read, since a fetch may have
     changed them or linked the discussion group; a chat removed meanwhile has nothing to index.
+    This is the step a cancelled sync runs on its way out, so the worker thread is joined rather
+    than abandoned (:func:`_joined_to_thread`).
     """
     for row in (db.get_chat(conn, chat.id), db.get_discussion_chat(conn, chat.id)):
         if row is None:
             continue
         pending = db.unindexed_message_ids(conn, row.id)
         if pending:
-            await asyncio.to_thread(on_chat_synced, conn, row, cfg, pending)
+            await _joined_to_thread(functools.partial(on_chat_synced, conn, row, cfg, pending))
 
 
 ConfigSource = Config | Callable[[], Config]
@@ -998,10 +1036,16 @@ async def sync_all(
 async def _embed_after_sync(
     conn: sqlite3.Connection, embedder: Embedder, budget: SyncBudget, report: SyncReport
 ) -> SyncReport:
-    """Embed what the sync left dirty, off the event loop so the client's keepalives run on."""
+    """Embed what the sync left dirty, off the event loop so the client's keepalives run on.
+
+    Joined like the indexing step (:func:`_joined_to_thread`): a cancelled run releases the
+    :class:`SyncLock` only once the worker thread has stopped writing vectors.
+    """
     warnings = list(report.warnings)
     try:
-        embedded = await asyncio.to_thread(index.embed_dirty_units, conn, embedder, budget=budget)
+        embedded = await _joined_to_thread(
+            functools.partial(index.embed_dirty_units, conn, embedder, budget=budget)
+        )
     except index.EmbeddingSpaceMismatch as exc:
         log.warning("dense index not updated: %s", exc)
         warnings.append(f"dense index not updated: {exc}")
