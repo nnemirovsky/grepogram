@@ -211,6 +211,12 @@ class Hit:
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class MessageView:
+    """One message as a reader sees it. ``chat_id`` is the chat the message is *in*, which is
+    not always the chat that was asked about: a channel post's thread carries the comments of
+    the linked discussion group, and their ``msg_id`` lives in that group's id space, where post
+    ids and comment ids both number from 1 and collide by construction."""
+
+    chat_id: int
     msg_id: int
     date: int
     from_name: str | None

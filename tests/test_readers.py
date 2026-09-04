@@ -212,6 +212,34 @@ def test_thread_of_a_channel_post_appends_its_comments(
     assert _ids(search.thread(conn, CHANNEL, 3)) == [3]
 
 
+def test_thread_of_a_channel_post_names_the_chat_of_every_comment(
+    conn: sqlite3.Connection,
+) -> None:
+    """A post's comments come from the discussion group, and both chats number their messages
+    from 1 — so a thread holds two messages of the same ``msg_id`` and only ``chat_id`` tells
+    them apart. It is what a caller must pass back with a comment's ``msg_id``."""
+    _store(
+        conn,
+        _chat(CHANNEL, type="channel", username="news"),
+        [_msg(CHANNEL, 1, 0), _msg(CHANNEL, 2, 60)],
+    )
+    _store(
+        conn,
+        _chat(DISC, discussion_of=CHANNEL),
+        [
+            _msg(DISC, 1, 5, comment_of_chat_id=CHANNEL, comment_of_msg_id=1),
+            _msg(DISC, 2, 6, comment_of_chat_id=CHANNEL, comment_of_msg_id=1),
+        ],
+    )
+    views = search.thread(conn, CHANNEL, 1)
+    assert _ids(views) == [1, 1, 2]
+    assert [v.chat_id for v in views] == [CHANNEL, DISC, DISC]
+    comment = views[2]
+    assert search.context(conn, comment.chat_id, comment.msg_id, 0, 0) == [comment]
+    (post,) = search.context(conn, CHANNEL, comment.msg_id, 0, 0)
+    assert post != comment and post.chat_id == CHANNEL
+
+
 def test_thread_of_a_channel_without_a_discussion_chat_is_the_post(
     conn: sqlite3.Connection,
 ) -> None:
@@ -275,6 +303,7 @@ def test_views_serialise_to_json(conn: sqlite3.Connection, loaded: chat_ru.Loade
     parsed = json.loads(document)
     assert len(parsed) == 8
     assert set(parsed[0]) == {
+        "chat_id",
         "msg_id",
         "date",
         "from_name",

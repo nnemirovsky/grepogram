@@ -85,7 +85,8 @@ tokens such as bank names, IDs or prices.
 price-related, filter with `since` when it matters, and state the date of the evidence \
 (`date_start`/`date_end` are unix seconds, UTC).
 - Call `thread` or `context` on a hit before drawing a conclusion from its snippet; the answer \
-usually sits in the replies.
+usually sits in the replies. Pass a message's own `chat_id` back with its `msg_id`: a channel \
+post's comments come from the discussion group, and both chats number their messages from 1.
 - Cite the hit's `url` for every claim so the user can open the message in Telegram \
 (`open_message` opens it directly).
 - If nothing relevant comes back, say so rather than guess — after trying other variants, \
@@ -591,9 +592,11 @@ def thread(chat_id: int, msg_id: int) -> ToolResult:
     """The whole reply thread a message belongs to, root first, chronological.
 
     For a channel post: the post followed by its comments from the linked discussion chat. Each
-    message has `msg_id`, `date` (unix seconds, UTC), `from_name`, `text`, `url`, `fallback_url`
-    and `reply_to_msg_id`. Read it before concluding from a snippet; `chat_id` and `msg_id` come
-    from a hit's `chat.id` and `anchor_msg_id`.
+    message has `chat_id`, `msg_id`, `date` (unix seconds, UTC), `from_name`, `text`, `url`,
+    `fallback_url` and `reply_to_msg_id`. A message's own `chat_id` is the one to pass back to
+    `context` or `open_message` with its `msg_id` — comments carry the discussion group's id,
+    not the channel's, and the two number their messages from 1 alike. Read it before
+    concluding from a snippet; the arguments come from a hit's `chat.id` and `anchor_msg_id`.
     """
     return _messages_result(chat_id, msg_id, retrieval.thread(_app().conn, chat_id, msg_id))
 
@@ -601,8 +604,9 @@ def thread(chat_id: int, msg_id: int) -> ToolResult:
 @guarded
 def context(chat_id: int, msg_id: int, before: int = 15, after: int = 15) -> ToolResult:
     """The messages around one in its chat (or forum topic), in order: up to `before` earlier
-    and `after` later ones, the message itself included. Same message fields as `thread`; use it
-    when a hit needs the surrounding conversation rather than the reply chain.
+    and `after` later ones, the message itself included. Same message fields as `thread`, every
+    one of them in the chat asked about; use it when a hit needs the surrounding conversation
+    rather than the reply chain.
     """
     views = retrieval.context(_app().conn, chat_id, msg_id, before, after)
     return _messages_result(chat_id, msg_id, views)
@@ -610,7 +614,11 @@ def context(chat_id: int, msg_id: int, before: int = 15, after: int = 15) -> Too
 
 def _messages_result(chat_id: int, msg_id: int, views: Sequence[MessageView]) -> ToolResult:
     """What ``thread`` and ``context`` both answer: the message they were asked about and the
-    :class:`~grepogram.models.MessageView` list around it."""
+    :class:`~grepogram.models.MessageView` list around it.
+
+    The top-level ``chat_id`` is the argument, not where every message lives: ``thread`` mixes a
+    channel's post with its discussion group's comments, and each message carries its own
+    ``chat_id`` for that reason."""
     return {"chat_id": chat_id, "msg_id": msg_id, "messages": [asdict(view) for view in views]}
 
 

@@ -872,6 +872,7 @@ def test_thread_and_context_read_messages(state: tools.AppState) -> None:
     assert [m["msg_id"] for m in result["messages"]] == [1, 2, 3, 4, 5, 6, 7, 10]
     assert result["messages"][0]["url"] == "https://t.me/arg_chat/1"
     assert set(result["messages"][0]) == {
+        "chat_id",
         "msg_id",
         "date",
         "from_name",
@@ -889,6 +890,43 @@ def test_thread_and_context_read_messages(state: tools.AppState) -> None:
     }
     assert tools.context(12345, 1)["hint"] == tools.MESSAGE_HINT
     assert "negative" in tools.context(ARG, 5, before=-1)["error"]
+
+
+async def test_thread_of_a_channel_post_names_each_message_chat(
+    state: tools.AppState, conn: sqlite3.Connection
+) -> None:
+    """The top-level ``chat_id`` is the argument; a comment's own is the discussion group, whose
+    ids collide with the channel's posts. Only the per-message ``chat_id`` leads back to it."""
+    disc_id = -1000000000201
+    db.upsert_chat(conn, ChatRow(id=NEWS_ID, type="channel", title="News", username="news"))
+    db.upsert_chat(
+        conn, ChatRow(id=disc_id, type="supergroup", title="News chat", discussion_of=NEWS_ID)
+    )
+    db.upsert_messages(
+        conn,
+        [
+            MessageRow(chat_id=NEWS_ID, msg_id=1, date=100, text="post 1"),
+            MessageRow(chat_id=NEWS_ID, msg_id=2, date=200, text="post 2"),
+            MessageRow(
+                chat_id=disc_id,
+                msg_id=2,
+                date=150,
+                text="comment on post 1",
+                comment_of_chat_id=NEWS_ID,
+                comment_of_msg_id=1,
+            ),
+        ],
+    )
+    result = tools.thread(NEWS_ID, 1)
+    assert result["chat_id"] == NEWS_ID
+    messages = result["messages"]
+    assert [(m["chat_id"], m["msg_id"]) for m in messages] == [(NEWS_ID, 1), (disc_id, 2)]
+    comment = messages[1]
+    assert comment["url"] == "https://t.me/c/201/2"
+    back = tools.context(comment["chat_id"], comment["msg_id"])
+    assert [m["text"] for m in back["messages"]] == ["comment on post 1"]
+    opened = await tools.open_message(comment["chat_id"], comment["msg_id"])
+    assert opened["url"] == comment["url"] and opened["opened"] is False
 
 
 async def test_open_message_returns_the_url_used(

@@ -185,6 +185,11 @@ never change the git identity.
   that prefix and any lexical rule either swallows them or refuses the id — which took `search`,
   `thread`, `context` and `open_message` down for the whole chat. `sources.parse_target` builds the
   same mark arithmetically for `t.me/c/<id>`, so such ids reach the index by the front door.
+- A `MessageView` names the chat it is in (`chat_id`), because a list of them can span two:
+  `search.thread` follows a channel post with its discussion group's comments, and post ids and
+  comment ids both number from 1, so `msg_id` alone names two different messages. The top-level
+  `chat_id` of `mcp._messages_result` is the argument, not where every message lives; the tool
+  docs, the server `INSTRUCTIONS` and README say to pass a message's own `chat_id` back.
 - Windows are cut in `msg_id` order but rows do not always arrive that way (a channel stores
   comments in its discussion group before the group's own history gets there). `units._recut_windows`
   starts at the open window unless a changed message no window holds lies below it; then it

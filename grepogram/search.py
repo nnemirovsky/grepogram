@@ -644,9 +644,11 @@ def _rerank(
 
 def message_view(chat: ChatRow, msg: MessageRow) -> MessageView:
     """``msg`` as the caller sees it: linked through :func:`grepogram.links.message_url`, with a
-    ``[photo]``-style placeholder as ``text`` when it has media and no caption."""
+    ``[photo]``-style placeholder as ``text`` when it has media and no caption and ``chat.id``
+    as ``chat_id`` — the chat the message is really in, which :func:`thread` mixes."""
     link = links.message_url(chat, msg.msg_id, msg.topic_id)
     return MessageView(
+        chat_id=chat.id,
         msg_id=msg.msg_id,
         date=msg.date,
         from_name=msg.from_name,
@@ -665,8 +667,10 @@ def thread(conn: sqlite3.Connection, chat_id: int, msg_id: int) -> list[MessageV
     nothing is a thread of one. For a channel post the comments stored under the linked
     discussion chat follow the post, each linked into that chat — the ones naming *this* channel
     and this post, so a forum topic of that group and a comment left by a channel that held the
-    group before are not among them. Raises :class:`UnknownMessage` when the message is not
-    indexed.
+    group before are not among them. Such a list spans two chats, and each view's ``chat_id``
+    is what says which: a comment's ``msg_id`` is only meaningful together with the discussion
+    group's id, because it numbers from 1 exactly as the channel's posts do. Raises
+    :class:`UnknownMessage` when the message is not indexed.
     """
     chat = _locate(conn, chat_id, msg_id)
     views = [message_view(chat, msg) for msg in db.get_thread_messages(conn, chat_id, msg_id)]

@@ -208,7 +208,7 @@ advisory; the data next to them is valid.
 | tool | arguments | returns |
 |---|---|---|
 | `search` | `query`, `chats: list[str] \| null`, `since`, `until`, `k=10`, `mode="hybrid"`, `rerank=true`, `full=false` | `{hits, warnings, index_age_min, synced}`; each hit has `score`, `chat` (id, type, title, username, …), `kind` (`window` / `thread` / `post`), `date_start`, `date_end` (unix seconds, UTC), `anchor_msg_id`, `url`, `fallback_url`, `snippet`, `msg_ids`, `text` (with `full`) |
-| `thread` | `chat_id`, `msg_id` | `{chat_id, msg_id, messages}`: the whole reply thread the message belongs to, root first; for a channel post, the post followed by its comments |
+| `thread` | `chat_id`, `msg_id` | `{chat_id, msg_id, messages}`: the whole reply thread the message belongs to, root first; for a channel post, the post followed by its comments — those live in the discussion group, so the list spans two chats and each message names its own |
 | `context` | `chat_id`, `msg_id`, `before=15`, `after=15` | `{chat_id, msg_id, messages}`: the surrounding messages in the same chat or forum topic |
 | `sync` | `budget_s=45` | the sync report: `new`, `chats_done`, `chats_remaining`, `unavailable`, `warnings`, `index_age_min` |
 | `sources` | — | `{sources, index_age_min}`: every configured source with its chats (`id`, `title`, `type`, `username`, `message_count`, `last_sync_at`, `unavailable`) |
@@ -217,8 +217,12 @@ advisory; the data next to them is valid.
 | `sources_remove` | `target` | `{source_id, removed_chat_ids, config_updated}` after deleting the chats' data; `target` is a source id from `sources` (`folder:<name>`, `chat:<value>`), a folder name, a chat id, `@username` or a fuzzy title; `error` while a sync is running |
 | `open_message` | `chat_id`, `msg_id` | `{chat_id, msg_id, url, fallback_url, app_url, opened, opened_with}`; launches the `tg://` `app_url` through `open` (the `https://t.me` `url` and then `fallback_url` only when the app form is rejected) and says which one worked; when none can be launched — or `GREPOGRAM_NO_OPEN` is set — the result still carries the links plus `error` and `hint` |
 
-Messages in `thread` and `context` have `msg_id`, `date`, `from_name`, `text` (a `[photo]`-style
-placeholder for media without a caption), `url`, `fallback_url` and `reply_to_msg_id`.
+Messages in `thread` and `context` have `chat_id`, `msg_id`, `date`, `from_name`, `text` (a
+`[photo]`-style placeholder for media without a caption), `url`, `fallback_url` and
+`reply_to_msg_id`. A message's `chat_id` is the chat it is really in, which the top-level one
+need not be: a channel post's comments come back under the discussion group's id, and comment
+ids collide with the channel's post ids (both number from 1), so pass a message's own `chat_id`
+back to `context` or `open_message` alongside its `msg_id`.
 
 The server's `instructions` tell the agent how to use the tools: run two or three query variants
 (Russian and English, the specific term and the concept, synonyms), prefer `lexical` for exact
