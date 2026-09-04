@@ -87,7 +87,7 @@ def auth() -> None:
     cfg = _load_config(paths)
     _require_api_keys(cfg, paths)
     tg.prepare_session(paths)
-    client = tg.make_client(cfg, paths)
+    client = tg.make_login_client(cfg, paths)
     try:
         name = asyncio.run(
             tg.login(client, phone=_ask_phone, code=_ask_code, password=_ask_password)
@@ -124,7 +124,7 @@ def dialogs_cmd(
         tg.ensure_session_mode(paths)
         client = tg.make_client(cfg, paths)
         matches = asyncio.run(_match_dialogs(client, query, limit))
-    except tg.AuthRequired as exc:
+    except (tg.AuthRequired, tg.SessionError) as exc:
         fail(str(exc))
     except (tg_errors.RPCError, ConnectionError) as exc:
         fail(f"telegram error: {exc}")
@@ -185,7 +185,7 @@ def sync_cmd(
         client = tg.make_client(cfg, paths)
         embedder = _optional_embedder(cfg)
         report = asyncio.run(_run_sync(client, conn, cfg, paths, budget, embedder))
-    except (tg.AuthRequired, sync.SyncInProgress, ConfigError) as exc:
+    except (tg.AuthRequired, tg.SessionError, sync.SyncInProgress, ConfigError) as exc:
         fail(str(exc))
     except (tg_errors.RPCError, ConnectionError) as exc:
         fail(f"telegram error: {exc}")
@@ -385,7 +385,7 @@ def sources_add(
         tg.ensure_session_mode(paths)
         client = tg.make_client(cfg, paths)
         added = asyncio.run(_add_source(client, cfg, parsed, since, comments))
-    except (sources.SourceError, tg.AuthRequired) as exc:
+    except (sources.SourceError, tg.AuthRequired, tg.SessionError) as exc:
         fail(str(exc))
     except (tg_errors.RPCError, ConnectionError) as exc:
         fail(f"telegram error: {exc}")
@@ -449,11 +449,14 @@ def sources_rm(
         ),
     ],
 ) -> None:
-    """Remove a source and delete its chats' messages and index data (offline)."""
+    """Remove a source and delete its chats' messages and index data (offline; refuses while a
+    sync is running, and refuses a chat indexed through a folder or as a channel's discussion
+    group)."""
     paths, cfg, conn = _load()
     try:
-        removed = sources.remove_source(cfg, conn, sources.parse_target(target))
-    except sources.SourceError as exc:
+        with sync.SyncLock(paths):
+            removed = sources.remove_source(cfg, conn, sources.parse_target(target))
+    except (sources.SourceError, sync.SyncInProgress) as exc:
         fail(str(exc))
     finally:
         conn.close()

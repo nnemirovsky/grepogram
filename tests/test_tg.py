@@ -1,11 +1,15 @@
 import datetime as dt
+import sqlite3
 import stat
+import time
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
 import pytest
 from telethon import errors
+from telethon.crypto import AuthKey
+from telethon.sessions import MemorySession, SQLiteSession
 from telethon.tl import functions, types
 from typer.testing import CliRunner
 
@@ -65,19 +69,90 @@ def test_session_missing_is_an_auth_error_not_a_file_error(tmp_path: Path) -> No
 # --- make_client -----------------------------------------------------------------------------
 
 
-def test_make_client_uses_session_path_and_config(tmp_path: Path) -> None:
+KEY = AuthKey(bytes(range(256)))
+
+
+def _signed_in(paths: Paths) -> SQLiteSession:
+    """A session file as ``grepogram auth`` leaves it: data centre and auth key stored."""
+    tg.prepare_session(paths)
+    stored = SQLiteSession(str(paths.session_file))
+    stored.set_dc(2, "149.154.167.51", 443)
+    stored.auth_key = KEY
+    stored.save()
+    return stored
+
+
+def test_make_client_copies_the_session_into_memory(tmp_path: Path) -> None:
     paths = _paths(tmp_path)
-    paths.ensure_dirs()
+    _signed_in(paths).close()
+    before = paths.session_file.read_bytes()
     cfg = Config(
         telegram=TelegramCfg(api_id=777, api_hash="hash"), sync=SyncCfg(flood_sleep_threshold=45)
     )
     client = tg.make_client(cfg, paths)
+    session = client.session
+    assert isinstance(session, MemorySession) and not isinstance(session, SQLiteSession)
+    assert (session.dc_id, session.server_address, session.port) == (2, "149.154.167.51", 443)
+    assert session.auth_key is not None and session.auth_key.key == KEY.key
+    assert client.api_id == 777
+    assert client.api_hash == "hash"
+    assert client.flood_sleep_threshold == 45
+    assert client._init_request.device_model == "grepogram"
+    assert not client.is_connected()
+    assert paths.session_file.read_bytes() == before
+    assert list(paths.session_file.parent.glob("*-journal")) == []
+
+
+def test_load_session_without_a_key_yields_an_unauthorized_copy(tmp_path: Path) -> None:
+    paths = _paths(tmp_path)
+    tg.prepare_session(paths)
+    session = tg.load_session(paths)
+    assert session.auth_key is None and session.server_address is None
+
+
+def test_load_session_reads_while_another_client_holds_the_write_lock(tmp_path: Path) -> None:
+    """A CLI sync or a ``grepogram auth`` keeps an uncommitted write open on the file for up to
+    a minute; a reader is not held up by it, and never contends for the lock itself."""
+    paths = _paths(tmp_path)
+    writer = _signed_in(paths)
+    writer.process_entities(
+        types.contacts.ResolvedPeer(None, [types.User(id=1, access_hash=1, first_name="me")], [])
+    )
+    assert writer._conn.in_transaction
+    started = time.monotonic()
     try:
+        session = tg.load_session(paths)
+        assert session.auth_key is not None and session.auth_key.key == KEY.key
+        assert time.monotonic() - started < 1.0
+        writer.process_entities(
+            types.contacts.ResolvedPeer(
+                None, [types.User(id=2, access_hash=2, first_name="you")], []
+            )
+        )
+    finally:
+        writer.close()
+
+
+def test_damaged_session_file_is_a_session_error(tmp_path: Path) -> None:
+    paths = _paths(tmp_path)
+    tg.prepare_session(paths)
+    paths.session_file.write_bytes(b"not a database, not at all, just some bytes " * 4)
+    with pytest.raises(tg.SessionError) as excinfo:
+        tg.make_client(Config(telegram=TelegramCfg(api_id=1, api_hash="h")), paths)
+    assert str(paths.session_file) in str(excinfo.value)
+    assert excinfo.value.path == paths.session_file
+    assert isinstance(excinfo.value.__cause__, sqlite3.DatabaseError)
+    assert not isinstance(excinfo.value, tg.AuthRequired)
+
+
+def test_make_login_client_writes_the_session_file(tmp_path: Path) -> None:
+    paths = _paths(tmp_path)
+    paths.ensure_dirs()
+    client = tg.make_login_client(Config(telegram=TelegramCfg(api_id=777, api_hash="hash")), paths)
+    try:
+        assert isinstance(client.session, SQLiteSession)
         assert client.session.filename == str(paths.session_file)
-        assert client.api_id == 777
-        assert client.api_hash == "hash"
-        assert client.flood_sleep_threshold == 45
-        assert client._init_request.device_model == "grepogram"
+        assert client.api_id == 777 and client._init_request.device_model == "grepogram"
         assert not client.is_connected()
     finally:
         client.session.close()
@@ -87,7 +162,7 @@ def test_prepare_session_keeps_the_file_private_when_telethon_opens_it(tmp_path:
     paths = _paths(tmp_path)
     assert tg.prepare_session(paths) == paths.session_file
     assert _mode(paths.session_file) == 0o600
-    client = tg.make_client(Config(telegram=TelegramCfg(api_id=1, api_hash="h")), paths)
+    client = tg.make_login_client(Config(telegram=TelegramCfg(api_id=1, api_hash="h")), paths)
     try:
         assert paths.session_file.stat().st_size > 0
         assert _mode(paths.session_file) == 0o600
@@ -203,6 +278,23 @@ async def test_connected_disconnects_an_unauthorized_client() -> None:
     assert not client.is_connected()
 
 
+async def test_connected_disconnects_a_client_that_failed_while_connecting() -> None:
+    """Telethon's ``connect()`` opens the transport before it talks to Telegram; a failure in
+    between must not leave the connection (and its keepalive task) behind."""
+    client = FakeClient()
+
+    async def half_connect() -> None:
+        client.connected = True
+        raise ConnectionError("init failed")
+
+    client.connect = half_connect  # type: ignore[method-assign]
+    with pytest.raises(ConnectionError, match="init failed"):
+        async with tg.connected(client):
+            pass
+    assert not client.is_connected()
+    assert [name for name, _ in client.calls] == ["disconnect"]
+
+
 # --- login -----------------------------------------------------------------------------------
 
 
@@ -276,12 +368,12 @@ def test_auth_signs_in_with_prompts_and_stores_a_private_session(
     fake = FakeClient(authorized=False, two_factor=True, me=make_user(1, "Ann", "Lee"))
     seen: dict[str, object] = {}
 
-    def make_client(cfg: Config, paths: Paths) -> FakeClient:
+    def make_login_client(cfg: Config, paths: Paths) -> FakeClient:
         seen["cfg"] = cfg
         seen["paths"] = paths
         return fake
 
-    monkeypatch.setattr(tg, "make_client", make_client)
+    monkeypatch.setattr(tg, "make_login_client", make_login_client)
     result = runner.invoke(cli.app, ["auth"], input="+15551234567\n12345\nhunter2\n")
     assert result.exit_code == 0, result.output
     assert "signed in as Ann Lee" in result.stdout
@@ -298,7 +390,7 @@ def test_auth_without_prompts_when_already_signed_in(
 ) -> None:
     (tmp_home / "config.toml").write_text(CONFIG_WITH_KEYS, encoding="utf-8")
     fake = FakeClient(me=make_user(1, "Ann"))
-    monkeypatch.setattr(tg, "make_client", lambda cfg, paths: fake)
+    monkeypatch.setattr(tg, "make_login_client", lambda cfg, paths: fake)
     result = runner.invoke(cli.app, ["auth"], input="")
     assert result.exit_code == 0, result.output
     assert "signed in as Ann" in result.stdout
@@ -314,7 +406,7 @@ def test_auth_reports_a_failed_sign_in(tmp_home: Path, monkeypatch: pytest.Monke
         raise errors.PhoneNumberInvalidError(request=None)
 
     monkeypatch.setattr(fake, "start", failing_start)
-    monkeypatch.setattr(tg, "make_client", lambda cfg, paths: fake)
+    monkeypatch.setattr(tg, "make_login_client", lambda cfg, paths: fake)
     result = runner.invoke(cli.app, ["auth"], input="+1\n")
     assert result.exit_code == 1
     assert "sign-in failed" in result.stderr

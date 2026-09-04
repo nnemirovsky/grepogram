@@ -2,18 +2,26 @@
 
 The session file is a Telethon SQLite database that holds the account's auth key, so it is
 created with mode 0600 (:func:`prepare_session`) and checked on every use
-(:func:`ensure_session_mode`). Never use ``async with client``: Telethon's ``__aenter__`` calls
-``start()``, which prompts for a phone number on stdin; :func:`connected` connects without
-prompting and turns dead-session errors into :class:`AuthRequired`.
+(:func:`ensure_session_mode`). Only ``grepogram auth`` writes it (:func:`make_login_client`);
+every other client gets a private in-memory copy of it (:func:`make_client`, :func:`load_session`).
+Telethon writes to its session database on every request that returns peers and commits once a
+minute, so two clients on one file — a cron ``grepogram sync`` next to the MCP server, or two
+tool calls in one process — block each other for the SQLite busy timeout and then fail with
+``database is locked``; an in-memory copy per client has nothing to contend for. Never use
+``async with client``: Telethon's ``__aenter__`` calls ``start()``, which prompts for a phone
+number on stdin; :func:`connected` connects without prompting and turns dead-session errors into
+:class:`AuthRequired`.
 """
 
 import os
+import sqlite3
 import stat
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from pathlib import Path
 
 from telethon import TelegramClient, errors, utils
+from telethon.sessions import MemorySession, SQLiteSession
 
 from grepogram.models import Config
 from grepogram.paths import Paths
@@ -51,10 +59,52 @@ class SessionMissing(AuthRequired):
         super().__init__(f"no Telegram session at {path}")
 
 
+class SessionError(Exception):
+    """The session file exists but cannot be read: another process is writing it (a
+    ``grepogram auth`` in progress) or the file is damaged."""
+
+    def __init__(self, path: Path, reason: Exception) -> None:
+        self.path = path
+        super().__init__(f"cannot read the Telegram session at {path}: {reason}")
+
+
+def load_session(paths: Paths) -> MemorySession:
+    """A private in-memory copy of the session file: data centre, address, port and auth key.
+
+    The file is opened read-only through Telethon's own ``SQLiteSession`` (so a file from an
+    older Telethon layout is understood) and closed at once; the copy never writes anything
+    back, and the entity cache starts empty — every caller re-reads the dialogs it needs.
+    Raises :class:`SessionError` when SQLite cannot read the file.
+    """
+    try:
+        stored = SQLiteSession(str(paths.session_file))
+    except sqlite3.Error as exc:
+        raise SessionError(paths.session_file, exc) from exc
+    try:
+        session = MemorySession()
+        if stored.server_address:
+            session.set_dc(stored.dc_id, stored.server_address, stored.port)
+        session.auth_key = stored.auth_key
+    finally:
+        stored.close()
+    return session
+
+
 def make_client(cfg: Config, paths: Paths) -> TelegramClient:
-    """Build the client for ``paths.session_file``; does not connect."""
+    """Build a client on a private copy of the session file (:func:`load_session`); does not
+    connect."""
+    return _client(load_session(paths), cfg)
+
+
+def make_login_client(cfg: Config, paths: Paths) -> TelegramClient:
+    """Build the client ``grepogram auth`` signs in with: the one client that writes
+    ``paths.session_file``. Does not connect."""
+    return _client(str(paths.session_file), cfg)
+
+
+def _client(session: MemorySession | str, cfg: Config) -> TelegramClient:
     return TelegramClient(
-        str(paths.session_file),
+        session,
         cfg.telegram.api_id,
         cfg.telegram.api_hash,
         flood_sleep_threshold=cfg.sync.flood_sleep_threshold,
@@ -95,9 +145,14 @@ async def wrap_auth_errors(client: TelegramClient) -> AsyncIterator[None]:
 
 @asynccontextmanager
 async def connected(client: TelegramClient) -> AsyncIterator[TelegramClient]:
-    """Connect without prompting, check authorization, and always disconnect."""
-    await client.connect()
+    """Connect without prompting, check authorization, and always disconnect.
+
+    ``connect()`` is inside the guarded block: it opens the transport first and then talks to
+    Telegram, so a failure on the way out would otherwise leave a connection (and its keepalive
+    task) behind. Disconnecting a client that never connected is a no-op.
+    """
     try:
+        await client.connect()
         async with wrap_auth_errors(client):
             yield client
     finally:
