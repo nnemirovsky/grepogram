@@ -820,7 +820,7 @@ async def _check_migration(client: Any, conn: sqlite3.Connection, chat: ChatRow)
                 exc,
             )
             return None
-        new_chat = db.upsert_chat(conn, _chat_row(entity, chat.source_id))
+        new_chat = db.upsert_chat(conn, _chat_row_from_entity(entity, chat.source_id))
     db.set_chat_migrated(conn, chat.id, new_id)
     log.info("chat %s (%s) migrated to supergroup %s", chat.id, chat.title, new_id)
     return new_chat
@@ -858,10 +858,12 @@ async def link_discussion_chat(
     source_id = (
         channel.source_id if existing is None or not existing.source_id else existing.source_id
     )
-    return db.upsert_chat(conn, _chat_row(entity, source_id, discussion_of=channel.id))
+    return db.upsert_chat(conn, _chat_row_from_entity(entity, source_id, discussion_of=channel.id))
 
 
-def _chat_row(entity: Any, source_id: str | None, *, discussion_of: int | None = None) -> ChatRow:
+def _chat_row_from_entity(
+    entity: Any, source_id: str | None, *, discussion_of: int | None = None
+) -> ChatRow:
     info = dialogs.dialog_info(entity)
     return ChatRow(
         id=info.id,

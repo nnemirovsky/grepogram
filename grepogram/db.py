@@ -41,6 +41,9 @@ BUSY_TIMEOUT_MS = 5000
 IN_BATCH = 500
 FTS_TOKENIZE = "unicode61 remove_diacritics 2"
 VEC_TABLE = "unit_vec"
+_WINDOW_SCOPE = "chat_id = ? AND kind = 'window' AND topic_id IS ?"
+"""The windows of one ``(chat, topic)``; the ranges of a forum's topics interleave, so both
+are part of every window lookup."""
 META_SCHEMA_VERSION = "schema_version"
 META_EMBED_MODEL = "embed_model"
 META_LAST_SYNC_RUN = "last_sync_run"
@@ -785,12 +788,7 @@ def get_units(conn: sqlite3.Connection, chat_id: int) -> list[UnitRow]:
 
 def get_units_by_ids(conn: sqlite3.Connection, ids: Iterable[int]) -> list[UnitRow]:
     """Units by id (any chat) in id order; ids that are not stored are skipped."""
-    found: dict[int, UnitRow] = {}
-    for chunk in _chunks(ids):
-        rows = conn.execute(f"SELECT * FROM units WHERE id IN ({_marks(chunk)})", chunk)
-        for row in rows:
-            found[int(row["id"])] = _unit_row(row)
-    return [found[unit_id] for unit_id in sorted(found)]
+    return _units_by_chunks(conn, "SELECT * FROM units WHERE id IN ({marks})", [], ids)
 
 
 def insert_units(conn: sqlite3.Connection, units: Iterable[UnitRow]) -> list[int]:
@@ -832,8 +830,7 @@ def open_window(conn: sqlite3.Connection, chat_id: int, topic_id: int | None) ->
     ``topic_id=None`` addresses the messages outside any topic.
     """
     row = conn.execute(
-        "SELECT * FROM units WHERE chat_id = ? AND kind = 'window' AND topic_id IS ? "
-        "ORDER BY msg_id_end DESC, id DESC LIMIT 1",
+        f"SELECT * FROM units WHERE {_WINDOW_SCOPE} ORDER BY msg_id_end DESC, id DESC LIMIT 1",
         (chat_id, topic_id),
     ).fetchone()
     return None if row is None else _unit_row(row)
@@ -867,7 +864,7 @@ def window_before(
     """The window of ``(chat, topic)`` that starts last among those starting at or before
     ``msg_id``; ``None`` when ``msg_id`` precedes every window."""
     row = conn.execute(
-        "SELECT * FROM units WHERE chat_id = ? AND kind = 'window' AND topic_id IS ? "
+        f"SELECT * FROM units WHERE {_WINDOW_SCOPE} "
         "AND msg_id_start <= ? ORDER BY msg_id_start DESC, id DESC LIMIT 1",
         (chat_id, topic_id, msg_id),
     ).fetchone()
@@ -880,8 +877,7 @@ def windows_from(
     """Windows of ``(chat, topic)`` that reach ``msg_id`` or beyond (``msg_id_end >= msg_id``),
     in ``msg_id_start`` order — the ones a recut starting at ``msg_id`` replaces."""
     rows = conn.execute(
-        "SELECT * FROM units WHERE chat_id = ? AND kind = 'window' AND topic_id IS ? "
-        "AND msg_id_end >= ? ORDER BY msg_id_start, id",
+        f"SELECT * FROM units WHERE {_WINDOW_SCOPE} AND msg_id_end >= ? ORDER BY msg_id_start, id",
         (chat_id, topic_id, msg_id),
     )
     return [_unit_row(row) for row in rows]
@@ -916,31 +912,23 @@ def threads_touching(
     conn: sqlite3.Connection, chat_id: int, msg_ids: Iterable[int]
 ) -> list[UnitRow]:
     """Thread units of a chat whose ``msg_ids`` include any of ``msg_ids``, in id order."""
-    found: dict[int, UnitRow] = {}
-    for chunk in _chunks(msg_ids):
-        rows = conn.execute(
-            "SELECT units.* FROM units WHERE chat_id = ? AND kind = 'thread' AND EXISTS ("
-            "SELECT 1 FROM json_each(units.msg_ids) "
-            f"WHERE json_each.value IN ({_marks(chunk)}))",
-            [chat_id, *chunk],
-        )
-        for row in rows:
-            found[int(row["id"])] = _unit_row(row)
-    return [found[unit_id] for unit_id in sorted(found)]
+    return _units_by_chunks(
+        conn,
+        "SELECT units.* FROM units WHERE chat_id = ? AND kind = 'thread' AND EXISTS ("
+        "SELECT 1 FROM json_each(units.msg_ids) WHERE json_each.value IN ({marks}))",
+        [chat_id],
+        msg_ids,
+    )
 
 
 def post_units(conn: sqlite3.Connection, chat_id: int, post_ids: Iterable[int]) -> list[UnitRow]:
     """The ``post`` units of a channel for the given post ids, in id order."""
-    found: dict[int, UnitRow] = {}
-    for chunk in _chunks(post_ids):
-        rows = conn.execute(
-            "SELECT * FROM units WHERE chat_id = ? AND kind = 'post' "
-            f"AND msg_id_start IN ({_marks(chunk)})",
-            [chat_id, *chunk],
-        )
-        for row in rows:
-            found[int(row["id"])] = _unit_row(row)
-    return [found[unit_id] for unit_id in sorted(found)]
+    return _units_by_chunks(
+        conn,
+        "SELECT * FROM units WHERE chat_id = ? AND kind = 'post' AND msg_id_start IN ({marks})",
+        [chat_id],
+        post_ids,
+    )
 
 
 def get_dirty_units(conn: sqlite3.Connection, limit: int, after_id: int = 0) -> list[UnitRow]:
@@ -977,6 +965,22 @@ def reset_embedded(conn: sqlite3.Connection) -> None:
 
 
 # --- helpers ---------------------------------------------------------------------------------
+
+
+def _units_by_chunks(
+    conn: sqlite3.Connection, sql: str, head: list[int], ids: Iterable[int]
+) -> list[UnitRow]:
+    """Units of a query whose last parameter list is ``ids``, deduplicated and in id order.
+
+    ``sql`` carries a ``{marks}`` placeholder for the ``IN (…)`` list, which is filled per chunk
+    of :data:`IN_BATCH` ids; ``head`` are the parameters before it.
+    """
+    found: dict[int, UnitRow] = {}
+    for chunk in _chunks(ids):
+        rows = conn.execute(sql.format(marks=_marks(chunk)), [*head, *chunk])
+        for row in rows:
+            found[int(row["id"])] = _unit_row(row)
+    return [found[unit_id] for unit_id in sorted(found)]
 
 
 def _chunks(ids: Iterable[int]) -> Iterator[list[int]]:
