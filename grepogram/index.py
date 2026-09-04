@@ -139,22 +139,16 @@ def index_chat(
 def check_embedding_space(conn: sqlite3.Connection, embedder: Embedder) -> None:
     """Raise :class:`EmbeddingSpaceMismatch` unless the stored space is ``embedder``'s.
 
-    Read-only: compares ``meta.embed_model`` / ``embed_dim`` and the width ``unit_vec`` declares
-    with the embedder's name and ``dim``; a database never embedded passes. This is what search
-    checks before a KNN, since a model change at the same width would otherwise go unnoticed.
+    Read-only: compares ``meta.embed_model`` and the width ``unit_vec`` declares with the
+    embedder's name and ``dim``; a database never embedded passes. This is what search checks
+    before a KNN, since a model change at the same width would otherwise go unnoticed.
     """
     stored_model = db.get_meta(conn, db.META_EMBED_MODEL)
-    stored_dim = db.get_meta(conn, db.META_EMBED_DIM)
     table_dim = db.vec_dim(conn)
-    mismatch = (
-        stored_model not in (None, embedder.name)
-        or stored_dim not in (None, str(embedder.dim))
-        or table_dim not in (None, embedder.dim)
-    )
-    if mismatch:
+    if stored_model not in (None, embedder.name) or table_dim not in (None, embedder.dim):
         raise EmbeddingSpaceMismatch(
             f"the dense index was built with {stored_model or 'an unknown model'} "
-            f"({stored_dim or table_dim}-d) but the configured model is {embedder.name} "
+            f"({table_dim}-d) but the configured model is {embedder.name} "
             f"({embedder.dim}-d); run `grepogram embed --reembed` to rebuild it"
         )
 
@@ -164,8 +158,8 @@ def ensure_embedding_space(
 ) -> None:
     """Make ``unit_vec`` and ``meta`` agree with ``embedder``; ``reembed`` starts from scratch.
 
-    A database never embedded gets its table created and ``embed_model`` / ``embed_dim``
-    recorded. One embedded with another model or width raises :class:`EmbeddingSpaceMismatch`
+    A database never embedded gets its table created and ``embed_model`` recorded. One
+    embedded with another model or width raises :class:`EmbeddingSpaceMismatch`
     — vectors from two spaces cannot be compared — unless ``reembed`` is set, which drops the
     vectors, flags every unit dirty and records the new space; ``reembed`` does the same for a
     matching space, which is how a deliberate full re-embed begins.

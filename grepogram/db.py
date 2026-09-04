@@ -7,17 +7,29 @@ removes their rows before the ``chats`` row cascades to ``messages`` and ``units
 
 Every writing function is atomic on its own and commits when it finishes, unless a transaction is
 already open — wrap several calls in ``with transaction(conn):`` to commit them together.
+
+One connection serves the whole process, including the worker threads the MCP server runs
+retrieval and embedding on, so :class:`Connection` serialises its use: every statement runs and
+is fetched to completion under one re-entrant lock (:class:`_Cursor`), and :func:`transaction`
+holds that lock from ``BEGIN`` to ``COMMIT``. Another thread therefore never steps a statement
+while one is in flight, never joins a transaction it did not open and never reads rows that are
+not committed yet. The connection runs in autocommit mode (``isolation_level=None``): a bare
+statement commits on its own instead of opening the implicit transaction the ``sqlite3`` module
+would otherwise leave behind for the next ``transaction()`` to join.
 """
 
 import json
 import re
 import sqlite3
+import threading
+from collections import deque
 from collections.abc import Iterable, Iterator, Sequence
-from contextlib import contextmanager
+from contextlib import AbstractContextManager, contextmanager, nullcontext
+from typing import Any
 
 import sqlite_vec
 
-from grepogram.models import ChatRow, MessageRow, UnitKind, UnitRow, UserRow
+from grepogram.models import ChatRow, MessageRow, UnitRow, UserRow
 from grepogram.paths import Paths
 
 BUSY_TIMEOUT_MS = 5000
@@ -26,7 +38,7 @@ FTS_TOKENIZE = "unicode61 remove_diacritics 2"
 VEC_TABLE = "unit_vec"
 META_SCHEMA_VERSION = "schema_version"
 META_EMBED_MODEL = "embed_model"
-META_EMBED_DIM = "embed_dim"
+META_LAST_SYNC_RUN = "last_sync_run"
 
 _V1: tuple[str, ...] = (
     "CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT)",
@@ -119,19 +131,93 @@ class VecDimMismatch(SchemaError):
     """``unit_vec`` already exists with a different embedding dimension."""
 
 
-def connect(target: Paths | str) -> sqlite3.Connection:
+class Connection(sqlite3.Connection):
+    """A connection whose statements run one at a time across threads (see the module docstring).
+
+    ``lock`` is the re-entrant lock every statement and every :func:`transaction` holds; a thread
+    that holds it may keep executing (nested ``transaction()`` blocks join), any other waits.
+    """
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.lock = threading.RLock()
+
+    def execute(self, sql: str, parameters: Any = (), /) -> sqlite3.Cursor:
+        cursor = self.cursor(_Cursor)
+        cursor.execute(sql, parameters)
+        return cursor
+
+    def executemany(self, sql: str, parameters: Iterable[Any], /) -> sqlite3.Cursor:
+        cursor = self.cursor(_Cursor)
+        cursor.executemany(sql, parameters)
+        return cursor
+
+
+class _Cursor(sqlite3.Cursor):
+    """A cursor that fetches every row while it holds the connection's lock.
+
+    ``sqlite3`` steps a statement lazily as rows are read, which is exactly what must not
+    interleave with another thread's statement on the same connection; reading the rows up front
+    leaves nothing in flight once the lock is released. The rows are then served from memory.
+    """
+
+    def __init__(self, connection: sqlite3.Connection) -> None:
+        super().__init__(connection)
+        self._rows: deque[Any] = deque()
+
+    def execute(self, sql: str, parameters: Any = (), /) -> "_Cursor":
+        with _lock_of(self.connection):
+            super().execute(sql, parameters)
+            self._rows = deque(super().fetchall())
+        return self
+
+    def executemany(self, sql: str, parameters: Iterable[Any], /) -> "_Cursor":
+        with _lock_of(self.connection):
+            super().executemany(sql, parameters)
+            self._rows = deque()
+        return self
+
+    def fetchone(self) -> Any:
+        return self._rows.popleft() if self._rows else None
+
+    def fetchmany(self, size: int | None = None) -> list[Any]:
+        count = self.arraysize if size is None else size
+        return [self._rows.popleft() for _ in range(min(count, len(self._rows)))]
+
+    def fetchall(self) -> list[Any]:
+        rows = list(self._rows)
+        self._rows.clear()
+        return rows
+
+    def __iter__(self) -> "_Cursor":
+        return self
+
+    def __next__(self) -> Any:
+        if not self._rows:
+            raise StopIteration
+        return self._rows.popleft()
+
+
+def _lock_of(conn: sqlite3.Connection) -> AbstractContextManager[Any]:
+    return conn.lock if isinstance(conn, Connection) else nullcontext()
+
+
+def connect(target: Paths | str) -> Connection:
     """Open the index database and load sqlite-vec.
 
     ``target`` is the resolved :class:`Paths` (directories are created) or a raw database string
-    such as ``":memory:"``. The connection may be shared between threads, waits up to five seconds
-    on a locked database, enforces foreign keys and returns :class:`sqlite3.Row` rows.
+    such as ``":memory:"``. The connection may be shared between threads (see :class:`Connection`),
+    waits up to five seconds on a locked database, enforces foreign keys and returns
+    :class:`sqlite3.Row` rows.
     """
     if isinstance(target, Paths):
         target.ensure_dirs()
         database = str(target.db_file)
     else:
         database = target
-    conn = sqlite3.connect(database, check_same_thread=False, isolation_level="IMMEDIATE")
+    conn = sqlite3.connect(
+        database, check_same_thread=False, isolation_level=None, factory=Connection
+    )
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA synchronous=NORMAL")
@@ -147,17 +233,22 @@ def connect(target: Paths | str) -> sqlite3.Connection:
 
 @contextmanager
 def transaction(conn: sqlite3.Connection) -> Iterator[None]:
-    """Run the block atomically, joining a transaction that is already open instead of nesting."""
-    if conn.in_transaction:
-        yield
-        return
-    conn.execute("BEGIN IMMEDIATE")
-    try:
-        yield
-    except BaseException:
-        conn.execute("ROLLBACK")
-        raise
-    conn.execute("COMMIT")
+    """Run the block atomically, joining a transaction that is already open instead of nesting.
+
+    The connection's lock is held for the whole block, so the open transaction a nested block
+    joins is always this thread's own.
+    """
+    with _lock_of(conn):
+        if conn.in_transaction:
+            yield
+            return
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            yield
+        except BaseException:
+            conn.execute("ROLLBACK")
+            raise
+        conn.execute("COMMIT")
 
 
 # --- schema ----------------------------------------------------------------------------------
@@ -217,7 +308,7 @@ def vec_dim(conn: sqlite3.Connection) -> int | None:
 
 
 def ensure_vec_table(conn: sqlite3.Connection, dim: int, drop: bool = False) -> None:
-    """Create ``unit_vec`` for ``dim``-sized embeddings and record ``embed_dim`` in ``meta``.
+    """Create ``unit_vec`` for ``dim``-sized embeddings; the table's DDL records the dimension.
 
     An existing table with the same dimension is kept as is; a different dimension raises
     :class:`VecDimMismatch`. With ``drop`` set every stored vector is discarded and the table is
@@ -241,7 +332,6 @@ def ensure_vec_table(conn: sqlite3.Connection, dim: int, drop: bool = False) -> 
             "chat_id INTEGER PARTITION KEY, date_start INTEGER, "
             f"embedding FLOAT[{dim}] distance_metric=cosine)"
         )
-        set_meta(conn, META_EMBED_DIM, str(dim))
 
 
 def has_vectors(conn: sqlite3.Connection) -> bool:
@@ -275,10 +365,11 @@ def upsert_chat(conn: sqlite3.Connection, chat: ChatRow) -> ChatRow:
     """Insert ``chat`` or refresh the identity columns of the existing row; returns what is stored.
 
     Identity columns are ``type``, ``title``, ``username``, ``is_forum``, ``source_id`` and
-    ``discussion_of``. Sync state (``last_msg_id``, ``last_sync_at``, ``unavailable``,
-    ``migrated_to``) is written on insert only, so re-resolving a source never rewinds a synced
-    chat; change it with :func:`set_chat_progress`, :func:`set_chat_unavailable` and
-    :func:`set_chat_migrated`.
+    ``discussion_of`` — the last one only when the new row carries it, so a discussion chat that
+    is resolved again as an ordinary source chat keeps its channel. Sync state (``last_msg_id``,
+    ``last_sync_at``, ``unavailable``, ``migrated_to``) is written on insert only, so re-resolving
+    a source never rewinds a synced chat; change it with :func:`set_chat_progress`,
+    :func:`set_chat_unavailable` and :func:`set_chat_migrated`.
     """
     with transaction(conn):
         conn.execute(
@@ -291,7 +382,7 @@ def upsert_chat(conn: sqlite3.Connection, chat: ChatRow) -> ChatRow:
                    username = excluded.username,
                    is_forum = excluded.is_forum,
                    source_id = excluded.source_id,
-                   discussion_of = excluded.discussion_of""",
+                   discussion_of = COALESCE(excluded.discussion_of, chats.discussion_of)""",
             (
                 chat.id,
                 chat.type,
@@ -335,6 +426,16 @@ def last_sync_at(conn: sqlite3.Connection) -> int | None:
     """When the most recently completed chat sync finished, or ``None`` before the first one."""
     row = conn.execute("SELECT max(last_sync_at) AS latest FROM chats").fetchone()
     return None if row["latest"] is None else int(row["latest"])
+
+
+def last_sync_run(conn: sqlite3.Connection) -> int | None:
+    """When the last sync run ended (``meta.last_sync_run``), whether or not it finished a chat."""
+    value = get_meta(conn, META_LAST_SYNC_RUN)
+    return None if value is None else int(value)
+
+
+def set_last_sync_run(conn: sqlite3.Connection, when: int) -> None:
+    set_meta(conn, META_LAST_SYNC_RUN, str(when))
 
 
 def set_chat_progress(
@@ -429,20 +530,14 @@ def upsert_messages(conn: sqlite3.Connection, batch: Iterable[MessageRow]) -> li
 
 
 def get_messages(
-    conn: sqlite3.Connection,
-    chat_id: int,
-    since_msg_id: int | None = None,
-    topic_id: int | None = None,
+    conn: sqlite3.Connection, chat_id: int, since_msg_id: int | None = None
 ) -> list[MessageRow]:
-    """Messages of a chat in ``msg_id`` order, from ``since_msg_id`` (inclusive), within a topic."""
+    """Messages of a chat in ``msg_id`` order, from ``since_msg_id`` (inclusive)."""
     sql = "SELECT * FROM messages WHERE chat_id = ?"
     params: list[int] = [chat_id]
     if since_msg_id is not None:
         sql += " AND msg_id >= ?"
         params.append(since_msg_id)
-    if topic_id is not None:
-        sql += " AND topic_id = ?"
-        params.append(topic_id)
     sql += " ORDER BY msg_id"
     return [_message_row(row) for row in conn.execute(sql, params)]
 
@@ -465,6 +560,26 @@ def get_topic_messages(
         for row in rows:
             grouped.setdefault(int(row["topic_id"]), []).append(_message_row(row))
     return grouped
+
+
+def count_topic_messages(
+    conn: sqlite3.Connection, chat_id: int, topic_ids: Iterable[int]
+) -> dict[int, int]:
+    """Stored messages per ``topic_id`` for the given topics; topics without messages are absent.
+
+    A channel with comments compares this with the reply counts Telegram reports on its posts to
+    find the threads that grew since they were stored.
+    """
+    counts: dict[int, int] = {}
+    for chunk in _chunks(topic_ids):
+        rows = conn.execute(
+            "SELECT topic_id, count(*) AS n FROM messages WHERE chat_id = ? "
+            f"AND topic_id IN ({_marks(chunk)}) GROUP BY topic_id",
+            [chat_id, *chunk],
+        )
+        for row in rows:
+            counts[int(row["topic_id"])] = int(row["n"])
+    return counts
 
 
 def get_messages_in_topic(
@@ -616,17 +731,10 @@ def message_counts(conn: sqlite3.Connection) -> dict[int, int]:
 # --- units -----------------------------------------------------------------------------------
 
 
-def get_units(
-    conn: sqlite3.Connection, chat_id: int, kind: UnitKind | None = None
-) -> list[UnitRow]:
-    """Units of a chat, optionally of one kind, in id order."""
-    sql = "SELECT * FROM units WHERE chat_id = ?"
-    params: list[int | str] = [chat_id]
-    if kind is not None:
-        sql += " AND kind = ?"
-        params.append(kind)
-    sql += " ORDER BY id"
-    return [_unit_row(row) for row in conn.execute(sql, params)]
+def get_units(conn: sqlite3.Connection, chat_id: int) -> list[UnitRow]:
+    """Units of a chat in id order."""
+    rows = conn.execute("SELECT * FROM units WHERE chat_id = ? ORDER BY id", (chat_id,))
+    return [_unit_row(row) for row in rows]
 
 
 def get_units_by_ids(conn: sqlite3.Connection, ids: Iterable[int]) -> list[UnitRow]:
@@ -738,13 +846,6 @@ def post_units(conn: sqlite3.Connection, chat_id: int, post_ids: Iterable[int]) 
         for row in rows:
             found[int(row["id"])] = _unit_row(row)
     return [found[unit_id] for unit_id in sorted(found)]
-
-
-def mark_dirty(conn: sqlite3.Connection, ids: Iterable[int]) -> None:
-    """Flag units for (re-)embedding."""
-    with transaction(conn):
-        for chunk in _chunks(ids):
-            conn.execute(f"UPDATE units SET dirty = 1 WHERE id IN ({_marks(chunk)})", chunk)
 
 
 def get_dirty_units(conn: sqlite3.Connection, limit: int, after_id: int = 0) -> list[UnitRow]:

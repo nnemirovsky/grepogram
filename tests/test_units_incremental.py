@@ -475,7 +475,7 @@ def test_channel_with_comments_builds_post_threads_and_discussion_windows(
     ]
     thread = _by_msg_ids(conn, "thread", CHANNEL)[(10,)]
     assert thread.text.splitlines()[1:] == [
-        units.render_line(m) for m in db.get_messages(conn, DISC, topic_id=10)
+        units.render_line(m) for m in db.get_messages_in_topic(conn, DISC, 10)
     ]
     assert _stored(conn, CHANNEL) == _expected(conn, channel)
     units.rebuild_for_chat(conn, discussion, CFG, comment_ids)

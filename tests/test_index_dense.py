@@ -203,7 +203,6 @@ def test_ensure_embedding_space_creates_the_table_and_records_the_space(
     index.ensure_embedding_space(conn, FakeEmbedder())
     assert db.vec_dim(conn) == FAKE_DIM
     assert db.get_meta(conn, db.META_EMBED_MODEL) == "fake"
-    assert db.get_meta(conn, db.META_EMBED_DIM) == str(FAKE_DIM)
     assert not conn.in_transaction
 
 
@@ -267,7 +266,6 @@ def test_ensure_embedding_space_reembed_rebuilds_for_a_new_width(
     assert _vec_rowids(conn) == []
     assert db.count_dirty_units(conn) == len(all_ids)
     assert all(u.embedded_model is None for u in _units(conn).values())
-    assert db.get_meta(conn, db.META_EMBED_DIM) == "8"
     assert index.embed_dirty_units(conn, small) == len(all_ids)
     assert _vec_rowids(conn) == sorted(all_ids)
     assert index.knn(conn, small.embed_query("ВНЖ"), ALL, 3, FANOUT) != []
@@ -347,7 +345,7 @@ def test_embed_dirty_units_re_embeds_only_units_marked_dirty_again(
 ) -> None:
     all_units = _units(conn)
     target = min(all_units)
-    db.mark_dirty(conn, [target])
+    conn.execute("UPDATE units SET dirty = 1 WHERE id = ?", (target,))
     assert index.embed_dirty_units(conn, embedded) == 1
     assert embedded.batches == [[all_units[target].text]]
     assert _vec_rowids(conn) == sorted(all_units)
@@ -366,7 +364,7 @@ def test_embed_dirty_units_does_not_store_zero_vectors(
     assert db.count_dirty_units(conn) == 0
     with db.transaction(conn):
         conn.execute("UPDATE units SET text = ? WHERE id = ?", (stamps, ids[1]))
-    db.mark_dirty(conn, [ids[1]])
+    conn.execute("UPDATE units SET dirty = 1 WHERE id = ?", (ids[1],))
     assert index.embed_dirty_units(conn, embedder) == 1
     assert _vec_rowids(conn) == []
     assert index.knn(conn, embedder.embed_query("hello world"), ALL, 5, FANOUT) == []
@@ -765,3 +763,50 @@ def test_cli_sync_embeds_and_only_warns_without_the_model(
     assert "new messages: 1" in result.stdout
     assert "warning: dense index not updated: torch is not installed" in result.stderr
     assert _inspect(paths) == (FAKE_DIM, 1, 0, 1)
+
+
+# --- added by the review fixes --------------------------------------------------------------
+
+
+def test_ensure_embedding_space_reembed_on_a_fresh_database(conn: sqlite3.Connection) -> None:
+    db.upsert_chat(conn, ChatRow(id=CHAT, type="supergroup"))
+    db.insert_units(conn, [_unit([1], "one")])
+    index.ensure_embedding_space(conn, FakeEmbedder(), reembed=True)
+    assert db.vec_dim(conn) == FAKE_DIM
+    assert db.get_meta(conn, db.META_EMBED_MODEL) == "fake"
+    assert db.count_dirty_units(conn) == 1
+
+
+def test_knn_fan_out_boundary_and_post_filter_shortfall(
+    conn: sqlite3.Connection, loaded: chat_ru.Loaded, embedded: CountingEmbedder
+) -> None:
+    all_units = _units(conn)
+    query = embedded.embed_query("SIM card Claro")
+    with _knn_statements(conn) as seen:
+        per_chat = index.knn(conn, query, Filters(chat_ids={ARG, GEO}), 5, fanout_max=2)
+    assert len(seen) == 2 and all("chat_id = " in sql for sql in seen)
+    assert per_chat == index.knn(conn, query, Filters(chat_ids={ARG, GEO}), 5, fanout_max=1)
+    geo_units = [u for u in all_units.values() if u.chat_id == GEO]
+    k = len(all_units) + 10
+    with _knn_statements(conn) as seen:
+        post_filtered = index.knn(conn, query, Filters(chat_ids={GEO}), k, fanout_max=0)
+    assert len(seen) == 1 and "chat_id = " not in seen[0]
+    assert 0 < len(post_filtered) <= len(geo_units) < k
+    assert all(all_units[r].chat_id == GEO for r in _ids(post_filtered))
+
+
+def test_knn_date_bounds_are_inclusive_on_the_stored_data(
+    conn: sqlite3.Connection, loaded: chat_ru.Loaded, embedded: CountingEmbedder
+) -> None:
+    all_units = _units(conn)
+    query = embedded.embed_query("Galicia счёт")
+    everything = _ids(index.knn(conn, query, ALL, len(all_units), FANOUT))
+    assert everything
+    oldest = min(everything, key=lambda unit_id: all_units[unit_id].date_start)
+    edge = all_units[oldest].date_start
+    assert oldest in _ids(index.knn(conn, query, Filters(since=edge), len(all_units), FANOUT))
+    assert oldest not in _ids(
+        index.knn(conn, query, Filters(since=edge + 1), len(all_units), FANOUT)
+    )
+    assert oldest in _ids(index.knn(conn, query, Filters(until=edge), len(all_units), FANOUT))
+    assert index.knn(conn, query, Filters(until=edge - 1), len(all_units), FANOUT) == []

@@ -1,6 +1,8 @@
 import dataclasses
 import sqlite3
+import stat
 import threading
+import time
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -94,7 +96,8 @@ def test_connect_configures_connection(conn: sqlite3.Connection) -> None:
     assert conn.execute("PRAGMA busy_timeout").fetchone()[0] == 5000
     assert conn.execute("PRAGMA foreign_keys").fetchone()[0] == 1
     assert conn.execute("SELECT vec_version()").fetchone()[0].startswith("v")
-    assert conn.isolation_level == "IMMEDIATE"
+    assert conn.isolation_level is None
+    assert isinstance(conn, db.Connection)
     with pytest.raises(sqlite3.OperationalError):
         conn.load_extension(sqlite_vec.loadable_path())
 
@@ -211,7 +214,6 @@ def test_ensure_vec_table_creates_vec0_with_dim(conn: sqlite3.Connection) -> Non
     db.ensure_vec_table(conn, 4)
     assert db.has_vec_table(conn)
     assert db.vec_dim(conn) == 4
-    assert db.get_meta(conn, "embed_dim") == "4"
     sql = conn.execute("SELECT sql FROM sqlite_master WHERE name = 'unit_vec'").fetchone()[0]
     assert "vec0" in sql
     assert "chat_id INTEGER PARTITION KEY" in sql
@@ -251,7 +253,6 @@ def test_ensure_vec_table_refuses_other_dim_unless_dropped(conn: sqlite3.Connect
     assert conn.execute("SELECT count(*) FROM unit_vec").fetchone()[0] == 1
     db.ensure_vec_table(conn, 8, drop=True)
     assert db.vec_dim(conn) == 8
-    assert db.get_meta(conn, "embed_dim") == "8"
     assert conn.execute("SELECT count(*) FROM unit_vec").fetchone()[0] == 0
     conn.execute(
         "INSERT INTO unit_vec(rowid, chat_id, date_start, embedding) VALUES (1, 1, 1, ?)",
@@ -268,7 +269,6 @@ def test_ensure_vec_table_drop_recreates_even_with_the_same_dim(conn: sqlite3.Co
     db.ensure_vec_table(conn, 4, drop=True)
     assert db.vec_dim(conn) == 4
     assert conn.execute("SELECT count(*) FROM unit_vec").fetchone()[0] == 0
-    assert db.get_meta(conn, db.META_EMBED_DIM) == "4"
 
 
 def test_has_vectors(conn: sqlite3.Connection) -> None:
@@ -317,14 +317,73 @@ def test_transaction_commits_and_rolls_back(conn: sqlite3.Connection) -> None:
     assert db.get_meta(conn, "k") is None
 
 
-def test_transaction_joins_python_implicit_transaction(conn: sqlite3.Connection) -> None:
+def test_bare_statements_autocommit_and_nested_transactions_join(conn: sqlite3.Connection) -> None:
     conn.execute("INSERT INTO meta(key, value) VALUES ('a', '1')")
-    assert conn.in_transaction
-    db.set_meta(conn, "b", "2")
-    assert conn.in_transaction
+    assert not conn.in_transaction
     conn.rollback()
-    assert db.get_meta(conn, "a") is None
+    assert db.get_meta(conn, "a") == "1"
+    with pytest.raises(RuntimeError), db.transaction(conn):
+        with db.transaction(conn):
+            db.set_meta(conn, "b", "2")
+        assert conn.in_transaction
+        raise RuntimeError("boom")
+    assert not conn.in_transaction
     assert db.get_meta(conn, "b") is None
+
+
+def test_transaction_serialises_threads_and_hides_uncommitted_rows(
+    conn: sqlite3.Connection,
+) -> None:
+    inside = threading.Event()
+    release = threading.Event()
+    seen: list[ChatRow | None] = []
+
+    def writer() -> None:
+        with db.transaction(conn):
+            db.upsert_chat(conn, _chat(1))
+            inside.set()
+            release.wait(5)
+
+    def reader() -> None:
+        inside.wait(5)
+        seen.append(db.get_chat(conn, 1))
+
+    threads = [threading.Thread(target=writer), threading.Thread(target=reader)]
+    for thread in threads:
+        thread.start()
+    inside.wait(5)
+    time.sleep(0.05)
+    assert seen == []
+    release.set()
+    for thread in threads:
+        thread.join(5)
+    assert seen == [_chat(1)]
+
+
+def test_concurrent_statements_on_one_connection_do_not_interfere(
+    conn: sqlite3.Connection,
+) -> None:
+    db.upsert_chat(conn, _chat(1))
+    db.upsert_messages(conn, [_message(1, i) for i in range(1, 201)])
+    errors: list[BaseException] = []
+
+    def work(offset: int) -> None:
+        try:
+            for i in range(50):
+                assert db.last_sync_at(conn) is None
+                assert len(db.get_messages(conn, 1)) == 200
+                db.upsert_messages(conn, [_message(1, offset + i, text="edit")])
+                assert db.get_message(conn, 1, offset + i) is not None
+        except BaseException as exc:
+            errors.append(exc)
+
+    threads = [threading.Thread(target=work, args=(n,)) for n in (1, 51, 101, 151)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(30)
+    assert errors == []
+    assert conn.execute("SELECT count(*) FROM messages").fetchone()[0] == 200
 
 
 # --- chats -----------------------------------------------------------------------------------
@@ -444,10 +503,12 @@ def test_delete_chat_fts_cleanup_is_rowid_lookup(conn: sqlite3.Connection) -> No
         "(SELECT id FROM messages WHERE chat_id = ?)",
         (1,),
     ).fetchall()
+    # fts5's idxStr ends in "=" for a rowid lookup and is bare for a full scan; the rest of the
+    # line is SQLite's wording and changes between versions
     fts_steps = [row["detail"] for row in plan if "msg_fts" in row["detail"]]
-    assert fts_steps == ["SCAN msg_fts VIRTUAL TABLE INDEX 0:="]
+    assert fts_steps and all(step.endswith("INDEX 0:=") for step in fts_steps)
     scan = conn.execute("EXPLAIN QUERY PLAN DELETE FROM msg_fts WHERE chat_id = ?", (1,)).fetchall()
-    assert [row["detail"] for row in scan] == ["SCAN msg_fts VIRTUAL TABLE INDEX 0:"]
+    assert scan and all(row["detail"].endswith("INDEX 0:") for row in scan)
 
 
 # --- users -----------------------------------------------------------------------------------
@@ -554,8 +615,8 @@ def test_get_messages_ordering_since_and_topic(conn: sqlite3.Connection) -> None
     )
     assert [m.msg_id for m in db.get_messages(conn, 1)] == [10, 20, 30]
     assert [m.msg_id for m in db.get_messages(conn, 1, since_msg_id=20)] == [20, 30]
-    assert [m.msg_id for m in db.get_messages(conn, 1, topic_id=7)] == [10, 30]
-    assert [m.msg_id for m in db.get_messages(conn, 1, since_msg_id=11, topic_id=7)] == [30]
+    assert db.count_topic_messages(conn, 1, [7, 8]) == {7: 2}
+    assert db.count_topic_messages(conn, 2, [7]) == {}
     assert db.get_messages(conn, 3) == []
 
 
@@ -696,7 +757,7 @@ def test_insert_and_get_units_roundtrip(conn: sqlite3.Connection) -> None:
     ]
     assert stored[0].dirty is True and stored[1].dirty is False
     assert conn.execute("SELECT msg_ids FROM units WHERE id = 1").fetchone()[0] == "[3,1,2]"
-    assert [u.id for u in db.get_units(conn, 1, kind="thread")] == [2]
+    assert [u.id for u in db.get_units(conn, 1) if u.kind == "thread"] == [2]
     assert db.get_units(conn, 3) == []
     assert db.insert_units(conn, []) == []
 
@@ -804,15 +865,6 @@ def test_containing_unit_by_topic_range_then_post(conn: sqlite3.Connection) -> N
     assert db.containing_unit(conn, 2, 1, None) is None
 
 
-def test_mark_dirty(conn: sqlite3.Connection) -> None:
-    db.upsert_chat(conn, _chat(1))
-    ids = db.insert_units(conn, [_unit(1, [1], dirty=False), _unit(1, [2], dirty=False)])
-    db.mark_dirty(conn, [ids[1], 999])
-    assert [u.dirty for u in db.get_units(conn, 1)] == [False, True]
-    db.mark_dirty(conn, [])
-    assert [u.dirty for u in db.get_units(conn, 1)] == [False, True]
-
-
 def test_dirty_unit_accessors(conn: sqlite3.Connection) -> None:
     db.upsert_chat(conn, _chat(1))
     ids = db.insert_units(conn, [_unit(1, [1]), _unit(1, [2]), _unit(1, [3])])
@@ -830,3 +882,60 @@ def test_dirty_unit_accessors(conn: sqlite3.Connection) -> None:
     assert db.count_dirty_units(conn) == 3
     assert all(u.dirty and u.embedded_model is None for u in db.get_units_by_ids(conn, ids))
     assert not conn.in_transaction
+
+
+# --- added by the review fixes --------------------------------------------------------------
+
+
+def test_connect_creates_missing_directories_private(tmp_path: Path) -> None:
+    paths = Paths.under(tmp_path / "fresh" / "nested")
+    connection = db.connect(paths)
+    try:
+        assert paths.db_file.is_file()
+        assert stat.S_IMODE(paths.db_file.parent.stat().st_mode) == 0o700
+    finally:
+        connection.close()
+
+
+def test_last_sync_run_round_trip(conn: sqlite3.Connection) -> None:
+    assert db.last_sync_run(conn) is None
+    db.set_last_sync_run(conn, 1_700_000_000)
+    assert db.last_sync_run(conn) == 1_700_000_000
+    db.set_last_sync_run(conn, 1_700_000_060)
+    assert db.last_sync_run(conn) == 1_700_000_060
+
+
+def test_upsert_chat_keeps_discussion_of_when_the_new_row_has_none(
+    conn: sqlite3.Connection,
+) -> None:
+    db.upsert_chat(conn, ChatRow(id=2, type="channel"))
+    db.upsert_chat(conn, ChatRow(id=1, type="supergroup", source_id="a", discussion_of=2))
+    kept = db.upsert_chat(conn, ChatRow(id=1, type="supergroup", title="t", source_id="b"))
+    assert (kept.discussion_of, kept.source_id, kept.title) == (2, "b", "t")
+    moved = db.upsert_chat(conn, ChatRow(id=1, type="supergroup", source_id="b", discussion_of=3))
+    assert moved.discussion_of == 3
+    plain = db.upsert_chat(conn, ChatRow(id=5, type="supergroup"))
+    assert plain.discussion_of is None
+
+
+def test_upsert_messages_rewrites_every_column_on_conflict(conn: sqlite3.Connection) -> None:
+    db.upsert_chat(conn, _chat(1))
+    first = MessageRow(chat_id=1, msg_id=5, date=100, from_id=1, from_name="Ann", text="a")
+    (row_id,) = db.upsert_messages(conn, [first])
+    second = MessageRow(
+        chat_id=1,
+        msg_id=5,
+        date=101,
+        edit_date=150,
+        from_id=2,
+        from_name="Bob",
+        reply_to_msg_id=3,
+        topic_id=9,
+        fwd_from="Carol",
+        text="b",
+        media_kind="photo",
+        media_filename="x.jpg",
+        reactions_total=4,
+    )
+    assert db.upsert_messages(conn, [second]) == [row_id]
+    assert db.get_message(conn, 1, 5) == dataclasses.replace(second, id=row_id)
