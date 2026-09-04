@@ -32,6 +32,11 @@ message-level hit, and for every other hit the unit's best message under the que
 ``msg_fts`` (:func:`best_anchor`), else the unit's first message. The snippet leads with the
 anchor's rendered line and adds its neighbours from within the unit while the total stays under
 :data:`SNIPPET_CHARS`; ``full`` adds the unit's whole text.
+
+Two readers let the caller see past a snippet: :func:`thread` returns the whole reply thread a
+message belongs to (for a channel post, the post with its comments from the linked discussion
+chat) and :func:`context` the messages around one in its topic, both as
+:class:`~grepogram.models.MessageView` lists with deep links.
 """
 
 import logging
@@ -44,10 +49,19 @@ from grepogram import db, embed, index, links
 from grepogram import rerank as reranking
 from grepogram.embed import Embedder, ModelUnavailable
 from grepogram.index import EmbeddingSpaceMismatch
-from grepogram.models import Config, Filters, Hit, MessageRow, SearchResult, UnitRow
+from grepogram.models import (
+    ChatRow,
+    Config,
+    Filters,
+    Hit,
+    MessageRow,
+    MessageView,
+    SearchResult,
+    UnitRow,
+)
 from grepogram.rerank import Reranker
 from grepogram.stem import FtsOp, fts_query
-from grepogram.units import render_line
+from grepogram.units import chronological, media_placeholder, render_line
 
 log = logging.getLogger(__name__)
 
@@ -64,6 +78,15 @@ _OPS: tuple[FtsOp, ...] = ("AND", "OR")
 
 class DenseUnavailable(Exception):
     """The dense side cannot run: no vectors, no embedding model, or a mismatched space."""
+
+
+class UnknownMessage(LookupError):
+    """No stored message has this ``(chat_id, msg_id)``."""
+
+    def __init__(self, chat_id: int, msg_id: int) -> None:
+        super().__init__(f"message {msg_id} of chat {chat_id} is not indexed")
+        self.chat_id = chat_id
+        self.msg_id = msg_id
 
 
 @dataclass(frozen=True, slots=True)
@@ -486,3 +509,60 @@ def _rerank(
     ]
     rescored.sort(key=lambda candidate: -candidate.score)
     return rescored
+
+
+# --- readers ---------------------------------------------------------------------------------
+
+
+def message_view(chat: ChatRow, msg: MessageRow) -> MessageView:
+    """``msg`` as the caller sees it: linked through :func:`grepogram.links.message_url`, with a
+    ``[photo]``-style placeholder as ``text`` when it has media and no caption."""
+    link = links.message_url(chat, msg.msg_id, msg.topic_id)
+    return MessageView(
+        msg_id=msg.msg_id,
+        date=msg.date,
+        from_name=msg.from_name,
+        text=msg.text.strip() or media_placeholder(msg),
+        url=link.url,
+        fallback_url=link.fallback_url,
+        reply_to_msg_id=msg.reply_to_msg_id,
+    )
+
+
+def thread(conn: sqlite3.Connection, chat_id: int, msg_id: int) -> list[MessageView]:
+    """The reply thread holding ``msg_id`` in ``chat_id``, chronological, root first.
+
+    The thread is the root reached by walking ``reply_to_msg_id`` upwards and every reply below
+    it (:func:`grepogram.db.get_thread_messages`); a message nobody replied to that replies to
+    nothing is a thread of one. For a channel post the comments stored under the linked
+    discussion chat follow the post, each linked into that chat. Raises :class:`UnknownMessage`
+    when the message is not indexed.
+    """
+    chat = _locate(conn, chat_id, msg_id)
+    views = [message_view(chat, msg) for msg in db.get_thread_messages(conn, chat_id, msg_id)]
+    if chat.type == "channel" and chat.discussion_of is None:
+        discussion = db.get_discussion_chat(conn, chat.id)
+        if discussion is not None:
+            comments = chronological(db.get_messages_in_topic(conn, discussion.id, msg_id))
+            views += [message_view(discussion, msg) for msg in comments]
+    return views
+
+
+def context(
+    conn: sqlite3.Connection, chat_id: int, msg_id: int, before: int = 15, after: int = 15
+) -> list[MessageView]:
+    """``msg_id`` with up to ``before`` messages preceding and ``after`` following it in the
+    same topic of ``chat_id``, in ``msg_id`` order (:func:`grepogram.db.get_context_messages`).
+    Raises :class:`UnknownMessage` when the message is not indexed and ``ValueError`` for a
+    negative count."""
+    chat = _locate(conn, chat_id, msg_id)
+    messages = db.get_context_messages(conn, chat_id, msg_id, before, after)
+    return [message_view(chat, msg) for msg in messages]
+
+
+def _locate(conn: sqlite3.Connection, chat_id: int, msg_id: int) -> ChatRow:
+    """The chat row of a stored message, or :class:`UnknownMessage`."""
+    chat = db.get_chat(conn, chat_id)
+    if chat is None or db.get_message(conn, chat_id, msg_id) is None:
+        raise UnknownMessage(chat_id, msg_id)
+    return chat

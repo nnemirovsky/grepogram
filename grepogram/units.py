@@ -448,7 +448,7 @@ def _thread_members(
     """Root id → root and every reply below it, for each thread a changed message belongs to."""
     threads: dict[int, list[MessageRow]] = {}
     for top in _chain_tops(conn, chat_id, changed):
-        replies = _descendants(conn, chat_id, top.msg_id)
+        replies = db.get_descendants(conn, chat_id, top.msg_id)
         if replies:
             threads[top.msg_id] = [top, *replies]
     return threads
@@ -486,21 +486,6 @@ def _chain_tops(
 def _parent_id(msg: MessageRow) -> int | None:
     parent = msg.reply_to_msg_id
     return None if parent is None or parent == msg.msg_id else parent
-
-
-def _descendants(conn: sqlite3.Connection, chat_id: int, root_id: int) -> list[MessageRow]:
-    """Every reply below ``root_id``, breadth-first over stored replies."""
-    seen = {root_id}
-    frontier = [root_id]
-    found: list[MessageRow] = []
-    while frontier:
-        level = [
-            reply for reply in db.get_replies(conn, chat_id, frontier) if reply.msg_id not in seen
-        ]
-        seen.update(reply.msg_id for reply in level)
-        found += level
-        frontier = [reply.msg_id for reply in level]
-    return found
 
 
 def _apply(

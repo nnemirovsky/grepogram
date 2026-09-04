@@ -486,13 +486,13 @@ FTS and vec virtual tables cannot carry FK constraints, so `db.delete_chat(conn,
 ### Task 22: Thread and context readers
 
 **Files:**
-- Modify: `grepogram/search.py`, `grepogram/db.py`
+- Modify: `grepogram/search.py`, `grepogram/db.py`, `grepogram/units.py` (its private descendant walk moved to `db.get_descendants`, shared with the thread reader)
 - Create: `tests/test_readers.py`
 
-- [ ] `db.py`: `get_thread_messages(chat_id, msg_id)` — walk up `reply_to_msg_id` to the root, then all descendants chronological; `get_context_messages(chat_id, msg_id, before, after)` — by `msg_id` order within the same `topic_id`
-- [ ] `search.py`: `thread(conn, chat_id, msg_id)` and `context(conn, chat_id, msg_id, before, after)` returning `MessageView` lists with `url`/`fallback_url`; unknown message → `UnknownMessage`
-- [ ] write tests: thread from a leaf reaches root and siblings; context respects before/after and topic boundary; error path
-- [ ] run tests — must pass before task 23
+- [x] `db.py`: `get_thread_messages(chat_id, msg_id)` — walk up `reply_to_msg_id` to the root, then all descendants chronological; `get_context_messages(chat_id, msg_id, before, after)` — by `msg_id` order within the same `topic_id`
+- [x] `search.py`: `thread(conn, chat_id, msg_id)` and `context(conn, chat_id, msg_id, before, after)` returning `MessageView` lists with `url`/`fallback_url`; unknown message → `UnknownMessage`
+- [x] write tests: thread from a leaf reaches root and siblings; context respects before/after and topic boundary; error path
+- [x] run tests — must pass before task 23
 
 ### Task 23: MCP server
 

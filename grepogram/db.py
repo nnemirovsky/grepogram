@@ -534,6 +534,79 @@ def get_message(conn: sqlite3.Connection, chat_id: int, msg_id: int) -> MessageR
     return None if row is None else _message_row(row)
 
 
+def get_descendants(conn: sqlite3.Connection, chat_id: int, root_id: int) -> list[MessageRow]:
+    """Every reply below ``root_id`` in ``chat_id``, breadth-first over stored replies, each
+    message once even when replies form a cycle; the root itself is not included."""
+    seen = {root_id}
+    frontier = [root_id]
+    found: list[MessageRow] = []
+    while frontier:
+        level = [
+            reply for reply in get_replies(conn, chat_id, frontier) if reply.msg_id not in seen
+        ]
+        seen.update(reply.msg_id for reply in level)
+        found += level
+        frontier = [reply.msg_id for reply in level]
+    return found
+
+
+def get_thread_messages(conn: sqlite3.Connection, chat_id: int, msg_id: int) -> list[MessageRow]:
+    """The reply thread holding ``msg_id``: its root and every reply below the root, in
+    ``(date, msg_id)`` order; ``[]`` when the message is not stored.
+
+    The root is found by walking ``reply_to_msg_id`` upwards until a message replies to nothing,
+    to itself, to something not stored or to a message already passed (a reply cycle). A
+    message that neither replies nor is replied to is a thread of one.
+    """
+    msg = get_message(conn, chat_id, msg_id)
+    if msg is None:
+        return []
+    root = _thread_root(conn, msg)
+    thread = [root, *get_descendants(conn, chat_id, root.msg_id)]
+    return sorted(thread, key=lambda m: (m.date, m.msg_id))
+
+
+def _thread_root(conn: sqlite3.Connection, msg: MessageRow) -> MessageRow:
+    seen = {msg.msg_id}
+    while msg.reply_to_msg_id is not None and msg.reply_to_msg_id not in seen:
+        parent = get_message(conn, msg.chat_id, msg.reply_to_msg_id)
+        if parent is None:
+            break
+        seen.add(parent.msg_id)
+        msg = parent
+    return msg
+
+
+def get_context_messages(
+    conn: sqlite3.Connection, chat_id: int, msg_id: int, before: int, after: int
+) -> list[MessageRow]:
+    """``msg_id`` with up to ``before`` stored messages preceding and ``after`` following it in
+    ``msg_id`` order, all from the same topic (``topic_id IS`` the message's own, so a forum
+    topic or a channel post's comments never bleed into a neighbour); ``[]`` when the message
+    is not stored. Negative counts are a ``ValueError``.
+    """
+    if before < 0 or after < 0:
+        raise ValueError(f"before and after must not be negative, got {before} and {after}")
+    msg = get_message(conn, chat_id, msg_id)
+    if msg is None:
+        return []
+    preceding = conn.execute(
+        "SELECT * FROM messages WHERE chat_id = ? AND topic_id IS ? AND msg_id < ? "
+        "ORDER BY msg_id DESC LIMIT ?",
+        (chat_id, msg.topic_id, msg_id, before),
+    ).fetchall()
+    following = conn.execute(
+        "SELECT * FROM messages WHERE chat_id = ? AND topic_id IS ? AND msg_id > ? "
+        "ORDER BY msg_id ASC LIMIT ?",
+        (chat_id, msg.topic_id, msg_id, after),
+    ).fetchall()
+    return [
+        *(_message_row(row) for row in reversed(preceding)),
+        msg,
+        *(_message_row(row) for row in following),
+    ]
+
+
 def message_counts(conn: sqlite3.Connection) -> dict[int, int]:
     """Stored messages per chat id; chats without messages are absent."""
     rows = conn.execute("SELECT chat_id, COUNT(*) AS n FROM messages GROUP BY chat_id")
