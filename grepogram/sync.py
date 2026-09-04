@@ -17,8 +17,9 @@ Fetching and indexing are decoupled through ``messages.indexed``: every row a ba
 flagged until :func:`on_chat_synced` has rebuilt its units and ``msg_fts`` entry, and
 :func:`_sync_chats` indexes a chat's pending rows after its fetch whether that returned or raised
 (a flood wait, an RPC error, a cancellation) and, at the end of the run, those of the chats it
-never reached. A run that dies between a commit and the rebuild therefore leaves nothing behind
-that the next run does not pick up (:func:`grepogram.db.unindexed_message_ids`). The rebuild, the
+never reached and of a bounded number of chats nothing leads to any more (:func:`index_stranded`).
+A run that dies between a commit and the rebuild therefore leaves nothing behind that the next run
+does not pick up (:func:`grepogram.db.unindexed_message_ids`). The rebuild, the
 indexing and the flag are one transaction, so the flag never clears over derived data that is not
 there; the worker thread they run on is joined even when the surrounding tool call is cancelled
 (:func:`_joined_to_thread`), so the :class:`SyncLock` outlives every write it covers.
@@ -64,13 +65,15 @@ from grepogram.models import (
     UserRow,
 )
 from grepogram.paths import FileLock, Paths
-from grepogram.sources import parse_since, resolve_sources
+from grepogram.sources import discussion_source_id, parse_since, resolve_sources
 from grepogram.units import UNKNOWN_SENDER
 
 log = logging.getLogger(__name__)
 
 BATCH_SIZE = 500
 JOIN_LOG_EVERY = 30.0
+STRANDED_CHATS = 4
+"""Chats outside the run's own that :func:`index_stranded` repairs per run."""
 SELF_NAME = "me"
 UNKNOWN_FORWARD = "unknown"
 _LOCATION_MEDIA = (types.MessageMediaGeo, types.MessageMediaGeoLive, types.MessageMediaVenue)
@@ -857,22 +860,26 @@ async def link_discussion_chat(
 ) -> ChatRow | None:
     """Upsert the channel's linked discussion group as its own ``chats`` row.
 
-    The row carries ``discussion_of = channel.id``. A group that is already stored — listed by a
-    source of its own, or linked in an earlier run — keeps its ``source_id`` and every message it
-    holds; a new row gets the channel's ``source_id`` so the comments stored under it are removed
-    together with the channel. ``None`` when the channel has no discussion group;
-    :class:`DiscussionUnavailable` when Telegram will not resolve the group (private, or the
-    account is not a member) — the channel's own errors propagate.
+    The row carries ``discussion_of = channel.id`` and the ``source_id``
+    :func:`~grepogram.sources.discussion_source_id` decides: a group a source covers on its own
+    keeps that source, and a group known only through this link takes the linking channel's, so
+    it moves along when another channel takes it over and is removed together with the source
+    whose comments it holds. Every message it holds stays either way. ``None`` when the channel
+    has no discussion group; :class:`DiscussionUnavailable` when Telegram will not resolve the
+    group (private, or the account is not a member) — the channel's own errors propagate.
 
     ``GetFullChannelRequest`` answers a channel without a discussion group with
     ``linked_chat_id = None``, and one whose group changed with the new id, so both cases are
-    read off the same field: the link is re-pointed or cleared here (:func:`_unlink_discussion`)
-    rather than left where an earlier run put it.
+    read off the same field: the link is re-pointed or cleared here (:func:`_relink_discussion`)
+    rather than left where an earlier run put it. A group Telegram names but will not resolve
+    still clears a link that points at a *different* group — that one is demonstrably not the
+    channel's any more — while a link to the very group that failed to resolve is left untouched
+    and retried next run.
     """
     full = await client(functions.channels.GetFullChannelRequest(channel.id))
     linked = getattr(full.full_chat, "linked_chat_id", None)
     if not linked:
-        _unlink_discussion(conn, channel, None)
+        _relink_discussion(conn, channel, None)
         log.info(
             "channel %s (%s) has no discussion group; comments skipped", channel.id, channel.title
         )
@@ -883,20 +890,32 @@ async def link_discussion_chat(
         try:
             entity = await client.get_entity(linked_id)
         except _DISCUSSION_ERRORS as exc:
+            _drop_stale_link(conn, channel, linked_id)
             raise DiscussionUnavailable(
                 f"cannot resolve discussion group {linked_id}: {exc}"
             ) from exc
-    existing = db.get_chat(conn, linked_id)
-    source_id = (
-        channel.source_id if existing is None or not existing.source_id else existing.source_id
-    )
     with db.transaction(conn):
+        source_id = discussion_source_id(db.get_chat(conn, linked_id), channel)
         stored = db.upsert_chat(conn, _chat_row_from_entity(entity, source_id))
-        _unlink_discussion(conn, channel, stored.id)
+        _relink_discussion(conn, channel, stored.id)
     return _refresh(conn, stored)
 
 
-def _unlink_discussion(conn: sqlite3.Connection, channel: ChatRow, keep: int | None) -> None:
+def _drop_stale_link(conn: sqlite3.Connection, channel: ChatRow, linked_id: int) -> None:
+    """Unlink the stored discussion group of ``channel`` when it is not ``linked_id``.
+
+    The group Telegram now names could not be resolved, so it cannot be stored — but the one
+    stored is not the channel's any more, and keeping the link would leave its comments in
+    :func:`grepogram.search.thread` and in the channel's post threads for as long as the group
+    stays unresolvable. A link to ``linked_id`` itself is a group that is still the channel's and
+    only unreachable this run: it is left alone rather than dropped and rebuilt on every retry.
+    """
+    stored = db.get_discussion_chat(conn, channel.id)
+    if stored is not None and stored.id != linked_id:
+        _relink_discussion(conn, channel, None)
+
+
+def _relink_discussion(conn: sqlite3.Connection, channel: ChatRow, keep: int | None) -> None:
     """Point the channel's ``discussion_of`` at ``keep`` and undo what a former group left.
 
     A group Telegram unlinked, or replaced with another one, keeps every message it holds: they
@@ -907,13 +926,20 @@ def _unlink_discussion(conn: sqlite3.Connection, channel: ChatRow, keep: int | N
 
     A group can only be linked to one channel at a time, so ``keep`` may be the group another
     channel held until now; that channel's post threads go the same way.
+
+    The whole transition is one transaction — the link that moves and the ``indexed = 0`` flags
+    that say which posts it invalidated — so a process killed inside it leaves either both or
+    neither. Half of it would be a channel whose post threads still hold the comments of a group
+    that is not its own, with nothing left to say those posts need a rebuild: the next run reads
+    the link, finds it already where it belongs and rebuilds nothing.
     """
-    if keep is not None:
-        taken_from = db.get_chat(conn, keep)
-        if taken_from is not None and taken_from.discussion_of not in (None, channel.id):
-            _drop_comment_units(conn, taken_from.discussion_of, keep)
-    for dropped in db.set_discussion_chat(conn, channel.id, keep):
-        _drop_comment_units(conn, channel.id, dropped)
+    with db.transaction(conn):
+        if keep is not None:
+            taken_from = db.get_chat(conn, keep)
+            if taken_from is not None and taken_from.discussion_of not in (None, channel.id):
+                _drop_comment_units(conn, taken_from.discussion_of, keep)
+        for dropped in db.set_discussion_chat(conn, channel.id, keep):
+            _drop_comment_units(conn, channel.id, dropped)
 
 
 def _drop_comment_units(conn: sqlite3.Connection, channel_id: int | None, group_id: int) -> None:
@@ -1029,7 +1055,9 @@ async def index_pending(conn: sqlite3.Connection, cfg: Config, chat: ChatRow) ->
     left behind get them on the next run. The chat rows are re-read, since a fetch may have
     changed them or linked the discussion group; a chat removed meanwhile has nothing to index.
     This is the step a cancelled sync runs on its way out, so the worker thread is joined rather
-    than abandoned (:func:`_joined_to_thread`).
+    than abandoned (:func:`_joined_to_thread`). Rows flagged in a chat this run holds no handle on
+    — a discussion group it was unlinked from meanwhile — are :func:`index_stranded`'s to repair
+    at the end of the run.
     """
     for row in (db.get_chat(conn, chat.id), db.get_discussion_chat(conn, chat.id)):
         if row is None:
@@ -1037,6 +1065,38 @@ async def index_pending(conn: sqlite3.Connection, cfg: Config, chat: ChatRow) ->
         pending = db.unindexed_message_ids(conn, row.id)
         if pending:
             await _joined_to_thread(functools.partial(on_chat_synced, conn, row, cfg, pending))
+
+
+async def index_stranded(
+    conn: sqlite3.Connection, cfg: Config, limit: int = STRANDED_CHATS
+) -> None:
+    """Rebuild and index rows left flagged in chats the run itself never went through.
+
+    :func:`index_pending` covers a chat and the discussion group it holds *now*, which is every
+    chat a run writes to — but not every chat the flag can be set in. A group a channel was
+    unlinked from, or that another channel took over, is no longer reachable from either the
+    source list or the link, so rows a killed run left behind in it would stay ``indexed = 0``
+    for good and its units would keep whatever that run half-wrote. ``messages.indexed`` says
+    where the work is whatever stranded it (:func:`grepogram.db.chats_with_unindexed`), and this
+    is the sweep that acts on it.
+
+    At most ``limit`` chats per run, in id order, so a database with a wide backlog — every row
+    is flagged right after the schema v2 upgrade — heals over a few runs instead of turning each
+    one into a full rebuild. It runs after the per-chat passes, which have cleared the run's own
+    chats by then, so what is left is genuinely stranded.
+    """
+    for chat_id in db.chats_with_unindexed(conn)[:limit]:
+        chat = db.get_chat(conn, chat_id)
+        pending = [] if chat is None else db.unindexed_message_ids(conn, chat_id)
+        if chat is None or not pending:
+            continue
+        log.info(
+            "chat %s (%s): %d rows an earlier run left unindexed; rebuilding them",
+            chat.id,
+            chat.title,
+            len(pending),
+        )
+        await _joined_to_thread(functools.partial(on_chat_synced, conn, chat, cfg, pending))
 
 
 ConfigSource = Config | Callable[[], Config]
@@ -1188,8 +1248,10 @@ async def _sync_chats(
     while a big chat is cut into units; it runs for every chat once its fetch is over — after
     the last batch, or after the batch a flood wait, an RPC error or a cancellation interrupted,
     which stays committed and searchable either way — and at the end for the chats the budget
-    or a flood wait kept the run from reaching, whose pending rows come from an earlier run.
-    Failures are :func:`_record_failure`'s to describe; the tally becomes the report.
+    or a flood wait kept the run from reaching, whose pending rows come from an earlier run. The
+    run ends with :func:`index_stranded`, a bounded sweep of the chats no source and no link
+    leads to any more but that still hold flagged rows. Failures are :func:`_record_failure`'s to
+    describe; the tally becomes the report.
     """
     me = _self_row(await client.get_me())
     queue = deque(sorted(await resolve_sources(cfg, client, conn), key=_sync_order))
@@ -1232,6 +1294,7 @@ async def _sync_chats(
             queued.add(migrated.id)
     for chat in [*deferred, *queue]:
         await index_pending(conn, cfg, chat)
+    await index_stranded(conn, cfg)
     return tally.report()
 
 

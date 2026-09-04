@@ -447,7 +447,8 @@ def _chat_source(chat: ChatRow | None, label: str) -> str:
 def _refuse_indirect(chat: ChatRow, label: str) -> None:
     """Refuse a target that names a chat whose source covers more than that chat: a member of a
     folder source, or a channel's discussion group indexed through the channel's source — the
-    group a channel was unlinked from included, which keeps that source until it is removed."""
+    group a channel was unlinked from included, which keeps that source until it is removed
+    (:func:`discussion_source_id` owns that rule)."""
     if not chat.source_id:
         return
     if chat.source_id.startswith(FOLDER_PREFIX):
@@ -560,6 +561,33 @@ async def source_dialogs(source: Source, catalog: DialogCatalog) -> list[DialogI
             f"use folder = {resolved.title!r} instead"
         )
     return [resolved]
+
+
+def discussion_source_id(group: ChatRow | None, channel: ChatRow) -> str | None:
+    """The ``source_id`` a channel's discussion group carries once the link is applied.
+
+    One rule decides who owns a group's rows — and therefore what a ``sources rm`` of that source
+    deletes:
+
+    * a group a source covers directly keeps that source, whether it is a folder holding it or a
+      ``chat:`` entry naming it; :func:`resolve_sources` writes the same id on every run, and the
+      link never overwrites it;
+    * a group known only through a channel's link belongs to the source of the channel that links
+      it *now*, so a group handed from channel X to channel Y moves to Y's source together with
+      the link — removing X then leaves the group alone and removing Y takes it along, which is
+      where its comments came from;
+    * a group a channel was unlinked from keeps the source it came in through until that source
+      is removed: the comments stored under it were indexed through that source and go with it.
+
+    A channel with no source of its own (never resolved, only stored) changes nothing.
+    :func:`_refuse_indirect` reads the same rule from the other end — only a group that is its
+    own source can be removed by naming it.
+    """
+    if group is None or not group.source_id:
+        return channel.source_id
+    if group.source_id.startswith(FOLDER_PREFIX) or _own_source(group):
+        return group.source_id
+    return channel.source_id or group.source_id
 
 
 # --- status ----------------------------------------------------------------------------------

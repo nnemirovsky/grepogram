@@ -736,6 +736,156 @@ async def test_a_group_two_channels_pointed_at_belongs_to_the_last_one(
     assert _texts(conn, DISC_ID) == {1: "comment one", 2: "reply", 9: "late comment"}
 
 
+async def test_an_unresolvable_new_group_still_drops_the_link_to_the_old_one(
+    conn: sqlite3.Connection, paths: Paths
+) -> None:
+    """Telegram names a group the account cannot resolve: the comments are off for the run, and
+    the group the channel held until now stops being its own. It demonstrably is not any more,
+    so leaving the link would keep its comments in the channel's threads and in ``search.thread``
+    for as long as the new group stays unresolvable."""
+    client = _news_client()
+    cfg = _cfg(NEWS_SOURCE)
+    await _run(client, conn, paths, cfg)
+    assert _thread_texts(conn, NEWS_ID) == {
+        1: ["post 1", "comment one", "reply"],
+        3: ["post 3", "late comment"],
+    }
+    client.responses[functions.channels.GetFullChannelRequest] = _full_channel(202, chats=[NEWS])
+    client.entity_errors[DISC2_ID] = errors.ChannelPrivateError(request=None)
+    report = await _run(client, conn, paths, cfg)
+    assert len(report.warnings) == 1
+    assert "comments of channel" in report.warnings[0] and "unavailable" in report.warnings[0]
+    assert db.get_discussion_chat(conn, NEWS_ID) is None
+    old = db.get_chat(conn, DISC_ID)
+    assert old is not None and old.discussion_of is None
+    assert _thread_texts(conn, NEWS_ID) == {}
+    assert [v.text for v in search.thread(conn, NEWS_ID, 1)] == ["post 1"]
+    assert _texts(conn, DISC_ID) == {1: "comment one", 2: "reply", 9: "late comment"}
+
+
+async def test_a_discussion_group_that_only_fails_to_resolve_keeps_its_link(
+    conn: sqlite3.Connection, paths: Paths
+) -> None:
+    """The very group the channel already holds, unreachable for one run — a permission blip —
+    is not a group it lost: the link stays, the comments stay its own, and nothing is rebuilt."""
+    client = _news_client()
+    cfg = _cfg(NEWS_SOURCE)
+    await _run(client, conn, paths, cfg)
+    client.responses[functions.channels.GetFullChannelRequest] = _full_channel(201, chats=[NEWS])
+    client.entity_errors[DISC_ID] = errors.ChannelPrivateError(request=None)
+    report = await _run(client, conn, paths, cfg)
+    assert len(report.warnings) == 1 and "comments of channel" in report.warnings[0]
+    linked = db.get_discussion_chat(conn, NEWS_ID)
+    assert linked is not None and linked.id == DISC_ID
+    assert _thread_texts(conn, NEWS_ID) == {
+        1: ["post 1", "comment one", "reply"],
+        3: ["post 3", "late comment"],
+    }
+    assert db.unindexed_message_ids(conn, NEWS_ID) == []
+
+
+async def test_a_handed_over_group_belongs_to_the_source_that_holds_it_now(
+    conn: sqlite3.Connection, paths: Paths
+) -> None:
+    """The group's ``source_id`` follows the link (`sources.discussion_source_id`): after it
+    moves from one channel to another, removing the channel it left keeps it and removing the
+    one holding it now takes its comments along."""
+    client = _news_client(entities=[DISC, OTHER])
+    cfg = _cfg(NEWS_SOURCE)
+    await _run(client, conn, paths, cfg)
+    group = db.get_chat(conn, DISC_ID)
+    assert group is not None and group.source_id == NEWS_SOURCE.id
+    other = db.upsert_chat(
+        conn, ChatRow(id=OTHER_ID, type="channel", title="Other", source_id="chat:@other_news")
+    )
+    handed = await sync.link_discussion_chat(client, conn, other)
+    assert handed is not None and handed.id == DISC_ID
+    assert handed.source_id == "chat:@other_news"
+    moved = _cfg(NEWS_SOURCE, Source(chat="@other_news", comments=True))
+    by_source = {
+        s.source_id: sorted(c.id for c in s.chats) for s in sources.sources_status(moved, conn)
+    }
+    assert by_source == {
+        NEWS_SOURCE.id: [NEWS_ID],
+        "chat:@other_news": sorted([DISC_ID, OTHER_ID]),
+    }
+    left = sources.remove_source(moved, conn, sources.parse_target("@news"))
+    assert left.chat_ids == [NEWS_ID]
+    assert db.get_chat(conn, DISC_ID) is not None
+    assert _texts(conn, DISC_ID) == {1: "comment one", 2: "reply", 9: "late comment"}
+    gone = sources.remove_source(left.config, conn, sources.parse_target("@other_news"))
+    assert sorted(gone.chat_ids) == sorted([DISC_ID, OTHER_ID])
+    assert db.get_chat(conn, DISC_ID) is None
+    assert db.get_messages(conn, DISC_ID) == []
+
+
+async def test_the_unlink_and_the_flags_of_the_posts_it_invalidates_are_one_commit(
+    conn: sqlite3.Connection, paths: Paths, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A kill between clearing the link and flagging the posts that held the group's comments
+    would leave post threads full of a group that is not the channel's and nothing saying they
+    need a rebuild. Both halves are one transaction, so a failure in the second undoes the
+    first and the next run does the whole transition again."""
+    client = _news_client()
+    cfg = _cfg(NEWS_SOURCE)
+    await _run(client, conn, paths, cfg)
+    news = db.get_chat(conn, NEWS_ID)
+    assert news is not None
+
+    def killed(*args: object, **kwargs: object) -> None:
+        raise RuntimeError("killed between the unlink and the flags")
+
+    monkeypatch.setattr(db, "mark_unindexed", killed)
+    client.responses[functions.channels.GetFullChannelRequest] = _full_channel(None)
+    with pytest.raises(RuntimeError):
+        await sync.link_discussion_chat(client, conn, news)
+    monkeypatch.undo()
+    linked = db.get_discussion_chat(conn, NEWS_ID)
+    assert linked is not None and linked.id == DISC_ID
+    assert db.unindexed_message_ids(conn, NEWS_ID) == []
+    assert not conn.in_transaction
+    assert await sync.link_discussion_chat(client, conn, news) is None
+    assert db.get_discussion_chat(conn, NEWS_ID) is None
+    flagged = db.get_messages_by_ids(conn, db.unindexed_message_ids(conn, NEWS_ID))
+    assert [post.msg_id for post in flagged] == [1, 3]
+
+
+async def test_rows_stranded_in_an_unlinked_group_are_rebuilt_by_the_sweep(
+    conn: sqlite3.Connection, paths: Paths
+) -> None:
+    """Comment rows a killed run left flagged in a group the channel then loses: no source
+    lists that group and no link leads to it any more, so only the sweep over
+    ``messages.indexed`` at the end of the run reaches them."""
+    client = _news_client()
+    cfg = _cfg(NEWS_SOURCE)
+    await _run(client, conn, paths, cfg)
+    stranded = [m.id for m in db.get_messages(conn, DISC_ID) if m.id is not None]
+    db.mark_unindexed(conn, stranded)
+    client.responses[functions.channels.GetFullChannelRequest] = _full_channel(None)
+    report = await _run(client, conn, paths, cfg)
+    assert report.warnings == []
+    assert db.get_discussion_chat(conn, NEWS_ID) is None
+    assert db.unindexed_message_ids(conn, DISC_ID) == []
+    assert db.get_units(conn, DISC_ID) != []
+    assert db.chats_with_unindexed(conn) == []
+
+
+async def test_the_stranded_sweep_repairs_at_most_its_limit_of_chats_per_run(
+    conn: sqlite3.Connection, paths: Paths
+) -> None:
+    """A backlog — every row is flagged right after the schema v2 upgrade — heals over a few
+    runs instead of turning one into a full rebuild; chats are taken in id order."""
+    client = _news_client()
+    cfg = _cfg(NEWS_SOURCE)
+    await _run(client, conn, paths, cfg)
+    for chat_id in (NEWS_ID, DISC_ID):
+        db.mark_unindexed(conn, [m.id for m in db.get_messages(conn, chat_id) if m.id is not None])
+    await sync.index_stranded(conn, cfg, limit=1)
+    assert db.chats_with_unindexed(conn) == [NEWS_ID]
+    await sync.index_stranded(conn, cfg, limit=1)
+    assert db.chats_with_unindexed(conn) == []
+
+
 async def test_comments_are_not_fetched_without_the_flag(conn: sqlite3.Connection) -> None:
     client = _news_client()
     news = db.upsert_chat(conn, ChatRow(id=NEWS_ID, type="channel", source_id="chat:@news"))
