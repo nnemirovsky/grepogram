@@ -70,10 +70,11 @@ _V5: tuple[str, ...] = (
        WHERE discussion_of IS NOT NULL""",
     "CREATE TABLE users(id INTEGER PRIMARY KEY, display_name TEXT, username TEXT)",
     # comment_of_chat_id / comment_of_msg_id name the channel post a message is a comment on and
-    # are kept apart from topic_id, which is a forum topic and nothing else: a discussion group
-    # can be a forum, and a forum topic root and a channel post are separate id spaces that both
-    # start at 1, so one column cannot say which of the two a number is. Both are NULL on every
-    # row that is not a comment.
+    # are kept apart from topic_id, Telegram's thread/topic id: a discussion group can be a forum,
+    # and a forum topic root and a channel post are separate id spaces that both start at 1, so
+    # one column cannot say which of the two a number is. Both comment columns are NULL on every
+    # row that is not a comment. topic_id is only meaningful inside a forum — outside one it may
+    # still hold a legacy thread id, which units.window_topic ignores.
     # indexed is 0 while the units and the msg_fts row derived from a message are behind it: set
     # by every insert and update, cleared by the rebuild.
     """CREATE TABLE messages(
@@ -1085,9 +1086,15 @@ def get_context_messages(
     conn: sqlite3.Connection, chat_id: int, msg_id: int, before: int, after: int
 ) -> list[MessageRow]:
     """``msg_id`` with up to ``before`` stored messages preceding and ``after`` following it in
-    ``msg_id`` order, all from the same topic (``topic_id IS`` the message's own, so one forum
-    topic never bleeds into a neighbour); ``[]`` when the message is not stored. Negative counts
-    are a ``ValueError``.
+    ``msg_id`` order, all sharing its ``topic_id`` (``topic_id IS`` the message's own, so one
+    forum topic never bleeds into a neighbour); ``[]`` when the message is not stored. Negative
+    counts are a ``ValueError``.
+
+    Outside a forum the column is not always NULL — Telegram sets ``reply_to_top_id`` for legacy
+    message threads too — so the context of such a message is bounded to that thread rather than
+    to the whole chat. That is deliberate: it is the conversation the message sits in. Windowing
+    ignores the same column outside a forum (:func:`grepogram.units.window_topic`), so the
+    message is still found by a linear window.
 
     A discussion group's comments are not a topic: they are that group's own linear
     conversation, cut into the same windows as everything else it holds, so the neighbours of a

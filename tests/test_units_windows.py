@@ -225,6 +225,9 @@ def test_window_topic_follows_forum_topics_only() -> None:
 
 
 def test_group_by_topic_non_forum_is_one_linear_run() -> None:
+    """A non-forum chat really does hold messages with a ``topic_id``: Telegram sets
+    ``reply_to_top_id`` for legacy message threads too. Outside a forum it is ignored, so the
+    whole chat is one linear run of windows."""
     messages = [_msg(1), _msg(2, 1), _msg(3, 2, topic_id=5)]
     assert units.group_by_topic(GROUP, messages) == {None: messages}
 

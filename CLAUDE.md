@@ -169,7 +169,15 @@ never change the git identity.
   that outlives it (through `db.set_discussion_chat`, still the only way `discussion_of` is
   cleared) and runs the same cleanup for every group it unlinks; the group keeps every message it
   holds, its own windows, threads and forum topics among them, and only stops holding *comments*.
-- `messages.topic_id` is a forum topic and nothing else; the post a message comments on is
+- `messages.topic_id` is Telegram's thread/topic id, and it is *only meaningful inside a forum*:
+  there it is the topic root `units.window_topic` cuts windows by. Outside a forum Telegram still
+  sets `reply_to.reply_to_top_id` for a legacy message thread, so the column is populated on such
+  rows too (a real non-forum supergroup here: 124 of 13,227 messages) — `units.window_topic`
+  returns `None` unless `chat.is_forum`, so those messages are windowed linearly and
+  `db.containing_unit` finds their window through `lookup_topic=None`. Never treat a set
+  `topic_id` as proof of a forum. `search.context` does scope by the column
+  (`db.get_context_messages` filters on `topic_id IS`), so the context of such a message is
+  bounded to its legacy thread rather than to the whole chat. The post a message comments on is
   `comment_of_chat_id` / `comment_of_msg_id`, NULL on every row that is not a comment.
   They cannot share a column: a discussion group can be a forum, and a topic root and a channel
   post are separate id spaces that both number from 1, so a group that is both would answer a

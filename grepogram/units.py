@@ -165,10 +165,14 @@ def cut_windows(
 def window_topic(chat: ChatRow, msg: MessageRow) -> int | None:
     """The topic whose windows hold ``msg``: its ``topic_id`` in a forum, ``None`` anywhere else.
 
-    Outside forums a chat is one linear conversation and its windows carry no topic. A comment a
-    channel stores in its discussion group names its post in ``comment_of_msg_id``, never in
-    ``topic_id``, so it sits in the group's windows exactly where its own forum topic — or the
-    absence of one — puts it, like any other message the group holds.
+    Outside forums a chat is one linear conversation and its windows carry no topic — and
+    ``msg.topic_id`` is deliberately ignored there, because Telegram sets it outside forums as
+    well: a legacy message thread puts its root in ``reply_to.reply_to_top_id``, so an ordinary
+    supergroup carries one on a minority of its rows. Windowing such a chat by that id would cut
+    its history into fragments nobody reads as separate. A comment a channel stores in its
+    discussion group names its post in ``comment_of_msg_id``, never in ``topic_id``, so it sits
+    in the group's windows exactly where its own forum topic — or the absence of one — puts it,
+    like any other message the group holds.
     """
     return msg.topic_id if chat.is_forum else None
 
