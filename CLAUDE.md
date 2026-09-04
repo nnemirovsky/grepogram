@@ -62,6 +62,17 @@ never change the git identity.
   `AppState.editing_config()` takes it inside the process-wide lock. Never save a config derived
   from a snapshot read before a network round trip; re-read under the lock and apply the delta
   (`sources.with_source`, drop by id). Lock order is `SyncLock` → `ConfigLock` → thread lock.
+- A model loads from the Hugging Face cache and nothing else. Both `BgeM3Embedder` and
+  `BgeReranker` go through `embed.load_cached_first(load, what)`, which calls the
+  sentence-transformers constructor with `local_files_only=True` and retries with the network
+  only when `embed.not_cached` recognises the failure — transformers re-raises huggingface_hub's
+  `LocalEntryNotFoundError` as a plain `OSError` about the connection, so the match walks
+  `__cause__` / `__context__` and compares class *names*: huggingface_hub belongs to the `dense`
+  extra and nothing outside it may be imported here. That retry is the first download and is
+  logged at INFO; `HF_HUB_OFFLINE` set skips it, and every failure still reaches the caller as
+  `ModelUnavailable`. Never call `SentenceTransformer` / `CrossEncoder` directly: the round trip
+  they make for an already-cached model costs about 8.7 s per `grepogram search` on a reachable
+  network and minutes behind a firewall that holds connections open.
 - `db.MIGRATIONS` maps a schema version to the step that brings a database to it, and `_V5` —
   keyed by `db.BASE_VERSION` — is the whole schema as the code queries it. The numbering starts
   at 5 because it is an identity, not a count: development builds walked a database up through 1,
@@ -229,6 +240,11 @@ never change the git identity.
   `open_message` tool answers `opened: false` with an `error` saying so. The same autouse fixture
   sets it for every test; the `open_link` / `open_message` tests unset it and inject a runner.
   Both flags are read through `paths.env_flag` (`1`, `true`, `yes`, `on`).
+- `HF_HUB_OFFLINE=1` — huggingface_hub's own flag, honoured rather than owned:
+  `embed.load_cached_first` never retries with the network while it is set, so a model missing
+  from the cache degrades the search instead of downloading. CI sets it for the whole suite,
+  which is why the `stubs` fixtures of `tests/test_embed.py` and `tests/test_rerank.py` unset it
+  and each test decides it.
 
 ## Tests
 
@@ -262,7 +278,10 @@ never change the git identity.
 fuzzy matching), `sources` (targets, resolution, status), `sync` (fetch, mapping, lock, budget),
 `units` (windows, threads, posts, incremental rebuild), `stem` (tokenizer, Snowball, FTS query),
 `index` (FTS and vec maintenance, KNN), `embed` and `rerank` (protocols, fakes, bge models),
-`links` (deep links, `open`), `filters` (chat specs, dates), `search` (retrieval, fusion, dedup,
-readers), `cli` (typer app), `mcp` (FastMCP server with nine tools).
+`links` (deep links, `open`), `filters` (chat specs, dates, `resolve_chat` for the one-chat
+readers), `search` (retrieval, fusion, dedup, readers), `cli` (typer app: `search` and the
+`thread` / `context` readers beside `sources`, `sync`, `embed`, `config`), `mcp` (FastMCP server
+with nine tools). The CLI and the MCP server offer the same readers, and `--json` prints the
+document the matching tool returns.
 
 Plans live in `docs/plans/`, finished ones in `docs/plans/completed/`.

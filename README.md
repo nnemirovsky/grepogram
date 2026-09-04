@@ -76,7 +76,11 @@ Everything lives in one SQLite file.
   grepogram refuses to open the index and prints this same list.
 - A Telegram account and an API key pair from https://my.telegram.org/apps.
 - Optional: about 4.5 GB of disk for the two models (`BAAI/bge-m3`, `BAAI/bge-reranker-v2-m3`),
-  downloaded from Hugging Face on first use. Without them every search runs lexical-only.
+  downloaded from Hugging Face on first use. Without them every search runs lexical-only. Once
+  they are in the cache they load from it alone: grepogram asks huggingface.co nothing about
+  files it already has, and reaches the network only when the cache holds nothing — a first
+  download, logged at INFO as one. `HF_HUB_OFFLINE=1` forbids even that, and a model missing
+  from the cache then degrades the search instead of downloading.
 
 ## Setup in Five Minutes
 
@@ -189,6 +193,8 @@ diagnostics and logs to stderr and the log file.
 | `grepogram sync [--budget S]` | fetch new messages from every source, rebuild units, index and embed; stops cleanly after `S` seconds (at least 1) |
 | `grepogram embed [--reembed]` | embed units the dense index does not hold yet; `--reembed` drops every vector and starts over (needed after changing `[models] embed`); refuses while a sync is running |
 | `grepogram search <query> …` | search the index, see below |
+| `grepogram thread <chat> <msg_id> [--json]` | print the whole reply thread a message belongs to, root first; for a channel post, the post followed by its comments from the linked discussion group |
+| `grepogram context <chat> <msg_id> [--before N] [--after N] [--json]` | print the messages around one in its chat or forum topic, the message included (15 each way by default) |
 | `grepogram-mcp [-v]` | the MCP server over stdio (what an MCP client launches) |
 
 Chat ids are negative for groups, supergroups and channels (`-100…`); when one is a positional
@@ -208,6 +214,22 @@ argument, put `--` before it: `grepogram sources add --since 2024-01-01 -- -1001
 
 Text output prints one block per hit — rank, score, unit kind, chat, UTC date range, the deep link
 (and a fallback link for private chats), then the snippet.
+
+`thread` and `context` are what a hit leads to, the CLI half of the MCP tools of the same names:
+read the conversation around a hit instead of guessing from its snippet. `<chat>` takes the same
+specs as `-c`, but has to name exactly one indexed chat — a folder name, or a title several chats
+share, is an error listing them to pick from. Each message prints as `chat_id/msg_id`, the UTC
+timestamp and the sender, then its link and its text; `--json` prints the same
+`{chat_id, msg_id, messages}` document the MCP tools return and nothing else on stdout. A channel
+post's thread carries the comments from its discussion group, so every message names the chat it
+is really in — that is the id to pass back, because the group numbers its messages from 1 exactly
+as the channel numbers its posts. Options come before the `--` that protects a negative id:
+
+```bash
+grepogram search "открыть счёт без DNI" -k 5
+grepogram thread @arg_chat 1284
+grepogram context --before 5 --after 5 -- -1001234567890 1284
+```
 
 ## MCP Tools
 
@@ -478,6 +500,12 @@ the Hugging Face cache (`HF_HUB_OFFLINE=1`), fp16 on MPS, `max_seq_length = 512`
 Loading takes about 8 s for the embedder and 3.5 s for the reranker, once per process. At these
 rates a query has its 40 candidates reranked in about a second, and 10 000 units embed in about
 four minutes.
+
+Loading reads the local cache and nothing else (see Requirements), which is worth about 8.7 s per
+run on the same machine: a `grepogram search` that loads both models took 24.2 s while the hub was
+reachable and takes 15.5 s now, matching what `HF_HUB_OFFLINE=1` already gave. Where outbound
+connections are held open rather than refused — a firewall prompt nobody answers, a captive portal
+— the same round trips cost minutes instead of seconds.
 
 ## Known Limitations
 
