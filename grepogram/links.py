@@ -2,8 +2,8 @@
 
 Telegram addresses a message differently per chat type. Public channels and supergroups have a
 web link, ``https://t.me/<username>/<msg>``; private ones use ``https://t.me/c/<id>/<msg>``,
-where ``<id>`` is Telegram's bare channel id — Telethon's marked ``-100<id>`` form the ``chats``
-table stores is a client-side convention no Telegram URL understands, so
+where ``<id>`` is Telegram's bare channel id — the marked ``-(1000000000000 + id)`` form the
+``chats`` table stores is a Telethon convention no Telegram URL understands, so
 :func:`strip_channel_prefix` undoes it. Forum supergroups insert the topic: ``…/<topic>/<msg>``.
 Private chats and legacy groups have no web form at all; the ``tg://openmessage`` scheme reaches
 the message on mobile, and the desktop clients at least open the conversation through
@@ -26,11 +26,12 @@ still opens nothing on the machine.
 """
 
 import logging
-import re
 import subprocess
 import sys
 from collections.abc import Sequence
 from typing import Protocol
+
+from telethon import types, utils
 
 from grepogram.models import ChatRow, Link
 from grepogram.paths import env_flag
@@ -39,7 +40,6 @@ log = logging.getLogger(__name__)
 
 OPEN_TIMEOUT_S = 15
 NO_OPEN_ENV = "GREPOGRAM_NO_OPEN"
-_CHANNEL_MARK = re.compile(r"^-100([1-9]\d*)$")  # Telethon's utils.resolve_id rule
 
 
 class OpenFailed(Exception):
@@ -51,15 +51,20 @@ class Runner(Protocol):
 
 
 def strip_channel_prefix(chat_id: int) -> int:
-    """Telegram's bare channel id from Telethon's marked one: ``-1001234`` → ``1234``.
+    """Telegram's bare channel id from Telethon's marked one: ``-1000000001234`` → ``1234``.
 
-    Only a channel or supergroup mark is accepted; a user id (positive) or a legacy group id
-    (``-1234``) raises ``ValueError`` rather than producing a link to the wrong place.
+    The mark is arithmetic — Telethon builds it as ``-(1000000000000 + channel_id)`` — so
+    :func:`telethon.utils.resolve_id` is what undoes it, never string surgery on the ``-100``
+    prefix: a channel id below ten digits leaves zeros right behind that prefix
+    (``-1000123456789`` is channel ``123456789``) and a lexical rule reading the digits after
+    ``-100`` either loses them or refuses the id outright. Only a channel or supergroup mark is
+    accepted; a user id (positive) or a legacy group id (``-1234``) raises ``ValueError`` rather
+    than producing a link to the wrong place.
     """
-    match = _CHANNEL_MARK.match(str(chat_id))
-    if match is None:
+    bare, kind = utils.resolve_id(chat_id)
+    if kind is not types.PeerChannel:
         raise ValueError(f"not a marked channel id: {chat_id}")
-    return int(match.group(1))
+    return int(bare)
 
 
 def message_url(chat: ChatRow, msg_id: int, topic_id: int | None = None) -> Link:

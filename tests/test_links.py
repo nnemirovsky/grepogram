@@ -18,6 +18,7 @@ def opening_enabled(monkeypatch: pytest.MonkeyPatch) -> None:
 
 SUPERGROUP = -1001234567890
 CHANNEL = -1009876543210
+SHORT = -1000123456789  # a channel whose bare id is shorter than ten digits: 123456789
 GROUP = -4567
 USER = 777000
 MSG = 42
@@ -36,20 +37,37 @@ def _chat(
 @pytest.mark.parametrize(
     ("chat_id", "expected"),
     [
-        (-1001234, 1234),
         (SUPERGROUP, 1234567890),
         (CHANNEL, 9876543210),
-        (-1001000000000100, 1000000000100),
-        (-1001, 1),
-        (-10012, 12),
+        pytest.param(-1009999999999, 9999999999, id="bare-id-at-telethon-max"),
+        pytest.param(SHORT, 123456789, id="bare-id-of-nine-digits"),
+        pytest.param(-1000000001234, 1234, id="bare-id-of-four-digits"),
+        pytest.param(-1000000000001, 1, id="bare-id-of-one-digit"),
     ],
 )
 def test_strip_channel_prefix(chat_id: int, expected: int) -> None:
+    """The mark is arithmetic, so every zero between the ``-100`` and the bare id belongs to the
+    ``1000000000000`` that was added — a bare id shorter than ten digits is not a malformed one.
+    """
     assert links.strip_channel_prefix(chat_id) == expected
 
 
-@pytest.mark.parametrize("chat_id", [USER, 0, -1234, GROUP, -100, -1000123])
+@pytest.mark.parametrize(
+    "chat_id",
+    [
+        USER,
+        0,
+        -1234,
+        GROUP,
+        -100,
+        -1000123,
+        pytest.param(-1001234, id="legacy-group-that-looks-marked"),
+        pytest.param(-1000000000000, id="the-mark-itself"),
+    ],
+)
 def test_strip_channel_prefix_rejects_non_channel_ids(chat_id: int) -> None:
+    """Telethon reads anything down to ``-1000000000000`` as a legacy group; only a marked
+    channel gets a ``t.me/c`` link."""
     with pytest.raises(ValueError, match=str(chat_id)):
         links.strip_channel_prefix(chat_id)
 
@@ -113,6 +131,15 @@ GROUP_APP = "tg://openmessage?chat_id=4567&message_id=42"
             TOPIC,
             Link("https://t.me/c/1234567890/42", app_url=PRIVATE_APP),
             id="supergroup-private-not-forum-ignores-topic",
+        ),
+        pytest.param(
+            _chat(SHORT, "supergroup"),
+            None,
+            Link(
+                "https://t.me/c/123456789/42",
+                app_url="tg://privatepost?channel=123456789&post=42",
+            ),
+            id="supergroup-private-short-bare-id",
         ),
         pytest.param(
             _chat(CHANNEL, "channel", "durov"),

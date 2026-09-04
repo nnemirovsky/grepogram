@@ -15,6 +15,7 @@ CHANNEL = -1001000000300
 DISC = -1001000000400
 FORUM = -1001000000500
 PLAIN = -1001000000600
+SHORT = -1000123456789  # bare channel id 123456789: shorter than the ten digits ids usually have
 BASE = 1_705_314_600  # 2024-01-15 10:30:00 UTC
 
 
@@ -225,6 +226,16 @@ def test_thread_from_a_comment_stays_in_the_discussion_chat(
     views = search.thread(conn, DISC, 11)
     assert _ids(views) == [10, 11]
     assert all(v.url.startswith("https://t.me/c/1000000400/") for v in views)
+
+
+def test_views_of_a_chat_with_a_short_bare_id_are_linked(conn: sqlite3.Connection) -> None:
+    """A private channel id below 1e9 leaves zeros right behind the ``-100`` of the marked form;
+    the bare id is what is left after subtracting the mark, not the digits that follow it."""
+    _store(conn, _chat(SHORT), [_msg(SHORT, 7, 0), _msg(SHORT, 8, 1, reply_to=7)])
+    views = search.thread(conn, SHORT, 8)
+    assert [v.chat_id for v in views] == [SHORT, SHORT]
+    assert [v.url for v in views] == ["https://t.me/c/123456789/7", "https://t.me/c/123456789/8"]
+    assert [v.url for v in search.context(conn, SHORT, 7)] == [v.url for v in views]
 
 
 def test_thread_in_a_forum_links_through_the_topic(conn: sqlite3.Connection, forum: None) -> None:

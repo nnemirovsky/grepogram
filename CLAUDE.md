@@ -179,7 +179,12 @@ never change the git identity.
 - `links.message_url` returns the `https://t.me` form in `Link.url` (what hits and message views
   show) and the `tg://` form in `Link.app_url` (`resolve` / `privatepost` / `openmessage`);
   `open_link` tries `app_url`, then `url`, then `fallback_url`, because `open https://t.me/…` on
-  macOS lands in Safari, not in the Telegram app.
+  macOS lands in Safari, not in the Telegram app. The bare channel id a `t.me/c/` link needs comes
+  from `telethon.utils.resolve_id`, never from string surgery on the `-100` prefix: the mark is
+  arithmetic (`-(1000000000000 + id)`), so a channel id below ten digits leaves zeros right behind
+  that prefix and any lexical rule either swallows them or refuses the id — which took `search`,
+  `thread`, `context` and `open_message` down for the whole chat. `sources.parse_target` builds the
+  same mark arithmetically for `t.me/c/<id>`, so such ids reach the index by the front door.
 - Windows are cut in `msg_id` order but rows do not always arrive that way (a channel stores
   comments in its discussion group before the group's own history gets there). `units._recut_windows`
   starts at the open window unless a changed message no window holds lies below it; then it
