@@ -628,6 +628,22 @@ def test_upsert_flags_rows_until_they_are_marked_indexed(conn: sqlite3.Connectio
     assert not conn.in_transaction
 
 
+def test_chats_with_unindexed_names_every_chat_holding_pending_rows(
+    conn: sqlite3.Connection,
+) -> None:
+    """The flag is the only thing that says where a rebuild is owed: a chat no source and no
+    discussion link leads to is found through this and nothing else."""
+    db.upsert_chat(conn, _chat(1))
+    db.upsert_chat(conn, _chat(2))
+    first = db.upsert_messages(conn, [_message(1, 1)])
+    second = db.upsert_messages(conn, [_message(2, 1)])
+    assert db.chats_with_unindexed(conn) == [1, 2]
+    db.mark_indexed(conn, first)
+    assert db.chats_with_unindexed(conn) == [2]
+    db.mark_indexed(conn, second)
+    assert db.chats_with_unindexed(conn) == []
+
+
 def test_upsert_messages_preserves_id_across_edit(conn: sqlite3.Connection) -> None:
     db.upsert_chat(conn, _chat(1))
     db.upsert_chat(conn, _chat(2))

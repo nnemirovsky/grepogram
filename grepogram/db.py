@@ -608,6 +608,21 @@ def unindexed_message_ids(conn: sqlite3.Connection, chat_id: int) -> list[int]:
     return [int(row["id"]) for row in rows]
 
 
+def chats_with_unindexed(conn: sqlite3.Connection) -> list[int]:
+    """``chat_id`` of every chat holding rows whose units and ``msg_fts`` rows are behind.
+
+    The same partial index :func:`unindexed_message_ids` reads answers this one, so it costs
+    nothing while — the normal case — nothing is pending. The flag is where the work is, whatever
+    put it there: a chat no source lists any more, a discussion group a channel was unlinked
+    from, is reachable through this and through nothing else
+    (:func:`grepogram.sync.index_stranded`).
+    """
+    rows = conn.execute(
+        "SELECT DISTINCT chat_id FROM messages WHERE indexed = 0 ORDER BY chat_id"
+    ).fetchall()
+    return [int(row["chat_id"]) for row in rows]
+
+
 def mark_indexed(conn: sqlite3.Connection, ids: Iterable[int]) -> None:
     """Record that the units and ``msg_fts`` rows of these ``messages.id`` are up to date."""
     with transaction(conn):
