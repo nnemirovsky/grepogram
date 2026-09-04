@@ -492,6 +492,63 @@ def test_remove_source_of_a_discussion_group_that_is_a_source_of_its_own(
     assert by_handle.source_id == "chat:@News_Chat" and by_handle.chat_ids == [DISC_ID]
 
 
+CHAT_SPELLINGS = [str(DISC_ID), "@news_chat", "https://t.me/news_chat", "t.me/c/201"]
+"""Every documented spelling of ``chat =`` for the same discussion group."""
+
+
+@pytest.mark.parametrize("spelling", CHAT_SPELLINGS)
+def test_discussion_source_id_keeps_a_group_its_own_source_covers(spelling: str) -> None:
+    """A ``chat:`` entry naming the group owns it whichever spelling it is written in; only the
+    text of ``Source.chat`` differs, and identity is what decides."""
+    group = _chat(
+        DISC_ID,
+        f"chat:{spelling}",
+        title="News chat",
+        username="news_chat",
+        discussion_of=NEWS_ID,
+    )
+    channel = _chat(NEWS_ID, "chat:@news", type="channel", title="News", username="news")
+    assert sources.discussion_source_id(group, channel) == f"chat:{spelling}"
+
+
+@pytest.mark.parametrize("spelling", CHAT_SPELLINGS)
+def test_remove_source_of_a_group_configured_under_any_spelling(
+    conn: sqlite3.Connection, spelling: str
+) -> None:
+    _with_news_and_its_group(conn, f"chat:{spelling}")
+    cfg = _cfg(Source(chat="@news", comments=True), Source(chat=spelling))
+    for raw in (str(DISC_ID), "@news_chat", "https://t.me/news_chat", "News chat"):
+        found = sources.find_source(cfg, conn, sources.parse_target(raw))
+        assert found == f"chat:{spelling}"
+    removed = sources.remove_source(cfg, conn, sources.parse_target("@news_chat"))
+    assert removed.source_id == f"chat:{spelling}" and removed.chat_ids == [DISC_ID]
+    assert removed.config.sources == [Source(chat="@news", comments=True)]
+    assert db.message_counts(conn) == {NEWS_ID: 2}
+
+
+@pytest.mark.parametrize(
+    ("spelling", "targets"),
+    [
+        (str(DISC_ID), [str(DISC_ID), "t.me/c/201", f"chat:{DISC_ID}"]),
+        ("t.me/c/201", [str(DISC_ID), "https://t.me/c/201/7"]),
+        ("@news_chat", ["@news_chat", "@NEWS_CHAT", "https://t.me/news_chat"]),
+        ("https://t.me/news_chat", ["@news_chat", "t.me/news_chat"]),
+    ],
+)
+def test_remove_source_of_a_configured_chat_that_was_never_synced(
+    conn: sqlite3.Connection, spelling: str, targets: list[str]
+) -> None:
+    """No ``chats`` row to resolve the target through, so the configured entries are all there
+    is to match against — and a target matches the one whose identity it shares, not the one
+    spelled the same way. Nothing maps an ``@username`` to an id without a stored chat, so only
+    targets of the entry's own kind can find it."""
+    cfg = _cfg(Source(chat=spelling))
+    for raw in targets:
+        removed = sources.remove_source(cfg, conn, sources.parse_target(raw))
+        assert removed.source_id == f"chat:{spelling}"
+        assert removed.chat_ids == [] and removed.config.sources == []
+
+
 def test_with_source_appends_and_rejects_duplicates() -> None:
     cfg = _cfg(Source(chat="@alice"))
     added = sources.with_source(cfg, Source(chat="@news", comments=True), None)

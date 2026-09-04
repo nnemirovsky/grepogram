@@ -18,7 +18,7 @@ from collections.abc import Sequence
 
 from grepogram import db, dialogs
 from grepogram.models import ChatRow, Config, Filters, Source
-from grepogram.sources import FOLDER_PREFIX, InvalidTarget, Target, parse_target
+from grepogram.sources import FOLDER_PREFIX, InvalidTarget, Target, parse_target, same_target
 
 WHEN_GRAMMAR = (
     "an ISO date (2025-06-01), month (2025-06) or datetime (2025-06-01T14:30[:00][Z|+03:00]), "
@@ -196,6 +196,12 @@ def _unsynced_hint(target: Target, cfg: Config, chats: list[ChatRow]) -> str | N
 
 
 def _names_source(target: Target, source: Source) -> bool:
+    """Whether a configured entry is the one ``target`` names.
+
+    A chat entry is matched by the identity its ``chat =`` value resolves to
+    (:func:`grepogram.sources.same_target`), so the id, the ``@username`` and both ``t.me`` link
+    forms of one chat all point at it; free text still scores against the value as written.
+    """
     if source.folder is not None:
         if target.kind == "folder":
             return dialogs.normalize(target.text) == dialogs.normalize(source.folder)
@@ -203,13 +209,13 @@ def _names_source(target: Target, source: Source) -> bool:
             target.kind == "fuzzy"
             and dialogs.score(dialogs.normalize(target.text), source.folder) > 0
         )
-    if target.kind == "id":
-        return source.chat == target.value
-    if target.kind == "username":
-        return str(source.chat).casefold() == f"@{target.text.casefold()}"
     if target.kind == "fuzzy":
         return dialogs.score(dialogs.normalize(target.text), str(source.chat)) > 0
-    return False
+    try:
+        spelled = parse_target(str(source.chat))
+    except InvalidTarget:
+        return False
+    return same_target(spelled, target)
 
 
 # --- composition -----------------------------------------------------------------------------

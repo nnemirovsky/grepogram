@@ -364,14 +364,46 @@ def _reject_duplicate(cfg: Config, source: Source, dialog: DialogInfo | None) ->
 
 
 def _same_chat(existing: Source, dialog: DialogInfo) -> bool:
+    target = _target_of(str(existing.chat))
+    return target is not None and _names_chat(target, dialog.id, dialog.username)
+
+
+def _target_of(value: str) -> Target | None:
+    """``value`` parsed as a target; ``None`` when it is not one (an invite link, a bad handle)."""
     try:
-        target = parse_target(str(existing.chat))
+        return parse_target(value)
     except InvalidTarget:
-        return False
+        return None
+
+
+def _names_chat(target: Target, chat_id: int, username: str | None) -> bool:
+    """Whether ``target`` is this very chat: its marked id, or its ``@username`` in any case.
+
+    Identity, never spelling. ``chat =`` takes an id, an ``@username``, ``https://t.me/<name>``
+    and ``t.me/c/<id>`` alike, and :func:`parse_target` has already folded all four into those
+    two shapes, so every documented form answers the same. A fuzzy value — a title typed into
+    ``config.toml`` by hand — names no identity without the dialog catalog and matches nothing.
+    """
     if target.kind == "id":
-        return target.value == dialog.id
+        return target.value == chat_id
     if target.kind == "username":
-        return bool(dialog.username) and target.text.casefold() == str(dialog.username).casefold()
+        return bool(username) and target.text.casefold() == str(username).casefold()
+    return False
+
+
+def same_target(one: Target, other: Target) -> bool:
+    """Whether two parsed targets name the same chat, whatever they were spelled as.
+
+    Used wherever a configured ``chat =`` value has to be recognised in a target the user typed
+    (:func:`_named_source`, :func:`grepogram.filters._names_source`); folder and fuzzy targets
+    name no identity and match nothing here.
+    """
+    if one.kind != other.kind:
+        return False
+    if one.kind == "id":
+        return one.value == other.value
+    if one.kind == "username":
+        return one.text.casefold() == other.text.casefold()
     return False
 
 
@@ -380,10 +412,15 @@ def remove_source(cfg: Config, conn: sqlite3.Connection, target: Target) -> Remo
 
     The target may be a source id (``folder:Argentina``, ``chat:@arg_chat``), a folder name, a
     chat id / ``@username`` / link, or a fuzzy name matched against source entries and the
-    titles of their indexed chats. Naming a chat that came in through a folder, or a channel's
+    titles of their indexed chats. A chat entry answers to every spelling of the same chat, its
+    own included: what is compared is the identity a target resolves to, never the text
+    ``config.toml`` happens to hold. Naming a chat that came in through a folder, or a channel's
     discussion group indexed through the channel's source, is refused: that would silently
     remove the whole folder or the channel (:func:`_refuse_indirect`). The caller holds the sync
     lock, so no sync writes to the chats being deleted.
+
+    Deleting a discussion group takes the comments it fed to a channel's post threads with it
+    (:func:`grepogram.db.delete_chat`), so the index never quotes rows this removed.
     """
     source_id = find_source(cfg, conn, target)
     source = next((s for s in cfg.sources if s.id == source_id), None)
@@ -407,19 +444,39 @@ def find_source(cfg: Config, conn: sqlite3.Connection, target: Target) -> str:
     known += sorted({c.source_id for c in chats if c.source_id and c.source_id not in known})
     if target.kind == "folder":
         return _folder_source(target.text, known)
-    if target.kind == "id":
-        candidate = f"{CHAT_PREFIX}{target.value}"
-        if candidate in known:
-            return candidate
-        return _chat_source(db.get_chat(conn, int(target.value)), f"id {target.value}")
-    if target.kind == "username":
-        wanted = target.text.casefold()
-        for source_id in known:
-            if source_id.casefold() == f"{CHAT_PREFIX}@{wanted}":
-                return source_id
-        owner = next((c for c in chats if (c.username or "").casefold() == wanted), None)
-        return _chat_source(owner, f"@{target.text}")
+    if target.kind in ("id", "username"):
+        named = _named_source(target, known)
+        if named is not None:
+            return named
+        return _indexed_source(conn, chats, target)
     return _fuzzy_source(target.text, known, chats)
+
+
+def _named_source(target: Target, known: Sequence[str]) -> str | None:
+    """The ``chat:`` entry that names the chat ``target`` names, under either one's spelling.
+
+    This is what finds a source that was never synced: with no ``chats`` row to resolve the
+    target through, the configured entries are all there is to match it against. Only entries of
+    the target's own kind can answer — nothing maps an ``@username`` to a marked id offline — so
+    a chat that *is* indexed still falls through to :func:`_indexed_source`, which knows both.
+    """
+    for source_id in known:
+        if not source_id.casefold().startswith(CHAT_PREFIX):
+            continue
+        other = _target_of(source_id)
+        if other is not None and same_target(other, target):
+            return source_id
+    return None
+
+
+def _indexed_source(conn: sqlite3.Connection, chats: Sequence[ChatRow], target: Target) -> str:
+    """The source of the indexed chat ``target`` names; refused when that source covers more."""
+    if target.kind == "id":
+        chat_id = int(target.value)
+        return _chat_source(db.get_chat(conn, chat_id), f"id {chat_id}")
+    wanted = target.text.casefold()
+    owner = next((c for c in chats if (c.username or "").casefold() == wanted), None)
+    return _chat_source(owner, f"@{target.text}")
 
 
 def _folder_source(name: str, known: list[str]) -> str:
@@ -469,11 +526,17 @@ def _refuse_indirect(chat: ChatRow, label: str) -> None:
 
 
 def _own_source(chat: ChatRow) -> bool:
-    """Whether ``chat.source_id`` is a ``chat:`` entry naming this very chat."""
-    own = {f"{CHAT_PREFIX}{chat.id}"}
-    if chat.username:
-        own.add(f"{CHAT_PREFIX}@{chat.username}".casefold())
-    return (chat.source_id or "").casefold() in own
+    """Whether ``chat.source_id`` is a ``chat:`` entry naming this very chat.
+
+    Read by identity (:func:`_names_chat`), so the id, the ``@username`` and the two ``t.me``
+    link forms of one chat all count as covering it directly — a group configured as
+    ``chat = "https://t.me/..."`` owns its rows exactly as one configured by id does.
+    """
+    source_id = chat.source_id or ""
+    if not source_id.casefold().startswith(CHAT_PREFIX):
+        return False
+    target = _target_of(source_id)
+    return target is not None and _names_chat(target, chat.id, chat.username)
 
 
 def _fuzzy_source(text: str, known: list[str], chats: list[ChatRow]) -> str:
@@ -570,8 +633,9 @@ def discussion_source_id(group: ChatRow | None, channel: ChatRow) -> str | None:
     deletes:
 
     * a group a source covers directly keeps that source, whether it is a folder holding it or a
-      ``chat:`` entry naming it; :func:`resolve_sources` writes the same id on every run, and the
-      link never overwrites it;
+      ``chat:`` entry naming it — by identity, so the id, the ``@username`` and both ``t.me``
+      link forms of one group all count (:func:`_own_source`); :func:`resolve_sources` writes the
+      same id on every run, and the link never overwrites it;
     * a group known only through a channel's link belongs to the source of the channel that links
       it *now*, so a group handed from channel X to channel Y moves to Y's source together with
       the link — removing X then leaves the group alone and removing Y takes it along, which is
@@ -581,7 +645,9 @@ def discussion_source_id(group: ChatRow | None, channel: ChatRow) -> str | None:
 
     A channel with no source of its own (never resolved, only stored) changes nothing.
     :func:`_refuse_indirect` reads the same rule from the other end — only a group that is its
-    own source can be removed by naming it.
+    own source can be removed by naming it — and :func:`grepogram.db.delete_chat` completes it:
+    whichever source owns the group, removing it drops the comments the group fed to the
+    channel's post threads along with the rows they quote.
     """
     if group is None or not group.source_id:
         return channel.source_id

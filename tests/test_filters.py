@@ -63,6 +63,8 @@ CFG = Config(
         Source(folder="Empty"),
         Source(chat="@ghost_channel"),
         Source(chat=-1000000000999),
+        Source(chat="https://t.me/ghost_link"),
+        Source(chat="t.me/c/998"),
     ]
 )
 
@@ -290,6 +292,11 @@ def test_resolve_chats_unknown_stops_at_first_bad_spec(conn: sqlite3.Connection)
         pytest.param("@ghost_channel", "chat:@ghost_channel", id="username"),
         pytest.param("ghost_channel", "chat:@ghost_channel", id="username-text"),
         pytest.param("-1000000000999", "chat:-1000000000999", id="id"),
+        pytest.param("@ghost_link", "chat:https://t.me/ghost_link", id="link-source-by-username"),
+        pytest.param(
+            "https://t.me/ghost_link", "chat:https://t.me/ghost_link", id="link-source-by-link"
+        ),
+        pytest.param("-1000000000998", "chat:t.me/c/998", id="link-source-by-id"),
     ],
 )
 def test_resolve_chats_names_unsynced_source(
