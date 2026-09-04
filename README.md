@@ -67,8 +67,13 @@ Everything lives in one SQLite file.
   uses `open`, and the default paths follow macOS conventions. The code runs elsewhere with
   `GREPOGRAM_HOME` set, but that is untested.
 - [uv](https://docs.astral.sh/uv/). The project pins CPython 3.12 (`torch` and `sqlite-vec`
-  wheels); uv installs it. The interpreter's `sqlite3` module must be able to load extensions —
-  uv-managed and Homebrew builds can, Apple's system Python cannot.
+  wheels); uv installs it. The interpreter's `sqlite3` module must be able to load extensions,
+  because sqlite-vec is one: uv's own managed builds and Homebrew's `python@3.12` can, while
+  python.org's macOS installer build (`/usr/local/bin/python3.12`, which is also what
+  `actions/setup-python` installs) and Apple's system Python cannot — they are compiled without
+  `--enable-loadable-sqlite-extensions`. uv prefers an interpreter it finds over downloading its
+  own, so the commands below pass `--managed-python`; installed under one of the others,
+  grepogram refuses to open the index and prints this same list.
 - A Telegram account and an API key pair from https://my.telegram.org/apps.
 - Optional: about 4.5 GB of disk for the two models (`BAAI/bge-m3`, `BAAI/bge-reranker-v2-m3`),
   downloaded from Hugging Face on first use. Without them every search runs lexical-only.
@@ -82,16 +87,23 @@ Everything lives in one SQLite file.
    ```sh
    git clone https://github.com/nnemirovsky/grepogram
    cd grepogram
-   uv tool install '.[dense]'     # or `uv tool install .` for lexical-only search
+   uv tool install --managed-python --python 3.12 '.[dense]'   # drop [dense] for lexical-only
    ```
 
    which puts `grepogram` and `grepogram-mcp` into `$(uv tool dir --bin)`, or from the checkout
    without installing:
 
    ```sh
-   uv sync --extra dense          # or plain `uv sync`
-   uv run grepogram --help        # prefix every command below with `uv run`
+   uv sync --managed-python --extra dense   # or plain `uv sync --managed-python`
+   uv run grepogram --help                  # prefix every command below with `uv run`
    ```
+
+   `--managed-python --python 3.12` makes uv install and use its own CPython 3.12 instead of
+   whichever `python3.12` it finds first, which is what keeps sqlite-vec loadable (see
+   Requirements); `--python /opt/homebrew/bin/python3.12` does as well. Both flags matter for
+   `uv tool install`: without `--python` it reuses an environment it already has, so an install
+   made under the wrong interpreter stays broken until you pass it (or `uv tool uninstall
+   grepogram` first).
 
 3. Write the config and fill in the keys:
 
@@ -549,7 +561,7 @@ four minutes.
 ## Development
 
 ```sh
-uv sync --all-extras --all-groups
+uv sync --managed-python --all-extras --all-groups
 uv run pytest                          # in-memory SQLite, fake models, no network
 HF_HUB_OFFLINE=1 uv run pytest -m slow # real bge-m3 and reranker, once they are cached
 uv run ruff check . && uv run ruff format --check . && uv run mypy
