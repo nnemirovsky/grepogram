@@ -51,6 +51,27 @@ never change the git identity.
   it. `sync_all` resolves its sources from the config as it is once it holds the `SyncLock`:
   callers pass a loader (`state.config`, `functools.partial(config.load, paths)`), not the
   snapshot they started with, so a source removed while the model loaded is not fetched again.
+- Every edit of `config.toml` is a read-modify-write under `config.ConfigLock` (a blocking flock
+  on `config.lock` next to the file, held for milliseconds): the CLI goes through
+  `config.update(paths, change)` or takes the lock explicitly inside its `SyncLock`, and
+  `AppState.editing_config()` takes it inside the process-wide lock. Never save a config derived
+  from a snapshot read before a network round trip; re-read under the lock and apply the delta
+  (`sources.with_source`, drop by id). Lock order is `SyncLock` → `ConfigLock` → thread lock.
+- `messages.indexed` (schema v2) is 0 for a row whose units and `msg_fts` entry are behind: every
+  `upsert_messages` sets it, `db.mark_unindexed` raises it for a post whose thread grew, and
+  `sync.on_chat_synced` clears it after the rebuild. `sync._sync_chats` runs `index_pending` for
+  a chat after its fetch whether it returned or raised, and for the chats the run never reached,
+  so a batch committed before a flood wait or a crash is never left without units. Never make
+  `on_chat_synced` depend on what a run remembers in memory; the flag is the source of truth.
+- Never let a probe, smoke test or validation step call `links.open_link`, `links.run_command` or
+  the `open_message` tool with the real runner: inject a recording runner. `GREPOGRAM_NO_OPEN=1`
+  (set by the autouse fixture) makes `open_link` return the url without running anything and
+  `open_message` report `opened: false`, so nothing under the test environment launches Telegram
+  or a browser.
+- `links.message_url` returns the `https://t.me` form in `Link.url` (what hits and message views
+  show) and the `tg://` form in `Link.app_url` (`resolve` / `privatepost` / `openmessage`);
+  `open_link` tries `app_url`, then `url`, then `fallback_url`, because `open https://t.me/…` on
+  macOS lands in Safari, not in the Telegram app.
 - Windows are cut in `msg_id` order but rows do not always arrive that way (a channel stores
   comments in its discussion group before the group's own history gets there). `units._recut_windows`
   starts at the open window unless a changed message no window holds lies below it; then it
@@ -65,19 +86,24 @@ never change the git identity.
   The one connection is shared across threads: `db.Connection` runs every statement to completion
   under a re-entrant lock and `transaction()` holds it from `BEGIN` to `COMMIT`; the connection is
   in autocommit mode, so a bare statement never leaves an implicit transaction open.
-- `config.toml`, the session file and the lock file are written with mode 0600
-  (`config.write_private`, `tg.prepare_session`); the directories grepogram creates get 0700 and
-  an existing one (a user's own `GREPOGRAM_HOME`) is left as it is.
+- `config.toml`, the session file and the lock files (`sync.lock`, `config.lock`) are written
+  with mode 0600 (`config.write_private`, `tg.prepare_session`); the directories grepogram
+  creates get 0700 and an existing one (a user's own `GREPOGRAM_HOME`) is left as it is.
 - Files end with a single newline; no trailing blank lines.
 
 ## Environment variables
 
-- `GREPOGRAM_HOME=<dir>` — every file (`config.toml`, `session.session`, `index.db`, `sync.lock`,
-  `logs/`) under one directory. The `tmp_home` fixture in `tests/conftest.py` points it at a
-  `tmp_path` subdirectory; tests must never touch the real `~/.config/grepogram`.
+- `GREPOGRAM_HOME=<dir>` — every file (`config.toml`, `config.lock`, `session.session`,
+  `index.db`, `sync.lock`, `logs/`) under one directory. The `tmp_home` fixture in
+  `tests/conftest.py` points it at a `tmp_path` subdirectory; tests must never touch the real
+  `~/.config/grepogram`.
 - `GREPOGRAM_FAKE_MODELS=1` — `embed.load_embedder` and `rerank.load_reranker` return
   `FakeEmbedder` (hashed bag of stems with a small RU/EN lexicon, 256-d) and `FakeReranker`. An
   autouse fixture sets it for every test; tests of the real loaders unset it themselves.
+- `GREPOGRAM_NO_OPEN=1` — `links.open_link` returns the url without running `open` and the
+  `open_message` tool answers `opened: false` with an `error` saying so. The same autouse fixture
+  sets it for every test; the `open_link` / `open_message` tests unset it and inject a runner.
+  Both flags are read through `paths.env_flag` (`1`, `true`, `yes`, `on`).
 
 ## Tests
 
