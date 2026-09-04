@@ -63,7 +63,7 @@ from grepogram.embed import Embedder, ModelUnavailable
 from grepogram.filters import FilterError, UnknownChat
 from grepogram.links import OpenFailed
 from grepogram.log import setup_logging
-from grepogram.models import Config, Filters, SearchMode, SearchResult
+from grepogram.models import Config, Filters, MessageView, SearchMode, SearchResult
 from grepogram.paths import Paths
 from grepogram.rerank import Reranker
 from grepogram.search import UnknownMessage
@@ -414,6 +414,12 @@ def failure(exc: BaseException) -> ToolResult:
     return result
 
 
+def tool_failure(name: str, exc: Exception) -> ToolResult:
+    """Log a tool's expected failure and turn it into the result the caller sees."""
+    log.warning("%s failed: %s", name, exc)
+    return failure(exc)
+
+
 def guarded[**P](fn: Callable[P, ToolResult]) -> Callable[P, ToolResult]:
     """Wrap a synchronous tool: stdout silenced, expected failures turned into results."""
 
@@ -423,8 +429,7 @@ def guarded[**P](fn: Callable[P, ToolResult]) -> Callable[P, ToolResult]:
             try:
                 return fn(*args, **kwargs)
             except TOOL_ERRORS as exc:
-                log.warning("%s failed: %s", fn.__name__, exc)
-                return failure(exc)
+                return tool_failure(fn.__name__, exc)
 
     return wrapper
 
@@ -432,7 +437,7 @@ def guarded[**P](fn: Callable[P, ToolResult]) -> Callable[P, ToolResult]:
 def guarded_async[**P](
     fn: Callable[P, Awaitable[ToolResult]],
 ) -> Callable[P, Coroutine[Any, Any, ToolResult]]:
-    """:func:`guarded` for a coroutine tool."""
+    """:func:`guarded` for a coroutine tool; the ``async def`` is all that differs."""
 
     @functools.wraps(fn)
     async def wrapper(*args: P.args, **kwargs: P.kwargs) -> ToolResult:
@@ -440,8 +445,7 @@ def guarded_async[**P](
             try:
                 return await fn(*args, **kwargs)
             except TOOL_ERRORS as exc:
-                log.warning("%s failed: %s", fn.__name__, exc)
-                return failure(exc)
+                return tool_failure(fn.__name__, exc)
 
     return wrapper
 
@@ -591,9 +595,7 @@ def thread(chat_id: int, msg_id: int) -> ToolResult:
     and `reply_to_msg_id`. Read it before concluding from a snippet; `chat_id` and `msg_id` come
     from a hit's `chat.id` and `anchor_msg_id`.
     """
-    state = _app()
-    views = retrieval.thread(state.conn, chat_id, msg_id)
-    return {"chat_id": chat_id, "msg_id": msg_id, "messages": [asdict(view) for view in views]}
+    return _messages_result(chat_id, msg_id, retrieval.thread(_app().conn, chat_id, msg_id))
 
 
 @guarded
@@ -602,8 +604,13 @@ def context(chat_id: int, msg_id: int, before: int = 15, after: int = 15) -> Too
     and `after` later ones, the message itself included. Same message fields as `thread`; use it
     when a hit needs the surrounding conversation rather than the reply chain.
     """
-    state = _app()
-    views = retrieval.context(state.conn, chat_id, msg_id, before, after)
+    views = retrieval.context(_app().conn, chat_id, msg_id, before, after)
+    return _messages_result(chat_id, msg_id, views)
+
+
+def _messages_result(chat_id: int, msg_id: int, views: Sequence[MessageView]) -> ToolResult:
+    """What ``thread`` and ``context`` both answer: the message they were asked about and the
+    :class:`~grepogram.models.MessageView` list around it."""
     return {"chat_id": chat_id, "msg_id": msg_id, "messages": [asdict(view) for view in views]}
 
 
