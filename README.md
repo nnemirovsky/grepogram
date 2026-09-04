@@ -185,7 +185,7 @@ advisory; the data next to them is valid.
 | `dialogs` | `query` | `{query, matches}`: chats and folders of the account matching the name; each match carries `kind`, `id`, `title`, `type`, `username`, `folders`, `score` and `target`, the string to pass to `sources_add` |
 | `sources_add` | `target`, `since=null`, `comments=false` | `{source, kind, title, chats, hint}` after saving the config |
 | `sources_remove` | `target` | `{source_id, removed_chat_ids, config_updated}` after deleting the chats' data; `target` is a source id from `sources` (`folder:<name>`, `chat:<value>`), a folder name, a chat id, `@username` or a fuzzy title; `error` while a sync is running |
-| `open_message` | `chat_id`, `msg_id` | `{chat_id, msg_id, url, fallback_url, opened}`; opens the message in the Telegram app through `open`; when that fails the result still carries the urls plus `error` and `hint` |
+| `open_message` | `chat_id`, `msg_id` | `{chat_id, msg_id, url, fallback_url, app_url, opened, opened_with}`; launches the `tg://` `app_url` through `open` (the `https://t.me` `url` and then `fallback_url` only when the app form is rejected) and says which one worked; when none can be launched — or `GREPOGRAM_NO_OPEN` is set — the result still carries the links plus `error` and `hint` |
 
 Messages in `thread` and `context` have `msg_id`, `date`, `from_name`, `text` (a `[photo]`-style
 placeholder for media without a caption), `url`, `fallback_url` and `reply_to_msg_id`.
@@ -198,8 +198,10 @@ the hit's `url` per claim, say so when nothing relevant comes back, and use `sou
 / `sources_add` / `sync` when the user names a chat that is not indexed yet.
 
 The server re-reads `config.toml` when the file changes, so a source added with the CLI while
-Claude Code runs is picked up by the next tool call. Models are loaded once per server process; a
-model that fails to load is not retried until the server restarts.
+Claude Code runs is picked up by the next tool call. Every change to the file — by the server or
+by `grepogram sources add` / `rm` in a terminal — is a read-modify-write under `config.lock`, so
+one side's save never undoes the other's. Models are loaded once per server process; a model that
+fails to load is not retried until the server restarts.
 
 ## Configuration
 
@@ -270,9 +272,11 @@ flood_sleep_threshold = 120
 | `sources[].since` | `YYYY-MM-DD`; history before this date is skipped on the first sync of the chat |
 | `sources[].comments` | channels only: index the comment threads of the linked discussion group as well; on a folder source it applies to every channel in the folder. The comments are stored under the group with the post id attached; a source that lists the group itself (the folder holding both, or a `chat` entry) indexes its whole history on top, and the two share one set of rows |
 
-`GREPOGRAM_HOME=<dir>` puts every file (`config.toml`, `session.session`, `index.db`,
-`sync.lock`, `logs/`) under one directory; the tests use it. `GREPOGRAM_FAKE_MODELS=1` swaps both
-models for deterministic fakes (tests and CI only).
+`GREPOGRAM_HOME=<dir>` puts every file (`config.toml`, `config.lock`, `session.session`,
+`index.db`, `sync.lock`, `logs/`) under one directory; the tests use it. `GREPOGRAM_FAKE_MODELS=1`
+swaps both models for deterministic fakes (tests and CI only). `GREPOGRAM_NO_OPEN=1` makes
+`open_message` return the link without launching anything; the test environment sets it, so
+nothing run under it can open Telegram or a browser on the machine.
 
 ## How search works
 
@@ -336,17 +340,32 @@ named; relative ages (`6m`) step the calendar rather than counting 30-day months
 **Snippets and links.** Every hit has an *anchor*, the message its link opens: the matched message
 for a message-level hit, otherwise the unit's best message under the query, else its first. The
 snippet leads with the anchor's line and adds neighbours from within the unit up to 600
-characters. Links follow Telegram's rules per chat type: `https://t.me/<username>/<msg>` for
+characters. A channel's post thread is anchored and linked on the post, but its snippet is cut
+from the unit text and leads with the line — the post or one of its comments — that shares the
+most word stems with the query, so a hit that owes its rank to a comment shows that comment.
+Links follow Telegram's rules per chat type: `https://t.me/<username>/<msg>` for
 public channels and supergroups, `https://t.me/c/<id>/<msg>` for private ones (with the topic
 inserted for forums), `tg://openmessage?user_id=…&message_id=…` for private chats and bots with
-`tg://user?id=…` as fallback, `tg://openmessage?chat_id=…&message_id=…` for legacy groups.
+`tg://user?id=…` as fallback, `tg://openmessage?chat_id=…&message_id=…` for legacy groups. Those
+are the links results carry, for showing and citing. `open_message` launches the app form
+instead — `tg://resolve?domain=<username>&post=<msg>` for public chats,
+`tg://privatepost?channel=<id>&post=<msg>` for private ones, `&thread=<topic>` added in a forum
+topic, the `tg://openmessage` forms as they are — because macOS routes `tg://` straight to the
+Telegram app while `open https://t.me/…` lands on the t.me page in the browser; the `https` link
+and then the fallback are tried only when the app form is rejected (no Telegram installed).
 
 **Staying current.** `sync` re-resolves every source (folders change), then syncs chats in
 `last_sync_at` order, never-synced first: new messages after the stored `last_msg_id` in batches
 of 500, then a re-read of the newest `edit_refetch` messages that rewrites only rows whose content
 changed (that re-read runs after every sync that finishes the chat's incremental pass, not on
-its first sync or one the budget cut short). A budget stops the run cleanly between batches and
-the report lists `chats_remaining`. A non-blocking file lock keeps two syncs off the same index:
+its first sync or one the budget cut short). With `comments` on, only the posts Telegram reports
+comments on cost a thread request; a thread that starts later is picked up by the re-read while
+the post is among the newest. A budget stops the run cleanly between batches and the report
+lists `chats_remaining`. Every stored message stays flagged until its units and its row in the
+message index exist: a run indexes what it committed even when a flood wait, an error or a
+cancelled tool call stops the fetch, and the next run picks up whatever a crash left behind, for
+the chats it reaches and for the ones it does not. A non-blocking file lock keeps two syncs off
+the same index:
 a CLI `sync`, `embed`, `sources rm` or MCP `sync` / `sources_remove` started while another sync
 runs fails at once with `SyncInProgress`, and the MCP `search` auto-sync turns that into a
 warning. Inside the MCP server, syncs queue instead: a `search` that finds the index stale while
@@ -378,6 +397,7 @@ a session created with `grepogram auth` while the server runs is picked up by it
 | `~/.config/grepogram/config.toml` | settings, API keys, sources | 0600 |
 | `~/.config/grepogram/session.session` | Telethon session with the account's auth key | 0600 |
 | `~/Library/Application Support/grepogram/index.db` | messages, units, FTS and vector tables (WAL) | — |
+| `~/.config/grepogram/config.lock` | cross-process lock around every edit of `config.toml` | 0600 |
 | `~/Library/Application Support/grepogram/sync.lock` | cross-process sync lock | 0600 |
 | `~/Library/Logs/grepogram/grepogram.log` | log, rotated at 5 MB, three old files kept | — |
 | `~/.cache/huggingface/hub/` | the two models, downloaded once | — |
@@ -391,7 +411,9 @@ client makes when you scroll a chat), and one download per model from `huggingfa
 `dense` extra is installed. Nothing else. Message text, embeddings, queries and results stay in
 the SQLite file and in the conversation with Claude Code on your machine; the log never contains
 message text above DEBUG level (text is replaced with its length and a short digest). There is no
-API key for any language model in the project: the model is whatever runs Claude Code.
+API key for any language model in the project: the model is whatever runs Claude Code. The one
+thing grepogram launches is macOS `open`, for `open_message`; `GREPOGRAM_NO_OPEN=1` turns that
+into returning the link.
 
 ## Local model throughput
 
@@ -412,11 +434,13 @@ four minutes.
 - Deep links into private chats and legacy groups use the `tg://openmessage` scheme, which
   Telegram's mobile apps honour; the desktop apps open the conversation through the
   `tg://user?id=` fallback but do not scroll to the message. Channel and supergroup links
-  (`https://t.me/…`) work everywhere.
+  (`https://t.me/…`) work everywhere; `open_message` opens them through their `tg://` form so the
+  desktop app, not a browser, receives them.
 - The first sync of a large chat (hundreds of thousands of messages) takes a long time and may run
   into Telegram flood waits; a wait longer than `flood_sleep_threshold` stops the run and the next
-  run continues. Use `--since` on the source to cap history and `--budget` to bound a run; embedding
-  runs at the rates above.
+  run continues, with everything the stopped run stored already searchable. Use `--since` on the
+  source to cap history and `--budget` to bound a run; embedding runs at the rates above. A
+  channel with `comments` adds one request per post that has a thread.
 - Deleted messages are not removed from the index; they disappear when their source is removed.
   Edits are picked up only for the newest `edit_refetch` messages of a chat, and an edited message
   inside an already closed window keeps the old window text (its reply thread is rebuilt). New
@@ -438,10 +462,11 @@ four minutes.
   uncommitted write open on the session file (a sync in another Telethon-based tool, say) can
   fail with `database is locked`; grepogram's own clients only read it.
 - `sources add` / `rm` and the MCP tools rewrite `config.toml` without its comments.
-- An index built with a development version before 2026-09-04 may hold discussion-group messages
-  outside any window: the group's own history stored after the channel's comments was never
-  re-cut, so those messages were invisible to search. Rebuild such an index — delete `index.db`
-  and run `grepogram sync`.
+- An index built with a development version before 2026-09-04 may hold messages no unit or
+  message-index row covers (discussion-group history stored after the channel's comments, batches
+  committed before a flood wait). The schema upgrade to v2 flags every stored message, so the
+  first `grepogram sync` after upgrading rebuilds all units and index rows once — units whose
+  content is unchanged keep their embeddings — and repairs such an index without a re-download.
 - The MCP contract targets the `mcp` 1.x SDK (`FastMCP`); 2.x renamed the API and is excluded by
   the dependency pin.
 
