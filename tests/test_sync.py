@@ -716,6 +716,69 @@ async def test_only_posts_with_replies_cost_a_getreplies_request(
     assert news is not None and news.last_msg_id == 5
 
 
+def _threads_asked(client: FakeClient, since: int = 0) -> list[int]:
+    """The post ids the run made a ``GetReplies`` request for, from call ``since`` onwards."""
+    return [
+        kw["reply_to"]
+        for name, kw in client.calls[since:]
+        if name == "iter_messages" and kw["chat_id"] == NEWS_ID and kw["reply_to"] is not None
+    ]
+
+
+async def test_a_flood_wait_on_a_thread_keeps_what_the_batch_earned(
+    conn: sqlite3.Connection, paths: Paths
+) -> None:
+    """A flood wait leaves the whole run, so the progress the batch made must be written first.
+
+    Without it the posts whose threads are already stored are re-requested on every later run —
+    against a channel Telegram is already rate-limiting — and the interrupted thread keeps
+    nothing of what it fetched.
+    """
+    comments = {
+        (NEWS_ID, post): [
+            tl.message(DISC_ID, 100 * post + i, f"c{post}-{i}", sender=1) for i in (1, 2, 3)
+        ]
+        for post in range(1, 6)
+    }
+    client = _news_client(
+        messages={NEWS_ID: _posts(3, 3, 3, 3, 3)},
+        comments=comments,
+        failures={(NEWS_ID, 3): (2, errors.FloodWaitError(request=None, capture=3600))},
+    )
+    cfg = _cfg(NEWS_SOURCE, edit_refetch=0)
+
+    first = await _run(client, conn, paths, cfg)
+    assert first.chats_remaining == [NEWS_ID] and len(first.warnings) == 1
+    assert _threads_asked(client) == [1, 2, 3]
+    news = db.get_chat(conn, NEWS_ID)
+    assert news is not None and news.last_msg_id == 2
+    stored = {m.msg_id for m in db.get_messages(conn, DISC_ID)}
+    assert stored == {101, 102, 103, 201, 202, 203, 302, 303}  # post 3 keeps the prefix it read
+
+    calls = len(client.calls)
+    await _run(client, conn, paths, cfg)
+    assert _threads_asked(client, calls) == [3]
+
+
+async def test_a_thread_stored_in_full_is_not_requested_again(
+    conn: sqlite3.Connection, paths: Paths
+) -> None:
+    """The rule :func:`_refresh_comments` uses, applied to the incremental pass too: a post whose
+    reply count is already stored costs no request when the run resumes over it."""
+    client = _news_client(messages={NEWS_ID: _posts(2, 0, 1)})
+    cfg = _cfg(NEWS_SOURCE, edit_refetch=0)
+    await _run(client, conn, paths, cfg)
+    assert _threads_asked(client) == [1, 3]
+    news = db.get_chat(conn, NEWS_ID)
+    assert news is not None
+    db.set_chat_progress(conn, NEWS_ID, 0, news.last_sync_at)
+
+    calls = len(client.calls)
+    await _run(client, conn, paths, cfg)
+    assert _threads_asked(client, calls) == []
+    assert {m.msg_id for m in db.get_messages(conn, DISC_ID)} == {1, 2, 9}
+
+
 async def test_private_discussion_group_disables_comments_and_keeps_the_posts(
     conn: sqlite3.Connection, paths: Paths
 ) -> None:

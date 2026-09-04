@@ -663,9 +663,16 @@ async def _store_batch(run: _Run, batch: list[MessageRow], progress: int, seen_u
     service messages included. With comments it advances post by post, so a budget expiry
     between two posts leaves the later posts to be re-fetched next time together with their
     threads; when Telegram refuses the threads on the way the posts count as done. Only a post
-    Telegram reports replies on costs a ``GetReplies`` request: a channel of thousands of posts
-    with a handful of threads makes a handful of them, not thousands, and a post whose thread
-    starts later is caught by :func:`_refresh_comments` while it is among the newest.
+    Telegram reports replies on costs a ``GetReplies`` request, and only while more replies are
+    reported than are stored (the rule :func:`_refresh_comments` uses): a channel of thousands of
+    posts with a handful of threads makes a handful of requests, not thousands, and a run that
+    stopped halfway through a batch does not replay the threads it already has. A post whose
+    thread starts later is caught by :func:`_refresh_comments` while it is among the newest.
+
+    The progress write is in a ``finally``: the rows are committed before the threads are read,
+    so a flood wait on one post's thread — which propagates out of the whole run — must still
+    leave the posts before it behind, or every run replays the same satisfied requests against a
+    channel Telegram is already rate-limiting.
     """
     chat = run.chat
     _track(run.changes, run.store(batch))
@@ -673,18 +680,23 @@ async def _store_batch(run: _Run, batch: list[MessageRow], progress: int, seen_u
         run.replies.clear()
         db.set_chat_progress(run.conn, chat.id, seen_up_to, chat.last_sync_at)
         return seen_up_to
-    for row in batch:
-        if run.budget.expired:
-            break
-        if run.discussion is None:
+    stored = db.count_topic_messages(
+        run.conn, run.discussion.id, [row.msg_id for row in batch if run.replies.get(row.msg_id)]
+    )
+    try:
+        for row in batch:
+            if run.budget.expired:
+                break
+            if run.discussion is None:
+                progress = seen_up_to
+                break
+            if run.replies.pop(row.msg_id, 0) > stored.get(row.msg_id, 0):
+                _track(run.comment_ids, await _fetch_comments(run, row.msg_id))
+            progress = row.msg_id
+        else:
             progress = seen_up_to
-            break
-        if run.replies.pop(row.msg_id, 0) > 0:
-            _track(run.comment_ids, await _fetch_comments(run, row.msg_id))
-        progress = row.msg_id
-    else:
-        progress = seen_up_to
-    db.set_chat_progress(run.conn, chat.id, progress, chat.last_sync_at)
+    finally:
+        db.set_chat_progress(run.conn, chat.id, progress, chat.last_sync_at)
     return progress
 
 
@@ -696,21 +708,31 @@ async def _fetch_comments(run: _Run, post_id: int) -> list[int]:
     channel post id is kept in ``topic_id`` to tie the thread back to its post. A post without a
     thread (``MsgIdInvalidError``) is skipped; a thread Telegram refuses switches the comments
     off for the rest of the run (:meth:`_Run.drop_comments`).
+
+    The rows are stored in batches and the tail in a ``finally``, so a thread cut short — a flood
+    wait partway through a long one, a cancellation — keeps the prefix it fetched instead of
+    dropping everything on the floor and starting from the same place on every later run. The
+    next run re-reads the thread from the top (an upsert, so nothing is stored twice) until as
+    many comments are stored as Telegram reports replies.
     """
     assert run.discussion is not None
     rows: list[MessageRow] = []
+    stored: list[int] = []
     try:
         async for msg in run.client.iter_messages(run.chat.id, reply_to=post_id):
             row = run.map(msg, run.discussion)
             if row is not None:
                 rows.append(dataclasses.replace(row, topic_id=post_id))
+            if len(rows) >= BATCH_SIZE:
+                stored += run.store(rows)
+                rows = []
     except errors.MsgIdInvalidError:
         log.debug("post %s in channel %s has no comment thread", post_id, run.chat.id)
-        return []
     except UNAVAILABLE_ERRORS as exc:
         run.drop_comments(exc)
-        return []
-    return run.store(rows)
+    finally:
+        stored += run.store(rows)
+    return stored
 
 
 async def _refetch_edits(run: _Run, sync_cfg: SyncCfg) -> list[int]:
