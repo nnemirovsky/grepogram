@@ -158,6 +158,16 @@ def test_make_login_client_writes_the_session_file(tmp_path: Path) -> None:
         client.session.close()
 
 
+def test_make_login_client_on_a_damaged_session_file_is_a_session_error(tmp_path: Path) -> None:
+    paths = _paths(tmp_path)
+    tg.prepare_session(paths)
+    paths.session_file.write_bytes(b"not a database, not at all, just some bytes " * 4)
+    with pytest.raises(tg.SessionError) as excinfo:
+        tg.make_login_client(Config(telegram=TelegramCfg(api_id=1, api_hash="h")), paths)
+    assert excinfo.value.path == paths.session_file
+    assert isinstance(excinfo.value.__cause__, sqlite3.DatabaseError)
+
+
 def test_prepare_session_keeps_the_file_private_when_telethon_opens_it(tmp_path: Path) -> None:
     paths = _paths(tmp_path)
     assert tg.prepare_session(paths) == paths.session_file
@@ -204,6 +214,20 @@ def test_ensure_session_mode_raises_session_missing(tmp_path: Path) -> None:
 
 
 # --- wrap_auth_errors ------------------------------------------------------------------------
+
+
+def test_auth_errors_cover_every_dead_session_error() -> None:
+    """Every ``UnauthorizedError`` Telethon defines maps to the auth hint, except the one that
+    belongs to the sign-in flow itself."""
+    unauthorized = {
+        cls
+        for cls in vars(errors).values()
+        if isinstance(cls, type)
+        and issubclass(cls, errors.UnauthorizedError)
+        and cls is not errors.UnauthorizedError
+    }
+    assert unauthorized - set(tg.AUTH_ERRORS) == {errors.SessionPasswordNeededError}
+    assert set(tg.AUTH_ERRORS) <= unauthorized
 
 
 @pytest.mark.parametrize("error_cls", tg.AUTH_ERRORS, ids=lambda cls: cls.__name__)
@@ -412,6 +436,19 @@ def test_auth_reports_a_failed_sign_in(tmp_home: Path, monkeypatch: pytest.Monke
     assert "sign-in failed" in result.stderr
     assert "signed in" not in result.stdout
     assert not fake.is_connected()
+
+
+def test_auth_reports_a_damaged_session_file(tmp_home: Path) -> None:
+    """The case ``SESSION_HINT`` sends users to ``grepogram auth`` for must end in an error
+    line, not a traceback."""
+    (tmp_home / "config.toml").write_text(CONFIG_WITH_KEYS, encoding="utf-8")
+    (tmp_home / "session.session").write_bytes(b"not a database, not at all, just bytes " * 4)
+    result = runner.invoke(cli.app, ["auth"], input="")
+    assert result.exit_code == 1, result.output
+    assert not isinstance(result.exception, sqlite3.Error)
+    assert result.stderr.startswith("error: cannot read the Telegram session at ")
+    assert "delete it and run grepogram auth again" in result.stderr
+    assert result.stdout == ""
 
 
 # --- FakeClient ------------------------------------------------------------------------------

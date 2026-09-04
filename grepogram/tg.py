@@ -36,7 +36,12 @@ AUTH_ERRORS: tuple[type[Exception], ...] = (
     errors.UserDeactivatedBanError,
     errors.SessionExpiredError,
     errors.AuthKeyInvalidError,
+    errors.AuthKeyPermEmptyError,
+    errors.ActiveUserRequiredError,
 )
+"""Every ``UnauthorizedError`` that means the stored session is dead and ``grepogram auth`` is
+the way out — all of Telethon's subclasses but ``SessionPasswordNeededError``, which belongs to
+the sign-in flow."""
 
 Prompt = Callable[[], str | Awaitable[str]]
 
@@ -98,8 +103,12 @@ def make_client(cfg: Config, paths: Paths) -> TelegramClient:
 
 def make_login_client(cfg: Config, paths: Paths) -> TelegramClient:
     """Build the client ``grepogram auth`` signs in with: the one client that writes
-    ``paths.session_file``. Does not connect."""
-    return _client(str(paths.session_file), cfg)
+    ``paths.session_file``. Does not connect. Raises :class:`SessionError` when the file exists
+    but SQLite cannot read it — Telethon opens it in the constructor."""
+    try:
+        return _client(str(paths.session_file), cfg)
+    except sqlite3.Error as exc:
+        raise SessionError(paths.session_file, exc) from exc
 
 
 def _client(session: MemorySession | str, cfg: Config) -> TelegramClient:
