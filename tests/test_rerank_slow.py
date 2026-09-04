@@ -45,7 +45,7 @@ GAP_MIN = 0.1
 def reranker() -> Iterator[BgeReranker]:
     pytest.importorskip("sentence_transformers")
     cfg = ModelsCfg()
-    yield BgeReranker(cfg.rerank, cfg.device)
+    yield BgeReranker(cfg.rerank, cfg.device, cfg.max_seq_length)
 
 
 def test_reports_model_and_device(reranker: BgeReranker) -> None:
@@ -79,6 +79,8 @@ def test_single_text_matches_its_batch_score(reranker: BgeReranker) -> None:
 
 
 def test_rerank_top_sized_batch_throughput(reranker: BgeReranker) -> None:
+    """A floor-free smoke check on batching, not the README's throughput figure — these fixture
+    pairs are far shorter than a real window; see ``test_embed_slow`` for the same caveat."""
     texts = [f"{RELEVANT}\n[2024-03-15 10:{40 + i:02d}] Bob: message {i}" for i in range(40)]
     reranker.score(QUERY_RU, texts[:4])
     started = time.perf_counter()

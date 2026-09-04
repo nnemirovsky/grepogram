@@ -14,7 +14,7 @@ import pytest
 from grepogram import config
 from grepogram.config import TEMPLATE, ConfigError
 from grepogram.log import redact, setup_logging, shutdown_logging
-from grepogram.models import Config, SearchCfg, Source, TelegramCfg
+from grepogram.models import Config, ModelsCfg, SearchCfg, Source, TelegramCfg
 from grepogram.paths import Paths, env_flag
 from tests.conftest import file_mode
 
@@ -210,6 +210,38 @@ def test_source_ids_are_stable() -> None:
 def test_template_parses_to_defaults() -> None:
     assert config.loads(TEMPLATE) == Config()
     assert "[[sources]]" in TEMPLATE
+
+
+# --- models.max_seq_length -------------------------------------------------------------------
+
+
+def test_max_seq_length_defaults_to_512() -> None:
+    assert ModelsCfg().max_seq_length == 512
+    assert config.loads("").models.max_seq_length == 512
+    assert config.loads(TEMPLATE).models.max_seq_length == 512
+
+
+def test_max_seq_length_round_trips_through_save_and_load(paths: Paths) -> None:
+    config.save(Config(models=ModelsCfg(max_seq_length=1024)), paths)
+    assert "max_seq_length = 1024" in paths.config_file.read_text()
+    assert config.load(paths).models.max_seq_length == 1024
+
+
+@pytest.mark.parametrize("value", ["'512'", "512.0", "true"])
+def test_max_seq_length_rejects_non_integers(value: str) -> None:
+    with pytest.raises(ConfigError, match=r"invalid value for models\.max_seq_length"):
+        config.loads(f"[models]\nmax_seq_length = {value}\n")
+
+
+@pytest.mark.parametrize("value", [0, -1, -512])
+def test_max_seq_length_rejects_non_positive(value: int) -> None:
+    with pytest.raises(ConfigError, match=r"invalid value for models\.max_seq_length: .*positive"):
+        config.loads(f"[models]\nmax_seq_length = {value}\n")
+
+
+def test_positive_rule_leaves_other_numeric_keys_alone() -> None:
+    """The rule is keyed by name, so a setting zero is meaningful for keeps accepting it."""
+    assert config.loads("[search]\nrerank_top = 0\n").search.rerank_top == 0
 
 
 # --- config lock -----------------------------------------------------------------------------

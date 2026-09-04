@@ -39,6 +39,9 @@ class ModelsCfg:
     embed: str = "BAAI/bge-m3"
     rerank: str = "BAAI/bge-reranker-v2-m3"
     device: str = "auto"
+    max_seq_length: int = 512
+    """Token cap both models truncate at: a longer unit is embedded and reranked only up to it.
+    Changing it re-embeds nothing by itself — ``grepogram embed --reembed`` does."""
 
 
 @dataclass(frozen=True, slots=True)

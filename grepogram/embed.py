@@ -28,7 +28,7 @@ import threading
 from collections.abc import Callable, Mapping
 from typing import Any, Protocol, runtime_checkable
 
-from grepogram.models import Config
+from grepogram.models import Config, ModelsCfg
 from grepogram.paths import env_flag
 from grepogram.stem import stem_token, tokenize
 
@@ -39,7 +39,8 @@ HF_OFFLINE_ENV = "HF_HUB_OFFLINE"
 NOT_CACHED_ERRORS = frozenset({"LocalEntryNotFoundError", "OfflineModeIsEnabled"})
 FAKE_NAME = "fake"
 FAKE_DIM = 256
-MAX_SEQ_LENGTH = 512
+DEFAULT_MAX_SEQ_LENGTH = ModelsCfg().max_seq_length
+"""The shipped ``models.max_seq_length``; the one literal lives on :class:`ModelsCfg`."""
 BATCH_SIZE = 32
 AUTO_DEVICE = "auto"
 FAKE_LEXICON: Mapping[str, str] = {
@@ -125,13 +126,24 @@ class BgeM3Embedder:
 
     The model is loaded eagerly so that a missing extra, a failed download or a broken cache
     surfaces as :class:`ModelUnavailable` right here, where the caller can degrade. On ``mps``
-    the weights are halved to fp16; ``max_seq_length`` is capped at 512 tokens, which covers a
-    unit of ``window_max_chars`` characters with room to spare. Encoding is serialized with a
-    lock because the MCP server may call it from several threads.
+    the weights are halved to fp16; the text is truncated at ``max_seq_length`` tokens
+    (``models.max_seq_length``, 512 by default), so a unit longer than that is embedded only up
+    to it while the FTS tables still hold it whole. ``units.window_max_chars`` does not bound
+    this: it is the size at which a window *closes*, so a finished window is at least that long
+    (see the README). Encoding is serialized with a lock because the MCP server may call it from
+    several threads.
     """
 
-    def __init__(self, model_id: str, device: str = AUTO_DEVICE) -> None:
+    def __init__(
+        self,
+        model_id: str,
+        device: str = AUTO_DEVICE,
+        max_seq_length: int = DEFAULT_MAX_SEQ_LENGTH,
+    ) -> None:
+        if max_seq_length < 1:
+            raise ValueError(f"max_seq_length must be positive, got {max_seq_length}")
         self.name = model_id
+        self.max_seq_length = max_seq_length
         try:
             from sentence_transformers import SentenceTransformer
         except ImportError as exc:
@@ -150,14 +162,20 @@ class BgeM3Embedder:
                 model.half()
         except Exception as exc:
             raise ModelUnavailable(f"cannot load embedding model {model_id!r}: {exc}") from exc
-        model.max_seq_length = MAX_SEQ_LENGTH
+        model.max_seq_length = max_seq_length
         dim = embedding_dimension(model)
         if not dim:
             raise ModelUnavailable(f"embedding model {model_id!r} reports no embedding dimension")
         self.dim = dim
         self._model = model
         self._lock = threading.Lock()
-        log.info("embedding model %s loaded on %s (dim %d)", model_id, self.device, dim)
+        log.info(
+            "embedding model %s loaded on %s (dim %d, %d tokens)",
+            model_id,
+            self.device,
+            dim,
+            max_seq_length,
+        )
 
     def embed(self, texts: list[str]) -> list[list[float]]:
         if not texts:
@@ -183,7 +201,7 @@ def load_embedder(cfg: Config) -> Embedder:
     """
     if fake_models_enabled():
         return FakeEmbedder()
-    return BgeM3Embedder(cfg.models.embed, cfg.models.device)
+    return BgeM3Embedder(cfg.models.embed, cfg.models.device, cfg.models.max_seq_length)
 
 
 def fake_models_enabled() -> bool:

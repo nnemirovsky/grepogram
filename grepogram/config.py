@@ -34,6 +34,7 @@ api_hash = ""
 embed = "BAAI/bge-m3"                  # sentence-transformers id; change → full re-embed
 rerank = "BAAI/bge-reranker-v2-m3"
 device = "auto"                        # auto → mps if available else cpu
+max_seq_length = 512                   # token cap for both models; change → `embed --reembed`
 
 [search]
 k = 10
@@ -67,6 +68,8 @@ flood_sleep_threshold = 120
 
 _SECTIONS = ("telegram", "models", "search", "units", "sync")
 _SOURCE_KEYS = ("folder", "chat", "since", "comments")
+_POSITIVE_KEYS = frozenset({"models.max_seq_length"})
+"""Integer settings a zero or a negative value is meaningless for, checked after the type."""
 
 
 class ConfigError(Exception):
@@ -180,7 +183,11 @@ def _section[SectionT: (TelegramCfg, ModelsCfg, SearchCfg, UnitsCfg, SyncCfg)](
     for key, value in data.items():
         if key not in hints:
             raise ConfigError(f"unknown key: {name}.{key}")
-        kwargs[key] = _checked(value, hints[key], f"{name}.{key}")
+        where = f"{name}.{key}"
+        checked = _checked(value, hints[key], where)
+        if where in _POSITIVE_KEYS and isinstance(checked, int) and checked < 1:
+            raise ConfigError(f"invalid value for {where}: expected a positive int, got {checked}")
+        kwargs[key] = checked
     return cls(**kwargs)
 
 

@@ -41,7 +41,7 @@ def length(vector: list[float]) -> float:
 def embedder() -> Iterator[BgeM3Embedder]:
     pytest.importorskip("sentence_transformers")
     cfg = ModelsCfg()
-    yield BgeM3Embedder(cfg.embed, cfg.device)
+    yield BgeM3Embedder(cfg.embed, cfg.device, cfg.max_seq_length)
 
 
 def test_reports_model_and_dimension(embedder: BgeM3Embedder) -> None:
@@ -73,6 +73,12 @@ def test_query_embedding_matches_batch_row(embedder: BgeM3Embedder) -> None:
 
 
 def test_unit_sized_batch_throughput(embedder: BgeM3Embedder) -> None:
+    """A floor-free smoke check on batching, not the README's throughput figure.
+
+    These fixture units are about a third the token length of a real window, and encoder cost
+    scales with sequence length, so the rate printed here runs several times the one the README
+    publishes — that table is measured on real units.
+    """
     unit = "\n".join(UNIT_LINES)
     texts = [f"{unit}\n[2024-03-15 11:{10 + i:02d}] Bob: message {i}" for i in range(64)]
     embedder.embed(texts[:4])

@@ -8,11 +8,10 @@ from typing import Any
 import pytest
 
 from grepogram import embed
-from grepogram.embed import ModelUnavailable
+from grepogram.embed import DEFAULT_MAX_SEQ_LENGTH, ModelUnavailable
 from grepogram.models import Config, ModelsCfg
 from grepogram.rerank import (
     BATCH_SIZE,
-    MAX_SEQ_LENGTH,
     BgeReranker,
     FakeReranker,
     Reranker,
@@ -221,8 +220,8 @@ def test_bge_loads_on_mps_in_fp16_with_max_length(stubs: Install) -> None:
     assert reranker.device == "mps"
     assert model.model_id == "BAAI/bge-reranker-v2-m3"
     assert model.device == "mps"
-    assert model.kwargs == {"max_length": MAX_SEQ_LENGTH, "local_files_only": True}
-    assert MAX_SEQ_LENGTH == 512
+    assert model.kwargs == {"max_length": DEFAULT_MAX_SEQ_LENGTH, "local_files_only": True}
+    assert DEFAULT_MAX_SEQ_LENGTH == 512
     assert model.halved is True
 
 
@@ -376,6 +375,29 @@ def test_load_reranker_uses_the_configured_model_and_device(stubs: Install) -> N
     assert reranker.name == "BAAI/bge-reranker-base"
     assert reranker.device == "cpu"
     assert StubCrossEncoder.instances[0].model_id == "BAAI/bge-reranker-base"
+
+
+def test_max_seq_length_reaches_the_model_from_the_config(stubs: Install) -> None:
+    stubs()
+    reranker = load_reranker(Config(models=ModelsCfg(max_seq_length=1024)))
+    assert isinstance(reranker, BgeReranker)
+    assert reranker.max_seq_length == 1024
+    assert StubCrossEncoder.instances[0].kwargs["max_length"] == 1024
+
+
+def test_max_seq_length_defaults_to_the_shipped_cap(stubs: Install) -> None:
+    stubs()
+    reranker = load_reranker(Config())
+    assert isinstance(reranker, BgeReranker)
+    assert reranker.max_seq_length == DEFAULT_MAX_SEQ_LENGTH == 512
+    assert StubCrossEncoder.instances[0].kwargs["max_length"] == 512
+
+
+@pytest.mark.parametrize("cap", [0, -1])
+def test_bge_rejects_a_non_positive_cap(stubs: Install, cap: int) -> None:
+    stubs()
+    with pytest.raises(ValueError, match="max_seq_length must be positive"):
+        BgeReranker("BAAI/bge-reranker-v2-m3", "cpu", cap)
 
 
 def test_load_reranker_resolves_auto_device(stubs: Install) -> None:

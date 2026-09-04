@@ -11,8 +11,8 @@ import pytest
 from grepogram import embed
 from grepogram.embed import (
     BATCH_SIZE,
+    DEFAULT_MAX_SEQ_LENGTH,
     FAKE_DIM,
-    MAX_SEQ_LENGTH,
     BgeM3Embedder,
     Embedder,
     FakeEmbedder,
@@ -341,7 +341,7 @@ def test_bge_loads_on_mps_in_fp16(stubs: Install) -> None:
     assert model.model_id == "BAAI/bge-m3"
     assert model.device == "mps"
     assert model.halved is True
-    assert model.max_seq_length == MAX_SEQ_LENGTH == 512
+    assert model.max_seq_length == DEFAULT_MAX_SEQ_LENGTH == 512
 
 
 def test_bge_on_cpu_keeps_fp32(stubs: Install) -> None:
@@ -525,6 +525,29 @@ def test_load_embedder_uses_the_configured_model_and_device(stubs: Install) -> N
     assert embedder.name == "BAAI/bge-m3-small"
     assert embedder.device == "cpu"
     assert StubModel.instances[0].model_id == "BAAI/bge-m3-small"
+
+
+def test_max_seq_length_reaches_the_model_from_the_config(stubs: Install) -> None:
+    stubs()
+    embedder = load_embedder(Config(models=ModelsCfg(max_seq_length=1024)))
+    assert isinstance(embedder, BgeM3Embedder)
+    assert embedder.max_seq_length == 1024
+    assert StubModel.instances[0].max_seq_length == 1024
+
+
+def test_max_seq_length_defaults_to_the_shipped_cap(stubs: Install) -> None:
+    stubs()
+    embedder = load_embedder(Config())
+    assert isinstance(embedder, BgeM3Embedder)
+    assert embedder.max_seq_length == DEFAULT_MAX_SEQ_LENGTH == 512
+    assert StubModel.instances[0].max_seq_length == 512
+
+
+@pytest.mark.parametrize("cap", [0, -1])
+def test_bge_rejects_a_non_positive_cap(stubs: Install, cap: int) -> None:
+    stubs()
+    with pytest.raises(ValueError, match="max_seq_length must be positive"):
+        BgeM3Embedder("BAAI/bge-m3", "cpu", cap)
 
 
 def test_load_embedder_resolves_auto_device(stubs: Install) -> None:

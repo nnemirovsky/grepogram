@@ -25,6 +25,7 @@ from typing import Any, Protocol, runtime_checkable
 
 from grepogram.embed import (
     AUTO_DEVICE,
+    DEFAULT_MAX_SEQ_LENGTH,
     FakeEmbedder,
     ModelUnavailable,
     fake_models_enabled,
@@ -36,7 +37,6 @@ from grepogram.models import Config
 log = logging.getLogger(__name__)
 
 FAKE_NAME = "fake"
-MAX_SEQ_LENGTH = 512
 BATCH_SIZE = 32
 
 
@@ -79,13 +79,24 @@ class BgeReranker:
 
     The model is loaded eagerly so that a missing extra, a failed download or a broken cache
     surfaces as :class:`ModelUnavailable` right here, where the caller can degrade. On ``mps``
-    the weights are halved to fp16; the query and the unit are truncated together at 512
-    tokens, which covers a unit of ``window_max_chars`` characters with room to spare. Scoring
-    is serialized with a lock because the MCP server may call it from several threads.
+    the weights are halved to fp16; the query and the unit are truncated together at
+    ``max_seq_length`` tokens — the same ``models.max_seq_length`` the embedder reads, because
+    both read the *same* unit text and a cap that let one of them see more of a unit than the
+    other would have the two stages rank different documents. The query shares that budget, so
+    the reranker sees marginally less of a long unit than the embedder does. Scoring is
+    serialized with a lock because the MCP server may call it from several threads.
     """
 
-    def __init__(self, model_id: str, device: str = AUTO_DEVICE) -> None:
+    def __init__(
+        self,
+        model_id: str,
+        device: str = AUTO_DEVICE,
+        max_seq_length: int = DEFAULT_MAX_SEQ_LENGTH,
+    ) -> None:
+        if max_seq_length < 1:
+            raise ValueError(f"max_seq_length must be positive, got {max_seq_length}")
         self.name = model_id
+        self.max_seq_length = max_seq_length
         try:
             from sentence_transformers import CrossEncoder
         except ImportError as exc:
@@ -98,7 +109,7 @@ class BgeReranker:
                 lambda local: CrossEncoder(
                     model_id,
                     device=self.device,
-                    max_length=MAX_SEQ_LENGTH,
+                    max_length=max_seq_length,
                     local_files_only=local,
                 ),
                 f"reranker model {model_id!r}",
@@ -109,7 +120,9 @@ class BgeReranker:
             raise ModelUnavailable(f"cannot load reranker model {model_id!r}: {exc}") from exc
         self._model = model
         self._lock = threading.Lock()
-        log.info("reranker model %s loaded on %s", model_id, self.device)
+        log.info(
+            "reranker model %s loaded on %s (%d tokens)", model_id, self.device, max_seq_length
+        )
 
     def score(self, query: str, texts: list[str]) -> list[float]:
         if not texts:
@@ -137,7 +150,7 @@ def load_reranker(cfg: Config) -> Reranker:
     """
     if fake_models_enabled():
         return FakeReranker()
-    return BgeReranker(cfg.models.rerank, cfg.models.device)
+    return BgeReranker(cfg.models.rerank, cfg.models.device, cfg.models.max_seq_length)
 
 
 def as_scores(raw: Any) -> list[float]:
