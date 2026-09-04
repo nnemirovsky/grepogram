@@ -67,8 +67,8 @@ CFG = Config(
 )
 
 
-def ts(*args: int, tz: dt.tzinfo = dt.UTC) -> int:
-    return int(dt.datetime(*args, tzinfo=tz).timestamp())
+def ts(year: int, month: int, day: int, hour: int = 0, minute: int = 0, second: int = 0) -> int:
+    return int(dt.datetime(year, month, day, hour, minute, second, tzinfo=dt.UTC).timestamp())
 
 
 NOW = ts(2025, 3, 31, 12, 0, 0)

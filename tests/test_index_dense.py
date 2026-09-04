@@ -10,7 +10,16 @@ from grepogram import cli, db, embed, filters, index, sync, tg, units
 from grepogram.embed import FAKE_DIM, FakeEmbedder, ModelUnavailable
 from grepogram.index import EmbeddingSpaceMismatch
 from grepogram.log import shutdown_logging
-from grepogram.models import ChatRow, Config, Filters, MessageRow, Source, UnitRow, UnitsCfg
+from grepogram.models import (
+    ChatRow,
+    Config,
+    Filters,
+    MessageRow,
+    Source,
+    SyncReport,
+    UnitRow,
+    UnitsCfg,
+)
 from grepogram.paths import Paths
 from grepogram.sync import SyncBudget, SyncLock
 from tests.fakes import FakeClient, make_channel, make_dialog, make_folder, make_user
@@ -550,7 +559,7 @@ def _client(messages: list[object]) -> FakeClient:
     return FakeClient(
         dialogs=[make_dialog(ALICE), make_dialog(BOB), make_dialog(ARG_CHANNEL)],
         folders=[make_folder(3, "Argentina", include=[ARG_CHANNEL])],
-        messages={CHAT: messages},  # type: ignore[dict-item]
+        messages={CHAT: messages},
         me=make_user(42, "Me"),
     )
 
@@ -561,7 +570,7 @@ async def _run(
     paths: Paths,
     embedder: FakeEmbedder | None = None,
     budget: SyncBudget | None = None,
-) -> sync.SyncReport:
+) -> SyncReport:
     async with tg.connected(client):
         return await sync.sync_all(client, conn, SYNC_CFG, paths, budget or SyncBudget(), embedder)
 

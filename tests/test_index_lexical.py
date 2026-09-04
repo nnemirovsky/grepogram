@@ -456,7 +456,7 @@ def _client(messages: list[object]) -> FakeClient:
     return FakeClient(
         dialogs=[make_dialog(ALICE), make_dialog(BOB), make_dialog(ARG)],
         folders=[make_folder(3, "Argentina", include=[ARG])],
-        messages={CHAT: messages},  # type: ignore[dict-item]
+        messages={CHAT: messages},
         me=make_user(42, "Me"),
     )
 

@@ -13,7 +13,7 @@ from typer.testing import CliRunner
 from grepogram import cli, db, sync, tg
 from grepogram.config import ConfigError
 from grepogram.log import shutdown_logging
-from grepogram.models import ChatRow, Config, Source, SyncCfg, TelegramCfg
+from grepogram.models import ChatRow, Config, Source, SyncCfg, SyncReport, TelegramCfg
 from grepogram.paths import Paths
 from grepogram.sync import SyncBudget, SyncInProgress, SyncLock
 from tests.fakes import FakeClient, make_channel, make_dialog, make_folder, make_group, make_user
@@ -148,7 +148,7 @@ async def _run(
     paths: Paths,
     cfg: Config,
     seconds: float | None = None,
-) -> sync.SyncReport:
+) -> SyncReport:
     async with tg.connected(client):
         return await sync.sync_all(client, conn, cfg, paths, SyncBudget(seconds))
 
@@ -748,7 +748,7 @@ async def test_sync_all_syncs_the_supergroup_a_group_migrated_to(
 
 async def test_sync_all_with_no_sources_is_empty(conn: sqlite3.Connection, paths: Paths) -> None:
     report = await _run(_client(), conn, paths, _cfg())
-    assert report == sync.SyncReport()
+    assert report == SyncReport()
 
 
 # --- cli -------------------------------------------------------------------------------------

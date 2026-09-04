@@ -322,8 +322,13 @@ def test_folder_members_exclude_flags_narrow_category_members(
     flag: str, expected: set[int]
 ) -> None:
     folder = FolderInfo(
-        id=1, title="x", contacts=True, non_contacts=True, bots=True, **{flag: True}
-    )  # type: ignore[arg-type]
+        id=1,
+        title="x",
+        contacts=True,
+        non_contacts=True,
+        bots=True,
+        **{flag: True},  # type: ignore[arg-type]
+    )
     assert dialogs.folder_members(folder, _dialogs(), now=NOW) == expected
 
 

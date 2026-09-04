@@ -2,6 +2,7 @@ import json
 import sqlite3
 from collections.abc import Iterator
 from pathlib import Path
+from typing import Any
 
 import pytest
 from typer.testing import CliRunner
@@ -224,9 +225,9 @@ def test_dense_units_score_by_cosine_similarity(
     assert all(0.0 < score < 1.0 for score in scores)
     assert all(m.anchor_msg_id is None for m in matches)
     knn = index.knn(conn, embedded.embed_query("Recoleta"), ALL, 40, CFG.search.vec_fanout_max)
-    assert [(m.unit_id, m.score) for m in matches] == [
-        (unit_id, pytest.approx(1.0 - distance)) for unit_id, distance in knn if distance < 1.0
-    ]
+    near = [(unit_id, distance) for unit_id, distance in knn if distance < 1.0]
+    assert [m.unit_id for m in matches] == [unit_id for unit_id, _ in near]
+    assert scores == pytest.approx([1.0 - distance for _, distance in near])
     assert len(knn) > len(matches)  # orthogonal units are not matches
     assert _ids(search.dense_units(conn, CFG, "Recoleta", ALL, 1, embedded)) == _ids(matches)[:1]
     assert search.dense_units(conn, CFG, "Recoleta", Filters(chat_ids={GEO}), 40, embedded) == []
@@ -549,7 +550,7 @@ def embedded_home(seeded_home: Path) -> Path:
     return seeded_home
 
 
-def _hits(args: list[str]) -> tuple[list[dict[str, object]], list[str]]:
+def _hits(args: list[str]) -> tuple[list[dict[str, Any]], list[str]]:
     result = runner.invoke(cli.app, ["search", *args, "--json"])
     assert result.exit_code == 0, result.output
     payload = json.loads(result.stdout)

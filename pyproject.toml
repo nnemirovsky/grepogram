@@ -54,6 +54,7 @@ target-version = "py312"
 select = ["E", "F", "I", "UP", "B"]
 
 [tool.mypy]
+files = ["grepogram", "tests"]
 python_version = "3.12"
 strict = true
 

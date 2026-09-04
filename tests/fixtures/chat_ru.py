@@ -21,7 +21,7 @@ import sqlite3
 from dataclasses import dataclass
 
 from grepogram import db, index, units
-from grepogram.models import ChatRow, Config, MessageRow, Source, UnitsCfg
+from grepogram.models import ChatRow, Config, MediaKind, MessageRow, Source, UnitsCfg
 
 ARG_ID = -1001000000100
 GEO_ID = -1001000000200
@@ -173,7 +173,9 @@ def messages(chat_id: int | None = None) -> list[MessageRow]:
         if chat_id is not None and block_chat != chat_id:
             continue
         for msg_id, minute, sender, text, reply_to in entries:
-            media = "photo" if (block_chat, msg_id) in (MEDIA_ONLY, CAPTIONED) else None
+            media: MediaKind | None = (
+                "photo" if (block_chat, msg_id) in (MEDIA_ONLY, CAPTIONED) else None
+            )
             rows.append(
                 MessageRow(
                     chat_id=block_chat,

@@ -1,4 +1,5 @@
 import random
+from typing import Any
 
 import pytest
 
@@ -59,7 +60,7 @@ def test_render_line_strips_text_but_keeps_inner_newlines() -> None:
         ({"text": "caption", "media_kind": "photo"}, "caption"),
     ],
 )
-def test_render_line_placeholders(overrides: dict[str, object], expected: str) -> None:
+def test_render_line_placeholders(overrides: dict[str, Any], expected: str) -> None:
     line = units.render_line(_msg(1, **overrides))
     assert line == f"[2024-01-15 10:30] Alice: {expected}"
 

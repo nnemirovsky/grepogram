@@ -240,7 +240,7 @@ class DimensionlessModel(StubModel):
 class LegacyModel(StubModel):
     """A sentence-transformers release before ``get_embedding_dimension`` existed."""
 
-    get_embedding_dimension = None
+    get_embedding_dimension = None  # type: ignore[assignment]
 
 
 Install = Callable[..., None]

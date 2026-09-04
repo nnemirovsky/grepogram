@@ -2,6 +2,7 @@ import random
 import sqlite3
 from collections.abc import Iterable, Iterator, Sequence
 from pathlib import Path
+from typing import Any
 
 import pytest
 from telethon.tl import functions, types
@@ -93,7 +94,7 @@ def _shape_of(unit: UnitRow) -> Shape:
 def _shape(rows: Iterable[UnitRow]) -> list[Shape]:
     return sorted(
         (_shape_of(unit) for unit in rows),
-        key=lambda s: (str(s[0]), s[1] is not None, s[1] or 0, s[2]),  # type: ignore[operator]
+        key=lambda s: (str(s[0]), s[1] is not None, s[1] or 0, s[2]),
     )
 
 
@@ -407,9 +408,7 @@ def test_chunked_syncs_match_a_one_pass_rebuild(conn: sqlite3.Connection, chat: 
 # --- channels --------------------------------------------------------------------------------
 
 
-def _post(
-    msg_id: int, minutes: int = 0, text: str | None = None, **overrides: object
-) -> MessageRow:
+def _post(msg_id: int, minutes: int = 0, text: str | None = None, **overrides: Any) -> MessageRow:
     return _msg(
         msg_id,
         minutes,

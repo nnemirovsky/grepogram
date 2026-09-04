@@ -2,6 +2,7 @@ import logging
 import re
 import stat
 import sys
+from collections.abc import Iterator
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
@@ -20,7 +21,7 @@ def paths(tmp_home: Path) -> Paths:
 
 
 @pytest.fixture
-def clean_logging() -> None:
+def clean_logging() -> Iterator[None]:
     yield
     shutdown_logging()
 

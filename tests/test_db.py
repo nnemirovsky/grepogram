@@ -1,6 +1,7 @@
 import dataclasses
 import sqlite3
 import threading
+from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
@@ -15,7 +16,7 @@ INDEXES = {"messages_chat_date", "messages_reply", "units_chat_kind_range"}
 
 
 @pytest.fixture
-def conn() -> sqlite3.Connection:
+def conn() -> Iterator[sqlite3.Connection]:
     connection = db.connect(":memory:")
     db.migrate(connection)
     yield connection

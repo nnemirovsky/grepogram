@@ -2,6 +2,7 @@ import datetime as dt
 import stat
 from collections.abc import Iterator
 from pathlib import Path
+from typing import Any
 
 import pytest
 from telethon import errors
@@ -131,7 +132,7 @@ def test_ensure_session_mode_raises_session_missing(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize("error_cls", tg.AUTH_ERRORS, ids=lambda cls: cls.__name__)
-async def test_wrap_auth_errors_maps_dead_session_errors(error_cls: type[Exception]) -> None:
+async def test_wrap_auth_errors_maps_dead_session_errors(error_cls: type[Any]) -> None:
     client = FakeClient()
     with pytest.raises(tg.AuthRequired) as excinfo:
         async with tg.wrap_auth_errors(client):
@@ -337,7 +338,7 @@ def _client() -> FakeClient:
     )
 
 
-async def _collect(client: FakeClient, entity: object, **kwargs: object) -> list[int]:
+async def _collect(client: FakeClient, entity: object, **kwargs: Any) -> list[int]:
     return [m.id async for m in client.iter_messages(entity, **kwargs) if m is not None]
 
 
