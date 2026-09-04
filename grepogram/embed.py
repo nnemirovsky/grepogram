@@ -12,6 +12,8 @@ import is lazy and every failure to import or load — the ``dense`` extra not i
 network for the first download, a broken cache — becomes :class:`ModelUnavailable`, so callers
 degrade to lexical search with a warning instead of crashing; nothing in this module touches
 torch at import time, which is what keeps the MCP server and the CLI usable without the extra.
+The load itself goes through :func:`load_cached_first`, which keeps a cached model off the
+network entirely and downloads only when the cache has nothing — see its docstring for why.
 
 :class:`FakeEmbedder` is what ``GREPOGRAM_FAKE_MODELS=1`` selects for tests and CI: a hashed
 bag of stems with a tiny built-in Russian/English lexicon, so texts that share words (or a
@@ -23,7 +25,7 @@ import hashlib
 import logging
 import math
 import threading
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from typing import Any, Protocol, runtime_checkable
 
 from grepogram.models import Config
@@ -33,6 +35,8 @@ from grepogram.stem import stem_token, tokenize
 log = logging.getLogger(__name__)
 
 FAKE_MODELS_ENV = "GREPOGRAM_FAKE_MODELS"
+HF_OFFLINE_ENV = "HF_HUB_OFFLINE"
+NOT_CACHED_ERRORS = frozenset({"LocalEntryNotFoundError", "OfflineModeIsEnabled"})
 FAKE_NAME = "fake"
 FAKE_DIM = 256
 MAX_SEQ_LENGTH = 512
@@ -136,7 +140,12 @@ class BgeM3Embedder:
             ) from exc
         self.device = resolve_device(device)
         try:
-            model = SentenceTransformer(model_id, device=self.device)
+            model = load_cached_first(
+                lambda local: SentenceTransformer(
+                    model_id, device=self.device, local_files_only=local
+                ),
+                f"embedding model {model_id!r}",
+            )
             if self.device == "mps":
                 model.half()
         except Exception as exc:
@@ -201,6 +210,49 @@ def resolve_device(device: str) -> str:
         _cpu_warned = True
         log.warning("MPS is not available; models run on the CPU, which is much slower")
     return "cpu"
+
+
+def load_cached_first[T](load: Callable[[bool], T], what: str) -> T:
+    """``load(local_files_only)``, from the local cache first and from the hub only if it must.
+
+    sentence-transformers asks huggingface.co whether each file of the model is still current
+    even when the cache already holds every one of them, and that round trip is paid by every
+    process that loads a model — every ``search``, every ``sync``. It costs seconds on a good
+    connection and minutes where outbound connections are held open rather than refused (a
+    firewall prompt nobody answers, a captive portal). So the load runs with
+    ``local_files_only=True`` first, and only a failure that says the files are *not cached*
+    (:func:`not_cached`) is retried with the network — the first run and nothing else. That
+    retry is logged at INFO, so a first download reads as a download rather than a hang.
+
+    ``HF_HUB_OFFLINE`` set is the user saying no network at all: the first failure is then the
+    answer, and the caller turns it into :class:`ModelUnavailable` as before.
+    """
+    try:
+        return load(True)
+    except Exception as exc:
+        if env_flag(HF_OFFLINE_ENV) or not not_cached(exc):
+            raise
+    log.info("%s is not in the Hugging Face cache yet; downloading it", what)
+    return load(False)
+
+
+def not_cached(exc: BaseException) -> bool:
+    """Whether a ``local_files_only`` load failed only because the model is not in the cache.
+
+    huggingface_hub raises ``LocalEntryNotFoundError`` for that, but transformers re-raises it
+    as a plain ``OSError`` whose message talks about the connection, so what identifies the
+    cause is the chain of ``__cause__`` / ``__context__`` below it — walked defensively, since
+    a chain may loop. The match is on the class name because huggingface_hub belongs to the
+    ``dense`` extra alone, and this module imports nothing that the extra brings.
+    """
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if type(current).__name__ in NOT_CACHED_ERRORS:
+            return True
+        current = current.__cause__ or current.__context__
+    return False
 
 
 def normalize(vector: list[float]) -> list[float]:

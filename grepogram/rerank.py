@@ -6,10 +6,12 @@ match; the fused list is re-sorted by those scores. Everything downstream needs 
 the model, ``score(query, texts)``, and that is the whole protocol.
 
 :class:`BgeReranker` runs ``BAAI/bge-reranker-v2-m3`` through sentence-transformers'
-``CrossEncoder`` on the Mac GPU with the same device selection as the embedder. The import is
-lazy and every failure to import or load — the ``dense`` extra not installed, no network for
-the first download, a broken cache — becomes :class:`ModelUnavailable`, so callers skip the
-rerank step with a warning instead of crashing; nothing here touches torch at import time.
+``CrossEncoder`` on the Mac GPU with the same device selection as the embedder, and through the
+same :func:`~grepogram.embed.load_cached_first` that keeps a cached model off the network. The
+import is lazy and every failure to import or load — the ``dense`` extra not installed, no
+network for the first download, a broken cache — becomes :class:`ModelUnavailable`, so callers
+skip the rerank step with a warning instead of crashing; nothing here touches torch at import
+time.
 
 :class:`FakeReranker` is what ``GREPOGRAM_FAKE_MODELS=1`` selects for tests and CI: the share
 of the query's stems found in each text, through the same lexicon as :class:`FakeEmbedder`, so
@@ -26,6 +28,7 @@ from grepogram.embed import (
     FakeEmbedder,
     ModelUnavailable,
     fake_models_enabled,
+    load_cached_first,
     resolve_device,
 )
 from grepogram.models import Config
@@ -91,7 +94,15 @@ class BgeReranker:
             ) from exc
         self.device = resolve_device(device)
         try:
-            model = CrossEncoder(model_id, device=self.device, max_length=MAX_SEQ_LENGTH)
+            model = load_cached_first(
+                lambda local: CrossEncoder(
+                    model_id,
+                    device=self.device,
+                    max_length=MAX_SEQ_LENGTH,
+                    local_files_only=local,
+                ),
+                f"reranker model {model_id!r}",
+            )
             if self.device == "mps":
                 model.half()
         except Exception as exc:

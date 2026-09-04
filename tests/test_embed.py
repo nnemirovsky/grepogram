@@ -21,6 +21,7 @@ from grepogram.embed import (
     fake_models_enabled,
     load_embedder,
     normalize,
+    not_cached,
     resolve_device,
 )
 from grepogram.models import Config, ModelsCfg
@@ -233,6 +234,30 @@ class OfflineModel(StubModel):
         raise OSError("offline: cannot reach huggingface.co")
 
 
+class LocalEntryNotFoundError(FileNotFoundError):
+    """huggingface_hub's "not in the cache" error under its own name, which is all
+    :func:`not_cached` matches on — the real one belongs to the ``dense`` extra."""
+
+
+class UncachedModel(StubModel):
+    """A model the cache does not hold: the ``local_files_only`` load fails the way
+    transformers reports it (a plain ``OSError`` about the connection, over huggingface_hub's
+    ``LocalEntryNotFoundError``) and the download that follows succeeds. ``attempts`` records
+    the ``local_files_only`` of every construction, failed ones included."""
+
+    attempts: list[bool] = []
+
+    def __init__(self, model_id: str, device: str | None = None, **kwargs: Any) -> None:
+        local = bool(kwargs.get("local_files_only"))
+        UncachedModel.attempts.append(local)
+        if local:
+            try:
+                raise LocalEntryNotFoundError("cannot find the requested files in the disk cache")
+            except LocalEntryNotFoundError as exc:
+                raise OSError("We couldn't connect to 'https://huggingface.co'") from exc
+        super().__init__(model_id, device, **kwargs)
+
+
 class DimensionlessModel(StubModel):
     dim = None
 
@@ -266,7 +291,10 @@ def stubs(monkeypatch: pytest.MonkeyPatch) -> Install:
         monkeypatch.setitem(sys.modules, "sentence_transformers", None if model is None else st_mod)
         monkeypatch.setattr(embed, "_cpu_warned", False)
         monkeypatch.delenv("GREPOGRAM_FAKE_MODELS", raising=False)
+        # CI runs the whole suite with HF_HUB_OFFLINE=1; these tests decide it themselves
+        monkeypatch.delenv(embed.HF_OFFLINE_ENV, raising=False)
         StubModel.instances.clear()
+        UncachedModel.attempts.clear()
 
     return install
 
@@ -388,6 +416,94 @@ def test_bge_without_a_dimension_is_unavailable(stubs: Install) -> None:
     stubs(model=DimensionlessModel)
     with pytest.raises(ModelUnavailable, match="dimension"):
         BgeM3Embedder("BAAI/bge-m3")
+
+
+# --- loading from the cache ------------------------------------------------------------------
+
+
+def test_bge_asks_for_the_cached_files_only(
+    stubs: Install, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A cached model is loaded with ``local_files_only``, so nothing asks huggingface.co
+    whether files already on disk are current — the round trip every search used to pay."""
+    stubs()
+    with caplog.at_level(logging.INFO, logger="grepogram.embed"):
+        assert BgeM3Embedder("BAAI/bge-m3", "cpu").dim == 4
+    (model,) = StubModel.instances
+    assert model.kwargs == {"local_files_only": True}
+    assert UncachedModel.attempts == []
+    assert [r for r in caplog.records if "downloading" in r.getMessage()] == []
+
+
+def test_bge_downloads_once_when_the_cache_holds_nothing(
+    stubs: Install, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The first run: the local-only load says the files are not cached, and exactly one retry
+    with the network follows, logged at INFO so the wait reads as a download."""
+    stubs(model=UncachedModel)
+    with caplog.at_level(logging.INFO, logger="grepogram.embed"):
+        assert BgeM3Embedder("BAAI/bge-m3", "cpu").dim == 4
+    assert UncachedModel.attempts == [True, False]
+    (model,) = StubModel.instances
+    assert model.kwargs == {"local_files_only": False}
+    downloads = [r for r in caplog.records if "downloading" in r.getMessage()]
+    assert len(downloads) == 1
+    assert "embedding model 'BAAI/bge-m3'" in downloads[0].getMessage()
+
+
+def test_bge_never_retries_with_the_network_under_hf_hub_offline(
+    stubs: Install, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``HF_HUB_OFFLINE`` is the user saying no network at all: the first failure is the answer,
+    and it still reaches the caller as :class:`ModelUnavailable`."""
+    stubs(model=UncachedModel)
+    monkeypatch.setenv(embed.HF_OFFLINE_ENV, "1")
+    with pytest.raises(ModelUnavailable, match="cannot load embedding model 'BAAI/bge-m3'"):
+        BgeM3Embedder("BAAI/bge-m3", "cpu")
+    assert UncachedModel.attempts == [True]
+    assert StubModel.instances == []
+
+
+def test_bge_keeps_reporting_a_load_failure_that_is_not_a_cache_miss(stubs: Install) -> None:
+    stubs(model=OfflineModel)
+    with pytest.raises(ModelUnavailable, match="cannot load embedding model"):
+        BgeM3Embedder("BAAI/bge-m3", "cpu")
+
+
+def test_not_cached_reads_the_chain_transformers_wraps() -> None:
+    """transformers re-raises the cache miss as an ``OSError`` about the connection, so the
+    cause below it is what identifies one."""
+    try:
+        try:
+            raise LocalEntryNotFoundError("not in the disk cache")
+        except LocalEntryNotFoundError as exc:
+            raise OSError("We couldn't connect to 'https://huggingface.co'") from exc
+    except OSError as exc:
+        assert not_cached(exc) is True
+
+
+def test_not_cached_accepts_the_offline_flag_error_by_name() -> None:
+    offline = type("OfflineModeIsEnabled", (RuntimeError,), {})
+    assert not_cached(offline("offline mode is enabled")) is True
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [
+        pytest.param(OSError("offline: cannot reach huggingface.co"), id="plain-oserror"),
+        pytest.param(ValueError("no such revision"), id="value-error"),
+        pytest.param(ImportError("torch"), id="import-error"),
+    ],
+)
+def test_not_cached_says_no_to_everything_else(exc: BaseException) -> None:
+    assert not_cached(exc) is False
+
+
+def test_not_cached_walks_a_cycle_of_causes_once() -> None:
+    first, second = RuntimeError("first"), RuntimeError("second")
+    first.__cause__ = second
+    second.__cause__ = first
+    assert not_cached(first) is False
 
 
 # --- load_embedder ---------------------------------------------------------------------------

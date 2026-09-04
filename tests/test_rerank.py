@@ -153,6 +153,29 @@ class OfflineCrossEncoder(StubCrossEncoder):
         raise OSError("offline: cannot reach huggingface.co")
 
 
+class LocalEntryNotFoundError(FileNotFoundError):
+    """huggingface_hub's "not in the cache" error under its own name — see the twin in
+    ``tests/test_embed.py``; the name is all :func:`grepogram.embed.not_cached` matches on."""
+
+
+class UncachedCrossEncoder(StubCrossEncoder):
+    """A cross-encoder the cache does not hold: the ``local_files_only`` load fails the way
+    transformers reports it and the download that follows succeeds. ``attempts`` records the
+    ``local_files_only`` of every construction, failed ones included."""
+
+    attempts: list[bool] = []
+
+    def __init__(self, model_name_or_path: str, device: str | None = None, **kwargs: Any) -> None:
+        local = bool(kwargs.get("local_files_only"))
+        UncachedCrossEncoder.attempts.append(local)
+        if local:
+            try:
+                raise LocalEntryNotFoundError("cannot find the requested files in the disk cache")
+            except LocalEntryNotFoundError as exc:
+                raise OSError("We couldn't connect to 'https://huggingface.co'") from exc
+        super().__init__(model_name_or_path, device, **kwargs)
+
+
 class ShortCrossEncoder(StubCrossEncoder):
     def predict(self, pairs: list[tuple[str, str]], **kwargs: Any) -> _ArrayLike:
         return _ArrayLike([1.0])
@@ -181,7 +204,10 @@ def stubs(monkeypatch: pytest.MonkeyPatch) -> Install:
         monkeypatch.setitem(sys.modules, "sentence_transformers", None if model is None else st_mod)
         monkeypatch.setattr(embed, "_cpu_warned", False)
         monkeypatch.delenv("GREPOGRAM_FAKE_MODELS", raising=False)
+        # CI runs the whole suite with HF_HUB_OFFLINE=1; these tests decide it themselves
+        monkeypatch.delenv(embed.HF_OFFLINE_ENV, raising=False)
         StubCrossEncoder.instances.clear()
+        UncachedCrossEncoder.attempts.clear()
 
     return install
 
@@ -195,7 +221,7 @@ def test_bge_loads_on_mps_in_fp16_with_max_length(stubs: Install) -> None:
     assert reranker.device == "mps"
     assert model.model_id == "BAAI/bge-reranker-v2-m3"
     assert model.device == "mps"
-    assert model.kwargs == {"max_length": MAX_SEQ_LENGTH}
+    assert model.kwargs == {"max_length": MAX_SEQ_LENGTH, "local_files_only": True}
     assert MAX_SEQ_LENGTH == 512
     assert model.halved is True
 
@@ -289,6 +315,48 @@ def test_bge_rejects_a_short_answer(stubs: Install) -> None:
     reranker = BgeReranker("BAAI/bge-reranker-v2-m3")
     with pytest.raises(RuntimeError, match="1 scores for 2 texts"):
         reranker.score("q", ["a", "b"])
+
+
+# --- loading from the cache ------------------------------------------------------------------
+
+
+def test_bge_asks_for_the_cached_files_only(
+    stubs: Install, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The cross-encoder is loaded from the cache without a hub round trip, like the embedder;
+    a search that reranks would otherwise pay it twice."""
+    stubs()
+    with caplog.at_level(logging.INFO, logger="grepogram.embed"):
+        BgeReranker("BAAI/bge-reranker-v2-m3", "cpu")
+    (model,) = StubCrossEncoder.instances
+    assert model.kwargs["local_files_only"] is True
+    assert UncachedCrossEncoder.attempts == []
+    assert [r for r in caplog.records if "downloading" in r.getMessage()] == []
+
+
+def test_bge_downloads_once_when_the_cache_holds_nothing(
+    stubs: Install, caplog: pytest.LogCaptureFixture
+) -> None:
+    stubs(model=UncachedCrossEncoder)
+    with caplog.at_level(logging.INFO, logger="grepogram.embed"):
+        BgeReranker("BAAI/bge-reranker-v2-m3", "cpu")
+    assert UncachedCrossEncoder.attempts == [True, False]
+    (model,) = StubCrossEncoder.instances
+    assert model.kwargs["local_files_only"] is False
+    downloads = [r for r in caplog.records if "downloading" in r.getMessage()]
+    assert len(downloads) == 1
+    assert "reranker model 'BAAI/bge-reranker-v2-m3'" in downloads[0].getMessage()
+
+
+def test_bge_never_retries_with_the_network_under_hf_hub_offline(
+    stubs: Install, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    stubs(model=UncachedCrossEncoder)
+    monkeypatch.setenv(embed.HF_OFFLINE_ENV, "1")
+    with pytest.raises(ModelUnavailable, match="cannot load reranker model"):
+        BgeReranker("BAAI/bge-reranker-v2-m3", "cpu")
+    assert UncachedCrossEncoder.attempts == [True]
+    assert StubCrossEncoder.instances == []
 
 
 # --- load_reranker ---------------------------------------------------------------------------
