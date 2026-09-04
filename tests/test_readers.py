@@ -1,7 +1,6 @@
 import dataclasses
 import json
 import sqlite3
-from collections.abc import Iterator
 
 import pytest
 
@@ -17,14 +16,6 @@ DISC = -1001000000400
 FORUM = -1001000000500
 PLAIN = -1001000000600
 BASE = 1_705_314_600  # 2024-01-15 10:30:00 UTC
-
-
-@pytest.fixture
-def conn() -> Iterator[sqlite3.Connection]:
-    connection = db.connect(":memory:")
-    db.migrate(connection)
-    yield connection
-    connection.close()
 
 
 @pytest.fixture

@@ -1,5 +1,5 @@
 import sqlite3
-from collections.abc import Iterable, Iterator
+from collections.abc import Iterable
 from pathlib import Path
 
 import pytest
@@ -66,14 +66,6 @@ def _unit(msg_ids: list[int], text: str, chat_id: int = CHAT, date_start: int = 
         date_end=date_start + 60,
         text=text,
     )
-
-
-@pytest.fixture
-def conn() -> Iterator[sqlite3.Connection]:
-    connection = db.connect(":memory:")
-    db.migrate(connection)
-    yield connection
-    connection.close()
 
 
 @pytest.fixture

@@ -4,7 +4,6 @@ import logging
 import os
 import sqlite3
 import stat
-from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
@@ -14,7 +13,6 @@ from typer.testing import CliRunner
 
 from grepogram import cli, config, db, sources, sync, tg
 from grepogram.dialogs import DialogCatalog, DialogInfo
-from grepogram.log import shutdown_logging
 from grepogram.models import ChatRow, Config, MessageRow, Source
 from grepogram.paths import Paths
 from grepogram.sources import (
@@ -53,20 +51,6 @@ GEORGIA_ID = -1000000000101
 NEWS_ID = -1000000000200
 OUTSIDE_ID = -1000000000300
 GHOST_ID = -1000000000999
-
-
-@pytest.fixture(autouse=True)
-def clean_logging() -> Iterator[None]:
-    yield
-    shutdown_logging()
-
-
-@pytest.fixture
-def conn() -> Iterator[sqlite3.Connection]:
-    connection = db.connect(":memory:")
-    db.migrate(connection)
-    yield connection
-    connection.close()
 
 
 def _client(**kwargs: object) -> FakeClient:

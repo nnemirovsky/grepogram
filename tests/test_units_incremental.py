@@ -1,6 +1,6 @@
 import random
 import sqlite3
-from collections.abc import Iterable, Iterator, Sequence
+from collections.abc import Iterable, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -58,14 +58,6 @@ def _chat(chat_id: int = CHAT, **overrides: object) -> ChatRow:
     }
     fields.update(overrides)
     return ChatRow(**fields)  # type: ignore[arg-type]
-
-
-@pytest.fixture
-def conn() -> Iterator[sqlite3.Connection]:
-    connection = db.connect(":memory:")
-    db.migrate(connection)
-    yield connection
-    connection.close()
 
 
 @pytest.fixture

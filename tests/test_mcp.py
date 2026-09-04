@@ -30,7 +30,6 @@ from grepogram import sync as syncing
 from grepogram.embed import FakeEmbedder, ModelUnavailable
 from grepogram.filters import InvalidDate, UnknownChat
 from grepogram.links import OpenFailed
-from grepogram.log import shutdown_logging
 from grepogram.models import (
     ChatRow,
     Config,
@@ -67,26 +66,12 @@ NEW_TEXT = "Brubank теперь открывает счёт без DNI за ч�
 NO_VECTORS = f"dense search unavailable: {retrieval.NO_VECTORS}"
 
 
-@pytest.fixture(autouse=True)
-def clean_logging() -> Iterator[None]:
-    yield
-    shutdown_logging()
-
-
 @pytest.fixture
 def paths(tmp_path: Path) -> Paths:
     home = Paths.under(tmp_path / "home")
     home.ensure_dirs()
     home.session_file.touch()
     return home
-
-
-@pytest.fixture
-def conn() -> Iterator[sqlite3.Connection]:
-    connection = db.connect(":memory:")
-    db.migrate(connection)
-    yield connection
-    connection.close()
 
 
 def _client(**kwargs: object) -> FakeClient:

@@ -9,7 +9,6 @@ from typer.testing import CliRunner
 from grepogram import cli, db, embed, filters, index, sync, tg, units
 from grepogram.embed import FAKE_DIM, FakeEmbedder, ModelUnavailable
 from grepogram.index import EmbeddingSpaceMismatch
-from grepogram.log import shutdown_logging
 from grepogram.models import (
     ChatRow,
     Config,
@@ -78,20 +77,6 @@ class Clock:
 
     def __call__(self) -> float:
         return self.now
-
-
-@pytest.fixture(autouse=True)
-def clean_logging() -> Iterator[None]:
-    yield
-    shutdown_logging()
-
-
-@pytest.fixture
-def conn() -> Iterator[sqlite3.Connection]:
-    connection = db.connect(":memory:")
-    db.migrate(connection)
-    yield connection
-    connection.close()
 
 
 @pytest.fixture

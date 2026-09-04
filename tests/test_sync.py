@@ -3,7 +3,7 @@ import datetime as dt
 import sqlite3
 import stat
 import time
-from collections.abc import AsyncIterator, Callable, Iterator
+from collections.abc import AsyncIterator, Callable
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -16,7 +16,6 @@ from typer.testing import CliRunner
 
 from grepogram import cli, db, search, sources, sync, tg
 from grepogram.config import ConfigError
-from grepogram.log import shutdown_logging
 from grepogram.models import (
     ChatRow,
     Config,
@@ -54,20 +53,6 @@ TELEGRAM = TelegramCfg(api_id=12345, api_hash="fakehash")
 ARG_SOURCE = Source(folder="Argentina")
 NEWS_SOURCE = Source(chat="@news", comments=True)
 ALICE_SOURCE = Source(chat="@alice")
-
-
-@pytest.fixture(autouse=True)
-def clean_logging() -> Iterator[None]:
-    yield
-    shutdown_logging()
-
-
-@pytest.fixture
-def conn() -> Iterator[sqlite3.Connection]:
-    connection = db.connect(":memory:")
-    db.migrate(connection)
-    yield connection
-    connection.close()
 
 
 @pytest.fixture

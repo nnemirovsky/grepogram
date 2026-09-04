@@ -85,17 +85,16 @@ def non_utc_local_timezone() -> Iterator[None]:
 
 
 @pytest.fixture
-def conn() -> Iterator[sqlite3.Connection]:
-    connection = db.connect(":memory:")
-    db.migrate(connection)
+def conn(conn: sqlite3.Connection) -> sqlite3.Connection:
+    """The shared index of ``conftest``, with the fixture chats stored (a pytest override)."""
     for chat in CHATS:
-        db.upsert_chat(connection, chat)
-    yield connection
-    connection.close()
+        db.upsert_chat(conn, chat)
+    return conn
 
 
 @pytest.fixture
 def empty_conn() -> Iterator[sqlite3.Connection]:
+    """A second index with no chats, for the resolver's "nothing indexed" answers."""
     connection = db.connect(":memory:")
     db.migrate(connection)
     yield connection

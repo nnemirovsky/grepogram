@@ -1,13 +1,11 @@
 import json
 import sqlite3
-from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
 from typer.testing import CliRunner
 
 from grepogram import cli, config, db, filters, search, sync
-from grepogram.log import shutdown_logging
 from grepogram.models import ChatRow, Config, Filters, MessageRow, SearchCfg, Source, UnitRow
 from grepogram.paths import Paths
 from grepogram.search import Match
@@ -24,14 +22,6 @@ ALL = Filters()
 JUNE = filters.parse_when("2024-06")
 
 runner = CliRunner()
-
-
-@pytest.fixture
-def conn() -> Iterator[sqlite3.Connection]:
-    connection = db.connect(":memory:")
-    db.migrate(connection)
-    yield connection
-    connection.close()
 
 
 @pytest.fixture
@@ -503,12 +493,6 @@ def test_best_line_picks_the_line_sharing_the_most_stems_with_the_query() -> Non
 
 
 # --- CLI -------------------------------------------------------------------------------------
-
-
-@pytest.fixture(autouse=True)
-def clean_logging() -> Iterator[None]:
-    yield
-    shutdown_logging()
 
 
 @pytest.fixture

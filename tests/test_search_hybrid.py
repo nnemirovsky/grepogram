@@ -1,6 +1,5 @@
 import json
 import sqlite3
-from collections.abc import Iterator
 from pathlib import Path
 from typing import Any, NoReturn
 
@@ -11,7 +10,6 @@ from grepogram import cli, db, embed, filters, index, search
 from grepogram import rerank as reranking
 from grepogram.embed import FAKE_DIM, FakeEmbedder, ModelUnavailable
 from grepogram.index import EmbeddingSpaceMismatch
-from grepogram.log import shutdown_logging
 from grepogram.models import ChatRow, Config, Filters, Hit, SearchCfg, UnitRow
 from grepogram.paths import Paths
 from grepogram.rerank import FakeReranker
@@ -74,20 +72,6 @@ class ShortReranker(FakeReranker):
 
     def score(self, query: str, texts: list[str]) -> list[float]:
         return super().score(query, texts)[:-1]
-
-
-@pytest.fixture(autouse=True)
-def clean_logging() -> Iterator[None]:
-    yield
-    shutdown_logging()
-
-
-@pytest.fixture
-def conn() -> Iterator[sqlite3.Connection]:
-    connection = db.connect(":memory:")
-    db.migrate(connection)
-    yield connection
-    connection.close()
 
 
 @pytest.fixture

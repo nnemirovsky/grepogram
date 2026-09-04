@@ -3,7 +3,6 @@ import sqlite3
 import stat
 import threading
 import time
-from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
@@ -15,14 +14,6 @@ from grepogram.paths import Paths
 
 TABLES = {"meta", "chats", "users", "messages", "units", "msg_fts", "unit_fts"}
 INDEXES = {"messages_chat_date", "messages_reply", "units_chat_kind_range", "messages_unindexed"}
-
-
-@pytest.fixture
-def conn() -> Iterator[sqlite3.Connection]:
-    connection = db.connect(":memory:")
-    db.migrate(connection)
-    yield connection
-    connection.close()
 
 
 def _names(conn: sqlite3.Connection, kind: str) -> set[str]:

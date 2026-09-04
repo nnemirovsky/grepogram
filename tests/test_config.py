@@ -6,7 +6,6 @@ import re
 import stat
 import sys
 import threading
-from collections.abc import Iterator
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
@@ -17,21 +16,12 @@ from grepogram.config import TEMPLATE, ConfigError
 from grepogram.log import redact, setup_logging, shutdown_logging
 from grepogram.models import Config, SearchCfg, Source, TelegramCfg
 from grepogram.paths import Paths, env_flag
+from tests.conftest import file_mode
 
 
 @pytest.fixture
 def paths(tmp_home: Path) -> Paths:
     return Paths.from_env()
-
-
-@pytest.fixture
-def clean_logging() -> Iterator[None]:
-    yield
-    shutdown_logging()
-
-
-def _mode(path: Path) -> int:
-    return stat.S_IMODE(path.stat().st_mode)
 
 
 # --- paths -----------------------------------------------------------------------------------
@@ -97,7 +87,7 @@ def test_ensure_dirs_creates_private_directories(tmp_path: Path) -> None:
     paths.ensure_dirs()
     for directory in paths.directories:
         assert directory.is_dir()
-        assert _mode(directory) == 0o700
+        assert file_mode(directory) == 0o700
     assert len(paths.directories) == 3
 
 
@@ -135,7 +125,7 @@ def test_save_writes_mode_0600_even_over_a_permissive_file(paths: Paths) -> None
     paths.config_file.write_text("")
     paths.config_file.chmod(0o644)
     config.save(Config(), paths)
-    assert _mode(paths.config_file) == 0o600
+    assert file_mode(paths.config_file) == 0o600
     assert not paths.config_file.with_name(".config.toml.tmp").exists()
 
 
@@ -368,17 +358,17 @@ def test_ensure_dirs_leaves_an_existing_directory_alone(tmp_path: Path) -> None:
     paths.log_dir.mkdir(parents=True)
     paths.log_dir.chmod(0o755)
     paths.ensure_dirs()
-    assert _mode(paths.log_dir) == 0o755
-    assert _mode(paths.config_file.parent) == 0o700
-    assert _mode(paths.db_file.parent) == 0o700
+    assert file_mode(paths.log_dir) == 0o755
+    assert file_mode(paths.config_file.parent) == 0o700
+    assert file_mode(paths.db_file.parent) == 0o700
 
 
 def test_save_creates_the_directories_on_a_fresh_machine(tmp_path: Path) -> None:
     paths = Paths.under(tmp_path / "new" / "home")
     config.save(Config(telegram=TelegramCfg(api_id=1, api_hash="h")), paths)
     assert config.load(paths).telegram.api_id == 1
-    assert _mode(paths.config_file) == 0o600
-    assert _mode(paths.config_file.parent) == 0o700
+    assert file_mode(paths.config_file) == 0o600
+    assert file_mode(paths.config_file.parent) == 0o700
 
 
 def test_write_private_cleans_up_when_writing_fails(

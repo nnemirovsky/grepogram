@@ -1,6 +1,5 @@
 import datetime as dt
 import difflib
-from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
@@ -9,7 +8,6 @@ from typer.testing import CliRunner
 
 from grepogram import cli, dialogs, tg
 from grepogram.dialogs import DialogCatalog, DialogInfo, FolderInfo
-from grepogram.log import shutdown_logging
 from grepogram.paths import Paths
 from tests.fakes import (
     FAR_FUTURE,
@@ -34,12 +32,6 @@ OLD_GROUP = make_group(10, "Old group")
 ARG = make_channel(100, "Argentina chat", username="arg_chat", megagroup=True, forum=True)
 GEORGIA = make_channel(101, "Грузия | Georgia chat", megagroup=True)
 NEWS = make_channel(200, "News", username="news")
-
-
-@pytest.fixture(autouse=True)
-def clean_logging() -> Iterator[None]:
-    yield
-    shutdown_logging()
 
 
 def _dialogs() -> list:  # type: ignore[type-arg]

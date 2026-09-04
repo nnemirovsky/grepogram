@@ -1,8 +1,6 @@
 import datetime as dt
 import sqlite3
-import stat
 import time
-from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
@@ -14,9 +12,9 @@ from telethon.tl import functions, types
 from typer.testing import CliRunner
 
 from grepogram import cli, tg
-from grepogram.log import shutdown_logging
 from grepogram.models import Config, SyncCfg, TelegramCfg
 from grepogram.paths import Paths
+from tests.conftest import file_mode
 from tests.fakes import (
     FakeClient,
     make_channel,
@@ -29,16 +27,6 @@ from tests.fakes import (
 runner = CliRunner()
 
 CONFIG_WITH_KEYS = '[telegram]\napi_id = 12345\napi_hash = "fakehash"\n'
-
-
-@pytest.fixture(autouse=True)
-def clean_logging() -> Iterator[None]:
-    yield
-    shutdown_logging()
-
-
-def _mode(path: Path) -> int:
-    return stat.S_IMODE(path.stat().st_mode)
 
 
 def _paths(tmp_path: Path) -> Paths:
@@ -171,11 +159,11 @@ def test_make_login_client_on_a_damaged_session_file_is_a_session_error(tmp_path
 def test_prepare_session_keeps_the_file_private_when_telethon_opens_it(tmp_path: Path) -> None:
     paths = _paths(tmp_path)
     assert tg.prepare_session(paths) == paths.session_file
-    assert _mode(paths.session_file) == 0o600
+    assert file_mode(paths.session_file) == 0o600
     client = tg.make_login_client(Config(telegram=TelegramCfg(api_id=1, api_hash="h")), paths)
     try:
         assert paths.session_file.stat().st_size > 0
-        assert _mode(paths.session_file) == 0o600
+        assert file_mode(paths.session_file) == 0o600
     finally:
         client.session.close()
 
@@ -187,7 +175,7 @@ def test_prepare_session_fixes_the_mode_of_an_existing_file(tmp_path: Path) -> N
     paths.session_file.chmod(0o644)
     tg.prepare_session(paths)
     assert paths.session_file.read_bytes() == b"keep me"
-    assert _mode(paths.session_file) == 0o600
+    assert file_mode(paths.session_file) == 0o600
 
 
 # --- ensure_session_mode ---------------------------------------------------------------------
@@ -199,9 +187,9 @@ def test_ensure_session_mode_sets_0600_on_an_existing_file(tmp_path: Path) -> No
     paths.session_file.write_bytes(b"")
     paths.session_file.chmod(0o644)
     assert tg.ensure_session_mode(paths) == paths.session_file
-    assert _mode(paths.session_file) == 0o600
+    assert file_mode(paths.session_file) == 0o600
     tg.ensure_session_mode(paths)
-    assert _mode(paths.session_file) == 0o600
+    assert file_mode(paths.session_file) == 0o600
 
 
 def test_ensure_session_mode_raises_session_missing(tmp_path: Path) -> None:
@@ -405,7 +393,7 @@ def test_auth_signs_in_with_prompts_and_stores_a_private_session(
     assert fake.start_inputs == {"phone": "+15551234567", "code": "12345", "password": "hunter2"}
     assert seen["cfg"].telegram == TelegramCfg(api_id=12345, api_hash="fakehash")  # type: ignore[attr-defined]
     assert seen["paths"] == Paths.from_env()
-    assert _mode(tmp_home / "session.session") == 0o600
+    assert file_mode(tmp_home / "session.session") == 0o600
     assert not fake.is_connected()
 
 

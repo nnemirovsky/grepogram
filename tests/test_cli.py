@@ -1,7 +1,5 @@
 import logging
-import stat
 import sys
-from collections.abc import Iterator
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
@@ -11,21 +9,11 @@ from typer.testing import CliRunner
 
 from grepogram import __version__, cli, config, db, index, units
 from grepogram.config import TEMPLATE
-from grepogram.log import shutdown_logging
 from grepogram.models import ChatRow, Config, MessageRow
 from grepogram.paths import Paths
+from tests.conftest import file_mode
 
 runner = CliRunner()
-
-
-@pytest.fixture(autouse=True)
-def clean_logging() -> Iterator[None]:
-    yield
-    shutdown_logging()
-
-
-def _mode(path: Path) -> int:
-    return stat.S_IMODE(path.stat().st_mode)
 
 
 # --- app -------------------------------------------------------------------------------------
@@ -122,7 +110,7 @@ def test_config_init_writes_template_with_mode_0600(tmp_home: Path) -> None:
     assert result.exit_code == 0, result.output
     target = tmp_home / "config.toml"
     assert target.read_text(encoding="utf-8") == TEMPLATE
-    assert _mode(target) == 0o600
+    assert file_mode(target) == 0o600
     assert str(target) in result.output
     assert "my.telegram.org" in result.output
     assert config.load(Paths.from_env()) == Config()
@@ -136,7 +124,7 @@ def test_config_init_creates_missing_directories(
     result = runner.invoke(cli.app, ["config", "init"])
     assert result.exit_code == 0, result.output
     assert (home / "config.toml").read_text(encoding="utf-8") == TEMPLATE
-    assert _mode(home) == 0o700
+    assert file_mode(home) == 0o700
 
 
 def test_config_init_refuses_to_overwrite(tmp_home: Path) -> None:
@@ -223,7 +211,7 @@ def test_load_creates_the_home_on_a_fresh_machine(
     paths, cfg, conn = cli._load()
     try:
         assert paths.db_file.is_file() and cfg == Config()
-        assert _mode(home) == 0o700
+        assert file_mode(home) == 0o700
     finally:
         conn.close()
     result = runner.invoke(cli.app, ["sources", "ls"])

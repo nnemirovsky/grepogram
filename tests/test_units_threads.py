@@ -1,6 +1,5 @@
 import random
 import sqlite3
-from collections.abc import Iterator
 
 import pytest
 
@@ -59,14 +58,6 @@ def _ids(rows: list[UnitRow]) -> list[list[int]]:
 
 def _lines(messages: list[MessageRow]) -> str:
     return "\n".join(units.render_line(msg) for msg in messages)
-
-
-@pytest.fixture
-def conn() -> Iterator[sqlite3.Connection]:
-    connection = db.connect(":memory:")
-    db.migrate(connection)
-    yield connection
-    connection.close()
 
 
 # --- build_threads ---------------------------------------------------------------------------
