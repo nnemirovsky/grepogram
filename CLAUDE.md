@@ -101,8 +101,10 @@ never change the git identity.
   under a re-entrant lock and `transaction()` holds it from `BEGIN` to `COMMIT`; the connection is
   in autocommit mode, so a bare statement never leaves an implicit transaction open.
 - `config.toml`, the session file and the lock files (`sync.lock`, `config.lock`) are written
-  with mode 0600 (`config.write_private`, `tg.prepare_session`); the directories grepogram
-  creates get 0700 and an existing one (a user's own `GREPOGRAM_HOME`) is left as it is.
+  with `paths.PRIVATE_FILE_MODE` (0600) — `config.write_private`, `tg.prepare_session`,
+  `paths.FileLock`; the directories grepogram creates get `paths.DIR_MODE` (0700) and an existing
+  one (a user's own `GREPOGRAM_HOME`) is left as it is. Both cross-process locks derive from
+  `paths.FileLock`: `SyncLock` sets `blocking = False` and its own `busy()`, `ConfigLock` blocks.
 - Files end with a single newline; no trailing blank lines.
 
 ## Environment variables
@@ -121,6 +123,9 @@ never change the git identity.
 
 ## Tests
 
+- `tests/conftest.py` — the fixtures every module shares: `fake_models` and `clean_logging`
+  (both autouse), `tmp_home`, `conn` (an in-memory index, migrated) and the `file_mode` helper.
+  A module that needs more overrides `conn` by requesting it (`tests/test_filters.py`).
 - `tests/fakes.py` — `FakeClient` (async `get_dialogs`, `iter_messages` with Telethon's offset
   semantics, `get_entity`, raw requests such as `GetDialogFiltersRequest`) driven by in-memory
   fixtures, plus `make_*` builders for TL entities and dialogs.
@@ -142,7 +147,8 @@ never change the git identity.
 
 ## Layout
 
-`grepogram/`: `paths` (file locations), `config` (TOML and `TEMPLATE`), `models` (dataclasses),
+`grepogram/`: `paths` (file locations, `FileLock`), `config` (TOML and `TEMPLATE`), `models`
+(dataclasses and the shared `Literal`s: `ChatType`, `UnitKind`, `MediaKind`, `SearchMode`),
 `db` (schema, migrations, accessors), `tg` (client, session, auth errors), `dialogs` (folders,
 fuzzy matching), `sources` (targets, resolution, status), `sync` (fetch, mapping, lock, budget),
 `units` (windows, threads, posts, incremental rebuild), `stem` (tokenizer, Snowball, FTS query),
