@@ -364,7 +364,10 @@ the post is among the newest. A budget stops the run cleanly between batches and
 lists `chats_remaining`. Every stored message stays flagged until its units and its row in the
 message index exist: a run indexes what it committed even when a flood wait, an error or a
 cancelled tool call stops the fetch, and the next run picks up whatever a crash left behind, for
-the chats it reaches and for the ones it does not. A non-blocking file lock keeps two syncs off
+the chats it reaches and for the ones it does not. The rebuild, the index rows and the flag are
+one transaction, and each run checks the units of the chats it indexes against the unit index, so
+a run interrupted by an older version — or by a killed process — is repaired rather than marked
+done, and no re-download is ever needed. A non-blocking file lock keeps two syncs off
 the same index:
 a CLI `sync`, `embed`, `sources rm` or MCP `sync` / `sources_remove` started while another sync
 runs fails at once with `SyncInProgress`, and the MCP `search` auto-sync turns that into a
@@ -464,9 +467,11 @@ four minutes.
 - `sources add` / `rm` and the MCP tools rewrite `config.toml` without its comments.
 - An index built with a development version before 2026-09-04 may hold messages no unit or
   message-index row covers (discussion-group history stored after the channel's comments, batches
-  committed before a flood wait). The schema upgrade to v2 flags every stored message, so the
-  first `grepogram sync` after upgrading rebuilds all units and index rows once — units whose
-  content is unchanged keep their embeddings — and repairs such an index without a re-download.
+  committed before a flood wait), and units the unit index is missing or holds stale rows for (a
+  run killed between the unit rebuild and the indexing). The schema upgrade to v2 flags every
+  stored message, so the first `grepogram sync` after upgrading rebuilds all units and index rows
+  once — units whose content is unchanged keep their embeddings — and the consistency check every
+  sync runs closes the unit-index gaps, both without a re-download.
 - The MCP contract targets the `mcp` 1.x SDK (`FastMCP`); 2.x renamed the API and is excluded by
   the dependency pin.
 

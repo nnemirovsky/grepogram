@@ -63,6 +63,20 @@ never change the git identity.
   a chat after its fetch whether it returned or raised, and for the chats the run never reached,
   so a batch committed before a flood wait or a crash is never left without units. Never make
   `on_chat_synced` depend on what a run remembers in memory; the flag is the source of truth.
+  The rebuild, the indexing and `mark_indexed` are one transaction, so the flag is a two-phase
+  marker rather than three commits with gaps in between; keep it that way. A rerun over the same
+  rows only repairs because `index.index_chat` ends with `index.repair_unit_index`, which compares
+  `units` with `unit_fts` in both directions — a rebuild that re-cuts identical units reports an
+  empty delta and would index nothing.
+- Work a sync hands to a worker thread goes through `sync._joined_to_thread`, never bare
+  `asyncio.to_thread`: an `anyio` cancel scope (how the MCP server cancels a tool call) abandons
+  the future rather than the job, and the `SyncLock` must not be released while a detached thread
+  still writes. The join is a `threading.Event` with a bound — a cancelled scope raises out of
+  every `await`, so it cannot be one.
+- A partial batch keeps what it earned: `sync._store_batch` writes `set_chat_progress` in a
+  `finally` and `_fetch_comments` stores its rows as it reads them, because a flood wait on one
+  comment thread leaves the whole run. A thread is only requested while Telegram reports more
+  replies than are stored (`db.count_topic_messages`).
 - Never let a probe, smoke test or validation step call `links.open_link`, `links.run_command` or
   the `open_message` tool with the real runner: inject a recording runner. `GREPOGRAM_NO_OPEN=1`
   (set by the autouse fixture) makes `open_link` return the url without running anything and
