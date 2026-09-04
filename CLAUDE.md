@@ -5,8 +5,13 @@ Python 3.12 pinned, `uv` only (no pip, no global installs), developed on macOS.
 
 ## Commands
 
-- `uv sync --all-extras --all-groups` — full environment (the `dense` extra brings torch and
-  sentence-transformers)
+- `uv sync --managed-python --all-extras --all-groups` — full environment (the `dense` extra
+  brings torch and sentence-transformers). `--managed-python` is not decoration: sqlite-vec is a
+  loadable extension, and uv would otherwise build the venv on whichever `python3.12` it finds
+  first — python.org's macOS build and Apple's system Python are compiled without
+  `--enable-loadable-sqlite-extensions`, so `db.connect` refuses them (`ExtensionsUnsupported`).
+  CI sets `UV_MANAGED_PYTHON: "1"` for the same reason: the macOS runner's
+  `/usr/local/bin/python3.12` is the python.org build and uv prefers it over a download.
 - `uv run pytest` — the suite: in-memory SQLite, fake models, no network; `slow` tests are
   deselected by `addopts`
 - `HF_HUB_OFFLINE=1 uv run pytest -m slow` — real `bge-m3` and reranker; both must already be in
