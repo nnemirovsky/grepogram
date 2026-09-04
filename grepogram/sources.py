@@ -91,15 +91,6 @@ class Target:
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
-class Resolution:
-    """What a target resolved to: exactly one of ``dialog`` / ``folder``."""
-
-    title: str
-    dialog: DialogInfo | None = None
-    folder: FolderInfo | None = None
-
-
-@dataclass(frozen=True, slots=True, kw_only=True)
 class Added:
     """Result of :func:`add_source`: the new config and what the entry resolved to.
 
@@ -194,17 +185,14 @@ def describe_match(found: Match) -> str:
 # --- resolution through the dialog catalog ---------------------------------------------------
 
 
-async def resolve_target(target: Target, catalog: DialogCatalog) -> Resolution:
+async def resolve_target(target: Target, catalog: DialogCatalog) -> DialogInfo | FolderInfo:
     """Turn a target into one dialog or one folder of the account."""
     if target.kind == "folder":
-        folder = await find_folder(target.text, catalog)
-        return Resolution(title=folder.title, folder=folder)
+        return await find_folder(target.text, catalog)
     if target.kind == "id":
-        dialog = await _dialog_by_id(int(target.value), catalog)
-        return Resolution(title=dialog.title, dialog=dialog)
+        return await _dialog_by_id(int(target.value), catalog)
     if target.kind == "username":
-        dialog = await _dialog_by_username(target.text, catalog)
-        return Resolution(title=dialog.title, dialog=dialog)
+        return await _dialog_by_username(target.text, catalog)
     return await _fuzzy(target.text, catalog)
 
 
@@ -263,7 +251,7 @@ async def _dialog_by_username(name: str, catalog: DialogCatalog) -> DialogInfo:
     return dialogs.dialog_info(entity)
 
 
-async def _fuzzy(text: str, catalog: DialogCatalog) -> Resolution:
+async def _fuzzy(text: str, catalog: DialogCatalog) -> DialogInfo | FolderInfo:
     found = dialogs.match(text, await catalog.list_dialogs(), await catalog.list_folders())
     if not found:
         raise UnknownTarget(
@@ -273,7 +261,7 @@ async def _fuzzy(text: str, catalog: DialogCatalog) -> Resolution:
     if len(found) > 1 and len(exact) != 1:
         raise AmbiguousTarget(text, [describe_match(m) for m in found])
     best = exact[0] if exact else found[0]
-    return Resolution(title=best.title, dialog=best.dialog, folder=best.folder)
+    return best.entry
 
 
 # --- add / remove ----------------------------------------------------------------------------
@@ -295,26 +283,26 @@ async def add_source(
     """
     resolved = await resolve_target(target, catalog)
     normalized_since = _since(since)
-    if resolved.folder is not None:
-        source = Source(folder=resolved.folder.title, since=normalized_since, comments=comments)
-        members = await folder_dialogs(resolved.folder, catalog)
+    if isinstance(resolved, FolderInfo):
+        source = Source(folder=resolved.title, since=normalized_since, comments=comments)
+        members = await folder_dialogs(resolved, catalog)
+        dialog = None
     else:
-        dialog = resolved.dialog
-        assert dialog is not None
+        dialog = resolved
         if comments and dialog.type != "channel":
             raise SourceError(
                 f"comments applies to channels only; {dialog.title!r} is a {dialog.type}"
             )
         source = Source(chat=chat_value(dialog), since=normalized_since, comments=comments)
         members = [dialog]
-    _reject_duplicate(cfg, source, resolved.dialog)
+    _reject_duplicate(cfg, source, dialog)
     log.info("adding source %s (%s)", source.id, resolved.title)
     return Added(
         config=dataclasses.replace(cfg, sources=[*cfg.sources, source]),
         source=source,
         title=resolved.title,
         dialogs=members,
-        folder=resolved.folder,
+        folder=resolved if isinstance(resolved, FolderInfo) else None,
     )
 
 
@@ -342,7 +330,7 @@ def _reject_duplicate(cfg: Config, source: Source, dialog: DialogInfo | None) ->
 
 def _same_chat(existing: Source, dialog: DialogInfo) -> bool:
     try:
-        target = source_target(existing)
+        target = parse_target(str(existing.chat))
     except InvalidTarget:
         return False
     if target.kind == "id":
@@ -350,13 +338,6 @@ def _same_chat(existing: Source, dialog: DialogInfo) -> bool:
     if target.kind == "username":
         return bool(dialog.username) and target.text.casefold() == str(dialog.username).casefold()
     return False
-
-
-def source_target(source: Source) -> Target:
-    """The target a ``chat`` source's stored value parses to."""
-    if isinstance(source.chat, int):
-        return Target(kind="id", value=source.chat)
-    return parse_target(str(source.chat))
 
 
 def remove_source(cfg: Config, conn: sqlite3.Connection, target: Target) -> Removed:
@@ -472,6 +453,8 @@ async def resolve_sources(cfg: Config, client: Any, conn: sqlite3.Connection) ->
     Folder membership and entities are re-read from Telegram each time (``client`` must be
     connected). A chat covered by two sources keeps the first source's id; a source that no
     longer resolves is logged at WARNING and skipped. Sync state on existing rows is preserved.
+    A chat already stored as the discussion group of a channel with comments on stays the
+    channel's (:func:`discussion_owner`): it is neither re-tagged nor returned for syncing.
     """
     catalog = DialogCatalog(client)
     rows: list[ChatRow] = []
@@ -487,6 +470,18 @@ async def resolve_sources(cfg: Config, client: Any, conn: sqlite3.Connection) ->
                 log.debug("chat %s already covered by another source, keeping the first", info.id)
                 continue
             seen.add(info.id)
+            stored = db.get_chat(conn, info.id)
+            owner = None if stored is None else discussion_owner(conn, cfg, stored)
+            if owner is not None:
+                log.info(
+                    "chat %s (%s) is the discussion group of channel %s; source %s does not "
+                    "index it on its own",
+                    info.id,
+                    info.title,
+                    owner.id,
+                    source.id,
+                )
+                continue
             rows.append(
                 db.upsert_chat(
                     conn,
@@ -508,13 +503,30 @@ async def source_dialogs(source: Source, catalog: DialogCatalog) -> list[DialogI
     """The chats one source covers right now."""
     if source.folder is not None:
         return await folder_dialogs(await find_folder(source.folder, catalog), catalog)
-    resolved = await resolve_target(source_target(source), catalog)
-    if resolved.dialog is None:
+    resolved = await resolve_target(parse_target(str(source.chat)), catalog)
+    if isinstance(resolved, FolderInfo):
         raise UnknownTarget(
             f"chat {source.chat!r} names the folder {resolved.title!r}; "
             f"use folder = {resolved.title!r} instead"
         )
-    return [resolved.dialog]
+    return [resolved]
+
+
+def discussion_owner(conn: sqlite3.Connection, cfg: Config, chat: ChatRow) -> ChatRow | None:
+    """The configured channel whose comment threads ``chat`` holds, or ``None``.
+
+    A stored chat with ``discussion_of`` set belongs to that channel as long as the channel is
+    indexed through a source with ``comments`` on; syncing it as a chat of its own would store
+    the same messages a second time without their post ids.
+    """
+    if chat.discussion_of is None:
+        return None
+    channel = db.get_chat(conn, chat.discussion_of)
+    if channel is None:
+        return None
+    if any(s.id == channel.source_id and s.comments for s in cfg.sources):
+        return channel
+    return None
 
 
 # --- status ----------------------------------------------------------------------------------

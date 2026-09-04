@@ -5,6 +5,7 @@ from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
+from telethon import errors
 from typer.testing import CliRunner
 
 from grepogram import cli, config, db, sources, tg
@@ -17,7 +18,6 @@ from grepogram.sources import (
     DuplicateSource,
     InvalidTarget,
     SourceError,
-    Target,
     UnknownSource,
     UnknownTarget,
 )
@@ -170,14 +170,6 @@ def test_parse_target(raw: str, kind: str, value: str | int) -> None:
 def test_parse_target_rejects_malformed_input(raw: str, message: str) -> None:
     with pytest.raises(InvalidTarget, match=message):
         sources.parse_target(raw)
-
-
-def test_source_target_reads_int_and_string_values() -> None:
-    assert sources.source_target(Source(chat=ARG_ID)) == Target(kind="id", value=ARG_ID)
-    assert sources.source_target(Source(chat="@arg_chat")) == Target(
-        kind="username", value="arg_chat"
-    )
-    assert sources.source_target(Source(chat="Argentina")).kind == "fuzzy"
 
 
 # --- add_source ------------------------------------------------------------------------------
@@ -753,3 +745,84 @@ def test_dialog_info_type_alias_used_by_added() -> None:
     assert sources.chat_value(DialogInfo(id=1, title="x", type="user", username="u_name")) == (
         "@u_name"
     )
+
+
+# --- added by the review fixes --------------------------------------------------------------
+
+
+async def test_entity_errors_only_unknown_peers_become_unknown_targets() -> None:
+    private = _client(entity_errors={GHOST_ID: errors.ChannelPrivateError(request=None)})
+    with pytest.raises(UnknownTarget, match="no dialog with id"):
+        await sources.add_source(
+            _cfg(), sources.parse_target(str(GHOST_ID)), DialogCatalog(private)
+        )
+    flooded = _client(entity_errors={GHOST_ID: errors.FloodWaitError(request=None, capture=30)})
+    with pytest.raises(errors.FloodWaitError):
+        await sources.add_source(
+            _cfg(), sources.parse_target(str(GHOST_ID)), DialogCatalog(flooded)
+        )
+
+
+async def test_resolve_sources_skips_private_folder_peers_but_not_flood_waits(
+    conn: sqlite3.Connection, caplog: pytest.LogCaptureFixture
+) -> None:
+    private = _client(entity_errors={GHOST_ID: errors.ChannelPrivateError(request=None)})
+    with caplog.at_level(logging.WARNING, logger="grepogram.sources"):
+        rows = await sources.resolve_sources(_cfg(Source(folder="Argentina")), private, conn)
+    assert {r.id for r in rows} == {ARG_ID, NEWS_ID, OUTSIDE_ID}
+    assert any("cannot resolve peer" in r.getMessage() for r in caplog.records)
+    flooded = _client(entity_errors={GHOST_ID: errors.FloodWaitError(request=None, capture=30)})
+    with pytest.raises(errors.FloodWaitError):
+        await sources.resolve_sources(_cfg(Source(folder="Argentina")), flooded, conn)
+
+
+async def test_username_targets_are_served_from_the_dialog_memo() -> None:
+    client = _client()
+    added = await sources.add_source(
+        _cfg(), sources.parse_target("@arg_chat"), DialogCatalog(client)
+    )
+    assert added.source == Source(chat="@arg_chat")
+    assert all(name != "get_entity" for name, _ in client.calls)
+
+
+async def test_duplicate_check_ignores_fuzzy_and_malformed_chat_values() -> None:
+    cfg = _cfg(Source(chat="georgia"), Source(chat="@ab"))
+    added = await sources.add_source(cfg, sources.parse_target("@news"), _catalog())
+    assert added.source == Source(chat="@news")
+    assert len(added.config.sources) == 3
+
+
+async def test_ambiguous_folder_names_are_refused_for_add_and_remove(
+    conn: sqlite3.Connection,
+) -> None:
+    folders = [
+        make_folder(3, "Argentina", include=[ARG]),
+        make_folder(6, "Argentine", include=[NEWS]),
+    ]
+    client = FakeClient(dialogs=[make_dialog(ARG), make_dialog(NEWS)], folders=folders)
+    with pytest.raises(AmbiguousTarget) as added:
+        await sources.add_source(
+            _cfg(), sources.parse_target("folder:argentin"), DialogCatalog(client)
+        )
+    assert added.value.candidates == [
+        "folder 'Argentina' (folder:Argentina)",
+        "folder 'Argentine' (folder:Argentine)",
+    ]
+    cfg = _cfg(Source(folder="Argentina"), Source(folder="Argentine"))
+    with pytest.raises(AmbiguousTarget) as removed:
+        sources.remove_source(cfg, conn, sources.parse_target("folder:argentin"))
+    assert removed.value.candidates == ["folder:Argentina", "folder:Argentine"]
+
+
+def test_remove_source_by_id_or_username_finds_the_other_spelling(
+    conn: sqlite3.Connection,
+) -> None:
+    _populate(conn)
+    _store(conn, _chat(555, "chat:555", title="X chat", username="xchat"), 1)
+    cfg = _cfg(*CFG.sources, Source(chat=555))
+    by_id = sources.remove_source(cfg, conn, sources.parse_target("1"))
+    assert (by_id.source_id, by_id.chat_ids) == ("chat:@alice", [1])
+    assert Source(chat="@alice") not in by_id.config.sources
+    by_username = sources.remove_source(by_id.config, conn, sources.parse_target("@xchat"))
+    assert (by_username.source_id, by_username.chat_ids) == ("chat:555", [555])
+    assert Source(chat=555) not in by_username.config.sources

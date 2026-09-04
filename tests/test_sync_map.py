@@ -23,7 +23,7 @@ DM = ChatRow(id=1, type="user", title="Alice Liddell", username="alice")
 ME = UserRow(id=42, display_name="Me Myself", username="me")
 
 USERS = sync.collect_users([ALICE, BOB, DELETED, HELPER, OLD_GROUP, ARG_ENTITY, NEWS_ENTITY])
-NAMES = sync.names_of(USERS)
+NAMES = {user_id: user.display_name for user_id, user in USERS.items() if user.display_name}
 
 
 def _map(msg: object, chat: ChatRow = ARG, names: dict[int, str] | None = None) -> MessageRow:
@@ -66,11 +66,6 @@ def test_collect_users_forbidden_chats_and_aliases() -> None:
     users = sync.collect_users([forbidden, aliased])
     assert users[-1000000000300] == UserRow(id=-1000000000300, display_name="Gone", username=None)
     assert users[-1000000000301].username == "main_alias"
-
-
-def test_names_of_skips_unnamed() -> None:
-    users = {1: UserRow(id=1, display_name="A"), 2: UserRow(id=2, display_name=None)}
-    assert sync.names_of(users) == {1: "A"}
 
 
 # --- sender_of -------------------------------------------------------------------------------

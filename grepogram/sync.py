@@ -6,15 +6,18 @@ sources, syncs chats in ``last_sync_at`` order until the :class:`SyncBudget` run
 :func:`on_chat_synced` — the unit rebuild followed by the lexical index — for every chat that
 changed, and finally embeds the dirty units when an embedder is given. :func:`sync_chat` fetches
 one chat: new messages after ``last_msg_id`` in batches, then a re-fetch of the newest messages
-for edits and reactions, plus channel comments stored under the linked discussion chat.
+for edits and reactions. A channel whose source has ``comments`` also gets the comment threads of
+its new posts, stored under the linked discussion chat, and on every later run the threads of
+its newest posts that grew since; the discussion chat belongs to the channel from then on and is
+never synced as a chat of its own, whichever source lists it.
 
 :func:`map_message` reads raw TL attributes only — ``msg.message``, ``msg.media``,
 ``msg.reply_to``, ``msg.fwd_from``, ``msg.reactions``, ``msg.from_id``, ``msg.post``, ``msg.date``,
 ``msg.edit_date`` — and never the client-bound helpers (``msg.text``, ``msg.file``, ``msg.sender``,
 ``msg.chat``), so a message built without a client (the test fixtures) maps exactly like one
 Telethon yields from ``iter_messages``. Display names come from a ``names`` map built with
-:func:`collect_users` and :func:`names_of` out of the users and chats Telegram returns alongside
-messages (:func:`peers_of`); the same rows feed the ``users`` upsert.
+:func:`collect_users` out of the users and chats Telegram returns alongside messages
+(:func:`peers_of`); the same rows feed the ``users`` upsert.
 """
 
 import asyncio
@@ -22,6 +25,7 @@ import dataclasses
 import datetime as dt
 import fcntl
 import logging
+import math
 import os
 import sqlite3
 import time
@@ -33,7 +37,7 @@ from typing import Any, Self
 from telethon import errors, utils
 from telethon.tl import functions, types
 
-from grepogram import db, dialogs, index, tg, units
+from grepogram import db, dialogs, index, units
 from grepogram.config import ConfigError
 from grepogram.dialogs import entity_username
 from grepogram.embed import Embedder
@@ -48,7 +52,7 @@ from grepogram.models import (
     UserRow,
 )
 from grepogram.paths import Paths
-from grepogram.sources import resolve_sources
+from grepogram.sources import discussion_owner, resolve_sources
 
 log = logging.getLogger(__name__)
 
@@ -108,11 +112,6 @@ def collect_users(entities: Iterable[Any]) -> dict[int, UserRow]:
                 username=entity_username(entity),
             )
     return users
-
-
-def names_of(users: Mapping[int, UserRow]) -> dict[int, str]:
-    """Marked id → display name, as :func:`map_message` expects; unnamed ids are left out."""
-    return {user_id: user.display_name for user_id, user in users.items() if user.display_name}
 
 
 def sender_of(
@@ -303,6 +302,17 @@ def reactions_total(reactions: Any) -> int:
     return sum(int(entry.count) for entry in reactions.results or ())
 
 
+def replies_count(msg: Any) -> int:
+    """How many replies Telegram reports on a message (``msg.replies.replies``); 0 without.
+
+    On a channel post with a linked discussion group this is the size of its comment thread.
+    """
+    replies = getattr(msg, "replies", None)
+    if not isinstance(replies, types.MessageReplies):
+        return 0
+    return int(replies.replies)
+
+
 # --- budget and lock -------------------------------------------------------------------------
 
 
@@ -333,9 +343,6 @@ class SyncBudget:
         if self.deadline is None:
             return None
         return max(0.0, self.deadline - self._clock())
-
-    def __repr__(self) -> str:
-        return f"SyncBudget(seconds={self.seconds!r})"
 
 
 class SyncLock:
@@ -380,10 +387,6 @@ class SyncLock:
             os.close(self._fd)
             self._fd = None
 
-    @property
-    def held(self) -> bool:
-        return self._fd is not None
-
 
 # --- one chat --------------------------------------------------------------------------------
 
@@ -396,16 +399,25 @@ UNAVAILABLE_ERRORS: tuple[type[Exception], ...] = (
 )
 
 
+class DiscussionUnavailable(Exception):
+    """A channel's linked discussion group cannot be resolved, though the channel itself can."""
+
+
+_DISCUSSION_ERRORS: tuple[type[Exception], ...] = (ValueError, *UNAVAILABLE_ERRORS)
+
+
 @dataclass(frozen=True, slots=True, kw_only=True)
 class SyncedChat:
     """What :func:`sync_chat` did for one chat.
 
     ``new_msg_ids`` are the ``messages.id`` rowids of every row inserted or changed (new messages
     and edits alike), in fetch order — the ids ``msg_fts`` is keyed by. ``new`` counts messages
-    seen for the first time. ``complete`` is ``False`` when the budget cut the fetch short; the
-    stored progress lets the next run resume. ``discussion`` carries the same for the linked
-    discussion chat when comments were fetched; ``migrated_to`` is the supergroup a legacy group
-    was upgraded to, freshly upserted so the caller can sync it too.
+    seen for the first time: rows that were not stored before this run. ``complete`` is ``False``
+    when the budget cut the fetch short; the stored progress lets the next run resume.
+    ``discussion`` carries the same for the linked discussion chat when comments were fetched;
+    ``migrated_to`` is the supergroup a legacy group was upgraded to, freshly upserted so the
+    caller can sync it too. ``warnings`` are for the report: so far only comment threads Telegram
+    refused while the posts themselves went through.
     """
 
     chat: ChatRow
@@ -415,6 +427,7 @@ class SyncedChat:
     unavailable: bool = False
     discussion: "SyncedChat | None" = None
     migrated_to: ChatRow | None = None
+    warnings: list[str] = field(default_factory=list)
 
 
 class _PeerBook:
@@ -440,24 +453,16 @@ class _PeerBook:
             self._pending = {}
 
 
-class _Changes:
-    """Ordered, deduplicated ``messages.id`` values touched by one chat's sync."""
-
-    def __init__(self) -> None:
-        self._ids: dict[int, None] = {}
-
-    def add(self, ids: Iterable[int]) -> None:
-        for row_id in ids:
-            self._ids.setdefault(row_id, None)
-
-    @property
-    def ids(self) -> list[int]:
-        return list(self._ids)
-
-
 @dataclass(slots=True, kw_only=True)
 class _Run:
-    """State one chat's fetch passes between its steps."""
+    """State one chat's fetch passes between its steps.
+
+    ``changes`` and ``comment_ids`` are the ordered, deduplicated ``messages.id`` values touched
+    in the chat and in its discussion chat (dicts used as ordered sets); ``inserted`` counts the
+    rows stored for the first time per chat id. ``discussion`` is the linked discussion chat of
+    a channel with comments, ``None`` when there is none or comments are off; it is dropped when
+    Telegram refuses a thread mid-run, with the reason kept in ``warnings``.
+    """
 
     client: Any
     conn: sqlite3.Connection
@@ -467,17 +472,42 @@ class _Run:
     me: UserRow | None
     discussion: ChatRow | None = None
     peers: _PeerBook = field(default_factory=_PeerBook)
-    changes: _Changes = field(default_factory=_Changes)
-    comments: _Changes = field(default_factory=_Changes)
+    changes: dict[int, None] = field(default_factory=dict)
+    comment_ids: dict[int, None] = field(default_factory=dict)
+    inserted: dict[int, int] = field(default_factory=dict)
+    warnings: list[str] = field(default_factory=list)
 
     def map(self, msg: Any, chat: ChatRow) -> MessageRow | None:
         self.peers.add(msg)
         return map_message(msg, chat, self.peers.names, me=self.me)
 
     def store(self, rows: list[MessageRow]) -> list[int]:
+        """Upsert ``rows`` (all of one chat) with the users met so far; returns their row ids."""
+        if not rows:
+            return []
+        chat_id = rows[0].chat_id
         with db.transaction(self.conn):
+            known = db.get_messages_by_msg_id(self.conn, chat_id, [row.msg_id for row in rows])
             self.peers.flush(self.conn)
-            return db.upsert_messages(self.conn, rows)
+            ids = db.upsert_messages(self.conn, rows)
+        fresh = sum(1 for row in rows if row.msg_id not in known)
+        self.inserted[chat_id] = self.inserted.get(chat_id, 0) + fresh
+        return ids
+
+    def drop_comments(self, exc: Exception) -> None:
+        """Stop fetching comments for this run; the posts themselves go on."""
+        warning = (
+            f"comments of channel {self.chat.id} ({self.chat.title}) are unavailable "
+            f"({exc}); its posts were synced without them"
+        )
+        log.warning(warning)
+        self.warnings.append(warning)
+        self.discussion = None
+
+
+def _track(seen: dict[int, None], ids: Iterable[int]) -> None:
+    for row_id in ids:
+        seen.setdefault(row_id, None)
 
 
 def since_of(source: Source | None) -> dt.datetime | None:
@@ -511,14 +541,17 @@ async def sync_chat(
     where it stopped. A run that finishes re-fetches the newest ``edit_refetch`` messages for
     edits and reactions (only rows that actually differ are written) and stamps
     ``last_sync_at``. Channels whose source has ``comments`` also get the comment threads of each
-    new post, stored under the linked discussion chat with ``topic_id`` = the channel post id.
+    new post, stored under the linked discussion chat with ``topic_id`` = the channel post id,
+    and the re-fetch pass re-reads the thread of every re-fetched post Telegram reports more
+    replies for than are stored, so comments that arrive after the post was indexed follow.
 
     A chat Telegram refuses (:data:`UNAVAILABLE_ERRORS`) is marked ``unavailable`` and reported,
-    not raised; a legacy group upgraded to a supergroup has ``migrated_to`` set and its history
-    left alone from then on, while the result keeps pointing at the supergroup so
-    :func:`sync_all` syncs that one. :class:`~telethon.errors.FloodWaitError` beyond the
-    client's sleep threshold and authorization errors propagate after the current batch is
-    committed.
+    not raised; the same errors on the discussion group alone (a private one, say) switch the
+    comments off for the run with a warning while the posts are synced. A legacy group upgraded
+    to a supergroup has ``migrated_to`` set and its history left alone from then on, while the
+    result keeps pointing at the supergroup so :func:`sync_all` syncs that one.
+    :class:`~telethon.errors.FloodWaitError` beyond the client's sleep threshold and
+    authorization errors propagate after the current batch is committed.
     """
     if chat.migrated_to is not None:
         log.debug("chat %s migrated to %s; its history is frozen", chat.id, chat.migrated_to)
@@ -527,10 +560,13 @@ async def sync_chat(
     try:
         migrated = await _check_migration(client, conn, chat) if chat.type == "group" else None
         if source.comments and chat.type == "channel":
-            run.discussion = await link_discussion_chat(client, conn, chat)
+            try:
+                run.discussion = await link_discussion_chat(client, conn, chat)
+            except DiscussionUnavailable as exc:
+                run.drop_comments(exc)
         fetched = await _fetch_new(run)
         if fetched.complete and chat.last_sync_at is not None:
-            run.changes.add(await _refetch_edits(run, sync_cfg or SyncCfg()))
+            _track(run.changes, await _refetch_edits(run, sync_cfg or SyncCfg()))
     except UNAVAILABLE_ERRORS as exc:
         log.warning("chat %s (%s) is unavailable: %s", chat.id, chat.title, exc)
         db.set_chat_unavailable(conn, chat.id, True)
@@ -544,34 +580,42 @@ async def sync_chat(
         "chat %s (%s): %d new messages%s",
         chat.id,
         chat.title,
-        fetched.new,
+        run.inserted.get(chat.id, 0),
         "" if fetched.complete else " (budget expired, will resume)",
     )
+    discussion = None
+    if fetched.discussion is not None:
+        discussion = SyncedChat(
+            chat=_refresh(conn, fetched.discussion),
+            new_msg_ids=list(run.comment_ids),
+            new=run.inserted.get(fetched.discussion.id, 0),
+        )
     return SyncedChat(
         chat=_refresh(conn, chat),
-        new_msg_ids=run.changes.ids,
-        new=fetched.new,
+        new_msg_ids=list(run.changes),
+        new=run.inserted.get(chat.id, 0),
         complete=fetched.complete,
-        discussion=fetched.discussion,
+        discussion=discussion,
         migrated_to=migrated,
+        warnings=run.warnings,
     )
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class _Fetched:
+    """Where the incremental pass ended; ``discussion`` is the linked chat it started with."""
+
     progress: int
-    new: int
     complete: bool
-    discussion: SyncedChat | None
+    discussion: ChatRow | None
 
 
 async def _fetch_new(run: _Run) -> _Fetched:
     """The incremental pass: everything after ``last_msg_id``, committed batch by batch."""
     chat = run.chat
+    discussion = run.discussion
     progress = chat.last_msg_id
-    new = 0
     complete = True
-    comment_count = 0
     batch: list[MessageRow] = []
     seen_up_to = progress
     offset_date = since_of(run.source) if progress == 0 else None
@@ -585,53 +629,42 @@ async def _fetch_new(run: _Run) -> _Fetched:
             batch.append(row)
         if len(batch) < BATCH_SIZE:
             continue
-        progress, done = await _store_batch(run, batch, progress, seen_up_to)
-        new += len(batch)
-        comment_count += done
+        progress = await _store_batch(run, batch, progress, seen_up_to)
         batch = []
         if run.budget.expired:
             complete = False
             break
     if complete and (batch or seen_up_to > progress):
-        progress, done = await _store_batch(run, batch, progress, seen_up_to)
-        new += len(batch)
-        comment_count += done
+        progress = await _store_batch(run, batch, progress, seen_up_to)
         complete = progress >= seen_up_to
-    synced_discussion = None
-    if run.discussion is not None:
-        synced_discussion = SyncedChat(
-            chat=_refresh(run.conn, run.discussion), new_msg_ids=run.comments.ids, new=comment_count
-        )
-    return _Fetched(progress=progress, new=new, complete=complete, discussion=synced_discussion)
+    return _Fetched(progress=progress, complete=complete, discussion=discussion)
 
 
-async def _store_batch(
-    run: _Run, batch: list[MessageRow], progress: int, seen_up_to: int
-) -> tuple[int, int]:
+async def _store_batch(run: _Run, batch: list[MessageRow], progress: int, seen_up_to: int) -> int:
     """Upsert one batch (and, for channels with comments, each post's thread) and record progress.
 
-    Returns ``(progress, comments_stored)``. Without comments progress jumps to the highest
-    message id seen, skipped service messages included. With comments it advances post by post,
-    so a budget expiry between two posts leaves the later posts to be re-fetched next time
-    together with their threads.
+    Returns the new progress. Without comments it jumps to the highest message id seen, skipped
+    service messages included. With comments it advances post by post, so a budget expiry
+    between two posts leaves the later posts to be re-fetched next time together with their
+    threads; when Telegram refuses the threads on the way the posts count as done.
     """
     chat = run.chat
-    run.changes.add(run.store(batch))
+    _track(run.changes, run.store(batch))
     if run.discussion is None:
         db.set_chat_progress(run.conn, chat.id, seen_up_to, chat.last_sync_at)
-        return seen_up_to, 0
-    stored = 0
+        return seen_up_to
     for row in batch:
         if run.budget.expired:
             break
-        ids = await _fetch_comments(run, row.msg_id)
-        run.comments.add(ids)
-        stored += len(ids)
+        if run.discussion is None:
+            progress = seen_up_to
+            break
+        _track(run.comment_ids, await _fetch_comments(run, row.msg_id))
         progress = row.msg_id
     else:
         progress = seen_up_to
     db.set_chat_progress(run.conn, chat.id, progress, chat.last_sync_at)
-    return progress, stored
+    return progress
 
 
 async def _fetch_comments(run: _Run, post_id: int) -> list[int]:
@@ -640,7 +673,8 @@ async def _fetch_comments(run: _Run, post_id: int) -> list[int]:
     Comments live in the discussion group with their own message ids; their reply headers
     point at the discussion-side copy of the post, which Telegram does not return here, so the
     channel post id is kept in ``topic_id`` to tie the thread back to its post. A post without a
-    thread (``MsgIdInvalidError``) is skipped.
+    thread (``MsgIdInvalidError``) is skipped; a thread Telegram refuses switches the comments
+    off for the rest of the run (:meth:`_Run.drop_comments`).
     """
     assert run.discussion is not None
     rows: list[MessageRow] = []
@@ -652,34 +686,87 @@ async def _fetch_comments(run: _Run, post_id: int) -> list[int]:
     except errors.MsgIdInvalidError:
         log.debug("post %s in channel %s has no comment thread", post_id, run.chat.id)
         return []
-    return run.store(rows) if rows else []
+    except UNAVAILABLE_ERRORS as exc:
+        run.drop_comments(exc)
+        return []
+    return run.store(rows)
 
 
 async def _refetch_edits(run: _Run, sync_cfg: SyncCfg) -> list[int]:
     """Re-read the newest ``edit_refetch`` messages and rewrite only stored rows that changed.
 
     Messages that are not stored — history before ``since``, or anything the incremental pass
-    has not reached — are left alone; this pass exists for edits and reactions only.
+    has not reached — are left alone; this pass exists for edits and reactions only. For a
+    channel with comments it also refreshes the threads of the re-fetched posts that grew
+    (:func:`_refresh_comments`); the ids of those posts are returned along with the edited rows
+    so their post-thread units are rebuilt.
     """
     if sync_cfg.edit_refetch <= 0:
         return []
     chat = run.chat
     fresh: list[MessageRow] = []
+    replies: dict[int, int] = {}
     async for msg in run.client.iter_messages(chat.id, limit=sync_cfg.edit_refetch):
         row = run.map(msg, chat)
         if row is not None:
             fresh.append(row)
+            replies[row.msg_id] = replies_count(msg)
     if not fresh:
         return []
     stored = {
-        row.msg_id: dataclasses.replace(row, id=None)
+        row.msg_id: row
         for row in db.get_messages(run.conn, chat.id, since_msg_id=min(r.msg_id for r in fresh))
     }
-    changed = [row for row in fresh if row.msg_id in stored and stored[row.msg_id] != row]
-    if not changed:
-        return []
-    log.debug("chat %s: %d of %d re-fetched messages changed", chat.id, len(changed), len(fresh))
-    return run.store(changed)
+    changed = [
+        row
+        for row in fresh
+        if row.msg_id in stored and dataclasses.replace(stored[row.msg_id], id=None) != row
+    ]
+    if changed:
+        log.debug(
+            "chat %s: %d of %d re-fetched messages changed", chat.id, len(changed), len(fresh)
+        )
+    ids = run.store(changed)
+    if run.discussion is not None:
+        ids += await _refresh_comments(run, stored, replies)
+    return ids
+
+
+async def _refresh_comments(
+    run: _Run, stored: Mapping[int, MessageRow], replies: Mapping[int, int]
+) -> list[int]:
+    """Re-read the comment threads of the stored posts with more replies than comments stored.
+
+    Telegram's reply count on a post is compared with the comments held under the discussion
+    chat for that post; a thread that grew is fetched again through :func:`_fetch_comments`
+    (an upsert, so nothing is stored twice). Returns the ``messages.id`` of the posts whose
+    threads were re-read. Stops when the budget expires or the threads become unavailable.
+    """
+    assert run.discussion is not None
+    counted = db.count_topic_messages(run.conn, run.discussion.id, replies)
+    grown = [
+        post_id
+        for post_id, total in replies.items()
+        if post_id in stored and total > counted.get(post_id, 0)
+    ]
+    touched: list[int] = []
+    for post_id in grown:
+        if run.budget.expired or run.discussion is None:
+            break
+        ids = await _fetch_comments(run, post_id)
+        _track(run.comment_ids, ids)
+        row_id = stored[post_id].id
+        if ids and row_id is not None:
+            touched.append(row_id)
+    if grown:
+        log.debug(
+            "channel %s: %d of %d re-fetched posts had new comments; %d threads re-read",
+            run.chat.id,
+            len(grown),
+            len(replies),
+            len(touched),
+        )
+    return touched
 
 
 async def _check_migration(client: Any, conn: sqlite3.Connection, chat: ChatRow) -> ChatRow | None:
@@ -695,7 +782,18 @@ async def _check_migration(client: Any, conn: sqlite3.Connection, chat: ChatRow)
     new_id = dialogs.peer_id(types.PeerChannel(int(target.channel_id)))
     new_chat = db.get_chat(conn, new_id)
     if new_chat is None:
-        new_chat = db.upsert_chat(conn, _chat_row(await client.get_entity(new_id), chat.source_id))
+        try:
+            entity = await client.get_entity(new_id)
+        except ValueError as exc:
+            log.warning(
+                "chat %s (%s) migrated to %s, which cannot be resolved: %s",
+                chat.id,
+                chat.title,
+                new_id,
+                exc,
+            )
+            return None
+        new_chat = db.upsert_chat(conn, _chat_row(entity, chat.source_id))
     db.set_chat_migrated(conn, chat.id, new_id)
     log.info("chat %s (%s) migrated to supergroup %s", chat.id, chat.title, new_id)
     return new_chat
@@ -708,7 +806,11 @@ async def link_discussion_chat(
 
     The row carries ``discussion_of = channel.id`` and the channel's ``source_id`` so the
     comments stored under it are removed together with the channel. ``None`` when the channel
-    has no discussion group.
+    has no discussion group; :class:`DiscussionUnavailable` when Telegram will not resolve the
+    group (private, or the account is not a member) — the channel's own errors propagate. A
+    group that was already indexed as an ordinary chat — a source listed it before the link was
+    known — is started over: its rows carry no post ids, and the comment threads stored from now
+    on would otherwise overlap them.
     """
     full = await client(functions.channels.GetFullChannelRequest(channel.id))
     linked = getattr(full.full_chat, "linked_chat_id", None)
@@ -720,7 +822,22 @@ async def link_discussion_chat(
     linked_id = dialogs.peer_id(types.PeerChannel(int(linked)))
     entity = next((c for c in full.chats if dialogs.peer_id(c) == linked_id), None)
     if entity is None:
-        entity = await client.get_entity(linked_id)
+        try:
+            entity = await client.get_entity(linked_id)
+        except _DISCUSSION_ERRORS as exc:
+            raise DiscussionUnavailable(
+                f"cannot resolve discussion group {linked_id}: {exc}"
+            ) from exc
+    existing = db.get_chat(conn, linked_id)
+    if existing is not None and existing.discussion_of is None and existing.last_msg_id:
+        log.warning(
+            "chat %s (%s) was indexed on its own before it turned out to be the discussion "
+            "group of channel %s; its history is replaced by the channel's comment threads",
+            linked_id,
+            existing.title,
+            channel.id,
+        )
+        db.delete_chat(conn, linked_id)
     row = _chat_row(entity, channel.source_id, discussion_of=channel.id)
     return db.upsert_chat(conn, row)
 
@@ -777,15 +894,19 @@ async def sync_all(
     not finished are reported in ``chats_remaining``. Each chat with changes goes through
     :func:`on_chat_synced`. A flood wait Telegram will not let the client sleep through stops
     the run with a warning; a chat Telegram refuses is reported in ``unavailable``; an
-    unauthorized session raises :class:`~grepogram.tg.AuthRequired`.
+    unauthorized session raises :class:`~telethon.errors.UnauthorizedError`, which the
+    :func:`~grepogram.tg.connected` block every caller runs in turns into
+    :class:`~grepogram.tg.AuthRequired`. The end of the run is stamped in ``meta.last_sync_run``
+    whether or not a chat completed, so a caller deciding whether the index is stale does not
+    retry a run that has nothing to finish.
 
     With an ``embedder`` the run ends by embedding the dirty units under the same budget and
     lock (:func:`~grepogram.index.embed_dirty_units`); units the budget leaves unembedded and a
     changed embedding model become ``warnings`` — the messages are synced either way.
     """
     with SyncLock(paths):
-        async with tg.wrap_auth_errors(client):
-            report = await _sync_chats(client, conn, cfg, budget)
+        report = await _sync_chats(client, conn, cfg, budget)
+        db.set_last_sync_run(conn, int(time.time()))
         if embedder is None:
             return report
         return await _embed_after_sync(conn, embedder, budget, report)
@@ -815,6 +936,13 @@ async def _embed_after_sync(
 async def _sync_chats(
     client: Any, conn: sqlite3.Connection, cfg: Config, budget: SyncBudget
 ) -> SyncReport:
+    """The chat loop of :func:`sync_all`.
+
+    A queued chat that turns out to be the discussion group of a channel with comments — linked
+    earlier in this run, or in a previous one when it was listed by another source — is skipped:
+    the channel's comment threads are its content. The unit rebuild runs on a worker thread so
+    the loop keeps serving the client's keepalives while a big chat is cut into units.
+    """
     me = _self_row(await client.get_me())
     queue = sorted(await resolve_sources(cfg, client, conn), key=_sync_order)
     sources = {source.id: source for source in cfg.sources}
@@ -822,9 +950,11 @@ async def _sync_chats(
     remaining: list[int] = []
     unavailable: list[int] = []
     warnings: list[str] = []
+    processed: set[int] = set()
     new = 0
     while queue:
         chat = queue.pop(0)
+        processed.add(chat.id)
         source = sources.get(chat.source_id or "")
         if source is None:
             log.debug("chat %s has no configured source; skipped", chat.id)
@@ -832,6 +962,17 @@ async def _sync_chats(
         if budget.expired:
             remaining.append(chat.id)
             continue
+        owner = discussion_owner(conn, cfg, _refresh(conn, chat))
+        if owner is not None:
+            log.info(
+                "chat %s (%s) is the discussion group of channel %s; its comment threads are "
+                "synced with the channel",
+                chat.id,
+                chat.title,
+                owner.id,
+            )
+            continue
+        _cap_flood_sleep(client, cfg.sync, budget)
         try:
             synced = await sync_chat(client, conn, chat, source, budget, sync_cfg=cfg.sync, me=me)
         except errors.FloodWaitError as exc:
@@ -850,9 +991,10 @@ async def _sync_chats(
             remaining.append(chat.id)
             continue
         new += synced.new
+        warnings.extend(synced.warnings)
         for part in (synced, synced.discussion):
             if part is not None and part.new_msg_ids:
-                on_chat_synced(conn, part.chat, cfg, part.new_msg_ids)
+                await asyncio.to_thread(on_chat_synced, conn, part.chat, cfg, part.new_msg_ids)
         if synced.discussion is not None:
             new += synced.discussion.new
         if synced.unavailable:
@@ -861,8 +1003,9 @@ async def _sync_chats(
             done.append(chat.id)
         else:
             remaining.append(chat.id)
-        if synced.migrated_to is not None and _not_queued(synced.migrated_to, queue, done):
-            queue.append(synced.migrated_to)
+        migrated = synced.migrated_to
+        if migrated is not None and migrated.id not in processed and _not_queued(migrated, queue):
+            queue.append(migrated)
     log.info(
         "sync: %d new messages, %d chats done, %d remaining, %d unavailable",
         new,
@@ -879,6 +1022,21 @@ async def _sync_chats(
     )
 
 
+def _cap_flood_sleep(client: Any, sync_cfg: SyncCfg, budget: SyncBudget) -> None:
+    """Never let Telethon sleep through a flood wait longer than the budget has left.
+
+    ``flood_sleep_threshold`` is what the client sleeps through on its own; a wait above it
+    raises :class:`~telethon.errors.FloodWaitError`, which :func:`_sync_chats` turns into a
+    warning. Inside a bounded run the threshold shrinks with the time left, so a 20-second
+    auto-sync never blocks a search for the two minutes the config allows an unattended sync.
+    """
+    remaining = budget.remaining
+    threshold = sync_cfg.flood_sleep_threshold
+    if remaining is not None:
+        threshold = min(threshold, math.ceil(remaining))
+    client.flood_sleep_threshold = threshold
+
+
 def _sync_order(chat: ChatRow) -> tuple[int, int, int]:
     """Never-synced chats first, then by ``last_sync_at`` ascending, ties by id."""
     if chat.last_sync_at is None:
@@ -886,8 +1044,8 @@ def _sync_order(chat: ChatRow) -> tuple[int, int, int]:
     return (1, chat.last_sync_at, chat.id)
 
 
-def _not_queued(chat: ChatRow, queue: list[ChatRow], done: list[int]) -> bool:
-    return chat.id not in done and all(item.id != chat.id for item in queue)
+def _not_queued(chat: ChatRow, queue: list[ChatRow]) -> bool:
+    return all(item.id != chat.id for item in queue)
 
 
 def _self_row(me: Any) -> UserRow | None:

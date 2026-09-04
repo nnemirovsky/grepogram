@@ -3,6 +3,7 @@ import sqlite3
 import stat
 from collections.abc import Callable, Iterator
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from telethon import errors
@@ -10,7 +11,7 @@ from telethon.tl import functions, types
 from telethon.tl.types import messages as tl_messages
 from typer.testing import CliRunner
 
-from grepogram import cli, db, sync, tg
+from grepogram import cli, db, search, sources, sync, tg
 from grepogram.config import ConfigError
 from grepogram.log import shutdown_logging
 from grepogram.models import ChatRow, Config, Source, SyncCfg, SyncReport, TelegramCfg
@@ -28,7 +29,7 @@ OLD_GROUP = make_group(10, "Old group", migrated_to=101)
 ARG = make_channel(100, "Argentina chat", username="arg_chat", megagroup=True)
 GEORGIA = make_channel(101, "Georgia chat", megagroup=True)
 NEWS = make_channel(200, "News", username="news")
-DISC = make_channel(201, "News chat", megagroup=True)
+DISC = make_channel(201, "News chat", username="news_chat", megagroup=True)
 
 ALICE_ID = 1
 OLD_ID = -10
@@ -81,7 +82,9 @@ def _cfg(*entries: Source, edit_refetch: int = 200) -> Config:
     return Config(telegram=TELEGRAM, sync=SyncCfg(edit_refetch=edit_refetch), sources=list(entries))
 
 
-def _full_channel(linked: int | None) -> tl_messages.ChatFull:
+def _full_channel(
+    linked: int | None, *, chats: list[types.Channel] | None = None
+) -> tl_messages.ChatFull:
     full = types.ChannelFull(
         id=200,
         about="",
@@ -94,27 +97,50 @@ def _full_channel(linked: int | None) -> tl_messages.ChatFull:
         pts=0,
         linked_chat_id=linked,
     )
-    return tl_messages.ChatFull(full_chat=full, chats=[NEWS, DISC] if linked else [NEWS], users=[])
+    if chats is None:
+        chats = [NEWS, DISC] if linked else [NEWS]
+    return tl_messages.ChatFull(full_chat=full, chats=chats, users=[])
+
+
+def _comments(disc_id: int = DISC_ID) -> dict[tuple[int, int], list[types.Message]]:
+    return {
+        (NEWS_ID, 1): [
+            tl.message(disc_id, 1, "comment one", sender=1, reply_to=tl.reply_header(7)),
+            tl.message(disc_id, 2, "reply", sender=2, reply_to=tl.reply_header(1)),
+        ],
+        (NEWS_ID, 3): [tl.message(disc_id, 9, "late comment", sender=2)],
+    }
 
 
 def _news_client(linked: int | None = 201, **kwargs: object) -> FakeClient:
     kwargs.setdefault(
         "messages", {NEWS_ID: [tl.channel_post(NEWS_ID, i, f"post {i}") for i in (1, 2, 3)]}
     )
-    kwargs.setdefault(
-        "comments",
-        {
-            (NEWS_ID, 1): [
-                tl.message(DISC_ID, 1, "comment one", sender=1, reply_to=tl.reply_header(7)),
-                tl.message(DISC_ID, 2, "reply", sender=2, reply_to=tl.reply_header(1)),
-            ],
-            (NEWS_ID, 3): [tl.message(DISC_ID, 9, "late comment", sender=2)],
-        },
-    )
+    kwargs.setdefault("comments", _comments())
     kwargs.setdefault(
         "responses", {functions.channels.GetFullChannelRequest: _full_channel(linked)}
     )
     return _client(**kwargs)
+
+
+def _discussion_client(disc: types.Channel) -> FakeClient:
+    """A channel whose discussion group is a dialog of its own, in the "News" folder with it,
+    and whose history holds the very messages the comment threads return."""
+    disc_id = -1000000000000 - disc.id
+    comments = _comments(disc_id)
+    return FakeClient(
+        dialogs=[make_dialog(ALICE), make_dialog(BOB), make_dialog(NEWS), make_dialog(disc)],
+        me=ME,
+        folders=[make_folder(3, "News", include=[NEWS, disc])],
+        messages={
+            NEWS_ID: [tl.channel_post(NEWS_ID, i, f"post {i}") for i in (1, 2, 3)],
+            disc_id: [m for pool in comments.values() for m in pool],
+        },
+        comments=comments,
+        responses={
+            functions.channels.GetFullChannelRequest: _full_channel(disc.id, chats=[NEWS, disc])
+        },
+    )
 
 
 def _clock(*ticks: float) -> Callable[[], float]:
@@ -162,7 +188,6 @@ def test_budget_without_seconds_never_expires() -> None:
     assert budget.deadline is None
     assert not budget.expired
     assert budget.remaining is None
-    assert repr(budget) == "SyncBudget(seconds=None)"
 
 
 def test_budget_expires_by_its_clock() -> None:
@@ -181,11 +206,12 @@ def test_budget_zero_is_expired_at_once() -> None:
 
 
 def test_lock_creates_a_private_file_and_releases(paths: Paths) -> None:
-    with SyncLock(paths) as lock:
-        assert lock.held
+    with SyncLock(paths):
         assert paths.lock_file.exists()
         assert stat.S_IMODE(paths.lock_file.stat().st_mode) == 0o600
-    assert not lock.held
+        with pytest.raises(SyncInProgress):
+            with SyncLock(paths):
+                pass
     assert paths.lock_file.exists()
     with SyncLock(paths):
         pass
@@ -459,6 +485,62 @@ async def test_flood_wait_propagates_after_committing_the_batch(conn: sqlite3.Co
     assert not _arg_chat(conn).unavailable
 
 
+@pytest.mark.parametrize(
+    "error",
+    [
+        errors.FloodWaitError(request=None, capture=3600),
+        errors.AuthKeyUnregisteredError(request=None),
+    ],
+    ids=["flood-wait", "auth-key-unregistered"],
+)
+async def test_mid_stream_failure_keeps_the_committed_batches(
+    conn: sqlite3.Connection, error: Exception
+) -> None:
+    client = _client(
+        messages={ARG_ID: [tl.message(ARG_ID, i, f"m{i}", sender=1) for i in range(1, 1201)]},
+        failures={ARG_ID: (700, error)},
+    )
+    chat = db.upsert_chat(conn, ChatRow(id=ARG_ID, type="supergroup"))
+    with pytest.raises(type(error)):
+        await sync.sync_chat(client, conn, chat, ARG_SOURCE, SyncBudget())
+    assert db.message_counts(conn) == {ARG_ID: sync.BATCH_SIZE}
+    stored = _arg_chat(conn)
+    assert stored.last_msg_id == sync.BATCH_SIZE
+    assert stored.last_sync_at is None
+    client.failures.clear()
+    resumed = await sync.sync_chat(client, conn, stored, ARG_SOURCE, SyncBudget())
+    assert resumed.new == 700 and resumed.complete
+    assert db.message_counts(conn) == {ARG_ID: 1200}
+    incremental = [c for c in _fetch_calls(client, ARG_ID) if c["reverse"]]
+    assert [c["min_id"] for c in incremental] == [0, sync.BATCH_SIZE]
+
+
+async def test_service_message_alone_advances_progress_without_rows(
+    conn: sqlite3.Connection,
+) -> None:
+    client = _client(messages={ARG_ID: [tl.message(ARG_ID, 1, "hi", sender=1)]})
+    chat = db.upsert_chat(conn, ChatRow(id=ARG_ID, type="supergroup"))
+    first = await sync.sync_chat(client, conn, chat, ARG_SOURCE, SyncBudget())
+    client.messages[ARG_ID].append(tl.service_message(ARG_ID, 2))
+    second = await sync.sync_chat(client, conn, first.chat, ARG_SOURCE, SyncBudget())
+    assert second.complete and second.new == 0 and second.new_msg_ids == []
+    assert second.chat.last_msg_id == 2
+    assert _texts(conn, ARG_ID) == {1: "hi"}
+
+
+async def test_forward_origins_bound_by_the_client_are_named_and_stored(
+    conn: sqlite3.Connection,
+) -> None:
+    forwarded = tl.forwarded_message(ARG_ID, 1, "fwd", origin=2)
+    forwarded._forward = SimpleNamespace(sender=BOB, chat=None)  # what Telethon binds
+    client = _client(messages={ARG_ID: [forwarded]})
+    chat = db.upsert_chat(conn, ChatRow(id=ARG_ID, type="supergroup"))
+    await sync.sync_chat(client, conn, chat, ARG_SOURCE, SyncBudget())
+    row = db.get_message(conn, ARG_ID, 1)
+    assert row is not None and row.fwd_from == "Bob"
+    assert conn.execute("SELECT display_name FROM users WHERE id = 2").fetchone()[0] == "Bob"
+
+
 # --- channel comments ------------------------------------------------------------------------
 
 
@@ -542,14 +624,193 @@ async def test_comment_budget_expiry_resumes_from_the_last_finished_post(
     assert not partial.complete
     assert partial.chat.last_msg_id == 1
     assert partial.chat.last_sync_at is None
+    assert partial.new == 3
+    assert partial.discussion is not None and partial.discussion.new == 2
     assert {m.msg_id for m in db.get_messages(conn, DISC_ID)} == {1, 2}
     assert db.message_counts(conn)[NEWS_ID] == 3
     resumed = await sync.sync_chat(client, conn, partial.chat, NEWS_SOURCE, SyncBudget())
     assert resumed.complete
     assert resumed.chat.last_msg_id == 3
+    assert resumed.new == 0
+    assert resumed.discussion is not None and resumed.discussion.new == 1
     assert {m.msg_id for m in db.get_messages(conn, DISC_ID)} == {1, 2, 9}
     threads = [c["reply_to"] for c in _fetch_calls(client, NEWS_ID) if c["reply_to"] is not None]
     assert threads == [1, 2, 3]
+
+
+async def test_threads_that_grew_are_re_read_on_later_runs(
+    conn: sqlite3.Connection, paths: Paths
+) -> None:
+    client = _news_client(
+        messages={
+            NEWS_ID: [
+                tl.channel_post(NEWS_ID, 1, "post 1", replies=2),
+                tl.channel_post(NEWS_ID, 2, "post 2", replies=0),
+                tl.channel_post(NEWS_ID, 3, "post 3", replies=1),
+            ]
+        }
+    )
+    cfg = _cfg(NEWS_SOURCE, edit_refetch=10)
+    await _run(client, conn, paths, cfg)
+    unchanged = await _run(client, conn, paths, cfg)
+    assert unchanged.new == 0
+    threads = [c["reply_to"] for c in _fetch_calls(client, NEWS_ID) if c["reply_to"] is not None]
+    assert threads == [1, 2, 3]
+    client.messages[NEWS_ID][1] = tl.channel_post(NEWS_ID, 2, "post 2", replies=1)
+    client.comments[(NEWS_ID, 2)] = [tl.message(DISC_ID, 5, "new comment", sender=1)]
+    client.comments[(NEWS_ID, 3)].append(tl.message(DISC_ID, 11, "another", sender=1))
+    grown = await _run(client, conn, paths, cfg)
+    assert grown.new == 1 and grown.chats_done == [NEWS_ID]
+    threads = [c["reply_to"] for c in _fetch_calls(client, NEWS_ID) if c["reply_to"] is not None]
+    assert threads == [1, 2, 3, 2]
+    comments = {m.msg_id: m.topic_id for m in db.get_messages(conn, DISC_ID)}
+    assert comments == {1: 1, 2: 1, 5: 2, 9: 3}
+    (thread,) = [u for u in db.get_units(conn, NEWS_ID) if u.kind == "thread" and u.msg_ids == [2]]
+    assert "new comment" in thread.text
+    views = search.thread(conn, NEWS_ID, 2)
+    assert [v.text for v in views] == ["post 2", "new comment"]
+    client.messages[NEWS_ID][2] = tl.channel_post(NEWS_ID, 3, "post 3", replies=2)
+    again = await _run(client, conn, paths, cfg)
+    assert again.new == 1
+    assert {m.msg_id for m in db.get_messages_in_topic(conn, DISC_ID, 3)} == {9, 11}
+
+
+async def test_private_discussion_group_disables_comments_and_keeps_the_posts(
+    conn: sqlite3.Connection, paths: Paths
+) -> None:
+    client = _news_client(
+        entities=[],
+        responses={
+            functions.channels.GetFullChannelRequest: _full_channel(201, chats=[NEWS]),
+        },
+        entity_errors={DISC_ID: errors.ChannelPrivateError(request=None)},
+    )
+    report = await _run(client, conn, paths, _cfg(NEWS_SOURCE))
+    assert report.chats_done == [NEWS_ID] and report.unavailable == []
+    assert report.new == 3
+    assert len(report.warnings) == 1
+    assert "comments of channel" in report.warnings[0] and "unavailable" in report.warnings[0]
+    assert _texts(conn, NEWS_ID) == {1: "post 1", 2: "post 2", 3: "post 3"}
+    assert db.get_chat(conn, DISC_ID) is None
+    assert all(c["reply_to"] is None for c in _fetch_calls(client, NEWS_ID))
+
+
+async def test_refused_comment_thread_switches_comments_off_for_the_run(
+    conn: sqlite3.Connection, paths: Paths
+) -> None:
+    client = _news_client(
+        messages={
+            NEWS_ID: [
+                tl.channel_post(NEWS_ID, 1, "post 1", replies=2),
+                tl.channel_post(NEWS_ID, 2, "post 2", replies=0),
+                tl.channel_post(NEWS_ID, 3, "post 3", replies=1),
+            ]
+        },
+        failures={(NEWS_ID, 1): errors.ChannelPrivateError(request=None)},
+    )
+    cfg = _cfg(NEWS_SOURCE, edit_refetch=10)
+    report = await _run(client, conn, paths, cfg)
+    assert report.chats_done == [NEWS_ID] and report.unavailable == []
+    assert len(report.warnings) == 1 and "comments of channel" in report.warnings[0]
+    assert _texts(conn, NEWS_ID) == {1: "post 1", 2: "post 2", 3: "post 3"}
+    news = db.get_chat(conn, NEWS_ID)
+    assert news is not None and news.last_msg_id == 3 and not news.unavailable
+    assert db.get_messages(conn, DISC_ID) == []
+    threads = [c["reply_to"] for c in _fetch_calls(client, NEWS_ID) if c["reply_to"] is not None]
+    assert threads == [1]
+    client.failures.clear()
+    recovered = await _run(client, conn, paths, cfg)
+    assert recovered.warnings == [] and recovered.new == 3
+    assert {m.msg_id: m.topic_id for m in db.get_messages(conn, DISC_ID)} == {1: 1, 2: 1, 9: 3}
+
+
+async def test_link_discussion_chat_resolves_the_group_through_get_entity(
+    conn: sqlite3.Connection,
+) -> None:
+    client = _news_client(
+        responses={functions.channels.GetFullChannelRequest: _full_channel(201, chats=[NEWS])}
+    )
+    news = db.upsert_chat(conn, ChatRow(id=NEWS_ID, type="channel", source_id=NEWS_SOURCE.id))
+    synced = await sync.sync_chat(client, conn, news, NEWS_SOURCE, SyncBudget())
+    assert ("get_entity", {"key": DISC_ID}) in client.calls
+    discussion = db.get_chat(conn, DISC_ID)
+    assert discussion is not None and discussion.discussion_of == NEWS_ID
+    assert synced.discussion is not None and synced.discussion.new == 3
+
+
+# --- discussion group listed as a chat of its own --------------------------------------------
+
+
+def _discussion_state(conn: sqlite3.Connection, disc_id: int) -> dict[str, object]:
+    chat = db.get_chat(conn, disc_id)
+    assert chat is not None
+    return {
+        "source_id": chat.source_id,
+        "discussion_of": chat.discussion_of,
+        "topics": {m.msg_id: m.topic_id for m in db.get_messages(conn, disc_id)},
+        "window_topics": {u.topic_id for u in db.get_units(conn, disc_id) if u.kind == "window"},
+    }
+
+
+@pytest.mark.parametrize(
+    ("disc", "config"),
+    [
+        pytest.param(DISC, [Source(folder="News", comments=True)], id="folder-group-first"),
+        pytest.param(
+            make_channel(199, "News chat", username="news_chat", megagroup=True),
+            [Source(folder="News", comments=True)],
+            id="folder-channel-first",
+        ),
+        pytest.param(
+            DISC,
+            [Source(chat="@news", comments=True), Source(chat=DISC_ID)],
+            id="explicit-sources",
+        ),
+    ],
+)
+async def test_discussion_group_belongs_to_its_channel_whichever_source_lists_it(
+    conn: sqlite3.Connection, paths: Paths, disc: types.Channel, config: list[Source]
+) -> None:
+    disc_id = -1000000000000 - disc.id
+    client = _discussion_client(disc)
+    cfg = _cfg(*config)
+    expected = {
+        "source_id": config[0].id,
+        "discussion_of": NEWS_ID,
+        "topics": {1: 1, 2: 1, 9: 3},
+        "window_topics": {1, 3},
+    }
+    first = await _run(client, conn, paths, cfg)
+    assert NEWS_ID in first.chats_done and first.unavailable == []
+    assert _discussion_state(conn, disc_id) == expected
+    assert [v.text for v in search.thread(conn, NEWS_ID, 1)] == ["post 1", "comment one", "reply"]
+    plain_fetches = len([c for c in _fetch_calls(client, disc_id) if c["reverse"]])
+    assert plain_fetches <= 1
+    second = await _run(client, conn, paths, cfg)
+    assert second.chats_done == [NEWS_ID] and second.new == 0
+    assert _discussion_state(conn, disc_id) == expected
+    assert len([c for c in _fetch_calls(client, disc_id) if c["reverse"]]) == plain_fetches
+    assert [v.text for v in search.thread(conn, NEWS_ID, 1)] == ["post 1", "comment one", "reply"]
+    by_source = {s.source_id: [c.id for c in s.chats] for s in sources.sources_status(cfg, conn)}
+    assert by_source[config[0].id] == sorted([disc_id, NEWS_ID])
+    if len(config) > 1:
+        assert by_source[config[1].id] == []
+
+
+def test_discussion_owner_requires_a_configured_channel_with_comments(
+    conn: sqlite3.Connection,
+) -> None:
+    news = db.upsert_chat(conn, ChatRow(id=NEWS_ID, type="channel", source_id=NEWS_SOURCE.id))
+    disc = db.upsert_chat(
+        conn,
+        ChatRow(id=DISC_ID, type="supergroup", source_id=NEWS_SOURCE.id, discussion_of=NEWS_ID),
+    )
+    assert sources.discussion_owner(conn, _cfg(NEWS_SOURCE), disc) == news
+    assert sources.discussion_owner(conn, _cfg(Source(chat="@news")), disc) is None
+    assert sources.discussion_owner(conn, _cfg(), disc) is None
+    assert sources.discussion_owner(conn, _cfg(NEWS_SOURCE), news) is None
+    db.delete_chat(conn, NEWS_ID)
+    assert sources.discussion_owner(conn, _cfg(NEWS_SOURCE), disc) is None
 
 
 # --- migration -------------------------------------------------------------------------------
@@ -582,6 +843,31 @@ async def test_group_without_migration_is_synced_normally(conn: sqlite3.Connecti
     synced = await sync.sync_chat(client, conn, chat, Source(chat=-11), SyncBudget())
     assert synced.migrated_to is None
     assert _texts(conn, -11) == {1: "hi"}
+
+
+async def test_migration_check_survives_unresolvable_entities(
+    conn: sqlite3.Connection, caplog: pytest.LogCaptureFixture
+) -> None:
+    gone = make_group(13, "Gone", migrated_to=999)
+    client = _client(
+        entities=[gone],
+        messages={
+            -12: [tl.message(-12, 1, "unknown group", sender=1)],
+            -13: [tl.message(-13, 1, "moved somewhere", sender=1)],
+        },
+    )
+    unknown = db.upsert_chat(conn, ChatRow(id=-12, type="group", source_id="chat:-12"))
+    moved = db.upsert_chat(conn, ChatRow(id=-13, type="group", source_id="chat:-13"))
+    with caplog.at_level("WARNING", logger="grepogram.sync"):
+        first = await sync.sync_chat(client, conn, unknown, Source(chat=-12), SyncBudget())
+        second = await sync.sync_chat(client, conn, moved, Source(chat=-13), SyncBudget())
+    assert first.migrated_to is None and _texts(conn, -12) == {1: "unknown group"}
+    assert second.migrated_to is None and _texts(conn, -13) == {1: "moved somewhere"}
+    stored = db.get_chat(conn, -13)
+    assert stored is not None and stored.migrated_to is None
+    messages = [record.getMessage() for record in caplog.records]
+    assert any("cannot check for migration" in m for m in messages)
+    assert any("cannot be resolved" in m for m in messages)
 
 
 # --- sync_all --------------------------------------------------------------------------------
@@ -746,9 +1032,59 @@ async def test_sync_all_syncs_the_supergroup_a_group_migrated_to(
     assert _fetch_calls(client, GEORGIA_ID) != []
 
 
+async def test_sync_all_does_not_queue_a_supergroup_it_already_processed(
+    conn: sqlite3.Connection, paths: Paths
+) -> None:
+    client = _client(
+        messages={
+            OLD_ID: [tl.message(OLD_ID, 1, "old", sender=1)],
+            GEORGIA_ID: [tl.message(GEORGIA_ID, 1, "new", sender=1)],
+        }
+    )
+    report = await _run(client, conn, paths, _cfg(Source(chat=OLD_ID), Source(chat=GEORGIA_ID)))
+    assert sorted(report.chats_done) == sorted([OLD_ID, GEORGIA_ID])
+    assert len(report.chats_done) == 2 and report.chats_remaining == []
+    assert len([c for c in _fetch_calls(client, GEORGIA_ID) if c["reverse"]]) == 1
+
+
 async def test_sync_all_with_no_sources_is_empty(conn: sqlite3.Connection, paths: Paths) -> None:
+    before = db.last_sync_run(conn)
     report = await _run(_client(), conn, paths, _cfg())
     assert report == SyncReport()
+    assert before is None and db.last_sync_run(conn) is not None
+
+
+async def test_sync_all_stamps_the_run_even_when_no_chat_completes(
+    conn: sqlite3.Connection, paths: Paths
+) -> None:
+    client = _client(failures={ARG_ID: errors.ChannelPrivateError(request=None)})
+    report = await _run(client, conn, paths, _cfg(ARG_SOURCE))
+    assert report.unavailable == [ARG_ID] and report.chats_done == []
+    assert db.last_sync_at(conn) is None
+    assert db.last_sync_run(conn) is not None
+
+
+@pytest.mark.parametrize(
+    ("threshold", "seconds", "expected"),
+    [(120, None, 120), (120, 10, 10), (5, 10, 5)],
+    ids=["unbounded", "budget-caps", "config-caps"],
+)
+async def test_sync_all_caps_the_flood_sleep_at_the_budget(
+    conn: sqlite3.Connection,
+    paths: Paths,
+    threshold: int,
+    seconds: float | None,
+    expected: int,
+) -> None:
+    client = _client(messages={ALICE_ID: [tl.message(ALICE_ID, 1, "hi", sender=1)]})
+    cfg = Config(
+        telegram=TELEGRAM,
+        sync=SyncCfg(flood_sleep_threshold=threshold),
+        sources=[ALICE_SOURCE],
+    )
+    async with tg.connected(client):
+        await sync.sync_all(client, conn, cfg, paths, SyncBudget(seconds))
+    assert client.flood_sleep_threshold == expected
 
 
 # --- cli -------------------------------------------------------------------------------------
@@ -846,3 +1182,28 @@ def test_cli_sync_reports_lock_and_auth_errors(
 def test_cli_sync_rejects_negative_budget(tmp_home: Path) -> None:
     result = runner.invoke(cli.app, ["sync", "--budget", "-1"])
     assert result.exit_code != 0
+
+
+def test_cli_sync_maps_network_errors(tmp_home: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _setup(tmp_home)
+    offline = _client()
+
+    async def failing_connect() -> None:
+        raise ConnectionError("offline")
+
+    monkeypatch.setattr(offline, "connect", failing_connect)
+    monkeypatch.setattr(tg, "make_client", lambda cfg, paths: offline)
+    result = runner.invoke(cli.app, ["sync"])
+    assert result.exit_code == 1
+    assert "error: telegram error: offline" in result.stderr
+    flooded = _client(
+        responses={
+            functions.messages.GetDialogFiltersRequest: errors.FloodWaitError(
+                request=None, capture=30
+            )
+        }
+    )
+    monkeypatch.setattr(tg, "make_client", lambda cfg, paths: flooded)
+    result = runner.invoke(cli.app, ["sync"])
+    assert result.exit_code == 1
+    assert "error: telegram error:" in result.stderr and "30" in result.stderr
