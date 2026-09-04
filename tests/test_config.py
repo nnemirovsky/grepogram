@@ -1,8 +1,11 @@
+import dataclasses
+import fcntl
 import logging
 import os
 import re
 import stat
 import sys
+import threading
 from collections.abc import Iterator
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
@@ -39,6 +42,7 @@ def test_paths_follow_grepogram_home(tmp_home: Path, paths: Paths) -> None:
     assert paths.session_file == tmp_home / "session.session"
     assert paths.db_file == tmp_home / "index.db"
     assert paths.lock_file == tmp_home / "sync.lock"
+    assert paths.config_lock_file == tmp_home / "config.lock"
     assert paths.log_dir == tmp_home / "logs"
     assert paths.log_file == tmp_home / "logs" / "grepogram.log"
 
@@ -57,6 +61,7 @@ def test_paths_macos_defaults_without_override(monkeypatch: pytest.MonkeyPatch) 
     assert paths.session_file == home / ".config" / "grepogram" / "session.session"
     assert paths.db_file == home / "Library" / "Application Support" / "grepogram" / "index.db"
     assert paths.lock_file == home / "Library" / "Application Support" / "grepogram" / "sync.lock"
+    assert paths.config_lock_file == home / ".config" / "grepogram" / "config.lock"
     assert paths.log_dir == home / "Library" / "Logs" / "grepogram"
     assert Paths.from_env({"GREPOGRAM_HOME": "  "}) == paths
 
@@ -203,6 +208,84 @@ def test_source_ids_are_stable() -> None:
 def test_template_parses_to_defaults() -> None:
     assert config.loads(TEMPLATE) == Config()
     assert "[[sources]]" in TEMPLATE
+
+
+# --- config lock -----------------------------------------------------------------------------
+
+
+def _free(path: Path) -> bool:
+    """Whether a fresh descriptor — another process, as far as ``flock`` is concerned — can take
+    the lock right now."""
+    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        return False
+    finally:
+        os.close(fd)
+    return True
+
+
+def test_config_lock_is_exclusive_and_blocks_until_released(paths: Paths) -> None:
+    entered = threading.Event()
+
+    def other_process() -> None:
+        with config.ConfigLock(paths):
+            entered.set()
+
+    waiter = threading.Thread(target=other_process)
+    with config.ConfigLock(paths) as lock:
+        assert lock.path == paths.config_lock_file and lock.path.is_file()
+        assert stat.S_IMODE(lock.path.stat().st_mode) == 0o600
+        assert not _free(lock.path)
+        waiter.start()
+        assert not entered.wait(0.2)
+    waiter.join(5)
+    assert entered.is_set()
+    assert _free(paths.config_lock_file) and paths.config_lock_file.is_file()
+
+
+def test_update_applies_the_change_to_the_stored_config_under_the_lock(paths: Paths) -> None:
+    stored = Config(telegram=TelegramCfg(api_id=1, api_hash="h"), sources=[Source(chat="@a")])
+    config.save(stored, paths)
+    seen: list[Config] = []
+
+    def add_b(current: Config) -> Config:
+        seen.append(current)
+        assert not _free(paths.config_lock_file)
+        return dataclasses.replace(current, sources=[*current.sources, Source(chat="@b")])
+
+    updated = config.update(paths, add_b)
+    assert seen == [stored]
+    assert updated.sources == [Source(chat="@a"), Source(chat="@b")]
+    assert config.load(paths) == updated
+    assert _free(paths.config_lock_file)
+    assert stat.S_IMODE(paths.config_file.stat().st_mode) == 0o600
+
+
+def test_update_starts_from_the_defaults_without_a_file(paths: Paths) -> None:
+    assert not paths.config_file.exists()
+    updated = config.update(paths, lambda current: dataclasses.replace(current, sources=[]))
+    assert updated == Config() and config.load(paths) == Config()
+
+
+def test_update_leaves_the_file_alone_and_frees_the_lock_when_the_change_fails(
+    paths: Paths,
+) -> None:
+    config.save(Config(sources=[Source(chat="@a")]), paths)
+    before = paths.config_file.read_text()
+
+    def broken(current: Config) -> Config:
+        raise ValueError("no")
+
+    with pytest.raises(ValueError, match="no"):
+        config.update(paths, broken)
+    assert paths.config_file.read_text() == before
+    assert _free(paths.config_lock_file)
+    paths.config_file.write_text("[search\n")
+    with pytest.raises(ConfigError, match="invalid TOML"):
+        config.update(paths, lambda current: current)
+    assert _free(paths.config_lock_file)
 
 
 # --- logging ---------------------------------------------------------------------------------

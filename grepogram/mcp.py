@@ -25,7 +25,9 @@ serialise their own calls. Tool calls arrive concurrently, so nothing that one c
 under another is shared: every Telegram-using block builds and disconnects its own client on a
 private in-memory copy of the session (:func:`grepogram.tg.make_client`), syncs queue on
 ``AppState.sync_lock`` instead of failing each other with ``SyncInProgress``, and config changes
-go through ``AppState.editing_config`` so two ``sources_add`` calls cannot overwrite each other.
+go through ``AppState.editing_config`` — the process-wide lock plus the cross-process
+:class:`grepogram.config.ConfigLock` — so neither two ``sources_add`` calls nor a CLI command in
+another terminal can overwrite each other's save.
 """
 
 import argparse
@@ -276,11 +278,13 @@ class AppState:
         """The config as it is now, for a read-modify-write that ends in :meth:`save_config`.
 
         Tool calls run concurrently, and a call that resolved its target over the network must
-        not save the snapshot it started from — another call may have saved in between. The
-        block holds the one lock every config change goes through, so the config it reads is
-        the one its save replaces. Keep the block short and free of awaits.
+        not save the snapshot it started from — another call, or ``grepogram sources add`` /
+        ``rm`` in a terminal, may have saved in between. The block holds the one lock every
+        config change in this process goes through and, inside it, the cross-process
+        :class:`~grepogram.config.ConfigLock` the CLI takes for its own edits, so the config it
+        reads is the one its save replaces. Keep the block short and free of awaits.
         """
-        with self._config_lock:
+        with self._config_lock, config.ConfigLock(self.paths):
             yield self.config()
 
     @asynccontextmanager

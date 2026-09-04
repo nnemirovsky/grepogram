@@ -398,11 +398,15 @@ def sources_add(
         tg.ensure_session_mode(paths)
         client = tg.make_client(cfg, paths)
         added = asyncio.run(_add_source(client, cfg, parsed, since, comments))
-    except (sources.SourceError, tg.AuthRequired, tg.SessionError) as exc:
+        # the target was resolved over the network; the source is applied to the file as it is
+        # by now, under the config lock, not to the snapshot read before the round trip — the
+        # MCP server may have saved a change (a removed source) in the meantime
+        dialog = None if added.folder is not None else added.dialogs[0]
+        config.update(paths, lambda current: sources.with_source(current, added.source, dialog))
+    except (sources.SourceError, tg.AuthRequired, tg.SessionError, ConfigError) as exc:
         fail(str(exc))
     except (tg_errors.RPCError, ConnectionError) as exc:
         fail(f"telegram error: {exc}")
-    config.save(added.config, paths)
     if added.folder is not None:
         what = f"folder {added.title!r} with {len(added.dialogs)} chats"
     else:
@@ -465,15 +469,18 @@ def sources_rm(
     """Remove a source and delete its chats' messages and index data (offline; refuses while a
     sync is running, and refuses a chat indexed through a folder or as a channel's discussion
     group)."""
-    paths, cfg, conn = _load()
+    paths, _, conn = _load()
     try:
-        # the config is saved under the same lock as the delete, so a sync that starts as soon
-        # as the lock is free reads a config without this source and cannot re-create its chats
-        with sync.SyncLock(paths):
-            removed = sources.remove_source(cfg, conn, sources.parse_target(target))
+        # the config is read and saved under the same lock as the delete, so a sync that starts
+        # as soon as the lock is free reads a config without this source and cannot re-create
+        # its chats; the config lock keeps an MCP `sources_add` saving in between from being
+        # overwritten by a snapshot that predates it
+        with sync.SyncLock(paths), config.ConfigLock(paths):
+            current = config.load(paths)
+            removed = sources.remove_source(current, conn, sources.parse_target(target))
             if removed.source is not None:
                 config.save(removed.config, paths)
-    except (sources.SourceError, sync.SyncInProgress) as exc:
+    except (sources.SourceError, sync.SyncInProgress, ConfigError) as exc:
         fail(str(exc))
     finally:
         conn.close()

@@ -14,6 +14,7 @@ from typing import Self
 
 ENV_HOME = "GREPOGRAM_HOME"
 SESSION_SUFFIX = ".session"
+CONFIG_LOCK_NAME = "config.lock"
 LOG_FILE_NAME = "grepogram.log"
 DIR_MODE = 0o700
 
@@ -36,6 +37,11 @@ class Paths:
     @property
     def log_file(self) -> Path:
         return self.log_dir / LOG_FILE_NAME
+
+    @property
+    def config_lock_file(self) -> Path:
+        """The flock taken around every read-modify-write of ``config_file``, next to it."""
+        return self.config_file.with_name(CONFIG_LOCK_NAME)
 
     @property
     def directories(self) -> tuple[Path, ...]:

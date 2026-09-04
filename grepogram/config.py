@@ -4,14 +4,23 @@
 :mod:`grepogram.models`; ``save`` serialises a :class:`Config` with :mod:`tomli_w` and writes it
 with mode 0600. Saving is comment-lossy by design: TOML libraries do not round-trip comments, so
 ``TEMPLATE`` (the annotated file written by ``grepogram config init``) is where comments live.
+
+The file is edited by more than one process — the CLI in a terminal, the MCP server under Claude
+Code — and every edit is a read-modify-write, so :class:`ConfigLock` (an ``flock`` on
+``config.lock`` next to the file) serialises them across processes and :func:`update` is the
+one way to apply a change: it re-reads the file under the lock and saves the result of a pure
+function of what is stored, never of a snapshot taken earlier.
 """
 
 import dataclasses
 import datetime as dt
+import fcntl
 import os
 import tomllib
+from collections.abc import Callable
 from pathlib import Path
-from typing import Any, get_type_hints
+from types import TracebackType
+from typing import Any, Self, get_type_hints
 
 import tomli_w
 
@@ -103,9 +112,67 @@ def from_dict(raw: dict[str, Any]) -> Config:
 
 
 def save(cfg: Config, paths: Paths) -> None:
-    """Write ``cfg`` to ``paths.config_file`` with mode 0600 (comments are not preserved)."""
+    """Write ``cfg`` to ``paths.config_file`` with mode 0600 (comments are not preserved).
+
+    Callers that derived ``cfg`` from an earlier :func:`load` go through :func:`update` instead,
+    which holds :class:`ConfigLock` from the read to the write.
+    """
     paths.ensure_dirs()
     write_private(paths.config_file, dumps(cfg))
+
+
+class ConfigLock:
+    """Exclusive ``flock`` on ``paths.config_lock_file`` around a read-modify-write of the config.
+
+    Blocking, unlike the sync lock: a holder keeps it for the milliseconds a load and a save
+    take, and a process that dies releases it. The lock file is created with mode 0600 and never
+    deleted. Re-entering from the same descriptor is not supported; callers nest it inside the
+    sync lock when they need both.
+    """
+
+    def __init__(self, paths: Paths) -> None:
+        self.path = paths.config_lock_file
+        self._fd: int | None = None
+
+    def __enter__(self) -> Self:
+        self.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        fd = os.open(self.path, os.O_RDWR | os.O_CREAT, FILE_MODE)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+        except BaseException:
+            os.close(fd)
+            raise
+        self._fd = fd
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> None:
+        if self._fd is None:
+            return
+        try:
+            fcntl.flock(self._fd, fcntl.LOCK_UN)
+        finally:
+            os.close(self._fd)
+            self._fd = None
+
+
+def update(paths: Paths, change: Callable[[Config], Config]) -> Config:
+    """Apply ``change`` to the config as stored and save the result; returns what was saved.
+
+    The file is read inside :class:`ConfigLock`, so a change another process saved since the
+    caller last looked — a source the MCP server removed while ``sources add`` was resolving its
+    target — is carried over instead of being overwritten. ``change`` is a pure function of the
+    stored config (:func:`grepogram.sources.with_source`, say) and must not touch the network:
+    the lock is held while it runs. Raises what ``change`` or :func:`load` raise.
+    """
+    with ConfigLock(paths):
+        updated = change(load(paths))
+        save(updated, paths)
+    return updated
 
 
 def dumps(cfg: Config) -> str:

@@ -1,5 +1,6 @@
 import asyncio
 import dataclasses
+import fcntl
 import json
 import logging
 import os
@@ -11,6 +12,7 @@ import threading
 import time
 from collections.abc import Callable, Iterator, Sequence
 from pathlib import Path
+from typing import Any
 
 import pytest
 from mcp.server.fastmcp import FastMCP
@@ -594,6 +596,50 @@ async def test_concurrent_source_changes_all_reach_the_config(
     )
     assert all("error" not in result for result in again)
     assert {s.id for s in config.load(paths).sources} == {f"chat:{GEO}", "folder:Argentina"}
+
+
+def test_editing_config_holds_the_config_lock_across_processes(
+    bind: Callable[..., tools.AppState], paths: Paths
+) -> None:
+    """Another process's ``ConfigLock`` — a second descriptor, as far as ``flock`` is
+    concerned — must wait while the server edits the config, and gets through as soon as the
+    block ends."""
+    state = bind(Config(telegram=KEYS))
+    with state.editing_config() as current:
+        assert current.telegram == KEYS
+        fd = os.open(paths.config_lock_file, os.O_RDWR)
+        try:
+            with pytest.raises(BlockingIOError):
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            state.save_config(dataclasses.replace(current, sources=[Source(chat="@news")]))
+        finally:
+            os.close(fd)
+    with config.ConfigLock(paths):
+        pass
+    assert config.load(paths).sources == [Source(chat="@news")]
+    assert stat.S_IMODE(paths.config_lock_file.stat().st_mode) == 0o600
+
+
+async def test_sources_add_keeps_a_change_another_process_saved_meanwhile(
+    bind: Callable[..., tools.AppState], paths: Paths, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """While the target resolves over the network, ``grepogram sources rm`` in a terminal saves
+    the config without the Argentina folder; the add applies to the file as it is by then, not
+    to the snapshot it started from, so the removal survives."""
+    state = bind(Config(telegram=KEYS, sources=[Source(folder="Argentina")]))
+    state.save_config(state.cfg)
+    real_add = sourcing.add_source
+
+    async def add_then_lose_the_folder(*args: Any, **kwargs: Any) -> sourcing.Added:
+        added = await real_add(*args, **kwargs)
+        config.update(paths, lambda current: dataclasses.replace(current, sources=[]))
+        return added
+
+    monkeypatch.setattr(sourcing, "add_source", add_then_lose_the_folder)
+    result = await tools.sources_add("@news")
+    assert "error" not in result
+    assert config.load(paths).sources == [Source(chat="@news")]
+    assert state.config().sources == [Source(chat="@news")]
 
 
 def _offline() -> FakeClient:

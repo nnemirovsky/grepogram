@@ -1,8 +1,12 @@
+import dataclasses
+import fcntl
 import logging
+import os
 import sqlite3
 import stat
 from collections.abc import Iterator
 from pathlib import Path
+from typing import Any
 
 import pytest
 from telethon import errors
@@ -679,6 +683,66 @@ def test_cli_sources_add_writes_config(tmp_home: Path, monkeypatch: pytest.Monke
     ]
 
 
+def _config_lock_held(paths: Paths) -> bool:
+    """Whether another descriptor — another process, as far as ``flock`` is concerned — is
+    refused the config lock right now."""
+    fd = os.open(paths.config_lock_file, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        return True
+    finally:
+        os.close(fd)
+    return False
+
+
+def test_cli_sources_add_keeps_a_change_saved_while_the_target_resolved(
+    tmp_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The MCP server removes ``@alice`` while ``sources add`` is talking to Telegram; the add
+    is applied to the file as it is by then, under the config lock, so the removal survives."""
+    _signed_in(tmp_home, '[[sources]]\nchat = "@alice"\n')
+    paths = Paths.from_env()
+    monkeypatch.setattr(tg, "make_client", lambda cfg, paths: _client())
+    real_add = cli._add_source
+
+    async def add_after_the_removal(
+        client: Any, cfg: Config, target: sources.Target, since: str | None, comments: bool
+    ) -> sources.Added:
+        added = await real_add(client, cfg, target, since, comments)
+        config.update(paths, lambda current: dataclasses.replace(current, sources=[]))
+        return added
+
+    monkeypatch.setattr(cli, "_add_source", add_after_the_removal)
+    result = runner.invoke(cli.app, ["sources", "add", "@arg_chat"])
+    assert result.exit_code == 0, result.output
+    assert config.load(paths).sources == [Source(chat="@arg_chat")]
+    assert stat.S_IMODE(paths.config_lock_file.stat().st_mode) == 0o600
+    assert not _config_lock_held(paths)
+
+
+def test_cli_sources_add_refuses_a_source_another_process_added_meanwhile(
+    tmp_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _signed_in(tmp_home)
+    paths = Paths.from_env()
+    monkeypatch.setattr(tg, "make_client", lambda cfg, paths: _client())
+    real_add = cli._add_source
+
+    async def add_after_the_other_add(
+        client: Any, cfg: Config, target: sources.Target, since: str | None, comments: bool
+    ) -> sources.Added:
+        added = await real_add(client, cfg, target, since, comments)
+        config.update(paths, lambda current: sources.with_source(current, added.source, None))
+        return added
+
+    monkeypatch.setattr(cli, "_add_source", add_after_the_other_add)
+    result = runner.invoke(cli.app, ["sources", "add", "@arg_chat"])
+    assert result.exit_code == 1
+    assert "already" in result.stderr and result.stdout == ""
+    assert config.load(paths).sources == [Source(chat="@arg_chat")]
+
+
 def test_cli_sources_add_reports_source_errors(
     tmp_home: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -830,6 +894,45 @@ def test_cli_sources_rm_saves_the_config_under_the_sync_lock(
     result = runner.invoke(cli.app, ["sources", "rm", "@alice"])
     assert result.exit_code == 0, result.output
     assert held == [True] and config.load(Paths.from_env()).sources == []
+
+
+def test_cli_sources_rm_applies_to_the_config_as_stored_under_the_config_lock(
+    tmp_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An MCP ``sources_add`` saves the Argentina folder after ``rm`` read the file and before
+    it took the locks; the removal is applied to the file with the folder in it, not to the
+    earlier snapshot, and runs with the config lock held."""
+    (tmp_home / "config.toml").write_text('[[sources]]\nchat = "@alice"\n', encoding="utf-8")
+    paths = Paths.from_env()
+    real_load = cli._load
+    real_remove = sources.remove_source
+
+    def load_then_lose_the_race() -> tuple[Paths, Config, sqlite3.Connection]:
+        loaded = real_load()
+        config.update(
+            paths,
+            lambda current: dataclasses.replace(
+                current, sources=[*current.sources, Source(folder="Argentina")]
+            ),
+        )
+        return loaded
+
+    def remove_under_the_locks(
+        cfg: Config, conn: sqlite3.Connection, target: sources.Target
+    ) -> sources.Removed:
+        assert [s.id for s in cfg.sources] == ["chat:@alice", "folder:Argentina"]
+        assert _config_lock_held(paths)
+        with pytest.raises(sync.SyncInProgress), sync.SyncLock(paths):
+            pass
+        return real_remove(cfg, conn, target)
+
+    monkeypatch.setattr(cli, "_load", load_then_lose_the_race)
+    monkeypatch.setattr(sources, "remove_source", remove_under_the_locks)
+    result = runner.invoke(cli.app, ["sources", "rm", "@alice"])
+    assert result.exit_code == 0, result.output
+    assert result.stdout.strip() == "removed chat:@alice (0 chats deleted)"
+    assert config.load(paths).sources == [Source(folder="Argentina")]
+    assert not _config_lock_held(paths)
 
 
 def test_cli_when_formats_timestamps() -> None:
