@@ -449,15 +449,21 @@ four minutes.
   inside an already closed window keeps the old window text (its reply thread is rebuilt). New
   comments on a channel post are picked up the same way — for the newest `edit_refetch` posts,
   when Telegram reports more replies than are stored; edited or deleted comments are not.
-- `since` on a source relies on Telethon's `offset_date` under `reverse=True` meaning "after this
-  date". This is what Telethon documents and what the test double implements; it has not yet been
-  confirmed against a real long chat. If a first sync pulls the wrong side of the date, please open
-  an issue.
+- `since` on a source is that day's UTC midnight, and the bound is inclusive: a message stamped
+  exactly at `00:00:00Z` is indexed. Telethon 1.44 hands `offset_date` to `messages.getHistory`
+  untouched and filters nothing by date itself, so a `reverse=True` chunk is the complement of the
+  server's exclusive "messages before this date" cut. (Telethon's docstring calls the reversed
+  bound exclusive, but only the *id* offset is compensated to stay so.) This has not been confirmed
+  against a real long chat; if a first sync pulls the wrong side of the date, please open an issue.
 - With `comments = true` and no source listing the discussion group itself, the group holds only
   the comment threads of the channel's posts and is removed together with the channel; list the
   group (in the folder, or as a `chat` entry) to index its whole history as well. The same comments
   then appear twice in the index — in the channel's post threads and in the group's windows — so a
   question about a post may surface both.
+- A channel that loses its discussion group, or is given another one, drops the old link on its
+  next sync: the comments already stored stay in the index as what they are — the messages of that
+  group — but they stop being shown as the channel's comments, and the posts they hung under are
+  rebuilt without them. The old group keeps being synced only if a source of its own lists it.
 - A chat that came in through a folder cannot be removed on its own; remove the folder source or
   take the chat out of the folder in Telegram. Nor can a channel's discussion group be removed
   through the channel's source by naming the group; remove the channel's source.
@@ -471,7 +477,9 @@ four minutes.
   run killed between the unit rebuild and the indexing). The schema upgrade to v2 flags every
   stored message, so the first `grepogram sync` after upgrading rebuilds all units and index rows
   once — units whose content is unchanged keep their embeddings — and the consistency check every
-  sync runs closes the unit-index gaps, both without a re-download.
+  sync runs closes the unit-index gaps, both without a re-download. The upgrade to v3 leaves each
+  channel a single discussion group, keeping the one such an index would have answered with; a
+  channel whose group had changed picks the current one up on its next sync.
 - The MCP contract targets the `mcp` 1.x SDK (`FastMCP`); 2.x renamed the API and is excluded by
   the dependency pin.
 

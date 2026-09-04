@@ -357,7 +357,11 @@ class FakeClient:
         selected = [
             m for m in pool if (not min_id or m.id > min_id) and (not max_id or m.id < max_id)
         ]
-        # offset_id (and min_id, which Telethon turns into one) takes priority over offset_date
+        # offset_id (and min_id, which Telethon turns into one) takes priority over offset_date.
+        # Reversed, the date bound is inclusive: Telethon 1.44 passes offset_date to
+        # GetHistoryRequest untouched and filters nothing by date, so the chunk is the complement
+        # of the server's exclusive "before this date" cut — while the id offset it does
+        # compensate by hand (`offset_id += 1` in _MessagesIter._init) to stay exclusive.
         by_date = offset_date is not None and not offset_id and not min_id
         if reverse:
             selected.sort(key=lambda m: m.id)

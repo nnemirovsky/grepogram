@@ -477,7 +477,15 @@ async def test_fake_iter_messages_reverse_with_min_id_and_limit() -> None:
 
 async def test_fake_iter_messages_offset_date_follows_telethon() -> None:
     """Newest-first, ``offset_date`` is exclusive; reversed it means "from this date on"
-    (inclusive); an ``offset_id`` or ``min_id`` takes priority over it."""
+    (inclusive); an ``offset_id`` or ``min_id`` takes priority over it.
+
+    Telethon's own docstring calls the reversed bound exclusive, but its code does not: it hands
+    ``offset_date`` to ``GetHistoryRequest`` untouched and filters no message by date
+    (``_MessagesIter._init``, ``_message_in_range``), so a reversed chunk is the complement of
+    the server's exclusive "before this date" cut. The *id* offset is the one it compensates by
+    hand to stay exclusive (``offset_id += 1`` under ``reverse``) — which is the proof that an
+    uncompensated reversed bound keeps its boundary.
+    """
     client = _client()
     cutoff = dt.datetime(2025, 1, 1, tzinfo=dt.UTC) + dt.timedelta(minutes=3)
     assert await _collect(client, GROUP, offset_date=cutoff, reverse=True) == [3, 4, 5]

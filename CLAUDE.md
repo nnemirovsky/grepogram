@@ -71,8 +71,23 @@ never change the git identity.
 - Work a sync hands to a worker thread goes through `sync._joined_to_thread`, never bare
   `asyncio.to_thread`: an `anyio` cancel scope (how the MCP server cancels a tool call) abandons
   the future rather than the job, and the `SyncLock` must not be released while a detached thread
-  still writes. The join is a `threading.Event` with a bound — a cancelled scope raises out of
-  every `await`, so it cannot be one.
+  still writes. The join is a `threading.Event` — a cancelled scope raises out of every `await`,
+  so it cannot be one — and it is **not** bounded: a bound would give the lock up over a live
+  writer in exactly the case it exists for (a big rebuild, an embedding backlog), and the next
+  process would start writing against a database this one has not finished with. What keeps the
+  wait short is the `abort` callback: the embedding step is paced by `SyncBudget`, so a
+  cancellation calls `budget.cancel()` and `index.embed_dirty_units` stops at the next batch;
+  the indexing step is one transaction and ends on its own. Only a killed process detaches a
+  writer, and `messages.indexed` plus `index.repair_unit_index` are what the next run repairs it
+  with.
+- A channel has at most one discussion group, and the partial unique index on
+  `chats.discussion_of` (schema v3) is what says so — `db.get_discussion_chat` is a lookup, not a
+  pick between rows. `db.set_discussion_chat` is the only way the link moves or clears
+  (`upsert_chat` COALESCEs the column so re-resolving the group as a source chat never drops it);
+  `sync.link_discussion_chat` calls it on every sync with what `GetFullChannelRequest` reports,
+  so an unlinked or replaced group loses the link. Its messages stay — they are a real group's —
+  and the channel's posts that held them are flagged `indexed = 0` so the next rebuild drops the
+  post threads they fed.
 - A partial batch keeps what it earned: `sync._store_batch` writes `set_chat_progress` in a
   `finally` and `_fetch_comments` stores its rows as it reads them, because a flood wait on one
   comment thread leaves the whole run. A thread is only requested while Telegram reports more
