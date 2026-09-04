@@ -159,6 +159,7 @@ Run `grepogram sync` whenever you want the index current; the MCP `search` tool 
 index older than an hour on its own (see below). A `launchd` job or a cron entry calling
 `grepogram sync --budget 300` works fine next to a running MCP server: only one sync runs at a
 time, and the two never contend for the session file.
+
 ## CLI Reference
 
 Global options: `--version`, `--verbose` / `-v` (DEBUG logging). Command output goes to stdout,
