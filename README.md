@@ -300,7 +300,7 @@ flood_sleep_threshold = 120
 | `sources[].folder` | a Telegram folder by name; its membership (included and pinned chats minus excluded ones, plus category flags) is re-resolved on every sync |
 | `sources[].chat` | one chat: `@username`, `https://t.me/…` link or the id printed by `grepogram dialogs` (Telethon's marked form, `-100…` for channels and supergroups) |
 | `sources[].since` | `YYYY-MM-DD`; history before this date is skipped on the first sync of the chat |
-| `sources[].comments` | channels only: index the comment threads of the linked discussion group as well; on a folder source it applies to every channel in the folder. The comments are stored under the group with the post id attached; a source that lists the group itself (the folder holding both, or a `chat` entry) indexes its whole history on top, and the two share one set of rows |
+| `sources[].comments` | channels only: index the comment threads of the linked discussion group as well; on a folder source it applies to every channel in the folder. The comments are stored under the group, each naming the channel and the post it hangs under; a source that lists the group itself (the folder holding both, or a `chat` entry) indexes its whole history on top, and the two share one set of rows |
 
 `GREPOGRAM_HOME=<dir>` puts every file (`config.toml`, `config.lock`, `session.session`,
 `index.db`, `sync.lock`, `logs/`) under one directory; the tests use it. `GREPOGRAM_FAKE_MODELS=1`
@@ -495,11 +495,22 @@ four minutes.
   next sync: the comments already stored stay in the index as what they are — the messages of that
   group — but they stop being shown as the channel's comments the moment the link goes. The post
   threads they fed are dropped with it, and the posts they hung under are cut again on the next
-  rebuild. They stop hanging under a post at all: post numbers repeat across channels, so a group
-  handed from one channel to another would otherwise show the old channel's comments under the new
-  channel's post of the same number. The old group keeps being synced only if a source of its own lists it. A
+  rebuild. They stop naming a channel and a post at all: post numbers repeat across channels, so a
+  group handed from one channel to another would otherwise show the old channel's comments under
+  the new channel's post of the same number. The group's own units are untouched by that — a
+  window is cut per forum topic and knows nothing of comments — so a comment that stops being one
+  is searchable through the very window it was already in, with no sync in between. The old group
+  keeps being synced only if a source of its own lists it. A
   group Telegram reports but this account cannot open (it went private, say) leaves the comments
   out of that run, and drops the stored link when it is not that same group.
+- A discussion group that is also a forum keeps the two apart: a message's forum topic and the
+  post it comments on are separate columns, because a topic root and a channel post are separate
+  id spaces that both number from 1. Unlinking, handing the group over or deleting the channel
+  therefore leaves the group's own topics exactly as they are. An index written before this
+  (schema v3 or older) stored a comment's post id in the topic column; the upgrade moves it for
+  every discussion group that is not a forum, and for one that is it flags the affected rows and
+  the channel's posts for a rebuild rather than guess which of the two a number was — those
+  comments are re-read and re-attributed by the next sync of the channel.
 - A discussion group belongs to the source that brought it in: the folder or `chat` entry listing
   it when one does, and otherwise the source of the channel that links it now — so a group handed
   from one channel to another moves to the new channel's source, and removing the channel it left
