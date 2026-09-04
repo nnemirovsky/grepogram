@@ -89,8 +89,12 @@ never change the git identity.
   (`upsert_chat` COALESCEs the column so re-resolving the group as a source chat never drops it);
   `sync.link_discussion_chat` calls it on every sync with what `GetFullChannelRequest` reports,
   so an unlinked or replaced group loses the link. Its messages stay — they are a real group's —
-  and the channel's posts that held them are flagged `indexed = 0` so the next rebuild drops the
-  post threads they fed. The whole transition is one `db.transaction` in
+  while the post threads they fed are dropped right there with their index rows
+  (`sync._drop_comment_units` → `db.drop_comment_units`) and the channel's posts that held them
+  are flagged `indexed = 0` so the next rebuild cuts them again, with the new group's comments or
+  with none. Leaving the threads to that rebuild would not do: nothing inside a thread names the
+  group it quotes, only the link does, so a group deleted in between would leave them
+  unreachable. The whole transition is one `db.transaction` in
   `sync._relink_discussion` — the link that moves, the group's `source_id` and the flags of the
   posts it invalidates — so a killed process leaves all of it or none of it; never split those
   halves again. A group Telegram names but will not resolve still clears a link pointing at a
@@ -110,13 +114,18 @@ never change the git identity.
   `_same_chat` and `find_source`'s `_named_source` all go through them; a spelling-based
   comparison silently treats a directly configured group as indirect, which hands its rows to the
   channel's source. A fuzzy `chat =` value names no identity offline and matches nothing.
-- `db.delete_chat` removes the units of *other* chats that quote the chat going away: a channel's
-  post threads carry the comments of its discussion group, so deleting a group drops those
-  threads with their `unit_fts` and `unit_vec` rows and flags the posts `indexed = 0`. The flag
-  alone is not enough — the channel may never resolve again, and the index must not answer with
-  rows that are gone. Deleting a channel clears the link of a group that outlives it (through
-  `db.set_discussion_chat`, still the only way `discussion_of` is cleared); the group's own
-  windows and threads are its own messages and stay.
+- `db.delete_chat` is a no-op for a chat this index does not hold — deleting an unknown id must
+  not clear the `discussion_of` of a live group that names it — and for a stored one it removes
+  the units of *other* chats that quote it: a channel's post threads carry the comments of its
+  discussion group, so deleting a group drops those threads with their `unit_fts` and `unit_vec`
+  rows and flags the posts `indexed = 0`. The flag alone is not enough — the channel may never
+  resolve again, and the index must not answer with rows that are gone. `db.drop_comment_units`
+  is that cleanup, and the single answer to "which units quote this group": `delete_chat` and
+  `sync._drop_comment_units` both call it, so the threads never outlive the link that is the only
+  thing tying them to the group (a thread lists the post in `msg_ids`, never a comment id — no
+  `json_each` over `units.msg_ids` can find them). Deleting a channel clears the link of a group
+  that outlives it (through `db.set_discussion_chat`, still the only way `discussion_of` is
+  cleared); the group's own windows and threads are its own messages and stay.
 - A partial batch keeps what it earned: `sync._store_batch` writes `set_chat_progress` in a
   `finally` and `_fetch_comments` stores its rows as it reads them, because a flood wait on one
   comment thread leaves the whole run. A thread is only requested while Telegram reports more

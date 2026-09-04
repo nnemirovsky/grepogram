@@ -920,9 +920,11 @@ def _relink_discussion(conn: sqlite3.Connection, channel: ChatRow, keep: int | N
 
     A group Telegram unlinked, or replaced with another one, keeps every message it holds: they
     are a real group's real messages, and the group stays indexed as the chat it is. They stop
-    being the channel's comments, though, so the posts they hang under are flagged for a rebuild
-    — :func:`grepogram.units.build_posts` reads the link and finds none (or the new group), and
-    the post threads the old group fed are dropped by the next :func:`index_pending`.
+    being the channel's comments, though, so the post threads they fed are dropped here, with
+    their index rows, and the posts they hang under are flagged for a rebuild — the next
+    :func:`index_pending` cuts those posts again, with the new group's comments or with none
+    (:func:`_drop_comment_units`). Waiting for that rebuild to drop the threads would leave them
+    quoting a group that can be deleted in the meantime, and then nothing would say they exist.
 
     A group can only be linked to one channel at a time, so ``keep`` may be the group another
     channel held until now; that channel's post threads go the same way.
@@ -943,17 +945,23 @@ def _relink_discussion(conn: sqlite3.Connection, channel: ChatRow, keep: int | N
 
 
 def _drop_comment_units(conn: sqlite3.Connection, channel_id: int | None, group_id: int) -> None:
-    """Flag the posts of ``channel_id`` that hold comments from ``group_id`` for a rebuild."""
+    """Drop the post threads of ``channel_id`` that carry ``group_id``'s comments.
+
+    :func:`grepogram.db.drop_comment_units` deletes them with their index rows and flags the
+    posts for a rebuild — the same call :func:`grepogram.db.delete_chat` makes when the group
+    itself goes. The threads cannot be left to the rebuild the flag asks for: nothing in a
+    thread names the group it quotes, only the link does, so a group deleted between the unlink
+    and that rebuild would leave them with no link to find them by.
+    """
     if channel_id is None:
         return
-    posts = db.get_messages_by_msg_id(conn, channel_id, db.stored_topic_ids(conn, group_id))
-    db.mark_unindexed(conn, [post.id for post in posts.values() if post.id is not None])
+    flagged = db.drop_comment_units(conn, channel_id, group_id)
     log.info(
         "channel %s no longer has discussion group %s; %d of its posts are rebuilt without the "
         "comments stored there",
         channel_id,
         group_id,
-        len(posts),
+        flagged,
     )
 
 

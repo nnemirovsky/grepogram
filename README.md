@@ -492,8 +492,9 @@ four minutes.
   question about a post may surface both.
 - A channel that loses its discussion group, or is given another one, drops the old link on its
   next sync: the comments already stored stay in the index as what they are — the messages of that
-  group — but they stop being shown as the channel's comments, and the posts they hung under are
-  rebuilt without them. The old group keeps being synced only if a source of its own lists it. A
+  group — but they stop being shown as the channel's comments the moment the link goes. The post
+  threads they fed are dropped with it, and the posts they hung under are cut again on the next
+  rebuild. The old group keeps being synced only if a source of its own lists it. A
   group Telegram reports but this account cannot open (it went private, say) leaves the comments
   out of that run, and drops the stored link when it is not that same group.
 - A discussion group belongs to the source that brought it in: the folder or `chat` entry listing

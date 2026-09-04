@@ -9,6 +9,7 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
+import sqlite_vec
 from telethon import errors
 from telethon.tl import functions, types
 from telethon.tl.types import messages as tl_messages
@@ -734,6 +735,74 @@ async def test_a_group_two_channels_pointed_at_belongs_to_the_last_one(
     await sync.index_pending(conn, cfg, news)
     assert _thread_texts(conn, NEWS_ID) == {}
     assert _texts(conn, DISC_ID) == {1: "comment one", 2: "reply", 9: "late comment"}
+
+
+def _fake_vectors(conn: sqlite3.Connection, chat_id: int) -> None:
+    """A vector row for every unit of a chat, so a cleanup that misses them is visible."""
+    db.ensure_vec_table(conn, 4)
+    for unit in db.get_units(conn, chat_id):
+        conn.execute(
+            "INSERT INTO unit_vec(rowid, chat_id, date_start, embedding) VALUES (?, ?, 1, ?)",
+            (unit.id, chat_id, sqlite_vec.serialize_float32([1.0, 0.0, 0.0, 0.0])),
+        )
+
+
+def _index_orphans(conn: sqlite3.Connection) -> list[int]:
+    """``unit_fts`` and ``unit_vec`` rowids no ``units`` row backs any more."""
+    tables = ["unit_fts"] + (["unit_vec"] if db.has_vec_table(conn) else [])
+    return [
+        int(row[0])
+        for table in tables
+        for row in conn.execute(
+            f"SELECT rowid FROM {table} WHERE rowid NOT IN (SELECT id FROM units)"
+        )
+    ]
+
+
+async def test_a_group_deleted_after_an_unlink_leaves_no_thread_quoting_it(
+    conn: sqlite3.Connection, paths: Paths
+) -> None:
+    """Nothing inside a post thread names the group whose comments it carries — the link does,
+    and an unlink is the end of it. So the threads go with the link rather than with the rebuild
+    the flagged posts ask for: remove the group's source in between and the comments would sit
+    in ``units``, ``unit_fts`` and ``unit_vec`` with nothing left to find them by."""
+    client = _news_client()
+    cfg = _cfg(NEWS_SOURCE)
+    await _run(client, conn, paths, cfg)
+    news = db.get_chat(conn, NEWS_ID)
+    assert news is not None
+    assert _thread_texts(conn, NEWS_ID) != {}
+    _fake_vectors(conn, NEWS_ID)
+    client.responses[functions.channels.GetFullChannelRequest] = _full_channel(None)
+    assert await sync.link_discussion_chat(client, conn, news) is None
+    assert _thread_texts(conn, NEWS_ID) == {}
+    db.delete_chat(conn, DISC_ID)
+    assert _thread_texts(conn, NEWS_ID) == {}
+    assert _index_orphans(conn) == []
+    assert [v.text for v in search.thread(conn, NEWS_ID, 1)] == ["post 1"]
+    assert db.get_chat(conn, DISC_ID) is None
+
+
+async def test_a_group_deleted_after_a_handover_leaves_the_old_channel_clean(
+    conn: sqlite3.Connection, paths: Paths
+) -> None:
+    """The same for a group another channel takes over: the channel that lost it drops the
+    threads it fed there and then, so deleting the group later — its source now belongs to the
+    channel holding it — has nothing of it left anywhere."""
+    client = _news_client(entities=[DISC, OTHER])
+    cfg = _cfg(NEWS_SOURCE)
+    await _run(client, conn, paths, cfg)
+    other = db.upsert_chat(
+        conn, ChatRow(id=OTHER_ID, type="channel", title="Other", source_id="chat:@other_news")
+    )
+    assert await sync.link_discussion_chat(client, conn, other) is not None
+    assert _thread_texts(conn, NEWS_ID) == {}
+    db.delete_chat(conn, DISC_ID)
+    assert _thread_texts(conn, NEWS_ID) == {}
+    assert _index_orphans(conn) == []
+    assert [v.text for v in search.thread(conn, NEWS_ID, 1)] == ["post 1"]
+    flagged = db.get_messages_by_ids(conn, db.unindexed_message_ids(conn, NEWS_ID))
+    assert [post.msg_id for post in flagged] == [1, 3]
 
 
 async def test_an_unresolvable_new_group_still_drops_the_link_to_the_old_one(
