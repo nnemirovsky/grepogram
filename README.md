@@ -142,9 +142,9 @@ diagnostics and logs to stderr and the log file.
 | `grepogram dialogs <query> [-n N]` | find chats and folders of the account whose title, `@username` or folder name matches; prints kind, id, type, title, username, folders, score |
 | `grepogram sources add <target> [--since YYYY-MM-DD] [--comments]` | add a source and save the config; `target` is a chat id, `@username`, `t.me` link, `folder:<name>` or a fuzzy chat / folder title |
 | `grepogram sources ls` | configured sources with their chats, message counts and last sync |
-| `grepogram sources rm <target>` | remove a source and delete its chats' messages and index rows |
+| `grepogram sources rm <target>` | remove a source and delete its chats' messages and index rows; `target` is a source id as `sources ls` prints it (`folder:<name>`, `chat:@name`, `chat:-100…`), a folder name, a chat id, `@username` or a fuzzy title |
 | `grepogram sync [--budget S]` | fetch new messages from every source, rebuild units, index and embed; stops cleanly after `S` seconds |
-| `grepogram embed [--reembed]` | embed units the dense index does not hold yet; `--reembed` drops every vector and starts over (needed after changing `[models] embed`) |
+| `grepogram embed [--reembed]` | embed units the dense index does not hold yet; `--reembed` drops every vector and starts over (needed after changing `[models] embed`); refuses while a sync is running |
 | `grepogram search <query> …` | search the index, see below |
 | `grepogram-mcp [-v]` | the MCP server over stdio (what Claude Code launches) |
 
@@ -183,7 +183,7 @@ advisory; the data next to them is valid.
 | `sources` | — | `{sources, index_age_min}`: every configured source with its chats (`id`, `title`, `type`, `username`, `message_count`, `last_sync_at`, `unavailable`) |
 | `dialogs` | `query` | `{query, matches}`: chats and folders of the account matching the name; each match carries `kind`, `id`, `title`, `type`, `username`, `folders`, `score` and `target`, the string to pass to `sources_add` |
 | `sources_add` | `target`, `since=null`, `comments=false` | `{source, kind, title, chats, hint}` after saving the config |
-| `sources_remove` | `target` | `{source_id, removed_chat_ids, config_updated}` after deleting the chats' data |
+| `sources_remove` | `target` | `{source_id, removed_chat_ids, config_updated}` after deleting the chats' data; `target` is a source id from `sources` (`folder:<name>`, `chat:<value>`), a folder name, a chat id, `@username` or a fuzzy title |
 | `open_message` | `chat_id`, `msg_id` | `{chat_id, msg_id, url, fallback_url, opened}`; opens the message in the Telegram app through `open`; when that fails the result still carries the urls plus `error` and `hint` |
 
 Messages in `thread` and `context` have `msg_id`, `date`, `from_name`, `text` (a `[photo]`-style
@@ -262,12 +262,12 @@ flood_sleep_threshold = 120
 | `units.window_gap_min` | a pause longer than this closes the current window |
 | `units.window_max_msgs`, `units.window_max_chars` | a window also closes at this many messages or this many characters of rendered text |
 | `units.thread_max_msgs` | a reply thread longer than this continues in further units, each repeating the root |
-| `sync.edit_refetch` | how many of the newest messages of each chat are re-read on every sync to pick up edits and reaction counts |
+| `sync.edit_refetch` | how many of the newest messages of each chat are re-read to pick up edits and reaction counts — after every sync that finishes the chat's incremental pass (skipped on the chat's first sync and when the budget stops the chat); for a channel with `comments` the re-read posts whose reply count grew get their threads fetched again |
 | `sync.flood_sleep_threshold` | Telethon sleeps through a `FloodWait` up to this many seconds; a longer one stops the run with a warning and the chats resume next time |
 | `sources[].folder` | a Telegram folder by name; its membership (included and pinned chats minus excluded ones, plus category flags) is re-resolved on every sync |
 | `sources[].chat` | one chat: `@username`, `https://t.me/…` link or the id printed by `grepogram dialogs` (Telethon's marked form, `-100…` for channels and supergroups) |
 | `sources[].since` | `YYYY-MM-DD`; history before this date is skipped on the first sync of the chat |
-| `sources[].comments` | channels only: index the comment threads of the linked discussion group as well; only honoured on `chat` sources, not on channels that arrive through a folder |
+| `sources[].comments` | channels only: index the comment threads of the linked discussion group as well; on a folder source it applies to every channel in the folder. The discussion group then belongs to the channel — a source that lists the group itself does not index it a second time |
 
 `GREPOGRAM_HOME=<dir>` puts every file (`config.toml`, `session.session`, `index.db`,
 `sync.lock`, `logs/`) under one directory; the tests use it. `GREPOGRAM_FAKE_MODELS=1` swaps both
@@ -337,14 +337,19 @@ inserted for forums), `tg://openmessage?user_id=…&message_id=…` for private 
 **Staying current.** `sync` re-resolves every source (folders change), then syncs chats in
 `last_sync_at` order, never-synced first: new messages after the stored `last_msg_id` in batches
 of 500, then a re-read of the newest `edit_refetch` messages that rewrites only rows whose content
-changed. A budget stops the run cleanly between batches and the report lists `chats_remaining`.
-A file lock makes concurrent syncs from the CLI and the MCP server wait for each other
-(`SyncInProgress` when one is running). Chats Telegram refuses (left, kicked, private) are marked
-`unavailable`, retried on every sync, and cleared when they succeed again; a legacy group that
-was upgraded to a supergroup is followed to its new id. When the MCP `search` tool finds the
-index older than `auto_sync_after_min`, it first runs a sync capped at `auto_sync_budget_s`
-seconds and reports `synced: true`; anything that goes wrong with that refresh — no session, a
-running sync, a flood wait — becomes a warning and the search runs on the index as it is.
+changed (that re-read runs after every sync that finishes the chat's incremental pass, not on
+its first sync or one the budget cut short). A budget stops the run cleanly between batches and
+the report lists `chats_remaining`. A non-blocking file lock keeps two syncs off the same index:
+a CLI `sync`, `embed` or MCP `sync` started while another runs fails at once with
+`SyncInProgress`, and the MCP `search` auto-sync turns that into a warning. Chats Telegram
+refuses (left, kicked, private) are marked `unavailable`, retried on every sync, and cleared when
+they succeed again; a legacy group that was upgraded to a supergroup is followed to its new id.
+When the MCP `search` tool finds the last sync run older than `auto_sync_after_min`, it first
+runs a sync capped at `auto_sync_budget_s` seconds (a flood wait is never slept through for
+longer than the budget has left) and reports `synced: true`; anything that goes wrong with that
+refresh — no session, a running sync, a flood wait — becomes a warning and the search runs on the
+index as it is. A never-synced index is not refreshed automatically — the first `sync` (CLI or
+tool) is explicit.
 
 ## Files and privacy
 
@@ -394,13 +399,17 @@ four minutes.
   runs at the rates above.
 - Deleted messages are not removed from the index; they disappear when their source is removed.
   Edits are picked up only for the newest `edit_refetch` messages of a chat, and an edited message
-  inside an already closed window keeps the old window text (its reply thread is rebuilt).
+  inside an already closed window keeps the old window text (its reply thread is rebuilt). New
+  comments on a channel post are picked up the same way — for the newest `edit_refetch` posts,
+  when Telegram reports more replies than are stored; edited or deleted comments are not.
 - `since` on a source relies on Telethon's `offset_date` under `reverse=True` meaning "after this
   date". This is what Telethon documents and what the test double implements; it has not yet been
   confirmed against a real long chat. If a first sync pulls the wrong side of the date, please open
   an issue.
-- `comments = true` is honoured for `chat` sources only; channels that arrive through a folder get
-  their posts indexed without the discussion threads.
+- With `comments = true` the discussion group is the channel's: its content is the comment threads
+  of the channel's posts, and a source that lists the group itself (a folder holding both, or an
+  explicit `chat` entry) does not index its history separately. Drop `comments` to index the group
+  as a chat of its own.
 - A chat that came in through a folder cannot be removed on its own; remove the folder source or
   take the chat out of the folder in Telegram.
 - `sources add` / `rm` and the MCP tools rewrite `config.toml` without its comments.
