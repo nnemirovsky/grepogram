@@ -201,42 +201,6 @@ def test_build_threads_is_deterministic_under_shuffle() -> None:
         assert unit.msg_ids[1:] == sorted(unit.msg_ids[1:])
 
 
-# --- thread_roots ----------------------------------------------------------------------------
-
-
-@pytest.mark.parametrize(
-    ("msg_ids", "expected"),
-    [
-        ([3], {1}),
-        ([2], {1}),
-        ([1], {1}),
-        ([4], set()),
-        ([6], {5}),
-        ([5], {5}),
-        ([7], set()),
-        ([999], set()),
-        ([3, 6, 4], {1, 5}),
-        ([], set()),
-    ],
-)
-def test_thread_roots(msg_ids: list[int], expected: set[int]) -> None:
-    messages = [
-        _msg(1, 0),
-        _msg(2, 1, reply_to=1),
-        _msg(3, 2, reply_to=2),
-        _msg(4, 3),
-        _msg(5, 4, reply_to=99),
-        _msg(6, 5, reply_to=5),
-        _msg(7, 6, reply_to=98),
-    ]
-    assert units.thread_roots(messages, msg_ids) == expected
-
-
-def test_thread_roots_survive_cycles() -> None:
-    messages = [_msg(1, 0, reply_to=2), _msg(2, 1, reply_to=1), _msg(3, 2, reply_to=1)]
-    assert units.thread_roots(messages, [3, 1, 2]) == set()
-
-
 # --- build_posts -----------------------------------------------------------------------------
 
 

@@ -198,17 +198,6 @@ class _ReplyIndex:
         """Messages that head a thread — replied to, with no parent in the chat — in date order."""
         return [msg for msg in chronological(self.by_id.values()) if self.is_root(msg)]
 
-    def top_of(self, msg_id: int) -> MessageRow | None:
-        """The message at the top of ``msg_id``'s reply chain; ``None`` for an unknown id."""
-        msg = self.by_id.get(msg_id)
-        if msg is None:
-            return None
-        seen = {msg_id}
-        while (parent := self.parent_of(msg)) is not None and parent not in seen:
-            seen.add(parent)
-            msg = self.by_id[parent]
-        return msg
-
     def descendants(self, root_id: int) -> list[MessageRow]:
         """Every reply below ``root_id`` (breadth-first), returned in chronological order."""
         seen = {root_id}
@@ -259,22 +248,6 @@ def build_threads(
         for chunk in thread_chunks(root, index.descendants(root.msg_id), cfg.thread_max_msgs):
             units.append(build_unit("thread", chunk, chat_id, root.topic_id))
     return units
-
-
-def thread_roots(messages: Iterable[MessageRow], msg_ids: Iterable[int]) -> set[int]:
-    """Ids of the thread roots the given messages belong to, as root or as reply.
-
-    Walks up ``reply_to_msg_id`` from each message; a message whose chain ends in something
-    nobody replied to heads no thread and contributes nothing. An incremental rebuild uses this
-    to find the threads a batch of new or edited messages touches.
-    """
-    index = _ReplyIndex(messages)
-    roots: set[int] = set()
-    for msg_id in msg_ids:
-        top = index.top_of(msg_id)
-        if top is not None and index.is_root(top):
-            roots.add(top.msg_id)
-    return roots
 
 
 # --- posts -----------------------------------------------------------------------------------

@@ -426,3 +426,10 @@ def test_load_embedder_raises_when_the_import_fails(stubs: Install) -> None:
 
 def test_tmp_home_selects_the_fake(tmp_home: object) -> None:
     assert isinstance(load_embedder(Config()), FakeEmbedder)
+
+
+# --- added by the review fixes --------------------------------------------------------------
+
+
+def test_fake_features_keep_two_letter_tokens_and_drop_single_letters() -> None:
+    assert FakeEmbedder().features("go a to") == ["go", "to"]

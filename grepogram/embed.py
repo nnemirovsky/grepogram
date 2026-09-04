@@ -91,7 +91,6 @@ class FakeEmbedder:
         self.dim = dim
         source = FAKE_LEXICON if lexicon is None else lexicon
         self.lexicon = {stem_token(key.lower()): value for key, value in source.items()}
-        self._slots: dict[str, tuple[int, float]] = {}
 
     def features(self, text: str) -> list[str]:
         """The hashed features of ``text``: stems mapped through the lexicon, stamps dropped."""
@@ -112,17 +111,9 @@ class FakeEmbedder:
     def _vector(self, text: str) -> list[float]:
         vector = [0.0] * self.dim
         for feature in self.features(text):
-            bucket, sign = self._slot(feature)
-            vector[bucket] += sign
-        return normalize(vector)
-
-    def _slot(self, feature: str) -> tuple[int, float]:
-        slot = self._slots.get(feature)
-        if slot is None:
             digest = hashlib.blake2b(feature.encode("utf-8"), digest_size=8).digest()
-            slot = (int.from_bytes(digest[:4], "big") % self.dim, 1.0 if digest[4] & 1 else -1.0)
-            self._slots[feature] = slot
-        return slot
+            vector[int.from_bytes(digest[:4], "big") % self.dim] += 1.0 if digest[4] & 1 else -1.0
+        return normalize(vector)
 
 
 class BgeM3Embedder:
