@@ -3,14 +3,22 @@
 :func:`sync_all` is the one entry point every caller (CLI ``sync``, MCP ``sync``, auto-sync in
 ``search``) goes through: it takes the cross-process :class:`SyncLock`, re-resolves the configured
 sources, syncs chats in ``last_sync_at`` order until the :class:`SyncBudget` runs out, runs
-:func:`on_chat_synced` — the unit rebuild followed by the lexical index — for every chat that
-changed, and finally embeds the dirty units when an embedder is given. :func:`sync_chat` fetches
-one chat: new messages after ``last_msg_id`` in batches, then a re-fetch of the newest messages
-for edits and reactions. A channel whose source has ``comments`` also gets the comment threads of
-its new posts, stored under the linked discussion group with the post id as ``topic_id``, and on
-every later run the threads of its newest posts that grew since. A source that lists the group
-itself syncs its whole history as well: both paths write the same rows, and a post id already
-stored survives the plain history's upsert (:func:`grepogram.db.upsert_messages`).
+:func:`on_chat_synced` — the unit rebuild followed by the lexical index — over every stored row
+that no rebuild has covered yet, and finally embeds the dirty units when an embedder is given.
+:func:`sync_chat` fetches one chat: new messages after ``last_msg_id`` in batches, then a
+re-fetch of the newest messages for edits and reactions. A channel whose source has ``comments``
+also gets the comment threads of its new posts — the ones Telegram reports comments on — stored
+under the linked discussion group with the post id as ``topic_id``, and on every later run the
+threads of its newest posts that grew since. A source that lists the group itself syncs its
+whole history as well: both paths write the same rows, and a post id already stored survives the
+plain history's upsert (:func:`grepogram.db.upsert_messages`).
+
+Fetching and indexing are decoupled through ``messages.indexed``: every row a batch commits is
+flagged until :func:`on_chat_synced` has rebuilt its units and ``msg_fts`` entry, and
+:func:`_sync_chats` indexes a chat's pending rows after its fetch whether that returned or raised
+(a flood wait, an RPC error, a cancellation) and, at the end of the run, those of the chats it
+never reached. A run that dies between a commit and the rebuild therefore leaves nothing behind
+that the next run does not pick up (:func:`grepogram.db.unindexed_message_ids`).
 
 :func:`map_message` reads raw TL attributes only — ``msg.message``, ``msg.media``,
 ``msg.reply_to``, ``msg.fwd_from``, ``msg.reactions``, ``msg.from_id``, ``msg.post``, ``msg.date``,
@@ -757,7 +765,9 @@ async def _refresh_comments(
     Telegram's reply count on a post is compared with the comments held under the discussion
     chat for that post; a thread that grew is fetched again through :func:`_fetch_comments`
     (an upsert, so nothing is stored twice). Returns the ``messages.id`` of the posts whose
-    threads were re-read. Stops when the budget expires or the threads become unavailable.
+    threads were re-read. Stops when the budget expires or the threads become unavailable. The
+    grown posts are flagged for a rebuild before their threads are read, so the post-thread
+    unit follows the comments that were stored even when the read stops halfway.
     """
     assert run.discussion is not None
     counted = db.count_topic_messages(run.conn, run.discussion.id, replies)
@@ -766,6 +776,7 @@ async def _refresh_comments(
         for post_id, total in replies.items()
         if post_id in stored and total > counted.get(post_id, 0)
     ]
+    db.mark_unindexed(run.conn, [row_id for p in grown if (row_id := stored[p].id) is not None])
     touched: list[int] = []
     for post_id in grown:
         if run.budget.expired or run.discussion is None:
@@ -880,11 +891,31 @@ def on_chat_synced(
     function rather than a list of independent hooks because the indexer needs what the unit
     rebuild returns: :func:`~grepogram.units.rebuild_for_chat` first, then
     :func:`~grepogram.index.index_chat` over the same messages and the rebuild's
-    :class:`~grepogram.units.UnitDelta`. Embedding the dirty units is not per chat — it runs
-    once at the end of :func:`sync_all` when an embedder is given.
+    :class:`~grepogram.units.UnitDelta`, and finally the rows are marked indexed
+    (:func:`grepogram.db.mark_indexed`) so a later run does not rebuild them again. Embedding
+    the dirty units is not per chat — it runs once at the end of :func:`sync_all` when an
+    embedder is given.
     """
     delta = units.rebuild_for_chat(conn, chat, cfg, new_msg_ids)
     index.index_chat(conn, chat, new_msg_ids, delta)
+    db.mark_indexed(conn, new_msg_ids)
+
+
+async def index_pending(conn: sqlite3.Connection, cfg: Config, chat: ChatRow) -> None:
+    """Rebuild and index every stored row of ``chat`` — and of its discussion group, when it is
+    a channel — that no rebuild has covered yet, off the event loop.
+
+    Runs after every fetch, finished or not: the rows a batch committed before a flood wait,
+    an RPC error or a cancellation get their units and ``msg_fts`` entries now, and rows a crash
+    left behind get them on the next run. The chat rows are re-read, since a fetch may have
+    changed them or linked the discussion group; a chat removed meanwhile has nothing to index.
+    """
+    for row in (db.get_chat(conn, chat.id), db.get_discussion_chat(conn, chat.id)):
+        if row is None:
+            continue
+        pending = db.unindexed_message_ids(conn, row.id)
+        if pending:
+            await asyncio.to_thread(on_chat_synced, conn, row, cfg, pending)
 
 
 ConfigSource = Config | Callable[[], Config]
@@ -908,9 +939,11 @@ async def sync_all(
     config: it is called after the lock is taken, so a source removed while the caller was still
     loading its model or connecting — ``sources_remove`` holds the same lock for its delete and
     its config save — is not resolved and fetched again from a stale snapshot. Callers that hold
-    a config they own (tests, a one-shot script) pass it as it is. Each chat with changes goes
-    through :func:`on_chat_synced`. A flood wait Telegram will not let the client sleep through
-    stops the run with a warning; a chat Telegram refuses is reported in ``unavailable``; an
+    a config they own (tests, a one-shot script) pass it as it is. Every stored row no rebuild
+    has covered yet goes through :func:`on_chat_synced` (:func:`index_pending`) — after each
+    chat's fetch, however it ended, and for the chats the run did not reach. A flood wait
+    Telegram will not let the client sleep through stops the run with a warning; a chat Telegram
+    refuses is reported in ``unavailable``; an
     unauthorized session raises :class:`~telethon.errors.UnauthorizedError`, which the
     :func:`~grepogram.tg.connected` block every caller runs in turns into
     :class:`~grepogram.tg.AuthRequired`. The end of the run is stamped in ``meta.last_sync_run``
@@ -957,9 +990,13 @@ async def _sync_chats(
     """The chat loop of :func:`sync_all`.
 
     The unit rebuild runs on a worker thread so the loop keeps serving the client's keepalives
-    while a big chat is cut into units. A chat whose row disappears while it is being fetched —
-    a removal that got past the lock, or a hand-edited database — fails its next write with a
-    foreign-key error; that ends the chat for this run with a warning, not the run.
+    while a big chat is cut into units; it runs for every chat once its fetch is over — after
+    the last batch, or after the batch a flood wait, an RPC error or a cancellation interrupted,
+    which stays committed and searchable either way — and at the end for the chats the budget
+    or a flood wait kept the run from reaching, whose pending rows come from an earlier run. A
+    chat whose row disappears while it is being fetched — a removal that got past the lock, or
+    a hand-edited database — fails its next write with a foreign-key error; that ends the chat
+    for this run with a warning, not the run.
     """
     me = _self_row(await client.get_me())
     queue = sorted(await resolve_sources(cfg, client, conn), key=_sync_order)
@@ -969,6 +1006,7 @@ async def _sync_chats(
     unavailable: list[int] = []
     warnings: list[str] = []
     processed: set[int] = set()
+    deferred: list[ChatRow] = []
     new = 0
     while queue:
         chat = queue.pop(0)
@@ -979,13 +1017,16 @@ async def _sync_chats(
             continue
         if budget.expired:
             remaining.append(chat.id)
+            deferred.append(chat)
             continue
         _cap_flood_sleep(client, cfg.sync, budget)
         try:
-            synced = await sync_chat(client, conn, chat, source, budget, sync_cfg=cfg.sync, me=me)
-            for part in (synced, synced.discussion):
-                if part is not None and part.new_msg_ids:
-                    await asyncio.to_thread(on_chat_synced, conn, part.chat, cfg, part.new_msg_ids)
+            try:
+                synced = await sync_chat(
+                    client, conn, chat, source, budget, sync_cfg=cfg.sync, me=me
+                )
+            finally:
+                await index_pending(conn, cfg, chat)
         except errors.FloodWaitError as exc:
             log.warning("flood wait of %ss on chat %s; stopping this run", exc.seconds, chat.id)
             warnings.append(
@@ -1018,6 +1059,8 @@ async def _sync_chats(
         migrated = synced.migrated_to
         if migrated is not None and migrated.id not in processed and _not_queued(migrated, queue):
             queue.append(migrated)
+    for chat in [*deferred, *queue]:
+        await index_pending(conn, cfg, chat)
     log.info(
         "sync: %d new messages, %d chats done, %d remaining, %d unavailable",
         new,

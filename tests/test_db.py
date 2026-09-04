@@ -14,7 +14,7 @@ from grepogram.models import ChatRow, MessageRow, UnitRow, UserRow
 from grepogram.paths import Paths
 
 TABLES = {"meta", "chats", "users", "messages", "units", "msg_fts", "unit_fts"}
-INDEXES = {"messages_chat_date", "messages_reply", "units_chat_kind_range"}
+INDEXES = {"messages_chat_date", "messages_reply", "units_chat_kind_range", "messages_unindexed"}
 
 
 @pytest.fixture
@@ -139,11 +139,11 @@ def test_connection_usable_from_second_thread(conn: sqlite3.Connection) -> None:
 def test_fresh_migrate_creates_schema() -> None:
     connection = db.connect(":memory:")
     assert db.schema_version(connection) == 0
-    assert db.migrate(connection) == db.SCHEMA_VERSION == 1
+    assert db.migrate(connection) == db.SCHEMA_VERSION == 2
     assert TABLES <= _names(connection, "table")
     assert INDEXES <= _names(connection, "index")
-    assert db.schema_version(connection) == 1
-    assert db.get_meta(connection, "schema_version") == "1"
+    assert db.schema_version(connection) == 2
+    assert db.get_meta(connection, "schema_version") == "2"
     assert not db.has_vec_table(connection)
     assert not connection.in_transaction
     messages_sql = connection.execute(
@@ -151,6 +151,7 @@ def test_fresh_migrate_creates_schema() -> None:
     ).fetchone()[0]
     assert "UNIQUE (chat_id, msg_id)" in messages_sql
     assert "REFERENCES chats(id) ON DELETE CASCADE" in messages_sql
+    assert "indexed INTEGER NOT NULL DEFAULT 0" in messages_sql
     units_sql = connection.execute("SELECT sql FROM sqlite_master WHERE name = 'units'").fetchone()
     assert "AUTOINCREMENT" in units_sql[0]
     for fts in ("msg_fts", "unit_fts"):
@@ -160,9 +161,28 @@ def test_fresh_migrate_creates_schema() -> None:
 
 def test_migrate_twice_is_noop(conn: sqlite3.Connection) -> None:
     before = _schema(conn)
-    assert db.migrate(conn) == 1
+    assert db.migrate(conn) == 2
     assert _schema(conn) == before
-    assert db.get_meta(conn, "schema_version") == "1"
+    assert db.get_meta(conn, "schema_version") == "2"
+
+
+def test_migrate_v1_to_v2_flags_every_stored_message(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A v1 index is upgraded in place, and its rows start unindexed so the first sync after
+    the upgrade rebuilds what an interrupted run may have left without units."""
+    connection = db.connect(":memory:")
+    monkeypatch.setattr(db, "MIGRATIONS", db.MIGRATIONS[:1])
+    monkeypatch.setattr(db, "SCHEMA_VERSION", 1)
+    assert db.migrate(connection) == 1
+    assert "messages_unindexed" not in _names(connection, "index")
+    connection.execute("INSERT INTO chats(id, type) VALUES (1, 'supergroup')")
+    connection.execute("INSERT INTO messages(chat_id, msg_id, date, text) VALUES (1, 1, 10, 'a')")
+    connection.execute("INSERT INTO messages(chat_id, msg_id, date, text) VALUES (1, 2, 20, 'b')")
+    monkeypatch.undo()
+    assert db.migrate(connection) == 2
+    assert db.schema_version(connection) == 2
+    assert "messages_unindexed" in _names(connection, "index")
+    assert db.unindexed_message_ids(connection, 1) == [1, 2]
+    assert not connection.in_transaction
 
 
 def test_migrate_refuses_newer_schema(conn: sqlite3.Connection) -> None:
@@ -564,6 +584,30 @@ def test_upsert_messages_returns_ids_and_stores_all_columns(conn: sqlite3.Connec
     )
     assert db.get_message(conn, 1, 12) is None
     assert db.upsert_messages(conn, []) == []
+
+
+def test_upsert_flags_rows_until_they_are_marked_indexed(conn: sqlite3.Connection) -> None:
+    """Every row written — inserted or updated, changed or not — waits for a rebuild; the
+    flag is cleared per row, in chunks larger than one ``IN`` list, and can be raised again for
+    a row whose derived units went stale without the row itself changing."""
+    db.upsert_chat(conn, _chat(1))
+    db.upsert_chat(conn, _chat(2))
+    ids = db.upsert_messages(conn, [_message(1, i) for i in range(1, db.IN_BATCH + 102)])
+    other = db.upsert_messages(conn, [_message(2, 1)])
+    assert db.unindexed_message_ids(conn, 1) == ids
+    assert db.unindexed_message_ids(conn, 2) == other
+    db.mark_indexed(conn, ids)
+    assert db.unindexed_message_ids(conn, 1) == []
+    assert db.unindexed_message_ids(conn, 2) == other
+    edited = db.upsert_messages(conn, [_message(1, 5, text="edited"), _message(1, 6)])
+    assert db.unindexed_message_ids(conn, 1) == edited
+    db.mark_indexed(conn, edited)
+    db.mark_unindexed(conn, ids[:2])
+    assert db.unindexed_message_ids(conn, 1) == ids[:2]
+    db.mark_indexed(conn, [])
+    db.mark_unindexed(conn, [])
+    assert db.unindexed_message_ids(conn, 1) == ids[:2]
+    assert not conn.in_transaction
 
 
 def test_upsert_messages_preserves_id_across_edit(conn: sqlite3.Connection) -> None:

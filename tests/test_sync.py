@@ -16,7 +16,16 @@ from typer.testing import CliRunner
 from grepogram import cli, db, search, sources, sync, tg
 from grepogram.config import ConfigError
 from grepogram.log import shutdown_logging
-from grepogram.models import ChatRow, Config, Filters, Source, SyncCfg, SyncReport, TelegramCfg
+from grepogram.models import (
+    ChatRow,
+    Config,
+    Filters,
+    MessageRow,
+    Source,
+    SyncCfg,
+    SyncReport,
+    TelegramCfg,
+)
 from grepogram.paths import Paths
 from grepogram.sync import SyncBudget, SyncInProgress, SyncLock
 from tests.fakes import FakeClient, make_channel, make_dialog, make_folder, make_group, make_user
@@ -1447,3 +1456,157 @@ def test_cli_sync_maps_network_errors(tmp_home: Path, monkeypatch: pytest.Monkey
     result = runner.invoke(cli.app, ["sync"])
     assert result.exit_code == 1
     assert "error: telegram error:" in result.stderr and "30" in result.stderr
+
+
+# --- indexing what a run committed -----------------------------------------------------------
+
+
+def _fts_count(conn: sqlite3.Connection, chat_id: int) -> int:
+    row = conn.execute("SELECT count(*) FROM msg_fts WHERE chat_id = ?", (chat_id,)).fetchone()
+    return int(row[0])
+
+
+def _windowed(conn: sqlite3.Connection, chat_id: int) -> set[int]:
+    return {i for u in db.get_units(conn, chat_id) if u.kind == "window" for i in u.msg_ids}
+
+
+def _threaded_history(count: int) -> list[types.Message]:
+    """``count`` messages a minute apart where every third one replies to the one before it."""
+    return [
+        tl.message(
+            ARG_ID,
+            i,
+            f"w{i} word",
+            sender=1,
+            date=tl.at(i),
+            reply_to=tl.reply_header(i - 1) if i % 3 == 0 else None,
+        )
+        for i in range(1, count + 1)
+    ]
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        errors.FloodWaitError(request=None, capture=999),
+        errors.ServerError(request=None, message="INTERNAL"),
+    ],
+    ids=["flood-wait", "rpc-error"],
+)
+async def test_batches_committed_before_a_failure_are_indexed_in_the_same_run(
+    conn: sqlite3.Connection, paths: Paths, error: Exception
+) -> None:
+    """The 500 rows stored before the error get their units and ``msg_fts`` rows before the
+    run reports, and the next run — which resumes above them — leaves nothing behind."""
+    client = _client(messages={ARG_ID: _threaded_history(1200)}, failures={ARG_ID: (700, error)})
+    cfg = _cfg(ARG_SOURCE)
+    first = await _run(client, conn, paths, cfg)
+    assert first.chats_done == [] and first.chats_remaining == [ARG_ID]
+    assert len(first.warnings) == 1
+    assert db.message_counts(conn) == {ARG_ID: sync.BATCH_SIZE}
+    assert _fts_count(conn, ARG_ID) == sync.BATCH_SIZE
+    assert db.unindexed_message_ids(conn, ARG_ID) == []
+    assert _windowed(conn, ARG_ID) == set(range(1, sync.BATCH_SIZE + 1))
+    assert [m.anchor_msg_id for m in search.lexical_messages(conn, "w10", Filters(), 5)] == [10]
+    client.failures.clear()
+    second = await _run(client, conn, paths, cfg)
+    assert second.chats_done == [ARG_ID] and second.new == 700 and second.warnings == []
+    assert _fts_count(conn, ARG_ID) == 1200
+    assert db.unindexed_message_ids(conn, ARG_ID) == []
+    assert _windowed(conn, ARG_ID) == set(range(1, 1201))
+    roots = {u.msg_ids[0] for u in db.get_units(conn, ARG_ID) if u.kind == "thread"}
+    assert roots == {i - 1 for i in range(1, 1201) if i % 3 == 0}
+    for word in ("w10", "w499", "w501", "w900"):
+        assert len(search.lexical_messages(conn, word, Filters(), 5)) == 1
+
+
+async def test_batches_committed_before_an_auth_error_are_indexed_before_it_propagates(
+    conn: sqlite3.Connection, paths: Paths
+) -> None:
+    client = _client(
+        messages={ARG_ID: _threaded_history(1200)},
+        failures={ARG_ID: (700, errors.AuthKeyUnregisteredError(request=None))},
+    )
+    with pytest.raises(tg.AuthRequired):
+        await _run(client, conn, paths, _cfg(ARG_SOURCE))
+    assert db.message_counts(conn) == {ARG_ID: sync.BATCH_SIZE}
+    assert _fts_count(conn, ARG_ID) == sync.BATCH_SIZE
+    assert db.unindexed_message_ids(conn, ARG_ID) == []
+
+
+@pytest.mark.parametrize("seconds", [0, None], ids=["not-reached", "reached"])
+async def test_rows_a_crash_left_unindexed_are_indexed_by_the_next_run(
+    conn: sqlite3.Connection, paths: Paths, seconds: float | None
+) -> None:
+    """Rows committed with the progress already advanced past them — what a process killed
+    between a batch commit and the rebuild leaves — are picked up whether the run reaches the
+    chat or the budget keeps it from fetching anything."""
+    db.upsert_chat(conn, ChatRow(id=ARG_ID, type="supergroup", source_id=ARG_SOURCE.id))
+    ids = db.upsert_messages(
+        conn,
+        [
+            MessageRow(chat_id=ARG_ID, msg_id=i, date=1_700_000_000 + i * 60, text=f"stranded w{i}")
+            for i in (1, 2, 3)
+        ],
+    )
+    db.set_chat_progress(conn, ARG_ID, 3, 1_700_000_000)
+    assert db.unindexed_message_ids(conn, ARG_ID) == ids
+    client = _client(messages={ARG_ID: []})
+    report = await _run(client, conn, paths, _cfg(ARG_SOURCE), seconds)
+    if seconds is None:
+        assert report.chats_done == [ARG_ID]
+    else:
+        assert report.chats_remaining == [ARG_ID] and _fetch_calls(client, ARG_ID) == []
+    assert db.unindexed_message_ids(conn, ARG_ID) == []
+    assert _fts_count(conn, ARG_ID) == 3
+    assert [u.msg_ids for u in db.get_units(conn, ARG_ID)] == [[1, 2, 3]]
+    assert len(search.lexical_messages(conn, "stranded", Filters(), 5)) == 1
+
+
+def _thread_texts(conn: sqlite3.Connection, chat_id: int) -> dict[int, list[str]]:
+    """Post id → the texts in its post thread, post first."""
+    return {
+        u.msg_ids[0]: [line.split(": ", 1)[1] for line in u.text.splitlines()]
+        for u in db.get_units(conn, chat_id)
+        if u.kind == "thread"
+    }
+
+
+async def test_grown_posts_are_flagged_before_their_threads_are_re_read(
+    conn: sqlite3.Connection, paths: Paths
+) -> None:
+    """Threads that grew are re-read newest post first. When a flood wait stops the re-read
+    halfway, the post whose thread was already re-read gets its post thread rebuilt in the
+    same run — it was flagged before the reads began, and the run indexes what it committed —
+    while the other one waits for the next run."""
+    client = _news_client()
+    cfg = _cfg(NEWS_SOURCE, edit_refetch=10)
+    await _run(client, conn, paths, cfg)
+    assert _thread_texts(conn, NEWS_ID) == {
+        1: ["post 1", "comment one", "reply"],
+        3: ["post 3", "late comment"],
+    }
+    client.messages[NEWS_ID][0] = tl.channel_post(NEWS_ID, 1, "post 1", replies=3)
+    client.comments[(NEWS_ID, 1)].append(tl.message(DISC_ID, 22, "c22", sender=2))
+    client.messages[NEWS_ID][2] = tl.channel_post(NEWS_ID, 3, "post 3", replies=2)
+    client.comments[(NEWS_ID, 3)].append(tl.message(DISC_ID, 11, "another", sender=1))
+    client.failures[(NEWS_ID, 1)] = errors.FloodWaitError(request=None, capture=999)
+    stopped = await _run(client, conn, paths, cfg)
+    assert stopped.chats_remaining == [NEWS_ID] and "flood wait" in stopped.warnings[0]
+    threads = [c["reply_to"] for c in _fetch_calls(client, NEWS_ID) if c["reply_to"] is not None]
+    assert threads == [1, 3, 3, 1]
+    assert db.unindexed_message_ids(conn, NEWS_ID) == []
+    assert db.unindexed_message_ids(conn, DISC_ID) == []
+    assert _thread_texts(conn, NEWS_ID) == {
+        1: ["post 1", "comment one", "reply"],
+        3: ["post 3", "late comment", "another"],
+    }
+    assert db.containing_unit(conn, DISC_ID, 11, None) is not None
+    client.failures.clear()
+    resumed = await _run(client, conn, paths, cfg)
+    assert resumed.chats_done == [NEWS_ID] and resumed.warnings == [] and resumed.new == 1
+    assert _thread_texts(conn, NEWS_ID) == {
+        1: ["post 1", "comment one", "reply", "c22"],
+        3: ["post 3", "late comment", "another"],
+    }
+    assert db.unindexed_message_ids(conn, NEWS_ID) == []

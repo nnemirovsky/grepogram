@@ -8,6 +8,11 @@ removes their rows before the ``chats`` row cascades to ``messages`` and ``units
 Every writing function is atomic on its own and commits when it finishes, unless a transaction is
 already open — wrap several calls in ``with transaction(conn):`` to commit them together.
 
+``messages.indexed`` ties the raw rows to what is derived from them: a row is written with the
+flag at 0 and :func:`mark_indexed` sets it once its units and ``msg_fts`` entry exist, so a sync
+that stopped between a batch commit and the rebuild — a flood wait, a cancelled tool call, a
+crash — leaves rows :func:`unindexed_message_ids` reports and the next run picks up.
+
 One connection serves the whole process, including the worker threads the MCP server runs
 retrieval and embedding on, so :class:`Connection` serialises its use: every statement runs and
 is fetched to completion under one re-entrant lock (:class:`_Cursor`), and :func:`transaction`
@@ -93,7 +98,15 @@ _V1: tuple[str, ...] = (
         raw, stemmed, chat_id UNINDEXED, date_start UNINDEXED, tokenize='{FTS_TOKENIZE}')""",
 )
 
-MIGRATIONS: tuple[tuple[str, ...], ...] = (_V1,)
+_V2: tuple[str, ...] = (
+    # 0 while the units and the msg_fts row derived from a message are behind it: set by every
+    # insert and update, cleared by the rebuild; existing rows start at 0 so the first sync after
+    # the upgrade rebuilds everything once and repairs whatever an interrupted run left behind
+    "ALTER TABLE messages ADD COLUMN indexed INTEGER NOT NULL DEFAULT 0",
+    "CREATE INDEX messages_unindexed ON messages(chat_id, id) WHERE indexed = 0",
+)
+
+MIGRATIONS: tuple[tuple[str, ...], ...] = (_V1, _V2)
 SCHEMA_VERSION = len(MIGRATIONS)
 
 _VEC_DIM_RE = re.compile(r"FLOAT\[(\d+)\]")
@@ -113,7 +126,8 @@ _MESSAGE_UPSERT = """
         text = excluded.text,
         media_kind = excluded.media_kind,
         media_filename = excluded.media_filename,
-        reactions_total = excluded.reactions_total
+        reactions_total = excluded.reactions_total,
+        indexed = 0
     RETURNING id"""
 
 _UNIT_INSERT = """
@@ -504,8 +518,9 @@ def upsert_messages(conn: sqlite3.Connection, batch: Iterable[MessageRow]) -> li
     Conflicts update in place, so an edited message keeps its ``id`` and therefore its FTS
     rowid. A ``topic_id`` already stored survives a row without one: a channel's comment threads
     store a discussion group's messages with the post id as topic, and the group's own history
-    sync stores the same messages with none — either may arrive first. The chat row must exist
-    (foreign key).
+    sync stores the same messages with none — either may arrive first. Every row written, new or
+    updated, is flagged ``indexed = 0`` until a rebuild covers it (:func:`mark_indexed`). The
+    chat row must exist (foreign key).
     """
     ids: list[int] = []
     with transaction(conn):
@@ -530,6 +545,34 @@ def upsert_messages(conn: sqlite3.Connection, batch: Iterable[MessageRow]) -> li
             ).fetchone()
             ids.append(int(row["id"]))
     return ids
+
+
+def unindexed_message_ids(conn: sqlite3.Connection, chat_id: int) -> list[int]:
+    """``messages.id`` of every row of ``chat_id`` whose units and ``msg_fts`` row are behind.
+
+    Rows are flagged by :func:`upsert_messages` and :func:`mark_unindexed` and cleared by
+    :func:`mark_indexed` once :func:`grepogram.sync.on_chat_synced` has rebuilt them; a partial
+    index keeps the query cheap while — the normal case — nothing is pending.
+    """
+    rows = conn.execute(
+        "SELECT id FROM messages WHERE chat_id = ? AND indexed = 0 ORDER BY id", (chat_id,)
+    )
+    return [int(row["id"]) for row in rows]
+
+
+def mark_indexed(conn: sqlite3.Connection, ids: Iterable[int]) -> None:
+    """Record that the units and ``msg_fts`` rows of these ``messages.id`` are up to date."""
+    with transaction(conn):
+        for chunk in _chunks(ids):
+            conn.execute(f"UPDATE messages SET indexed = 1 WHERE id IN ({_marks(chunk)})", chunk)
+
+
+def mark_unindexed(conn: sqlite3.Connection, ids: Iterable[int]) -> None:
+    """Flag these ``messages.id`` for the next rebuild without changing the rows themselves —
+    a channel post whose comment thread grew, whose own text did not change."""
+    with transaction(conn):
+        for chunk in _chunks(ids):
+            conn.execute(f"UPDATE messages SET indexed = 0 WHERE id IN ({_marks(chunk)})", chunk)
 
 
 def get_messages(
