@@ -12,7 +12,7 @@ from grepogram.embed import ModelUnavailable
 from grepogram.models import Config, ModelsCfg
 from grepogram.rerank import (
     BATCH_SIZE,
-    MAX_LENGTH,
+    MAX_SEQ_LENGTH,
     BgeReranker,
     FakeReranker,
     Reranker,
@@ -195,8 +195,8 @@ def test_bge_loads_on_mps_in_fp16_with_max_length(stubs: Install) -> None:
     assert reranker.device == "mps"
     assert model.model_id == "BAAI/bge-reranker-v2-m3"
     assert model.device == "mps"
-    assert model.kwargs == {"max_length": MAX_LENGTH}
-    assert MAX_LENGTH == 512
+    assert model.kwargs == {"max_length": MAX_SEQ_LENGTH}
+    assert MAX_SEQ_LENGTH == 512
     assert model.halved is True
 
 

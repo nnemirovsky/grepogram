@@ -33,7 +33,7 @@ from grepogram.models import Config
 log = logging.getLogger(__name__)
 
 FAKE_NAME = "fake"
-MAX_LENGTH = 512
+MAX_SEQ_LENGTH = 512
 BATCH_SIZE = 32
 
 
@@ -91,7 +91,7 @@ class BgeReranker:
             ) from exc
         self.device = resolve_device(device)
         try:
-            model = CrossEncoder(model_id, device=self.device, max_length=MAX_LENGTH)
+            model = CrossEncoder(model_id, device=self.device, max_length=MAX_SEQ_LENGTH)
             if self.device == "mps":
                 model.half()
         except Exception as exc:
