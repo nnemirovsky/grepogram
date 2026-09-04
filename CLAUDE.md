@@ -16,6 +16,10 @@ Python 3.12 pinned, `uv` only (no pip, no global installs), developed on macOS.
 - `uv run grepogram --help`, `uv run grepogram-mcp` — the CLI and the MCP server
 - all checks pass before every commit; CI (`.github/workflows/ci.yml`) runs them with
   `--group dev` only, `GREPOGRAM_FAKE_MODELS=1` and `HF_HUB_OFFLINE=1`
+- `uv.lock` is committed and CI installs with `--locked`: after touching dependencies run
+  `uv lock` and commit the lockfile
+- the version lives in `grepogram/__init__.py` only (`__version__`, read by hatch and
+  `grepogram --version`)
 
 ## Commit convention
 
@@ -36,11 +40,21 @@ never change the git identity.
   `msg.edit_date` — never the client-bound helpers (`msg.text`, `msg.file`, `msg.sender`,
   `msg.chat`), so a message built without a client maps exactly like one Telethon yields.
 - Never `async with client` on a Telethon client (it calls `start()` and prompts on stdin); use
-  `tg.connected(client)`.
+  `tg.connected(client)`. The MCP server builds a fresh client per Telegram-using tool call
+  (`AppState.telegram()`): Telethon caches the authorization check per instance and concurrent
+  calls must never share a connection one of them will close.
+- `mcp` stays `<2`: `grepogram/mcp.py` targets the 1.x `FastMCP` API (2.x renamed it).
+- Never instantiate `FastMCP` at module level; `mcp.build_server()` runs after `setup_logging()`
+  because `FastMCP.__init__` calls `logging.basicConfig`, and `main()` lowers the `mcp` logger to
+  WARNING (the lowlevel server logs every request at INFO).
 - Every writer in `db.py` runs inside `db.transaction(conn)`. FTS and vec rows are keyed by the
   parent rowid (`messages.id`, `units.id`) and deleted by rowid, never by an UNINDEXED column.
+  The one connection is shared across threads: `db.Connection` runs every statement to completion
+  under a re-entrant lock and `transaction()` holds it from `BEGIN` to `COMMIT`; the connection is
+  in autocommit mode, so a bare statement never leaves an implicit transaction open.
 - `config.toml`, the session file and the lock file are written with mode 0600
-  (`config.write_private`, `tg.prepare_session`), directories with 0700.
+  (`config.write_private`, `tg.prepare_session`); the directories grepogram creates get 0700 and
+  an existing one (a user's own `GREPOGRAM_HOME`) is left as it is.
 - Files end with a single newline; no trailing blank lines.
 
 ## Environment variables
