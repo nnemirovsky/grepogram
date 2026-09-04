@@ -216,6 +216,22 @@ def test_load_exits_on_a_schema_version_it_cannot_read(
     assert "delete index.db and run `grepogram sync`" in captured.err
 
 
+def test_load_exits_when_the_interpreter_cannot_load_extensions(
+    tmp_home: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An install under a Python without loadable extensions is a broken install, and every
+    command says so with the interpreter and the reinstall command instead of a traceback."""
+    monkeypatch.setattr(db, "_extensions_supported", lambda: False)
+    with pytest.raises(typer.Exit) as excinfo:
+        cli._load()
+    assert excinfo.value.exit_code == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "error: this Python cannot load SQLite extensions" in captured.err
+    assert sys.executable in captured.err
+    assert "uv tool install --managed-python" in captured.err
+
+
 def test_fail_writes_to_stderr_and_exits(capsys: pytest.CaptureFixture[str]) -> None:
     with pytest.raises(typer.Exit) as excinfo:
         cli.fail("nope", code=3)

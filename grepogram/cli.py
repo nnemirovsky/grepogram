@@ -565,6 +565,6 @@ def _load() -> tuple[Paths, Config, sqlite3.Connection]:
     cfg = _load_config(paths)
     try:
         conn = _open_db(paths)
-    except db.SchemaError as exc:
+    except (db.SchemaError, db.ExtensionsUnsupported) as exc:
         fail(str(exc))
     return paths, cfg, conn

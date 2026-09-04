@@ -1,6 +1,7 @@
 import dataclasses
 import sqlite3
 import stat
+import sys
 import threading
 import time
 from pathlib import Path
@@ -113,6 +114,25 @@ def test_connect_with_paths_creates_wal_database(tmp_home: Path) -> None:
         assert connection.execute("PRAGMA synchronous").fetchone()[0] == 1
     finally:
         connection.close()
+
+
+def test_connect_refuses_an_interpreter_that_cannot_load_extensions(
+    tmp_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The capability is missing on python.org's macOS build and Apple's system Python, and the
+    method the loading needs is simply not there. The user gets the interpreter and the fix,
+    never the bare ``AttributeError`` from the middle of the connection setup, and no file is
+    created for an index that could not have been opened."""
+    monkeypatch.setattr(db, "_extensions_supported", lambda: False)
+    paths = Paths.from_env()
+    with pytest.raises(db.ExtensionsUnsupported) as excinfo:
+        db.connect(paths)
+    message = str(excinfo.value)
+    assert sys.executable in message
+    assert sys.version.split()[0] in message
+    assert "--enable-loadable-sqlite-extensions" in message
+    assert "uv tool install --managed-python" in message
+    assert not paths.db_file.exists()
 
 
 def test_connection_usable_from_second_thread(conn: sqlite3.Connection) -> None:

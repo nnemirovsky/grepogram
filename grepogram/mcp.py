@@ -840,7 +840,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     with contextlib.redirect_stdout(sys.stderr):
         try:
             state = AppState.open(paths)
-        except (ConfigError, db.SchemaError) as exc:
+        except (ConfigError, db.SchemaError, db.ExtensionsUnsupported) as exc:
             raise SystemExit(f"error: {exc}") from exc
         bind(state)
         server = build_server()

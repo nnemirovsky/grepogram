@@ -26,6 +26,7 @@ would otherwise leave behind for the next ``transaction()`` to join.
 import json
 import re
 import sqlite3
+import sys
 import threading
 from collections import deque
 from collections.abc import Iterable, Iterator, Sequence
@@ -142,6 +143,19 @@ write is rebuilt from Telegram, see :func:`migrate`."""
 SCHEMA_VERSION = max(MIGRATIONS)
 _REBUILD_HINT = "delete index.db and run `grepogram sync` to build it again"
 
+_EXTENSIONS_HINT = (
+    "Reinstall under an interpreter that can: uv's own managed builds and Homebrew's python@3.12 "
+    "can, python.org's macOS installer build (/usr/local/bin/python3.12, which is also what "
+    "actions/setup-python installs) and Apple's system Python cannot. From a checkout, "
+    "`uv tool install --managed-python --python 3.12 '.[dense]'` (or `--python "
+    "/opt/homebrew/bin/python3.12`); without installing, `uv sync --managed-python`."
+)
+"""What to do about :class:`ExtensionsUnsupported`, verified against the builds it names.
+
+The ``--python`` is not redundant: ``uv tool install`` reuses an environment whose interpreter
+still satisfies the request, so ``--managed-python`` alone leaves a tool installed under the
+wrong Python exactly as it is. ``uv sync`` re-creates the ``.venv`` on its own."""
+
 _VEC_DIM_RE = re.compile(r"FLOAT\[(\d+)\]")
 
 _MESSAGE_UPSERT = """
@@ -179,6 +193,24 @@ class SchemaError(Exception):
 
 class VecDimMismatch(SchemaError):
     """``unit_vec`` already exists with a different embedding dimension."""
+
+
+class ExtensionsUnsupported(Exception):
+    """The running interpreter's ``sqlite3`` cannot load extensions, so sqlite-vec cannot load.
+
+    CPython compiles :meth:`sqlite3.Connection.enable_load_extension` in only when it was
+    configured with ``--enable-loadable-sqlite-extensions``, and sqlite-vec is a loadable
+    extension: on an interpreter built without it no index can be opened at all. :func:`connect`
+    raises this before it touches the file, in place of the bare ``AttributeError`` the missing
+    method would otherwise raise from the middle of the connection setup.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(
+            "this Python cannot load SQLite extensions, so sqlite-vec cannot be loaded: "
+            f"{sys.executable} (Python {sys.version.split()[0]}) was built without "
+            f"--enable-loadable-sqlite-extensions. {_EXTENSIONS_HINT}"
+        )
 
 
 class Connection(sqlite3.Connection):
@@ -252,6 +284,16 @@ def _lock_of(conn: sqlite3.Connection) -> AbstractContextManager[Any]:
     return conn.lock if isinstance(conn, Connection) else nullcontext()
 
 
+def _extensions_supported() -> bool:
+    """Whether this interpreter's ``sqlite3`` was built with loadable-extension support.
+
+    The method is compiled in or out as a whole, so its presence on the class is the capability
+    (see :class:`ExtensionsUnsupported`); it is asked of the class so nothing has to be opened
+    first, and so a test can take the capability away without a second interpreter.
+    """
+    return hasattr(sqlite3.Connection, "enable_load_extension")
+
+
 def connect(target: Paths | str) -> Connection:
     """Open the index database and load sqlite-vec.
 
@@ -259,7 +301,12 @@ def connect(target: Paths | str) -> Connection:
     such as ``":memory:"``. The connection may be shared between threads (see :class:`Connection`),
     waits up to five seconds on a locked database, enforces foreign keys and returns
     :class:`sqlite3.Row` rows.
+
+    Raises :class:`ExtensionsUnsupported`, before creating or opening anything, when the
+    interpreter cannot load extensions at all.
     """
+    if not _extensions_supported():
+        raise ExtensionsUnsupported()
     if isinstance(target, Paths):
         target.ensure_dirs()
         database = str(target.db_file)
