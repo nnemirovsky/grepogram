@@ -74,6 +74,16 @@ def ts(year: int, month: int, day: int, hour: int = 0, minute: int = 0, second: 
 NOW = ts(2025, 3, 31, 12, 0, 0)
 
 
+@pytest.fixture(autouse=True, scope="module")
+def non_utc_local_timezone() -> Iterator[None]:
+    """Run the module under a zone with DST, so a bound computed in local time is caught."""
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setenv("TZ", "America/New_York")
+        time.tzset()
+        yield
+    time.tzset()
+
+
 @pytest.fixture
 def conn() -> Iterator[sqlite3.Connection]:
     connection = db.connect(":memory:")
@@ -121,6 +131,7 @@ def empty_conn() -> Iterator[sqlite3.Connection]:
         pytest.param("7D", False, NOW - 7 * 86400, id="days-uppercase"),
         pytest.param("7 d", False, NOW - 7 * 86400, id="days-spaced"),
         pytest.param("2w", False, NOW - 14 * 86400, id="weeks"),
+        pytest.param("30d", False, NOW - 30 * 86400, id="days-across-a-dst-change"),
         pytest.param("1m", False, ts(2025, 2, 28, 12), id="month-back-clamped"),
         pytest.param("3m", False, ts(2024, 12, 31, 12), id="months-back-across-year"),
         pytest.param("13m", False, ts(2024, 2, 29, 12), id="months-back-to-leap-day"),

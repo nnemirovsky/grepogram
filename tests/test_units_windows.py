@@ -156,10 +156,11 @@ def test_cut_windows_oversized_message_is_its_own_window() -> None:
     assert len(windows[0].text) > 500
 
 
-def test_cut_windows_char_budget_counts_rendered_lines() -> None:
-    cfg = UnitsCfg(window_gap_min=30, window_max_msgs=100, window_max_chars=50)
+def test_cut_windows_char_budget_counts_rendered_lines_and_their_newlines() -> None:
     line = units.render_line(_msg(1, 0, text="ab"))
-    assert len(line) < 50 <= 2 * len(line) + 1
+    # two lines plus the newline between them hit the budget exactly; without counting the
+    # newline a third line would still fit
+    cfg = UnitsCfg(window_gap_min=30, window_max_msgs=100, window_max_chars=2 * len(line) + 1)
     windows = _run([_msg(i, i, text="ab") for i in range(1, 5)], cfg)
     assert _ids(windows) == [[1, 2], [3, 4]]
 
@@ -247,7 +248,7 @@ def test_group_by_topic_then_cut_isolates_gaps_per_topic() -> None:
 
 def test_chronological_sorts_by_date_then_msg_id() -> None:
     later, earlier, same_time = _msg(1, 5), _msg(2, 0), _msg(3, 5)
-    assert units.chronological([later, same_time, earlier]) == [earlier, later, same_time]
+    assert units.chronological([same_time, later, earlier]) == [earlier, later, same_time]
 
 
 def test_build_unit_renders_in_given_order() -> None:

@@ -1,4 +1,5 @@
 import sqlite3
+import sys
 import threading
 from collections.abc import Iterator
 
@@ -205,3 +206,44 @@ def test_fts5_raw_column_keeps_exact_spelling(fts: sqlite3.Connection) -> None:
 def test_fts5_rejects_the_unquoted_form(fts: sqlite3.Connection) -> None:
     with pytest.raises(sqlite3.OperationalError):
         _match(fts, "bge-m3 12:30")
+
+
+# --- added by the review fixes --------------------------------------------------------------
+
+
+def test_stem_token_stays_correct_under_heavy_thread_switching() -> None:
+    words = [
+        "счета",
+        "банков",
+        "консультациями",
+        "открывающихся",
+        "accounts",
+        "visas",
+        "internationalization",
+        "responsibilities",
+    ] * 60
+    stem.stem_token.cache_clear()
+    expected = [stem.stem_token(word) for word in words]
+    results: dict[int, list[str]] = {}
+    errors: list[BaseException] = []
+
+    def run(index: int) -> None:
+        try:
+            stem.stem_token.cache_clear()
+            results[index] = [stem.stem_token(word) for word in words]
+        except BaseException as exc:  # a corrupted stemmer raises or returns garbage
+            errors.append(exc)
+
+    interval = sys.getswitchinterval()
+    sys.setswitchinterval(1e-6)
+    try:
+        threads = [threading.Thread(target=run, args=(i,)) for i in range(8)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+    finally:
+        sys.setswitchinterval(interval)
+    assert errors == []
+    assert len(results) == 8
+    assert all(result == expected for result in results.values())
