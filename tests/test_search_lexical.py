@@ -6,9 +6,9 @@ from pathlib import Path
 import pytest
 from typer.testing import CliRunner
 
-from grepogram import cli, config, db, filters, search
+from grepogram import cli, config, db, filters, search, sync
 from grepogram.log import shutdown_logging
-from grepogram.models import Config, Filters, MessageRow, SearchCfg, UnitRow
+from grepogram.models import ChatRow, Config, Filters, MessageRow, SearchCfg, Source, UnitRow
 from grepogram.paths import Paths
 from grepogram.search import Match
 from grepogram.stem import fts_query, stem_text
@@ -400,6 +400,106 @@ def test_build_hit_falls_back_to_the_first_message(
     assert search.best_anchor(conn, unit, "border") == 20
     assert search.best_anchor(conn, unit, "🙂") == unit.msg_ids[0]
     assert search.best_anchor(conn, unit, "unicorn") == unit.msg_ids[0]
+
+
+NEWS = -1001000000300
+NEWS_CHAT = -1001000000301
+
+
+def _channel_with_a_comment(conn: sqlite3.Connection) -> tuple[Config, UnitRow]:
+    """A channel post with one comment stored under its discussion group, both indexed as a
+    sync would, and the post-thread unit that carries the comment in its text alone."""
+    cfg = Config(sources=[Source(chat="@news", comments=True)])
+    db.upsert_chat(
+        conn,
+        ChatRow(id=NEWS, type="channel", title="News", username="news", source_id="chat:@news"),
+    )
+    db.upsert_chat(
+        conn,
+        ChatRow(
+            id=NEWS_CHAT,
+            type="supergroup",
+            title="News chat",
+            source_id="chat:@news",
+            discussion_of=NEWS,
+        ),
+    )
+    post = db.upsert_messages(
+        conn,
+        [
+            MessageRow(
+                chat_id=NEWS,
+                msg_id=1,
+                date=1_700_000_000,
+                from_name="News",
+                text="Announcing the new office hours",
+            )
+        ],
+    )
+    comment = db.upsert_messages(
+        conn,
+        [
+            MessageRow(
+                chat_id=NEWS_CHAT,
+                msg_id=5,
+                date=1_700_000_060,
+                from_id=2,
+                from_name="Bob",
+                topic_id=1,
+                text="Does the Brubank branch accept CUIT without DNI?",
+            )
+        ],
+    )
+    for chat_id, ids in ((NEWS, post), (NEWS_CHAT, comment)):
+        chat = db.get_chat(conn, chat_id)
+        assert chat is not None
+        sync.on_chat_synced(conn, chat, cfg, ids)
+    (thread,) = [u for u in db.get_units(conn, NEWS) if u.kind == "thread"]
+    return cfg, thread
+
+
+def test_post_thread_snippet_leads_with_the_comment_that_matched(
+    conn: sqlite3.Connection,
+) -> None:
+    """The comments of a post thread are not among its messages, so the snippet is cut from the
+    unit text around the line the query matches; the anchor and the link stay on the post."""
+    cfg, thread = _channel_with_a_comment(conn)
+    post_line, comment_line = thread.text.splitlines()
+    assert thread.msg_ids == [1]
+    only_news = Filters(chat_ids={NEWS})
+    (hit,) = search.search(conn, cfg, "Brubank CUIT", only_news, mode="lexical", rerank=False).hits
+    assert hit.kind == "thread" and hit.msg_ids == [1] and hit.text is None
+    assert hit.anchor_msg_id == 1 and hit.url == "https://t.me/news/1"
+    assert hit.snippet == f"{comment_line}\n{post_line}"
+    (about_post,) = search.search(
+        conn, cfg, "office hours", only_news, mode="lexical", rerank=False
+    ).hits
+    assert about_post.snippet.splitlines()[0] == post_line
+    plain = search.build_hit(conn, thread, None, 0.5)
+    assert plain.snippet == f"{post_line}\n{comment_line}" and plain.anchor_msg_id == 1
+    full = search.build_hit(conn, thread, 1, 0.5, full=True, query="CUIT DNI")
+    assert full.snippet.splitlines()[0] == comment_line and full.text == thread.text
+    (post_unit,) = [u for u in db.get_units(conn, NEWS) if u.kind == "post"]
+    assert search.build_hit(conn, post_unit, 1, 0.5, query="CUIT").snippet == post_line
+
+
+def test_best_line_picks_the_line_sharing_the_most_stems_with_the_query() -> None:
+    lines = [
+        "[t] News: Announcing the new office hours",
+        "[t] Bob: Does the Brubank branch accept CUIT?",
+        "[t] Ann: CUIT and DNI at Brubank branches",
+    ]
+    assert search.best_line(lines, "Brubank CUIT DNI") == 2
+    assert search.best_line(lines, "brubank") == 1
+    assert search.best_line(lines, "branch") == 1
+    assert search.best_line(lines, "offices") == 0
+    assert search.best_line(lines, "unicorn") == 0
+    assert search.best_line(lines, "🙂") == 0
+    assert search.best_line(lines, None) == 0
+    assert search.best_line([], "x") == 0
+    assert search.snippet_lines([], 0) == ""
+    assert search.snippet_lines(lines, 1, limit=len(lines[1])) == lines[1]
+    assert search.snippet_lines(lines, 2) == "\n".join([lines[2], lines[0], lines[1]])
 
 
 # --- CLI -------------------------------------------------------------------------------------

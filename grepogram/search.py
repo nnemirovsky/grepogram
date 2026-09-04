@@ -31,7 +31,11 @@ Every hit carries an *anchor*, the message its deep link opens: the matched mess
 message-level hit, and for every other hit the unit's best message under the query according to
 ``msg_fts`` (:func:`best_anchor`), else the unit's first message. The snippet leads with the
 anchor's rendered line and adds its neighbours from within the unit while the total stays under
-:data:`SNIPPET_CHARS`; ``full`` adds the unit's whole text.
+:data:`SNIPPET_CHARS`; ``full`` adds the unit's whole text. A channel's post thread is the one
+unit whose text says more than its messages — the comments live in the discussion chat and only
+the post is in ``msg_ids`` — so its snippet is cut from the unit text instead, leading with the
+line that shares the most stems with the query (:func:`best_line`), while the anchor and the link
+stay on the post.
 
 Two readers let the caller see past a snippet: :func:`thread` returns the whole reply thread a
 message belongs to (for a channel post, the post with its comments from the linked discussion
@@ -60,7 +64,7 @@ from grepogram.models import (
     UnitRow,
 )
 from grepogram.rerank import Reranker
-from grepogram.stem import FtsOp, fts_query
+from grepogram.stem import FtsOp, fts_query, stem_token, tokenize
 from grepogram.units import chronological, media_placeholder, render_line, window_topic
 
 log = logging.getLogger(__name__)
@@ -315,13 +319,31 @@ def snippet(messages: Sequence[MessageRow], anchor_msg_id: int, limit: int = SNI
     """
     if not messages:
         return ""
-    lines = [render_line(msg) for msg in messages]
     pos = next((i for i, msg in enumerate(messages) if msg.msg_id == anchor_msg_id), 0)
+    return snippet_lines([render_line(msg) for msg in messages], pos, limit)
+
+
+def snippet_lines(lines: Sequence[str], pos: int, limit: int = SNIPPET_CHARS) -> str:
+    """:func:`snippet` over rendered lines: ``lines[pos]`` first, then its neighbours in order."""
+    if not lines:
+        return ""
     anchor = lines[pos]
     if len(anchor) > limit:
         return clip(anchor, limit)
     chosen = sorted(_neighbours(lines, pos, limit - len(anchor)))
     return "\n".join([anchor, *(lines[i] for i in chosen)])
+
+
+def best_line(lines: Sequence[str], query: str | None) -> int:
+    """The index of the line sharing the most stems with ``query``; the first line on a tie or
+    when the query has no tokens (a post thread then leads with the post)."""
+    if query is None or not lines:
+        return 0
+    wanted = {stem_token(token) for token in tokenize(query)}
+    if not wanted:
+        return 0
+    overlaps = [len(wanted & {stem_token(t) for t in tokenize(line)}) for line in lines]
+    return max(range(len(lines)), key=lambda i: (overlaps[i], -i))
 
 
 def _neighbours(lines: Sequence[str], pos: int, budget: int) -> list[int]:
@@ -350,17 +372,29 @@ def build_hit(
     anchor_msg_id: int | None,
     score: float,
     full: bool = False,
+    query: str | None = None,
 ) -> Hit:
     """A :class:`~grepogram.models.Hit` for ``unit`` anchored at ``anchor_msg_id`` (the unit's
     first message when ``None`` or not part of it), linked through
-    :func:`grepogram.links.message_url`; ``full`` copies the unit text into ``text``."""
+    :func:`grepogram.links.message_url`; ``full`` copies the unit text into ``text``.
+
+    The snippet is built from the unit's stored messages around the anchor, except for a
+    channel's post thread, whose comments are not among its messages: there it is cut from the
+    unit text around the line ``query`` matches best (:func:`best_line`), so a hit that owes its
+    rank to a comment shows that comment, while the anchor and the link stay on the post.
+    """
     chat = db.get_chat(conn, unit.chat_id)
     if chat is None:
         raise LookupError(f"unit {unit.id} belongs to unknown chat {unit.chat_id}")
     if anchor_msg_id is None or anchor_msg_id not in unit.msg_ids:
         anchor_msg_id = unit.msg_ids[0]
-    messages = unit_messages(conn, unit)
     link = links.message_url(chat, anchor_msg_id, unit.topic_id)
+    if _is_post_thread(chat, unit):
+        lines = unit.text.splitlines()
+        excerpt = snippet_lines(lines, best_line(lines, query))
+    else:
+        messages = unit_messages(conn, unit)
+        excerpt = snippet(messages, anchor_msg_id) if messages else clip(unit.text, SNIPPET_CHARS)
     return Hit(
         score=score,
         chat=chat,
@@ -370,10 +404,16 @@ def build_hit(
         anchor_msg_id=anchor_msg_id,
         url=link.url,
         fallback_url=link.fallback_url,
-        snippet=snippet(messages, anchor_msg_id) if messages else clip(unit.text, SNIPPET_CHARS),
+        snippet=excerpt,
         msg_ids=list(unit.msg_ids),
         text=unit.text if full else None,
     )
+
+
+def _is_post_thread(chat: ChatRow, unit: UnitRow) -> bool:
+    """A ``thread`` of a channel: the post with its comments (:func:`grepogram.units.build_posts`),
+    the only unit whose ``msg_ids`` do not cover its text."""
+    return unit.kind == "thread" and chat.type == "channel" and chat.discussion_of is None
 
 
 # --- entry point -----------------------------------------------------------------------------
@@ -488,7 +528,7 @@ def search(
         anchor = anchors.get(candidate.unit_id)
         if anchor is None:
             anchor = best_anchor(conn, candidate.unit, query)
-        hits.append(build_hit(conn, candidate.unit, anchor, candidate.score, full))
+        hits.append(build_hit(conn, candidate.unit, anchor, candidate.score, full, query=query))
     hits = dedup(hits, cfg.search.dedup_overlap)[:k]
     log.debug(
         "%s search: %d unit, %d message, %d dense matches; %d candidates, %d hits",
