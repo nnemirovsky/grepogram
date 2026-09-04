@@ -63,7 +63,7 @@ from grepogram.models import (
     UserRow,
 )
 from grepogram.paths import FileLock, Paths
-from grepogram.sources import resolve_sources
+from grepogram.sources import parse_since, resolve_sources
 from grepogram.units import UNKNOWN_SENDER
 
 log = logging.getLogger(__name__)
@@ -505,11 +505,10 @@ def since_of(source: Source | None) -> dt.datetime | None:
     if source is None or not source.since:
         return None
     try:
-        day = dt.date.fromisoformat(source.since)
-    except ValueError:
-        raise ConfigError(
-            f"source {source.id}: since must be an ISO date (YYYY-MM-DD), got {source.since!r}"
-        ) from None
+        day = parse_since(source.since)
+    except ValueError as exc:
+        raise ConfigError(f"source {source.id}: {exc}") from None
+    assert day is not None
     return dt.datetime.combine(day, dt.time.min, tzinfo=dt.UTC)
 
 

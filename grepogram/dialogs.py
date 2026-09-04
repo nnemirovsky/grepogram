@@ -24,6 +24,8 @@ log = logging.getLogger(__name__)
 
 FUZZY_MIN_RATIO = 0.6
 SUBSTRING_BASE = 0.8
+EXACT_SCORE = 1.0
+"""The score of a match that is the name itself: it wins over every fuzzy rival."""
 MatchKind = Literal["dialog", "folder"]
 Category = Literal["contacts", "non_contacts", "groups", "broadcasts", "bots"]
 

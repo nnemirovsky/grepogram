@@ -14,7 +14,7 @@ import datetime as dt
 import logging
 import re
 import sqlite3
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Any, Literal
 
@@ -257,11 +257,21 @@ async def _fuzzy(text: str, catalog: DialogCatalog) -> DialogInfo | FolderInfo:
         raise UnknownTarget(
             f'nothing matches {text!r}; try `grepogram dialogs "{text}"` or an @username / id'
         )
-    exact = [m for m in found if m.score >= 1.0]
-    if len(found) > 1 and len(exact) != 1:
-        raise AmbiguousTarget(text, [describe_match(m) for m in found])
-    best = exact[0] if exact else found[0]
-    return best.entry
+    return _pick_unique(text, found, lambda m: m.score, describe_match).entry
+
+
+def _pick_unique[T](
+    text: str,
+    ranked: Sequence[T],
+    score_of: Callable[[T], float],
+    describe: Callable[[T], str],
+) -> T:
+    """The one candidate ``text`` names, best first: an exact score wins over every fuzzy rival,
+    and anything else with rivals is an :class:`AmbiguousTarget`."""
+    exact = [item for item in ranked if score_of(item) >= dialogs.EXACT_SCORE]
+    if len(ranked) > 1 and len(exact) != 1:
+        raise AmbiguousTarget(text, [describe(item) for item in ranked])
+    return exact[0] if exact else ranked[0]
 
 
 # --- add / remove ----------------------------------------------------------------------------
@@ -322,13 +332,27 @@ def chat_value(dialog: DialogInfo) -> str | int:
     return f"@{dialog.username}" if dialog.username else dialog.id
 
 
-def _since(value: str | None) -> str | None:
+def parse_since(value: str | None) -> dt.date | None:
+    """A source's ``since`` as a date, ``None`` when it is not set.
+
+    Raises :class:`ValueError` for anything else; each caller wraps it in the error its layer
+    reports — :class:`InvalidTarget` while a target is being added, ``ConfigError`` in
+    :func:`grepogram.sync.since_of` when a stored config turns out to hold a bad one.
+    """
     if value is None:
         return None
     try:
-        return dt.date.fromisoformat(value.strip()).isoformat()
+        return dt.date.fromisoformat(value.strip())
     except ValueError:
-        raise InvalidTarget(f"since must be an ISO date (YYYY-MM-DD), got {value!r}") from None
+        raise ValueError(f"since must be an ISO date (YYYY-MM-DD), got {value!r}") from None
+
+
+def _since(value: str | None) -> str | None:
+    try:
+        day = parse_since(value)
+    except ValueError as exc:
+        raise InvalidTarget(str(exc)) from None
+    return None if day is None else day.isoformat()
 
 
 def _reject_duplicate(cfg: Config, source: Source, dialog: DialogInfo | None) -> None:
@@ -468,10 +492,7 @@ def _fuzzy_source(text: str, known: list[str], chats: list[ChatRow]) -> str:
     if not best:
         raise UnknownSource(f"no source matches {text!r} (sources: {', '.join(known) or 'none'})")
     ranked = sorted(best, key=lambda s: (-best[s][0], s))
-    exact = [s for s in ranked if best[s][0] >= 1.0]
-    if len(ranked) > 1 and len(exact) != 1:
-        raise AmbiguousTarget(text, ranked)
-    winner = exact[0] if exact else ranked[0]
+    winner = _pick_unique(text, ranked, lambda s: best[s][0], str)
     matched = best[winner][2]
     if matched is not None:
         _refuse_indirect(matched, repr(text))
