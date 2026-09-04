@@ -446,7 +446,8 @@ def _chat_source(chat: ChatRow | None, label: str) -> str:
 
 def _refuse_indirect(chat: ChatRow, label: str) -> None:
     """Refuse a target that names a chat whose source covers more than that chat: a member of a
-    folder source, or a channel's discussion group indexed through the channel's source."""
+    folder source, or a channel's discussion group indexed through the channel's source — the
+    group a channel was unlinked from included, which keeps that source until it is removed."""
     if not chat.source_id:
         return
     if chat.source_id.startswith(FOLDER_PREFIX):
@@ -454,11 +455,16 @@ def _refuse_indirect(chat: ChatRow, label: str) -> None:
             f"{label} is indexed through {chat.source_id}; remove that folder source instead "
             "or take the chat out of the folder in Telegram"
         )
-    if chat.discussion_of is not None and not _own_source(chat):
-        raise SourceError(
-            f"{label} is the discussion group of channel {chat.discussion_of}, indexed through "
-            f"{chat.source_id}; remove that source instead"
-        )
+    if _own_source(chat):
+        return
+    owner = (
+        ""
+        if chat.discussion_of is None
+        else f"the discussion group of channel {chat.discussion_of}, "
+    )
+    raise SourceError(
+        f"{label} is {owner}indexed through {chat.source_id}; remove that source instead"
+    )
 
 
 def _own_source(chat: ChatRow) -> bool:

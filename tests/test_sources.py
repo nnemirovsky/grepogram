@@ -451,6 +451,21 @@ def test_remove_source_refuses_a_discussion_group_indexed_through_its_channel(
     assert removed.config.sources == [] and db.list_chats(conn) == []
 
 
+def test_remove_source_refuses_a_group_a_channel_was_unlinked_from(
+    conn: sqlite3.Connection,
+) -> None:
+    """The link is cleared when Telegram unlinks the group, but the channel's source still holds
+    its rows — naming the group must not silently remove the channel with it."""
+    _with_news_and_its_group(conn, "chat:@news")
+    db.set_discussion_chat(conn, NEWS_ID, None)
+    cfg = _cfg(Source(chat="@news", comments=True))
+    with pytest.raises(SourceError) as excinfo:
+        sources.remove_source(cfg, conn, sources.parse_target("@news_chat"))
+    assert "indexed through chat:@news; remove that source instead" in str(excinfo.value)
+    assert "discussion group" not in str(excinfo.value)
+    assert db.message_counts(conn) == {NEWS_ID: 2, DISC_ID: 3}
+
+
 def test_remove_source_of_a_discussion_group_that_is_a_source_of_its_own(
     conn: sqlite3.Connection,
 ) -> None:

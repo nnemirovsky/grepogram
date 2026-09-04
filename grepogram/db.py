@@ -109,7 +109,20 @@ _V2: tuple[str, ...] = (
     "CREATE INDEX messages_unindexed ON messages(chat_id, id) WHERE indexed = 0",
 )
 
-MIGRATIONS: tuple[tuple[str, ...], ...] = (_V1, _V2)
+_V3: tuple[str, ...] = (
+    # a channel has one discussion group at a time: sync.link_discussion_chat re-points the link
+    # when Telegram reports another group and clears it when the channel loses its own, so
+    # get_discussion_chat has a single row to answer with. A database written before that can
+    # hold several rows per channel; it keeps the lowest id, which is the row it used to return
+    """UPDATE chats SET discussion_of = NULL
+       WHERE discussion_of IS NOT NULL
+         AND id <> (SELECT MIN(other.id) FROM chats other
+                    WHERE other.discussion_of = chats.discussion_of)""",
+    """CREATE UNIQUE INDEX chats_discussion_of ON chats(discussion_of)
+       WHERE discussion_of IS NOT NULL""",
+)
+
+MIGRATIONS: tuple[tuple[str, ...], ...] = (_V1, _V2, _V3)
 SCHEMA_VERSION = len(MIGRATIONS)
 
 _VEC_DIM_RE = re.compile(r"FLOAT\[(\d+)\]")
@@ -423,11 +436,43 @@ def get_chat(conn: sqlite3.Connection, chat_id: int) -> ChatRow | None:
 
 
 def get_discussion_chat(conn: sqlite3.Connection, channel_id: int) -> ChatRow | None:
-    """The discussion group linked to a channel (``discussion_of = channel_id``), if stored."""
-    row = conn.execute(
-        "SELECT * FROM chats WHERE discussion_of = ? ORDER BY id LIMIT 1", (channel_id,)
-    ).fetchone()
+    """The discussion group linked to a channel (``discussion_of = channel_id``), if stored.
+
+    There is at most one: the partial unique index on ``discussion_of`` (schema v3) says so, and
+    :func:`set_discussion_chat` is the one way the link moves or goes away.
+    """
+    row = conn.execute("SELECT * FROM chats WHERE discussion_of = ?", (channel_id,)).fetchone()
     return None if row is None else _chat_row(row)
+
+
+def set_discussion_chat(
+    conn: sqlite3.Connection, channel_id: int, group_id: int | None
+) -> list[int]:
+    """Make ``group_id`` the discussion group of ``channel_id`` — ``None`` when it has none.
+
+    Returns the chats that were the channel's discussion group and are not any more: Telegram
+    unlinked the group, or the channel was given another one. Their rows keep their messages —
+    they are a real group's real messages — and only stop counting as this channel's comments,
+    which is what the caller rebuilds the channel's post threads for.
+
+    This is the only way ``discussion_of`` is cleared: :func:`upsert_chat` COALESCEs the column
+    so that re-resolving the group as a source chat of its own never drops the link. The old
+    rows are cleared before the new one is written, so the unique index never sees two.
+    """
+    with transaction(conn):
+        dropped = [
+            int(row["id"])
+            for row in conn.execute(
+                "SELECT id FROM chats WHERE discussion_of = ? AND id IS NOT ?",
+                (channel_id, group_id),
+            ).fetchall()
+        ]
+        conn.executemany(
+            "UPDATE chats SET discussion_of = NULL WHERE id = ?", [(row_id,) for row_id in dropped]
+        )
+        if group_id is not None:
+            conn.execute("UPDATE chats SET discussion_of = ? WHERE id = ?", (channel_id, group_id))
+    return dropped
 
 
 def list_chats(conn: sqlite3.Connection, source_id: str | None = None) -> list[ChatRow]:
@@ -609,6 +654,20 @@ def get_topic_messages(
         for row in rows:
             grouped.setdefault(int(row["topic_id"]), []).append(_message_row(row))
     return grouped
+
+
+def stored_topic_ids(conn: sqlite3.Connection, chat_id: int) -> list[int]:
+    """The distinct ``topic_id`` values a chat holds messages under, ascending.
+
+    In a discussion group these are the ids of the channel posts its comments hang under, which
+    is what a channel that lost that group rebuilds its post threads from.
+    """
+    rows = conn.execute(
+        "SELECT DISTINCT topic_id FROM messages "
+        "WHERE chat_id = ? AND topic_id IS NOT NULL ORDER BY topic_id",
+        (chat_id,),
+    ).fetchall()
+    return [int(row["topic_id"]) for row in rows]
 
 
 def count_topic_messages(

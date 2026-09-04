@@ -13,7 +13,13 @@ from grepogram.models import ChatRow, MessageRow, UnitRow, UserRow
 from grepogram.paths import Paths
 
 TABLES = {"meta", "chats", "users", "messages", "units", "msg_fts", "unit_fts"}
-INDEXES = {"messages_chat_date", "messages_reply", "units_chat_kind_range", "messages_unindexed"}
+INDEXES = {
+    "messages_chat_date",
+    "messages_reply",
+    "units_chat_kind_range",
+    "messages_unindexed",
+    "chats_discussion_of",
+}
 
 
 def _names(conn: sqlite3.Connection, kind: str) -> set[str]:
@@ -130,11 +136,11 @@ def test_connection_usable_from_second_thread(conn: sqlite3.Connection) -> None:
 def test_fresh_migrate_creates_schema() -> None:
     connection = db.connect(":memory:")
     assert db.schema_version(connection) == 0
-    assert db.migrate(connection) == db.SCHEMA_VERSION == 2
+    assert db.migrate(connection) == db.SCHEMA_VERSION == 3
     assert TABLES <= _names(connection, "table")
     assert INDEXES <= _names(connection, "index")
-    assert db.schema_version(connection) == 2
-    assert db.get_meta(connection, "schema_version") == "2"
+    assert db.schema_version(connection) == 3
+    assert db.get_meta(connection, "schema_version") == "3"
     assert not db.has_vec_table(connection)
     assert not connection.in_transaction
     messages_sql = connection.execute(
@@ -152,9 +158,9 @@ def test_fresh_migrate_creates_schema() -> None:
 
 def test_migrate_twice_is_noop(conn: sqlite3.Connection) -> None:
     before = _schema(conn)
-    assert db.migrate(conn) == 2
+    assert db.migrate(conn) == 3
     assert _schema(conn) == before
-    assert db.get_meta(conn, "schema_version") == "2"
+    assert db.get_meta(conn, "schema_version") == "3"
 
 
 def test_migrate_v1_to_v2_flags_every_stored_message(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -169,11 +175,32 @@ def test_migrate_v1_to_v2_flags_every_stored_message(monkeypatch: pytest.MonkeyP
     connection.execute("INSERT INTO messages(chat_id, msg_id, date, text) VALUES (1, 1, 10, 'a')")
     connection.execute("INSERT INTO messages(chat_id, msg_id, date, text) VALUES (1, 2, 20, 'b')")
     monkeypatch.undo()
-    assert db.migrate(connection) == 2
-    assert db.schema_version(connection) == 2
+    assert db.migrate(connection) == 3
+    assert db.schema_version(connection) == 3
     assert "messages_unindexed" in _names(connection, "index")
     assert db.unindexed_message_ids(connection, 1) == [1, 2]
     assert not connection.in_transaction
+
+
+def test_migrate_v2_to_v3_leaves_one_discussion_group_per_channel(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A database written before the link was re-pointed can hold several groups for one
+    channel; the upgrade keeps the lowest id, which is the row it used to be answered with."""
+    connection = db.connect(":memory:")
+    monkeypatch.setattr(db, "MIGRATIONS", db.MIGRATIONS[:2])
+    monkeypatch.setattr(db, "SCHEMA_VERSION", 2)
+    assert db.migrate(connection) == 2
+    connection.execute("INSERT INTO chats(id, type) VALUES (1, 'channel')")
+    for group in (-3, -2, -1):
+        connection.execute(
+            "INSERT INTO chats(id, type, discussion_of) VALUES (?, 'supergroup', 1)", (group,)
+        )
+    monkeypatch.undo()
+    assert db.migrate(connection) == 3
+    kept = db.get_discussion_chat(connection, 1)
+    assert kept is not None and kept.id == -3
+    assert [chat.id for chat in db.list_chats(connection) if chat.discussion_of == 1] == [-3]
 
 
 def test_migrate_refuses_newer_schema(conn: sqlite3.Connection) -> None:
@@ -664,6 +691,47 @@ def test_get_discussion_chat(conn: sqlite3.Connection) -> None:
     assert discussion is not None
     assert (discussion.id, discussion.discussion_of) == (2, 1)
     assert db.get_discussion_chat(conn, 2) is None
+
+
+def test_a_channel_cannot_hold_two_discussion_groups(conn: sqlite3.Connection) -> None:
+    """What makes :func:`db.get_discussion_chat` a lookup rather than a pick between rows."""
+    db.upsert_chat(conn, _chat(1, type="channel"))
+    db.upsert_chat(conn, _chat(2, discussion_of=1))
+    with pytest.raises(sqlite3.IntegrityError, match="chats.discussion_of"):
+        db.upsert_chat(conn, _chat(3, discussion_of=1))
+
+
+def test_set_discussion_chat_re_points_the_link_and_reports_what_it_dropped(
+    conn: sqlite3.Connection,
+) -> None:
+    db.upsert_chat(conn, _chat(1, type="channel"))
+    for group in (2, 3):
+        db.upsert_chat(conn, _chat(group))
+    assert db.set_discussion_chat(conn, 1, 2) == []
+    assert db.get_discussion_chat(conn, 1) == db.get_chat(conn, 2)
+    assert db.set_discussion_chat(conn, 1, 2) == []
+    assert db.set_discussion_chat(conn, 1, 3) == [2]
+    moved = db.get_chat(conn, 2)
+    assert moved is not None and moved.discussion_of is None
+    assert db.get_discussion_chat(conn, 1) == db.get_chat(conn, 3)
+    assert db.set_discussion_chat(conn, 1, None) == [3]
+    assert db.get_discussion_chat(conn, 1) is None
+    assert db.list_chats(conn) == [db.get_chat(conn, 1), db.get_chat(conn, 2), db.get_chat(conn, 3)]
+
+
+def test_stored_topic_ids_are_distinct_and_ordered(conn: sqlite3.Connection) -> None:
+    db.upsert_chat(conn, _chat(1))
+    db.upsert_messages(
+        conn,
+        [
+            _message(1, 10, topic_id=7),
+            _message(1, 11, topic_id=7),
+            _message(1, 12, topic_id=3),
+            _message(1, 13),
+        ],
+    )
+    assert db.stored_topic_ids(conn, 1) == [3, 7]
+    assert db.stored_topic_ids(conn, 2) == []
 
 
 def test_get_topic_messages_groups_and_orders(conn: sqlite3.Connection) -> None:
