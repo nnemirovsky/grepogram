@@ -66,8 +66,8 @@ def message_url(chat: ChatRow, msg_id: int, topic_id: int | None = None) -> Link
     """The links that open ``msg_id`` in ``chat``: the web form to show, the ``tg://`` form the
     app takes, and a fallback where the link is mobile-only.
 
-    ``topic_id`` is inserted only for forum supergroups; a discussion chat stores each comment's
-    channel post id in the same column, and that must not end up in the URL.
+    ``topic_id`` is inserted only for forum supergroups, where it is a topic root and nothing
+    else: a comment's channel post id lives in ``comment_of_msg_id`` and never reaches here.
     """
     if chat.type in ("channel", "supergroup"):
         topic = topic_id if chat.is_forum and topic_id is not None else None

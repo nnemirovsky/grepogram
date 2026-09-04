@@ -19,6 +19,7 @@ INDEXES = {
     "units_chat_kind_range",
     "messages_unindexed",
     "chats_discussion_of",
+    "messages_comments",
 }
 
 
@@ -136,11 +137,11 @@ def test_connection_usable_from_second_thread(conn: sqlite3.Connection) -> None:
 def test_fresh_migrate_creates_schema() -> None:
     connection = db.connect(":memory:")
     assert db.schema_version(connection) == 0
-    assert db.migrate(connection) == db.SCHEMA_VERSION == 3
+    assert db.migrate(connection) == db.SCHEMA_VERSION == 4
     assert TABLES <= _names(connection, "table")
     assert INDEXES <= _names(connection, "index")
-    assert db.schema_version(connection) == 3
-    assert db.get_meta(connection, "schema_version") == "3"
+    assert db.schema_version(connection) == 4
+    assert db.get_meta(connection, "schema_version") == "4"
     assert not db.has_vec_table(connection)
     assert not connection.in_transaction
     messages_sql = connection.execute(
@@ -149,6 +150,8 @@ def test_fresh_migrate_creates_schema() -> None:
     assert "UNIQUE (chat_id, msg_id)" in messages_sql
     assert "REFERENCES chats(id) ON DELETE CASCADE" in messages_sql
     assert "indexed INTEGER NOT NULL DEFAULT 0" in messages_sql
+    assert "comment_of_chat_id INTEGER" in messages_sql
+    assert "comment_of_msg_id INTEGER" in messages_sql
     units_sql = connection.execute("SELECT sql FROM sqlite_master WHERE name = 'units'").fetchone()
     assert "AUTOINCREMENT" in units_sql[0]
     for fts in ("msg_fts", "unit_fts"):
@@ -158,9 +161,9 @@ def test_fresh_migrate_creates_schema() -> None:
 
 def test_migrate_twice_is_noop(conn: sqlite3.Connection) -> None:
     before = _schema(conn)
-    assert db.migrate(conn) == 3
+    assert db.migrate(conn) == 4
     assert _schema(conn) == before
-    assert db.get_meta(conn, "schema_version") == "3"
+    assert db.get_meta(conn, "schema_version") == "4"
 
 
 def test_migrate_v1_to_v2_flags_every_stored_message(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -175,8 +178,8 @@ def test_migrate_v1_to_v2_flags_every_stored_message(monkeypatch: pytest.MonkeyP
     connection.execute("INSERT INTO messages(chat_id, msg_id, date, text) VALUES (1, 1, 10, 'a')")
     connection.execute("INSERT INTO messages(chat_id, msg_id, date, text) VALUES (1, 2, 20, 'b')")
     monkeypatch.undo()
-    assert db.migrate(connection) == 3
-    assert db.schema_version(connection) == 3
+    assert db.migrate(connection) == 4
+    assert db.schema_version(connection) == 4
     assert "messages_unindexed" in _names(connection, "index")
     assert db.unindexed_message_ids(connection, 1) == [1, 2]
     assert not connection.in_transaction
@@ -197,10 +200,94 @@ def test_migrate_v2_to_v3_leaves_one_discussion_group_per_channel(
             "INSERT INTO chats(id, type, discussion_of) VALUES (?, 'supergroup', 1)", (group,)
         )
     monkeypatch.undo()
-    assert db.migrate(connection) == 3
+    assert db.migrate(connection) == 4
     kept = db.get_discussion_chat(connection, 1)
     assert kept is not None and kept.id == -3
     assert [chat.id for chat in db.list_chats(connection) if chat.discussion_of == 1] == [-3]
+
+
+def _at_v3(connection: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Bring a fresh database to v3 and let the caller write pre-v4 rows into it."""
+    monkeypatch.setattr(db, "MIGRATIONS", db.MIGRATIONS[:3])
+    monkeypatch.setattr(db, "SCHEMA_VERSION", 3)
+    assert db.migrate(connection) == 3
+    monkeypatch.undo()
+
+
+def test_migrate_v3_to_v4_moves_the_comments_of_a_plain_discussion_group(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Before v4 a comment kept its post id in ``topic_id``. A discussion group that is not a
+    forum has no topics of its own, so every one of them is a post of the channel linking it and
+    moves to the comment columns unambiguously; the rows are flagged so what was cut from them
+    is cut again."""
+    connection = db.connect(":memory:")
+    _at_v3(connection, monkeypatch)
+    connection.execute("INSERT INTO chats(id, type) VALUES (1, 'channel')")
+    connection.execute(
+        "INSERT INTO chats(id, type, is_forum, discussion_of) VALUES (2, 'supergroup', 0, 1)"
+    )
+    connection.execute("INSERT INTO chats(id, type, is_forum) VALUES (3, 'supergroup', 1)")
+    connection.execute(
+        "INSERT INTO messages(chat_id, msg_id, date, text, topic_id, indexed) "
+        "VALUES (2, 5, 10, 'comment', 10, 1)"
+    )
+    connection.execute(
+        "INSERT INTO messages(chat_id, msg_id, date, text, indexed) VALUES (2, 6, 11, 'talk', 1)"
+    )
+    connection.execute(
+        "INSERT INTO messages(chat_id, msg_id, date, text, topic_id, indexed) "
+        "VALUES (3, 7, 12, 'in a topic', 10, 1)"
+    )
+    assert db.migrate(connection) == 4
+    comment = db.get_message(connection, 2, 5)
+    assert comment is not None
+    assert comment.topic_id is None
+    assert (comment.comment_of_chat_id, comment.comment_of_msg_id) == (1, 10)
+    assert db.stored_comment_post_ids(connection, 2, 1) == [10]
+    assert db.unindexed_message_ids(connection, 2) == [comment.id]
+    forum = db.get_message(connection, 3, 7)
+    assert forum is not None and forum.topic_id == 10
+    assert forum.comment_of_chat_id is None and forum.comment_of_msg_id is None
+    assert db.unindexed_message_ids(connection, 3) == []
+    connection.close()
+
+
+def test_migrate_v3_to_v4_flags_a_forum_discussion_group_instead_of_guessing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A group that is both a forum and a comment store wrote forum topic roots and channel post
+    ids into the same column, and nothing in the row says which is which. Nothing is moved and
+    nothing is attributed: the rows keep their ``topic_id`` and are flagged, and so are the posts
+    of the channel linking the group, whose post threads are therefore cut again without
+    comments until the next sync re-reads the threads under the new columns.
+    """
+    connection = db.connect(":memory:")
+    _at_v3(connection, monkeypatch)
+    connection.execute("INSERT INTO chats(id, type) VALUES (1, 'channel')")
+    connection.execute(
+        "INSERT INTO chats(id, type, is_forum, discussion_of) VALUES (2, 'supergroup', 1, 1)"
+    )
+    connection.execute(
+        "INSERT INTO messages(chat_id, msg_id, date, text, topic_id, indexed) "
+        "VALUES (2, 5, 10, 'comment or topic message', 10, 1)"
+    )
+    connection.execute(
+        "INSERT INTO messages(chat_id, msg_id, date, text, indexed) VALUES (2, 6, 11, 'talk', 1)"
+    )
+    connection.execute(
+        "INSERT INTO messages(chat_id, msg_id, date, text, indexed) VALUES (1, 10, 12, 'post', 1)"
+    )
+    assert db.migrate(connection) == 4
+    ambiguous = db.get_message(connection, 2, 5)
+    assert ambiguous is not None and ambiguous.topic_id == 10
+    assert ambiguous.comment_of_chat_id is None and ambiguous.comment_of_msg_id is None
+    assert db.stored_comment_post_ids(connection, 2, 1) == []
+    assert db.unindexed_message_ids(connection, 2) == [ambiguous.id]
+    post = db.get_message(connection, 1, 10)
+    assert post is not None
+    assert db.unindexed_message_ids(connection, 1) == [post.id]
+    connection.close()
 
 
 def test_migrate_refuses_newer_schema(conn: sqlite3.Connection) -> None:
@@ -543,7 +630,7 @@ def _channel_with_comments(conn: sqlite3.Connection) -> tuple[int, int, int]:
     db.upsert_chat(conn, _chat(1, type="channel"))
     db.upsert_chat(conn, _chat(2, discussion_of=1, source_id="chat:2"))
     db.upsert_messages(conn, [_message(1, 10), _message(1, 11)])
-    db.upsert_messages(conn, [_message(2, 5, topic_id=10)])
+    db.upsert_messages(conn, [_message(2, 5, comment_of_chat_id=1, comment_of_msg_id=10)])
     ids = db.insert_units(
         conn,
         [
@@ -583,35 +670,73 @@ def test_delete_chat_drops_the_post_threads_of_a_deleted_discussion_group(
 
 
 def test_drop_comment_units_unmaps_the_comments_it_undoes(conn: sqlite3.Connection) -> None:
-    """The rows stop being comments, not only the threads built from them. A ``topic_id`` is a
-    post id in the linking channel's id space and nothing in the row says whose; post ids start
-    at 1 in every channel, so a mapping left behind would hand these comments to the next
-    channel's post of the same number. The messages stay — the group's own — flagged so what was
-    cut from them is cut again, and the windows that filed them under a post id go with the
-    mapping. A topic that is no post of this channel is none of its business and is left alone.
+    """The rows stop being comments, not only the threads built from them: a comment left naming
+    a channel would be handed back to whichever channel links the group next, and post ids start
+    at 1 in every channel. The messages stay — the group's own — and so does everything cut from
+    them: no unit of a group reads the comment relation, so nothing about the group needs a
+    rebuild and nothing of it is dropped. A comment on another channel's post is none of this
+    channel's business and is left alone.
     """
     thread_id, _post_id, window_id = _channel_with_comments(conn)
-    db.upsert_messages(conn, [_message(2, 6, topic_id=999)])
+    db.upsert_messages(conn, [_message(2, 6, comment_of_chat_id=99, comment_of_msg_id=999)])
     own = db.get_message(conn, 2, 6)
     assert own is not None and own.id is not None
     db.mark_indexed(conn, [own.id])
-    filed, kept = db.insert_units(conn, [_unit(2, [5], topic_id=10), _unit(2, [6], topic_id=999)])
+    kept = db.insert_units(conn, [_unit(2, [6])])
     assert db.drop_comment_units(conn, 1, 2) == 1
     comment = db.get_message(conn, 2, 5)
-    assert comment is not None and comment.topic_id is None
-    assert db.get_messages_in_topic(conn, 2, 10) == []
-    assert db.stored_topic_ids(conn, 2) == [999]
-    assert db.unindexed_message_ids(conn, 2) == [comment.id]
-    assert [u.id for u in db.get_units(conn, 2)] == [window_id, kept]
-    assert filed not in {window_id, kept, thread_id}
+    assert comment is not None
+    assert comment.comment_of_chat_id is None and comment.comment_of_msg_id is None
+    assert db.get_comment_messages(conn, 2, 1, [10]) == {}
+    assert db.stored_comment_post_ids(conn, 2, 1) == []
+    assert db.stored_comment_post_ids(conn, 2, 99) == [999]
+    assert db.unindexed_message_ids(conn, 2) == []
+    assert [u.id for u in db.get_units(conn, 2)] == [window_id, *kept]
+    assert thread_id not in {window_id, *kept}
+
+
+def test_drop_comment_units_leaves_a_forum_topic_of_the_same_group_alone(
+    conn: sqlite3.Connection,
+) -> None:
+    """A discussion group can be a forum, and a topic root is numbered from 1 just like a channel
+    post. The topic whose root is the number of a stored post keeps its messages, its topic and
+    its window; only the rows that name the channel stop being its comments."""
+    thread_id, _post_id, window_id = _channel_with_comments(conn)
+    db.upsert_chat(conn, _chat(2, is_forum=True, discussion_of=1, source_id="chat:2"))
+    db.upsert_messages(conn, [_message(2, 20, topic_id=10), _message(2, 21, topic_id=10)])
+    topic = [m for m in db.get_messages(conn, 2) if m.msg_id in (20, 21)]
+    db.mark_indexed(conn, [m.id for m in topic if m.id is not None])
+    (topic_window,) = db.insert_units(conn, [_unit(2, [20, 21], topic_id=10)])
+    assert db.drop_comment_units(conn, 1, 2) == 1
+    assert [m.msg_id for m in db.get_messages_in_topic(conn, 2, 10)] == [20, 21]
+    assert db.unindexed_message_ids(conn, 2) == []
+    assert [u.id for u in db.get_units(conn, 2)] == [window_id, topic_window]
+    assert thread_id not in {window_id, topic_window}
+
+
+def test_drop_comment_units_unmaps_a_comment_whose_post_row_is_gone(
+    conn: sqlite3.Connection,
+) -> None:
+    """The mapping is keyed by the channel, not by which of its posts are still stored, so a
+    comment on a post the channel has dropped is unmapped like any other — otherwise the next
+    channel to link the group would inherit it through its own post of that number."""
+    _thread_id, _post_id, _window_id = _channel_with_comments(conn)
+    db.upsert_messages(conn, [_message(2, 7, comment_of_chat_id=1, comment_of_msg_id=42)])
+    assert db.get_message(conn, 1, 42) is None
+    assert db.drop_comment_units(conn, 1, 2) == 1
+    orphan = db.get_message(conn, 2, 7)
+    assert orphan is not None
+    assert orphan.comment_of_chat_id is None and orphan.comment_of_msg_id is None
+    assert db.stored_comment_post_ids(conn, 2, 1) == []
 
 
 def test_delete_chat_clears_the_link_of_a_group_that_outlives_its_channel(
     conn: sqlite3.Connection,
 ) -> None:
-    """The group keeps its messages and its window, and stops holding comments: the post id they
-    hung under names a post of a channel that is gone, and the next channel to link the group
-    numbers its own posts from 1 as well."""
+    """The group keeps its messages and its window, and stops holding comments: they named a post
+    of a channel that is gone, and the next channel to link the group numbers its own posts from
+    1 as well. The window stays — a cleared comment is searchable through it the moment the
+    delete commits, with no rebuild owed."""
     _thread_id, _post_id, window_id = _channel_with_comments(conn)
     db.delete_chat(conn, 1)
     group = db.get_chat(conn, 2)
@@ -619,9 +744,10 @@ def test_delete_chat_clears_the_link_of_a_group_that_outlives_its_channel(
     assert db.get_discussion_chat(conn, 1) is None
     assert [u.id for u in db.get_units(conn, 2)] == [window_id]
     comment = db.get_message(conn, 2, 5)
-    assert comment is not None and comment.topic_id is None
-    assert db.stored_topic_ids(conn, 2) == []
-    assert db.unindexed_message_ids(conn, 2) == [comment.id]
+    assert comment is not None
+    assert comment.comment_of_chat_id is None and comment.comment_of_msg_id is None
+    assert db.stored_comment_post_ids(conn, 2, 1) == []
+    assert db.unindexed_message_ids(conn, 2) == []
 
 
 def _dump(conn: sqlite3.Connection) -> dict[str, list[tuple[object, ...]]]:
@@ -809,8 +935,6 @@ def test_get_messages_ordering_since_and_topic(conn: sqlite3.Connection) -> None
     )
     assert [m.msg_id for m in db.get_messages(conn, 1)] == [10, 20, 30]
     assert [m.msg_id for m in db.get_messages(conn, 1, since_msg_id=20)] == [20, 30]
-    assert db.count_topic_messages(conn, 1, [7, 8]) == {7: 2}
-    assert db.count_topic_messages(conn, 2, [7]) == {}
     assert db.get_messages(conn, 3) == []
 
 
@@ -851,53 +975,71 @@ def test_set_discussion_chat_re_points_the_link_and_reports_what_it_dropped(
     assert db.list_chats(conn) == [db.get_chat(conn, 1), db.get_chat(conn, 2), db.get_chat(conn, 3)]
 
 
-def test_stored_topic_ids_are_distinct_and_ordered(conn: sqlite3.Connection) -> None:
+def test_stored_comment_post_ids_are_distinct_ordered_and_per_channel(
+    conn: sqlite3.Connection,
+) -> None:
+    """Only the comments of the channel asked about, and never a forum topic of the group: a
+    topic root and a post id are separate id spaces that both number from 1."""
     db.upsert_chat(conn, _chat(1))
     db.upsert_messages(
         conn,
         [
-            _message(1, 10, topic_id=7),
-            _message(1, 11, topic_id=7),
-            _message(1, 12, topic_id=3),
-            _message(1, 13),
+            _message(1, 10, comment_of_chat_id=5, comment_of_msg_id=7),
+            _message(1, 11, comment_of_chat_id=5, comment_of_msg_id=7),
+            _message(1, 12, comment_of_chat_id=5, comment_of_msg_id=3),
+            _message(1, 13, comment_of_chat_id=6, comment_of_msg_id=3),
+            _message(1, 14, topic_id=7),
+            _message(1, 15),
         ],
     )
-    assert db.stored_topic_ids(conn, 1) == [3, 7]
-    assert db.stored_topic_ids(conn, 2) == []
+    assert db.stored_comment_post_ids(conn, 1, 5) == [3, 7]
+    assert db.stored_comment_post_ids(conn, 1, 6) == [3]
+    assert db.stored_comment_post_ids(conn, 1, 9) == []
+    assert db.stored_comment_post_ids(conn, 2, 5) == []
 
 
-def test_get_topic_messages_groups_and_orders(conn: sqlite3.Connection) -> None:
+def test_get_comment_messages_groups_and_orders(conn: sqlite3.Connection) -> None:
     db.upsert_chat(conn, _chat(1))
     db.upsert_chat(conn, _chat(2))
     db.upsert_messages(
         conn,
         [
-            _message(1, 30, topic_id=7),
-            _message(1, 10, topic_id=7),
-            _message(1, 20, topic_id=9),
+            _message(1, 30, comment_of_chat_id=5, comment_of_msg_id=7),
+            _message(1, 10, comment_of_chat_id=5, comment_of_msg_id=7),
+            _message(1, 20, comment_of_chat_id=5, comment_of_msg_id=9),
             _message(1, 40),
-            _message(1, 50, topic_id=11),
-            _message(2, 15, topic_id=7),
+            _message(1, 45, topic_id=7),
+            _message(1, 46, comment_of_chat_id=6, comment_of_msg_id=7),
+            _message(1, 50, comment_of_chat_id=5, comment_of_msg_id=11),
+            _message(2, 15, comment_of_chat_id=5, comment_of_msg_id=7),
         ],
     )
-    grouped = db.get_topic_messages(conn, 1, [9, 7, 7, 12])
-    assert {topic: [m.msg_id for m in rows] for topic, rows in grouped.items()} == {
+    grouped = db.get_comment_messages(conn, 1, 5, [9, 7, 7, 12])
+    assert {post: [m.msg_id for m in rows] for post, rows in grouped.items()} == {
         7: [10, 30],
         9: [20],
     }
     assert all(m.chat_id == 1 for rows in grouped.values() for m in rows)
-    assert db.get_topic_messages(conn, 1, []) == {}
-    assert db.get_topic_messages(conn, 3, [7]) == {}
+    assert db.get_comment_messages(conn, 1, 5, []) == {}
+    assert db.get_comment_messages(conn, 3, 5, [7]) == {}
+    assert {
+        post: [m.msg_id for m in rows]
+        for post, rows in db.get_comment_messages(conn, 1, 6, [7]).items()
+    } == {7: [46]}
 
 
-def test_get_topic_messages_batches_long_topic_lists(conn: sqlite3.Connection) -> None:
+def test_get_comment_messages_batches_long_post_lists(conn: sqlite3.Connection) -> None:
     db.upsert_chat(conn, _chat(1))
     db.upsert_messages(
         conn,
-        [_message(1, 1, topic_id=1), _message(1, 2, topic_id=600), _message(1, 3, topic_id=1001)],
+        [
+            _message(1, 1, comment_of_chat_id=5, comment_of_msg_id=1),
+            _message(1, 2, comment_of_chat_id=5, comment_of_msg_id=600),
+            _message(1, 3, comment_of_chat_id=5, comment_of_msg_id=1001),
+        ],
     )
     assert len(range(1, 1002)) > 2 * db.IN_BATCH
-    grouped = db.get_topic_messages(conn, 1, range(1, 1002))
+    grouped = db.get_comment_messages(conn, 1, 5, range(1, 1002))
     assert {topic: [m.msg_id for m in rows] for topic, rows in grouped.items()} == {
         1: [1],
         600: [2],
@@ -1228,20 +1370,32 @@ def test_upsert_messages_rewrites_every_column_on_conflict(conn: sqlite3.Connect
     assert db.get_message(conn, 1, 5) == dataclasses.replace(second, id=row_id)
 
 
-def test_upsert_messages_keeps_a_stored_topic_when_the_new_row_has_none(
+def test_upsert_messages_keeps_a_stored_topic_and_comment_relation_when_a_row_has_none(
     conn: sqlite3.Connection,
 ) -> None:
-    """A comment stored with its post id, re-read as part of the group's plain history."""
+    """A comment stored as one, re-read as part of the group's plain history: that read knows
+    nothing of the channel it comments on, and must not unmap it."""
     db.upsert_chat(conn, _chat(1))
-    comment = MessageRow(chat_id=1, msg_id=5, date=100, topic_id=9, text="a")
+    comment = MessageRow(
+        chat_id=1,
+        msg_id=5,
+        date=100,
+        topic_id=9,
+        comment_of_chat_id=77,
+        comment_of_msg_id=4,
+        text="a",
+    )
     (row_id,) = db.upsert_messages(conn, [comment])
     plain = MessageRow(chat_id=1, msg_id=5, date=100, text="a (edited)")
     assert db.upsert_messages(conn, [plain]) == [row_id]
-    assert db.get_message(conn, 1, 5) == dataclasses.replace(plain, id=row_id, topic_id=9)
-    moved = dataclasses.replace(plain, topic_id=11)
+    assert db.get_message(conn, 1, 5) == dataclasses.replace(
+        plain, id=row_id, topic_id=9, comment_of_chat_id=77, comment_of_msg_id=4
+    )
+    moved = dataclasses.replace(plain, topic_id=11, comment_of_chat_id=78, comment_of_msg_id=5)
     db.upsert_messages(conn, [moved])
     assert db.get_message(conn, 1, 5) == dataclasses.replace(moved, id=row_id)
     fresh = MessageRow(chat_id=1, msg_id=6, date=101, text="b")
     db.upsert_messages(conn, [fresh])
     stored = db.get_message(conn, 1, 6)
     assert stored is not None and stored.topic_id is None
+    assert stored.comment_of_chat_id is None and stored.comment_of_msg_id is None

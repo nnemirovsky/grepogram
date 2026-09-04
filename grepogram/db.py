@@ -122,15 +122,50 @@ _V3: tuple[str, ...] = (
        WHERE discussion_of IS NOT NULL""",
 )
 
-MIGRATIONS: tuple[tuple[str, ...], ...] = (_V1, _V2, _V3)
+_V4: tuple[str, ...] = (
+    # which channel post a message is a comment on, kept apart from topic_id: a discussion group
+    # can be a forum, and a forum topic root and a channel post are separate id spaces that both
+    # start at 1, so one column cannot say which of the two a number is. NULL on every row that
+    # is not a comment
+    "ALTER TABLE messages ADD COLUMN comment_of_chat_id INTEGER",
+    "ALTER TABLE messages ADD COLUMN comment_of_msg_id INTEGER",
+    """CREATE INDEX messages_comments
+       ON messages(chat_id, comment_of_chat_id, comment_of_msg_id)
+       WHERE comment_of_chat_id IS NOT NULL""",
+    # a discussion group that is not a forum has no topics of its own, so every topic_id it holds
+    # is a post of the channel linking it now and moves over unambiguously
+    """UPDATE messages SET comment_of_chat_id = (SELECT discussion_of FROM chats
+                                                 WHERE chats.id = messages.chat_id),
+                           comment_of_msg_id = topic_id,
+                           topic_id = NULL,
+                           indexed = 0
+       WHERE topic_id IS NOT NULL
+         AND chat_id IN (SELECT id FROM chats
+                         WHERE discussion_of IS NOT NULL AND COALESCE(is_forum, 0) = 0)""",
+    # a discussion group that is a forum wrote both meanings into topic_id and nothing in the row
+    # says which is which, so nothing is moved: the rows keep the topic_id they have and are
+    # flagged for a rebuild, and so are the posts of the channel linking them, whose post threads
+    # are therefore cut again without comments. The next sync re-reads those threads (Telegram
+    # reports more replies than are stored as comments) and files them under the new columns
+    """UPDATE messages SET indexed = 0
+       WHERE topic_id IS NOT NULL
+         AND chat_id IN (SELECT id FROM chats
+                         WHERE discussion_of IS NOT NULL AND COALESCE(is_forum, 0) = 1)""",
+    """UPDATE messages SET indexed = 0
+       WHERE chat_id IN (SELECT discussion_of FROM chats
+                         WHERE discussion_of IS NOT NULL AND COALESCE(is_forum, 0) = 1)""",
+)
+
+MIGRATIONS: tuple[tuple[str, ...], ...] = (_V1, _V2, _V3, _V4)
 SCHEMA_VERSION = len(MIGRATIONS)
 
 _VEC_DIM_RE = re.compile(r"FLOAT\[(\d+)\]")
 
 _MESSAGE_UPSERT = """
     INSERT INTO messages(chat_id, msg_id, date, edit_date, from_id, from_name, reply_to_msg_id,
-                         topic_id, fwd_from, text, media_kind, media_filename, reactions_total)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                         topic_id, comment_of_chat_id, comment_of_msg_id, fwd_from, text,
+                         media_kind, media_filename, reactions_total)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(chat_id, msg_id) DO UPDATE SET
         date = excluded.date,
         edit_date = excluded.edit_date,
@@ -138,6 +173,8 @@ _MESSAGE_UPSERT = """
         from_name = excluded.from_name,
         reply_to_msg_id = excluded.reply_to_msg_id,
         topic_id = COALESCE(excluded.topic_id, messages.topic_id),
+        comment_of_chat_id = COALESCE(excluded.comment_of_chat_id, messages.comment_of_chat_id),
+        comment_of_msg_id = COALESCE(excluded.comment_of_msg_id, messages.comment_of_msg_id),
         fwd_from = excluded.fwd_from,
         text = excluded.text,
         media_kind = excluded.media_kind,
@@ -539,8 +576,7 @@ def delete_chat(conn: sqlite3.Connection, chat_id: int) -> None:
     resolve again, and until it does the index would answer with rows that are gone. The mirror
     case is a channel deleted while its group lives on under a source of its own: the group keeps
     every message it holds, and only the link goes — with the comment mapping under it, which
-    :func:`drop_comment_units` clears for the groups the delete unlinks, while the channel's own
-    posts are still there to say which topics were its.
+    :func:`drop_comment_units` clears for the groups the delete unlinks.
     """
     with transaction(conn):
         chat = get_chat(conn, chat_id)
@@ -569,10 +605,10 @@ def drop_comment_units(conn: sqlite3.Connection, channel_id: int | None, group_i
     """Undo what a discussion group's comments left in a channel's post threads, and stop the
     rows being that channel's comments at all.
 
-    Returns how many of the channel's posts were flagged for a rebuild. This is the one answer
-    to "which units quote this group": a channel's post threads are the only units built from
-    another chat's rows (:func:`grepogram.units.build_posts`), and they hang under the post ids
-    the group keeps its comments in ``topic_id`` — so only a broadcast channel, the one shape
+    Returns how many of the channel's stored posts were flagged for a rebuild. This is the one
+    answer to "which units quote this group": a channel's post threads are the only units built
+    from another chat's rows (:func:`grepogram.units.build_posts`), and they hang under the posts
+    the group's rows name in ``comment_of_msg_id`` — so only a broadcast channel, the one shape
     that has them, is touched. The threads themselves name no comment: each lists only the post
     in ``msg_ids`` (comment ids live in the group's id space), so nothing in the rows ties a
     thread back to the group whose text it carries. The link is that tie, and it is why every
@@ -584,56 +620,48 @@ def drop_comment_units(conn: sqlite3.Connection, channel_id: int | None, group_i
     The stale threads go with their ``unit_fts`` and vector rows, and the posts are flagged
     ``indexed = 0`` so the next rebuild cuts them again — without those comments, or with the
     ones the new group holds. The mapping that made them comments goes too
-    (:func:`_clear_comment_topics`), or the next channel to hold the group would inherit them.
-    Nothing to do when the channel is not stored, when ``channel_id`` is ``None`` (a group no
-    channel links) or when the chat is not a broadcast channel: no other shape holds another
-    chat's rows.
+    (:func:`_clear_comment_mapping`), or the next channel to hold the group would inherit them;
+    it goes for every comment of this channel, whether or not the post it hangs under is still
+    stored, so a post the channel has since dropped leaves nothing behind either. Nothing to do
+    when the channel is not stored, when ``channel_id`` is ``None`` (a group no channel links) or
+    when the chat is not a broadcast channel: no other shape holds another chat's rows.
     """
     channel = None if channel_id is None else get_chat(conn, channel_id)
     if channel is None or not channel.is_broadcast:
         return 0
-    topics = stored_topic_ids(conn, group_id)
-    if not topics:
+    post_ids = stored_comment_post_ids(conn, group_id, channel.id)
+    if not post_ids:
         return 0
     with transaction(conn):
-        stale = threads_touching(conn, channel.id, topics)
+        stale = threads_touching(conn, channel.id, post_ids)
         _drop_units_and_index(conn, [unit.id for unit in stale if unit.id is not None])
-        posts = get_messages_by_msg_id(conn, channel.id, topics)
+        posts = get_messages_by_msg_id(conn, channel.id, post_ids)
         mark_unindexed(conn, [post.id for post in posts.values() if post.id is not None])
-        _clear_comment_topics(conn, group_id, list(posts))
+        _clear_comment_mapping(conn, group_id, channel.id)
         return len(posts)
 
 
-def _clear_comment_topics(conn: sqlite3.Connection, group_id: int, post_ids: Sequence[int]) -> None:
-    """Un-designate the comments a group holds on these posts; they stay as group messages.
+def _clear_comment_mapping(conn: sqlite3.Connection, group_id: int, channel_id: int) -> None:
+    """Un-designate every comment ``group_id`` holds on ``channel_id``; they stay group messages.
 
-    A comment's ``topic_id`` is a post id in *some* channel's id space and nothing in the row
-    says whose. Post ids start at 1 in every channel, so a mapping that outlives the link hands
-    the old channel's comments to the new channel's post of the same number:
-    :func:`grepogram.units.build_posts` and :func:`grepogram.search.thread` read comments by
-    ``(group, topic_id)`` alone. Clearing it where the link goes is what keeps "they stop being
-    the channel's comments" true of the rows and not only of the units built from them.
+    Only the comment relation is cleared, and only this channel's: a forum topic of the group
+    carries none, and a comment on another channel's post names that channel, so neither is
+    touched. Clearing it where the link goes is what keeps "they stop being the channel's
+    comments" true of the rows and not only of the units built from them —
+    :func:`grepogram.units.build_posts` and :func:`grepogram.search.thread` would otherwise hand
+    them to whichever channel links the group next.
 
-    The messages themselves stay — a real group's messages, in the group's windows and found
-    through them — and are flagged ``indexed = 0`` so everything cut from them is cut again
-    without the topic. The windows that grouped them go the same way: a window is addressed by
-    ``(chat, topic)``, so a recut of the group's linear stream would never reach one filed under
-    a post id (only a discussion group that is a forum has any). Only topics that are this
-    channel's stored posts are cleared, so a forum group's own topics survive the unlink.
+    Nothing derived from a group's rows is rebuilt, because nothing derived from them reads the
+    comment relation: its windows are cut per forum topic (:func:`grepogram.units.window_topic`)
+    and its threads follow ``reply_to_msg_id``, both untouched here. So every cleared comment
+    stays in the window it was already in and is searchable through it the moment this commits,
+    with no rebuild owed and nothing to strand until a later sync.
     """
-    windows = _units_by_chunks(
-        conn,
-        "SELECT * FROM units WHERE chat_id = ? AND kind = 'window' AND topic_id IN ({marks})",
-        [group_id],
-        post_ids,
+    conn.execute(
+        "UPDATE messages SET comment_of_chat_id = NULL, comment_of_msg_id = NULL "
+        "WHERE chat_id = ? AND comment_of_chat_id = ?",
+        (group_id, channel_id),
     )
-    _drop_units_and_index(conn, [unit.id for unit in windows if unit.id is not None])
-    for chunk in _chunks(post_ids):
-        conn.execute(
-            f"UPDATE messages SET topic_id = NULL, indexed = 0 "
-            f"WHERE chat_id = ? AND topic_id IN ({_marks(chunk)})",
-            [group_id, *chunk],
-        )
 
 
 def _drop_units_and_index(conn: sqlite3.Connection, ids: Sequence[int]) -> None:
@@ -668,9 +696,10 @@ def upsert_messages(conn: sqlite3.Connection, batch: Iterable[MessageRow]) -> li
     """Insert or update messages keyed by ``(chat_id, msg_id)``; returns ``messages.id`` per row.
 
     Conflicts update in place, so an edited message keeps its ``id`` and therefore its FTS
-    rowid. A ``topic_id`` already stored survives a row without one: a channel's comment threads
-    store a discussion group's messages with the post id as topic, and the group's own history
-    sync stores the same messages with none — either may arrive first. Every row written, new or
+    rowid. A ``topic_id`` and a ``comment_of_*`` pair already stored survive a row without them:
+    a channel's comment fetch stores a discussion group's message as a comment on one of its
+    posts, and the group's own history sync stores the same message with no comment relation at
+    all — either may arrive first. Every row written, new or
     updated, is flagged ``indexed = 0`` until a rebuild covers it (:func:`mark_indexed`). The
     chat row must exist (foreign key).
     """
@@ -688,6 +717,8 @@ def upsert_messages(conn: sqlite3.Connection, batch: Iterable[MessageRow]) -> li
                     message.from_name,
                     message.reply_to_msg_id,
                     message.topic_id,
+                    message.comment_of_chat_id,
+                    message.comment_of_msg_id,
                     message.fwd_from,
                     message.text,
                     message.media_kind,
@@ -755,64 +786,67 @@ def get_messages(
     return [_message_row(row) for row in conn.execute(sql, params)]
 
 
-def get_topic_messages(
-    conn: sqlite3.Connection, chat_id: int, topic_ids: Iterable[int]
+def get_comment_messages(
+    conn: sqlite3.Connection, group_id: int, channel_id: int, post_ids: Iterable[int]
 ) -> dict[int, list[MessageRow]]:
-    """Messages of a chat grouped by ``topic_id`` for the given topics, each in ``msg_id`` order.
+    """The comments ``group_id`` holds on those posts of ``channel_id``, grouped by post id and
+    each group in ``msg_id`` order.
 
-    One query per :data:`IN_BATCH` topics rather than one per topic — a channel rebuild reads the
-    comments of every post this way. Topics without messages are absent from the result.
+    One query per :data:`IN_BATCH` posts rather than one per post — a channel rebuild reads the
+    comments of every post this way. Posts without comments are absent from the result.
 
-    The caller names the topics, never the channel they belong to, so a discussion group must
-    hold no mapping but the linking channel's: :func:`_clear_comment_topics` clears it where a
-    link goes, and without that a post id of the previous channel would answer here.
+    The channel is part of the key, not implied by the group: a discussion group can be a forum
+    and can have held another channel's comments before, and a post id is only a number until
+    something says whose id space it comes from. ``comment_of_chat_id`` says it, so a forum topic
+    of the group and a comment on some other channel's post of the same number are both invisible
+    here.
     """
     grouped: dict[int, list[MessageRow]] = {}
-    for chunk in _chunks(topic_ids):
+    for chunk in _chunks(post_ids):
         rows = conn.execute(
-            "SELECT * FROM messages WHERE chat_id = ? "
-            f"AND topic_id IN ({_marks(chunk)}) ORDER BY msg_id",
-            [chat_id, *chunk],
+            "SELECT * FROM messages WHERE chat_id = ? AND comment_of_chat_id = ? "
+            f"AND comment_of_msg_id IN ({_marks(chunk)}) ORDER BY msg_id",
+            [group_id, channel_id, *chunk],
         )
         for row in rows:
-            grouped.setdefault(int(row["topic_id"]), []).append(_message_row(row))
+            grouped.setdefault(int(row["comment_of_msg_id"]), []).append(_message_row(row))
     return grouped
 
 
-def stored_topic_ids(conn: sqlite3.Connection, chat_id: int) -> list[int]:
-    """The distinct ``topic_id`` values a chat holds messages under, ascending.
+def stored_comment_post_ids(conn: sqlite3.Connection, group_id: int, channel_id: int) -> list[int]:
+    """The distinct posts of ``channel_id`` that ``group_id`` holds comments on, ascending.
 
-    In a discussion group these are the ids of the channel posts its comments hang under, which
-    is what a channel that lost that group rebuilds its post threads from. They belong to the
-    id space of the channel that links the group *now*: the mapping is cleared where a link goes
-    (:func:`_clear_comment_topics`), so the ids of a channel that held the group before are not
-    among them.
+    This is what a channel that is losing that group rebuilds its post threads from. A forum
+    topic of the group is not one of these however its root is numbered, and neither is a
+    comment left over from a channel that held the group before.
     """
     rows = conn.execute(
-        "SELECT DISTINCT topic_id FROM messages "
-        "WHERE chat_id = ? AND topic_id IS NOT NULL ORDER BY topic_id",
-        (chat_id,),
+        "SELECT DISTINCT comment_of_msg_id FROM messages "
+        "WHERE chat_id = ? AND comment_of_chat_id = ? AND comment_of_msg_id IS NOT NULL "
+        "ORDER BY comment_of_msg_id",
+        (group_id, channel_id),
     ).fetchall()
-    return [int(row["topic_id"]) for row in rows]
+    return [int(row["comment_of_msg_id"]) for row in rows]
 
 
-def count_topic_messages(
-    conn: sqlite3.Connection, chat_id: int, topic_ids: Iterable[int]
+def count_comment_messages(
+    conn: sqlite3.Connection, group_id: int, channel_id: int, post_ids: Iterable[int]
 ) -> dict[int, int]:
-    """Stored messages per ``topic_id`` for the given topics; topics without messages are absent.
+    """Comments stored per post of ``channel_id``; posts without comments are absent.
 
     A channel with comments compares this with the reply counts Telegram reports on its posts to
     find the threads that grew since they were stored.
     """
     counts: dict[int, int] = {}
-    for chunk in _chunks(topic_ids):
+    for chunk in _chunks(post_ids):
         rows = conn.execute(
-            "SELECT topic_id, count(*) AS n FROM messages WHERE chat_id = ? "
-            f"AND topic_id IN ({_marks(chunk)}) GROUP BY topic_id",
-            [chat_id, *chunk],
+            "SELECT comment_of_msg_id, count(*) AS n FROM messages "
+            "WHERE chat_id = ? AND comment_of_chat_id = ? "
+            f"AND comment_of_msg_id IN ({_marks(chunk)}) GROUP BY comment_of_msg_id",
+            [group_id, channel_id, *chunk],
         )
         for row in rows:
-            counts[int(row["topic_id"])] = int(row["n"])
+            counts[int(row["comment_of_msg_id"])] = int(row["n"])
     return counts
 
 
@@ -930,9 +964,14 @@ def get_context_messages(
     conn: sqlite3.Connection, chat_id: int, msg_id: int, before: int, after: int
 ) -> list[MessageRow]:
     """``msg_id`` with up to ``before`` stored messages preceding and ``after`` following it in
-    ``msg_id`` order, all from the same topic (``topic_id IS`` the message's own, so a forum
-    topic or a channel post's comments never bleed into a neighbour); ``[]`` when the message
-    is not stored. Negative counts are a ``ValueError``.
+    ``msg_id`` order, all from the same topic (``topic_id IS`` the message's own, so one forum
+    topic never bleeds into a neighbour); ``[]`` when the message is not stored. Negative counts
+    are a ``ValueError``.
+
+    A discussion group's comments are not a topic: they are that group's own linear
+    conversation, cut into the same windows as everything else it holds, so the neighbours of a
+    comment are the group's — its comments on other posts included, and the post's own thread is
+    what :func:`grepogram.search.thread` is for.
     """
     if before < 0 or after < 0:
         raise ValueError(f"before and after must not be negative, got {before} and {after}")
@@ -1209,6 +1248,8 @@ def _message_row(row: sqlite3.Row) -> MessageRow:
         from_name=row["from_name"],
         reply_to_msg_id=row["reply_to_msg_id"],
         topic_id=row["topic_id"],
+        comment_of_chat_id=row["comment_of_chat_id"],
+        comment_of_msg_id=row["comment_of_msg_id"],
         fwd_from=row["fwd_from"],
         text=row["text"],
         media_kind=row["media_kind"],

@@ -165,9 +165,10 @@ def cut_windows(
 def window_topic(chat: ChatRow, msg: MessageRow) -> int | None:
     """The topic whose windows hold ``msg``: its ``topic_id`` in a forum, ``None`` anywhere else.
 
-    Outside forums a chat is one linear conversation and its windows carry no topic. The
-    comments a channel stores in its discussion group keep the post id in ``topic_id`` — for the
-    post threads and the readers — but sit in the group's windows like any other message.
+    Outside forums a chat is one linear conversation and its windows carry no topic. A comment a
+    channel stores in its discussion group names its post in ``comment_of_msg_id``, never in
+    ``topic_id``, so it sits in the group's windows exactly where its own forum topic — or the
+    absence of one — puts it, like any other message the group holds.
     """
     return msg.topic_id if chat.is_forum else None
 
@@ -275,9 +276,10 @@ def build_posts(
     """One ``post`` unit per channel message, plus a ``thread`` for every post with comments.
 
     Comments are stored under the linked discussion chat (``chats.discussion_of = chat.id``)
-    with ``topic_id`` = the post id and are read from there when ``comments`` is set — by post id
-    alone, which only holds because a group carries the mapping of the channel that links it now
-    and of no other (:func:`grepogram.db._clear_comment_topics`). The thread
+    naming this channel and the post in ``comment_of_chat_id`` / ``comment_of_msg_id``, and are
+    read back by that pair when ``comments`` is set — never by the post id alone, which is a bare
+    number that a forum topic of the same group, or a comment left over from a channel that held
+    the group before, would answer to just as well. The thread
     belongs to the channel and lists only the post in ``msg_ids`` — comment ids live in the
     discussion chat's id space and would not open from a channel link — while its text carries
     the post followed by its comments in order and ``date_end`` reaches the last comment. Long
@@ -289,7 +291,7 @@ def build_posts(
     discussion = db.get_discussion_chat(conn, chat.id) if comments else None
     if discussion is None or not posts:
         return units
-    by_post = db.get_topic_messages(conn, discussion.id, [post.msg_id for post in posts])
+    by_post = db.get_comment_messages(conn, discussion.id, chat.id, [post.msg_id for post in posts])
     for post in posts:
         replies = chronological(by_post.get(post.msg_id, []))
         for chunk in thread_chunks(post, replies, cfg.thread_max_msgs):

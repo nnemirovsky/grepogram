@@ -663,15 +663,18 @@ def thread(conn: sqlite3.Connection, chat_id: int, msg_id: int) -> list[MessageV
     The thread is the root reached by walking ``reply_to_msg_id`` upwards and every reply below
     it (:func:`grepogram.db.get_thread_messages`); a message nobody replied to that replies to
     nothing is a thread of one. For a channel post the comments stored under the linked
-    discussion chat follow the post, each linked into that chat. Raises :class:`UnknownMessage`
-    when the message is not indexed.
+    discussion chat follow the post, each linked into that chat — the ones naming *this* channel
+    and this post, so a forum topic of that group and a comment left by a channel that held the
+    group before are not among them. Raises :class:`UnknownMessage` when the message is not
+    indexed.
     """
     chat = _locate(conn, chat_id, msg_id)
     views = [message_view(chat, msg) for msg in db.get_thread_messages(conn, chat_id, msg_id)]
     if chat.is_broadcast:
         discussion = db.get_discussion_chat(conn, chat.id)
         if discussion is not None:
-            comments = chronological(db.get_messages_in_topic(conn, discussion.id, msg_id))
+            by_post = db.get_comment_messages(conn, discussion.id, chat.id, [msg_id])
+            comments = chronological(by_post.get(msg_id, []))
             views += [message_view(discussion, msg) for msg in comments]
     return views
 

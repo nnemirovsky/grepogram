@@ -436,7 +436,8 @@ def _channel_with_a_comment(conn: sqlite3.Connection) -> tuple[Config, UnitRow]:
                 date=1_700_000_060,
                 from_id=2,
                 from_name="Bob",
-                topic_id=1,
+                comment_of_chat_id=NEWS,
+                comment_of_msg_id=1,
                 text="Does the Brubank branch accept CUIT without DNI?",
             )
         ],

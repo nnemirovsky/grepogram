@@ -547,7 +547,8 @@ def _comment(msg_id: int, post_id: int, minutes: int, reply_to: int = 7) -> Mess
         minutes,
         reply_to=reply_to,
         chat_id=DISC,
-        topic_id=post_id,
+        comment_of_chat_id=CHANNEL,
+        comment_of_msg_id=post_id,
         from_name="Bob",
         text=f"comment {msg_id} on {post_id}",
     )
@@ -596,13 +597,13 @@ def test_channel_with_comments_builds_post_threads_and_discussion_windows(
     ]
     thread = _by_msg_ids(conn, "thread", CHANNEL)[(10,)]
     assert thread.text.splitlines()[1:] == [
-        units.render_line(m) for m in db.get_messages_in_topic(conn, DISC, 10)
+        units.render_line(m) for m in db.get_comment_messages(conn, DISC, CHANNEL, [10]).get(10, [])
     ]
     assert _stored(conn, CHANNEL) == _expected(conn, channel)
     units.rebuild_for_chat(conn, discussion, CFG, comment_ids)
     assert [(u.kind, u.topic_id, u.msg_ids) for u in db.get_units(conn, DISC)] == [
         ("window", None, [1, 2, 3]),
-        ("thread", 10, [1, 2]),
+        ("thread", None, [1, 2]),
     ]
     assert _stored(conn, DISC) == _expected(conn, discussion)
 
@@ -817,7 +818,7 @@ async def test_sync_all_builds_channel_posts_threads_and_discussion_units(
     ]
     assert [(u.kind, u.topic_id, u.msg_ids) for u in db.get_units(conn, DISC_ID)] == [
         ("window", None, [1, 2]),
-        ("thread", 1, [1, 2]),
+        ("thread", None, [1, 2]),
     ]
     for chat_id in (NEWS_ID, DISC_ID):
         chat = db.get_chat(conn, chat_id)

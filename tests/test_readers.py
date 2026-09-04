@@ -81,9 +81,9 @@ def channel(conn: sqlite3.Connection) -> None:
         conn,
         _chat(DISC, discussion_of=CHANNEL),
         [
-            _msg(DISC, 10, 5, reply_to=5, topic_id=1),
-            _msg(DISC, 11, 7, reply_to=10, topic_id=1),
-            _msg(DISC, 12, 65, reply_to=6, topic_id=2),
+            _msg(DISC, 10, 5, reply_to=5, comment_of_chat_id=CHANNEL, comment_of_msg_id=1),
+            _msg(DISC, 11, 7, reply_to=10, comment_of_chat_id=CHANNEL, comment_of_msg_id=1),
+            _msg(DISC, 12, 65, reply_to=6, comment_of_chat_id=CHANNEL, comment_of_msg_id=2),
         ],
     )
 
@@ -324,9 +324,14 @@ def test_context_stays_within_the_topic(conn: sqlite3.Connection, forum: None) -
     ]
 
 
-def test_context_of_a_comment_stays_with_its_post(conn: sqlite3.Connection, channel: None) -> None:
-    assert _ids(search.context(conn, DISC, 11, before=5, after=5)) == [10, 11]
-    assert _ids(search.context(conn, DISC, 12, before=5, after=5)) == [12]
+def test_context_of_a_comment_is_the_groups_own_neighbours(
+    conn: sqlite3.Connection, channel: None
+) -> None:
+    """A discussion group is one linear conversation and its comments share its windows, so the
+    context of a comment is what surrounds it in the group — comments on other posts included.
+    The post's own thread is :func:`search.thread`, not this."""
+    assert _ids(search.context(conn, DISC, 11, before=5, after=5)) == [10, 11, 12]
+    assert _ids(search.context(conn, DISC, 12, before=1, after=1)) == [11, 12]
     assert _ids(search.context(conn, CHANNEL, 2, before=5, after=5)) == [1, 2, 3]
 
 

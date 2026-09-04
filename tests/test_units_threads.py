@@ -210,13 +210,16 @@ def _post(msg_id: int, minutes: int = 0, text: str | None = None) -> MessageRow:
     )
 
 
-def _comment(msg_id: int, post_id: int, minutes: int, reply_to: int = 7) -> MessageRow:
+def _comment(
+    msg_id: int, post_id: int, minutes: int, reply_to: int = 7, channel_id: int = CHANNEL
+) -> MessageRow:
     return _msg(
         msg_id,
         minutes,
         reply_to=reply_to,
         chat_id=DISC,
-        topic_id=post_id,
+        comment_of_chat_id=channel_id,
+        comment_of_msg_id=post_id,
         from_name="Bob",
         text=f"comment {msg_id} on {post_id}",
     )
@@ -326,7 +329,19 @@ def test_build_posts_reads_only_the_channel_own_discussion(conn: sqlite3.Connect
     _with_discussion(conn, [_comment(1, 10, 20)])
     db.upsert_chat(conn, _chat(other_channel, type="channel", title="Other"))
     db.upsert_chat(conn, _chat(other_disc, title="Other chat", discussion_of=other_channel))
-    db.upsert_messages(conn, [_msg(5, 1, chat_id=other_disc, topic_id=10, text="foreign")])
+    db.upsert_messages(
+        conn,
+        [
+            _msg(
+                5,
+                1,
+                chat_id=other_disc,
+                comment_of_chat_id=other_channel,
+                comment_of_msg_id=10,
+                text="foreign",
+            )
+        ],
+    )
     result = units.build_posts(conn, [_post(10)], _channel(), True, CFG)
     assert [(u.kind, u.msg_ids) for u in result] == [("post", [10]), ("thread", [10])]
     assert "foreign" not in result[1].text
@@ -334,6 +349,38 @@ def test_build_posts_reads_only_the_channel_own_discussion(conn: sqlite3.Connect
         conn, [_post(10)], db.get_chat(conn, other_channel) or _channel(), True, CFG
     )
     assert other[1].text.endswith("foreign")
+
+
+def test_build_posts_ignores_a_forum_topic_numbered_like_a_post(conn: sqlite3.Connection) -> None:
+    """The discussion group is a forum too. Its topic 10 and the channel's post 10 are the same
+    number out of two id spaces, and only the rows that say which channel they comment on are
+    the post's comments."""
+    _with_discussion(conn, [_comment(1, 10, 20)])
+    db.upsert_chat(conn, _chat(DISC, title="News chat", is_forum=True, discussion_of=CHANNEL))
+    db.upsert_messages(
+        conn,
+        [
+            _msg(20, 1, chat_id=DISC, topic_id=10, text="in topic ten"),
+            _msg(21, 2, chat_id=DISC, topic_id=10, text="still in topic ten"),
+        ],
+    )
+    (thread,) = [
+        u for u in units.build_posts(conn, [_post(10)], _channel(), True, CFG) if u.kind == "thread"
+    ]
+    assert [line.split(": ", 1)[1] for line in thread.text.splitlines()[1:]] == ["comment 1 on 10"]
+
+
+def test_build_posts_ignores_a_comment_left_by_a_channel_that_lost_the_group(
+    conn: sqlite3.Connection,
+) -> None:
+    """A group can hold comments of a channel this index no longer links — one whose post rows
+    are gone as well. They belong to that channel's id space, so this channel's post of the same
+    number is none the wiser."""
+    _with_discussion(conn, [_comment(1, 10, 20), _comment(2, 10, 25, channel_id=CHANNEL - 1)])
+    (thread,) = [
+        u for u in units.build_posts(conn, [_post(10)], _channel(), True, CFG) if u.kind == "thread"
+    ]
+    assert [line.split(": ", 1)[1] for line in thread.text.splitlines()[1:]] == ["comment 1 on 10"]
 
 
 # --- units_for_chat --------------------------------------------------------------------------
@@ -406,8 +453,9 @@ def test_units_for_chat_channel_with_comments_off_in_source(conn: sqlite3.Connec
 def test_units_for_chat_discussion_chat_gets_linear_windows_and_threads(
     conn: sqlite3.Connection,
 ) -> None:
-    """The group is one conversation: comments of different posts (and the group's own talk,
-    ``topic_id`` None) share its windows; the post id stays on the rows for the post threads."""
+    """The group is one conversation: comments of different posts and the group's own talk share
+    its windows and its reply threads, all with no ``topic_id`` — the post a comment hangs under
+    is a relation of its own and never a topic of the group."""
     messages = [
         _comment(1, 10, 0),
         _comment(2, 10, 1, reply_to=1),
@@ -422,7 +470,7 @@ def test_units_for_chat_discussion_chat_gets_linear_windows_and_threads(
     assert [(u.kind, u.topic_id, u.msg_ids) for u in result] == [
         ("window", None, [1, 2, 3, 4]),
         ("window", None, [5]),
-        ("thread", 10, [1, 2]),
+        ("thread", None, [1, 2]),
     ]
     assert {u.chat_id for u in result} == {DISC}
     assert not any(u.kind == "post" for u in result)

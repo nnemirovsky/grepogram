@@ -132,6 +132,16 @@ class UserRow:
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class MessageRow:
+    """One stored message.
+
+    ``topic_id`` means one thing only: the forum topic the message sits in, ``None`` everywhere
+    else. ``comment_of_chat_id`` / ``comment_of_msg_id`` are the other, separate relation — the
+    channel and the post this message is a comment on, set only on the comments a channel's
+    discussion group holds and ``None`` on every other row, a forum topic message included. The
+    two are independent because their ids are: a forum topic root and a channel post both start
+    at 1 and a discussion group can be a forum, so one column could never carry both.
+    """
+
     id: int | None = None
     chat_id: int
     msg_id: int
@@ -141,6 +151,8 @@ class MessageRow:
     from_name: str | None = None
     reply_to_msg_id: int | None = None
     topic_id: int | None = None
+    comment_of_chat_id: int | None = None
+    comment_of_msg_id: int | None = None
     fwd_from: str | None = None
     text: str = ""
     media_kind: MediaKind | None = None

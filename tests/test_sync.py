@@ -44,6 +44,7 @@ NEWS = make_channel(200, "News", username="news")
 DISC = make_channel(201, "News chat", username="news_chat", megagroup=True)
 DISC2 = make_channel(202, "Second news chat", username="news_chat2", megagroup=True)
 OTHER = make_channel(203, "Other news", username="other_news")
+FORUM_DISC = make_channel(204, "Forum news chat", username="forum_chat", megagroup=True, forum=True)
 
 ALICE_ID = 1
 OLD_ID = -10
@@ -53,6 +54,7 @@ NEWS_ID = -1000000000200
 DISC_ID = -1000000000201
 DISC2_ID = -1000000000202
 OTHER_ID = -1000000000203
+FORUM_DISC_ID = -1000000000204
 
 TELEGRAM = TelegramCfg(api_id=12345, api_hash="fakehash")
 ARG_SOURCE = Source(folder="Argentina")
@@ -154,6 +156,56 @@ def _discussion_client(disc: types.Channel) -> FakeClient:
     )
 
 
+def _forum_discussion_client() -> FakeClient:
+    """A channel whose discussion group is a forum as well as its comment store.
+
+    The group's topic 3 is numbered like the channel's post 3, and messages 3 and 4 sit in that
+    topic without being comments on anything — the shape where a single ``topic_id`` could not
+    say which of the two id spaces a number came from.
+    """
+    comments = _comments(FORUM_DISC_ID)
+    history = [
+        *comments[(NEWS_ID, 1)],
+        tl.topic_message(FORUM_DISC_ID, 3, "topic three opens", topic_id=3, sender=1),
+        tl.reply_message(
+            FORUM_DISC_ID, 4, "still in topic three", reply_to=3, topic_id=3, sender=2
+        ),
+        *comments[(NEWS_ID, 3)],
+    ]
+    return FakeClient(
+        dialogs=[
+            make_dialog(ALICE),
+            make_dialog(BOB),
+            make_dialog(NEWS),
+            make_dialog(FORUM_DISC),
+        ],
+        me=ME,
+        folders=[make_folder(3, "News", include=[NEWS, FORUM_DISC])],
+        messages={NEWS_ID: _posts(), FORUM_DISC_ID: history},
+        comments=comments,
+        responses={
+            functions.channels.GetFullChannelRequest: _full_channel(
+                FORUM_DISC.id, chats=[NEWS, FORUM_DISC]
+            )
+        },
+    )
+
+
+def _forum_state(conn: sqlite3.Connection) -> dict[str, object]:
+    """What the forum topic of the discussion group looks like: its messages, their topic and
+    the window they are filed under."""
+    return {
+        "topics": {
+            m.msg_id: m.topic_id for m in db.get_messages(conn, FORUM_DISC_ID) if m.topic_id
+        },
+        "windows": sorted(
+            (u.topic_id, tuple(u.msg_ids))
+            for u in db.get_units(conn, FORUM_DISC_ID)
+            if u.kind == "window" and u.topic_id is not None
+        ),
+    }
+
+
 def _clock(*ticks: float) -> Callable[[], float]:
     """A monotonic clock returning ``ticks`` in order, then the last value forever."""
     values = iter(ticks)
@@ -169,6 +221,13 @@ def _arg_chat(conn: sqlite3.Connection) -> ChatRow:
     chat = db.get_chat(conn, ARG_ID)
     assert chat is not None
     return chat
+
+
+def _found(conn: sqlite3.Connection, word: str) -> set[int]:
+    """The chats whose units a message search for ``word`` reaches — a message no unit holds any
+    more is simply not there, so this is what "still searchable" means."""
+    hits = search.lexical_messages(conn, word, Filters(), 20)
+    return {u.chat_id for u in db.get_units_by_ids(conn, [m.unit_id for m in hits])}
 
 
 def _texts(conn: sqlite3.Connection, chat_id: int) -> dict[int, str]:
@@ -627,7 +686,9 @@ async def test_comments_are_stored_under_the_discussion_chat(conn: sqlite3.Conne
         2: "reply",
         9: "late comment",
     }
-    assert {k: v.topic_id for k, v in comments.items()} == {1: 1, 2: 1, 9: 3}
+    assert {k: v.comment_of_msg_id for k, v in comments.items()} == {1: 1, 2: 1, 9: 3}
+    assert {v.comment_of_chat_id for v in comments.values()} == {NEWS_ID}
+    assert {v.topic_id for v in comments.values()} == {None}
     assert comments[1].reply_to_msg_id == 7
     assert comments[2].reply_to_msg_id == 1
     assert comments[1].from_name == "Alice Liddell"
@@ -740,10 +801,10 @@ async def test_a_group_two_channels_pointed_at_belongs_to_the_last_one(
 async def test_a_handed_over_group_gives_the_new_channel_none_of_the_old_comments(
     conn: sqlite3.Connection, paths: Paths
 ) -> None:
-    """Post ids start at 1 in every channel and a comment's ``topic_id`` is one of them with no
-    channel attached, so the channel taking a group over must inherit nothing that hung under
-    the ids of the channel that lost it: its own post 1 is not the post 1 they commented on.
-    The comments themselves stay what they are — the group's messages, in its windows."""
+    """Post ids start at 1 in every channel, so the channel taking a group over must inherit
+    nothing that hung under the ids of the channel that lost it: its own post 1 is not the post 1
+    they commented on. The comments themselves stay what they are — the group's messages, in the
+    windows they were already in, searchable through them the moment the handover commits."""
     client = _news_client(entities=[DISC, OTHER])
     cfg = _cfg(NEWS_SOURCE)
     await _run(client, conn, paths, cfg)
@@ -771,7 +832,8 @@ async def test_a_handed_over_group_gives_the_new_channel_none_of_the_old_comment
     assert _thread_texts(conn, OTHER_ID) == {}
     assert [v.text for v in search.thread(conn, OTHER_ID, 1)] == ["other post 1"]
     assert _texts(conn, DISC_ID) == {1: "comment one", 2: "reply", 9: "late comment"}
-    assert {m.topic_id for m in db.get_messages(conn, DISC_ID)} == {None}
+    assert {m.comment_of_chat_id for m in db.get_messages(conn, DISC_ID)} == {None}
+    assert {m.comment_of_msg_id for m in db.get_messages(conn, DISC_ID)} == {None}
     assert db.unindexed_message_ids(conn, DISC_ID) == []
     hits = search.lexical_units(conn, "comment", Filters(), 5)
     assert {u.chat_id for u in db.get_units_by_ids(conn, [m.unit_id for m in hits])} == {DISC_ID}
@@ -802,6 +864,136 @@ def _index_orphans(conn: sqlite3.Connection) -> list[int]:
             f"SELECT rowid FROM {table} WHERE rowid NOT IN (SELECT id FROM units)"
         )
     ]
+
+
+async def test_a_forum_discussion_group_stores_comments_and_topics_side_by_side(
+    conn: sqlite3.Connection, paths: Paths
+) -> None:
+    """A discussion group can be a forum, and then ``topic_id`` and the comment relation are two
+    different things about the same row: topic 3 of the group and post 3 of the channel are the
+    same number out of different id spaces."""
+    client = _forum_discussion_client()
+    cfg = _cfg(NEWS_SOURCE, Source(chat="@forum_chat"))
+    await _run(client, conn, paths, cfg)
+    group = db.get_chat(conn, FORUM_DISC_ID)
+    assert group is not None and group.is_forum and group.discussion_of == NEWS_ID
+    stored = {m.msg_id: m for m in db.get_messages(conn, FORUM_DISC_ID)}
+    assert {i: m.comment_of_msg_id for i, m in stored.items()} == {
+        1: 1,
+        2: 1,
+        3: None,
+        4: None,
+        9: 3,
+    }
+    assert {i: m.topic_id for i, m in stored.items()} == {1: None, 2: None, 3: 3, 4: 3, 9: None}
+    assert db.stored_comment_post_ids(conn, FORUM_DISC_ID, NEWS_ID) == [1, 3]
+    assert _thread_texts(conn, NEWS_ID) == {
+        1: ["post 1", "comment one", "reply"],
+        3: ["post 3", "late comment"],
+    }
+    assert _forum_state(conn) == {"topics": {3: 3, 4: 3}, "windows": [(3, (3, 4))]}
+
+
+async def test_an_unlink_leaves_the_forum_topics_of_the_group_alone(
+    conn: sqlite3.Connection, paths: Paths
+) -> None:
+    """The channel loses the group: its comments stop being comments, and the group's own topic
+    numbered like one of the channel's posts keeps every message, its topic and its window."""
+    client = _forum_discussion_client()
+    cfg = _cfg(NEWS_SOURCE, Source(chat="@forum_chat"))
+    await _run(client, conn, paths, cfg)
+    before = _forum_state(conn)
+    news = db.get_chat(conn, NEWS_ID)
+    assert news is not None
+    client.responses[functions.channels.GetFullChannelRequest] = _full_channel(None)
+    assert await sync.link_discussion_chat(client, conn, news) is None
+    assert db.get_discussion_chat(conn, NEWS_ID) is None
+    assert _forum_state(conn) == before
+    assert db.stored_comment_post_ids(conn, FORUM_DISC_ID, NEWS_ID) == []
+    assert db.unindexed_message_ids(conn, FORUM_DISC_ID) == []
+    assert _texts(conn, FORUM_DISC_ID) == {
+        1: "comment one",
+        2: "reply",
+        3: "topic three opens",
+        4: "still in topic three",
+        9: "late comment",
+    }
+    assert [v.text for v in search.thread(conn, NEWS_ID, 3)] == ["post 3"]
+    assert _found(conn, "topic") == {FORUM_DISC_ID}
+
+
+async def test_a_handover_leaves_the_forum_topics_of_the_group_alone(
+    conn: sqlite3.Connection, paths: Paths
+) -> None:
+    """Another channel takes the group over. Its own post 3 must inherit neither the comments of
+    the channel that lost it nor the group's forum topic 3, which was never a comment at all."""
+    client = _forum_discussion_client()
+    client.entities[FORUM_DISC_ID] = FORUM_DISC
+    cfg = _cfg(NEWS_SOURCE, Source(chat="@forum_chat"))
+    await _run(client, conn, paths, cfg)
+    before = _forum_state(conn)
+    other_source = Source(chat="@other_news", comments=True)
+    other = db.upsert_chat(
+        conn,
+        ChatRow(
+            id=OTHER_ID,
+            type="channel",
+            title="Other",
+            username="other_news",
+            source_id=other_source.id,
+        ),
+    )
+    db.upsert_messages(
+        conn, [MessageRow(chat_id=OTHER_ID, msg_id=3, date=1_700_000_000, text="other post 3")]
+    )
+    linked = await sync.link_discussion_chat(client, conn, other)
+    assert linked is not None and linked.id == FORUM_DISC_ID
+    assert _forum_state(conn) == before
+    assert db.stored_comment_post_ids(conn, FORUM_DISC_ID, NEWS_ID) == []
+    assert db.stored_comment_post_ids(conn, FORUM_DISC_ID, OTHER_ID) == []
+    await sync.index_pending(conn, _cfg(NEWS_SOURCE, other_source), other)
+    assert _thread_texts(conn, OTHER_ID) == {}
+    assert [v.text for v in search.thread(conn, OTHER_ID, 3)] == ["other post 3"]
+
+
+async def test_deleting_the_channel_leaves_the_forum_topics_of_its_group_alone(
+    conn: sqlite3.Connection, paths: Paths
+) -> None:
+    """``sources rm`` of the channel deletes it and unlinks the group. The group's forum topic
+    numbered like one of the deleted channel's posts is untouched, and its cleared comments are
+    searchable right there — no sync in between."""
+    client = _forum_discussion_client()
+    cfg = _cfg(NEWS_SOURCE, Source(chat="@forum_chat"))
+    await _run(client, conn, paths, cfg)
+    before = _forum_state(conn)
+    removed = sources.remove_source(cfg, conn, sources.parse_target("@news"))
+    assert removed.chat_ids == [NEWS_ID]
+    assert db.get_chat(conn, NEWS_ID) is None
+    group = db.get_chat(conn, FORUM_DISC_ID)
+    assert group is not None and group.discussion_of is None
+    assert _forum_state(conn) == before
+    assert db.stored_comment_post_ids(conn, FORUM_DISC_ID, NEWS_ID) == []
+    assert db.unindexed_message_ids(conn, FORUM_DISC_ID) == []
+    assert _found(conn, "topic") == {FORUM_DISC_ID}
+    assert _found(conn, "comment") == {FORUM_DISC_ID}
+
+
+async def test_a_cleared_comment_is_searchable_before_any_later_sync(
+    conn: sqlite3.Connection, paths: Paths
+) -> None:
+    """Removing the channel unmaps the comments its group held. That must not take them out of
+    the index even for a moment: nothing cut from a group's rows reads the comment relation, so
+    every one of them stays in the window it was in and answers a message search immediately."""
+    client = _discussion_client(DISC)
+    cfg = _cfg(NEWS_SOURCE, Source(chat="@news_chat"))
+    await _run(client, conn, paths, cfg)
+    assert _found(conn, "comment") == {DISC_ID}
+    sources.remove_source(cfg, conn, sources.parse_target("@news"))
+    assert db.get_chat(conn, NEWS_ID) is None
+    assert {m.comment_of_chat_id for m in db.get_messages(conn, DISC_ID)} == {None}
+    assert db.unindexed_message_ids(conn, DISC_ID) == []
+    assert _found(conn, "comment") == {DISC_ID}
+    assert _found(conn, "late") == {DISC_ID}
 
 
 async def test_a_group_deleted_after_an_unlink_leaves_no_thread_quoting_it(
@@ -999,8 +1191,9 @@ async def test_removing_the_channel_leaves_its_discussion_group_whole(
 ) -> None:
     """The mirror case: the group is a source of its own and survives its channel. Its own
     windows and threads stay, the link that pointed at a chat which no longer exists goes, and
-    with it the post ids its messages hung under: they are posts of a channel this index no
-    longer holds. The rows are flagged, so the units that still carry the old topic are re-cut."""
+    with it the posts its messages hung under: they are posts of a channel this index no longer
+    holds. Nothing of the group is re-cut for it — its windows never named those posts — so the
+    comments stay searchable through the units they are already in."""
     client = _discussion_client(DISC)
     cfg = _cfg(NEWS_SOURCE, Source(chat="@news_chat"))
     await _run(client, conn, paths, cfg)
@@ -1013,12 +1206,11 @@ async def test_removing_the_channel_leaves_its_discussion_group_whole(
     assert [(u.kind, u.msg_ids) for u in db.get_units(conn, DISC_ID)] == before
     hits = search.lexical_units(conn, "comment", Filters(), 5)
     assert {u.chat_id for u in db.get_units_by_ids(conn, [m.unit_id for m in hits])} == {DISC_ID}
-    assert db.stored_topic_ids(conn, DISC_ID) == []
-    assert db.unindexed_message_ids(conn, DISC_ID) == [m.id for m in db.get_messages(conn, DISC_ID)]
+    assert db.stored_comment_post_ids(conn, DISC_ID, NEWS_ID) == []
+    assert db.unindexed_message_ids(conn, DISC_ID) == []
     await sync.index_pending(conn, removed.config, group)
     assert [(u.kind, u.msg_ids) for u in db.get_units(conn, DISC_ID)] == before
     assert {u.topic_id for u in db.get_units(conn, DISC_ID)} == {None}
-    assert db.unindexed_message_ids(conn, DISC_ID) == []
 
 
 async def test_removing_a_group_whose_channel_is_gone_leaves_nothing_to_repair(
@@ -1162,7 +1354,7 @@ async def test_threads_that_grew_are_re_read_on_later_runs(
     assert grown.new == 1 and grown.chats_done == [NEWS_ID]
     threads = [c["reply_to"] for c in _fetch_calls(client, NEWS_ID) if c["reply_to"] is not None]
     assert threads == [1, 3, 2]
-    comments = {m.msg_id: m.topic_id for m in db.get_messages(conn, DISC_ID)}
+    comments = {m.msg_id: m.comment_of_msg_id for m in db.get_messages(conn, DISC_ID)}
     assert comments == {1: 1, 2: 1, 5: 2, 9: 3}
     (thread,) = [u for u in db.get_units(conn, NEWS_ID) if u.kind == "thread" and u.msg_ids == [2]]
     assert "new comment" in thread.text
@@ -1171,7 +1363,10 @@ async def test_threads_that_grew_are_re_read_on_later_runs(
     client.messages[NEWS_ID][2] = tl.channel_post(NEWS_ID, 3, "post 3", replies=2)
     again = await _run(client, conn, paths, cfg)
     assert again.new == 1
-    assert {m.msg_id for m in db.get_messages_in_topic(conn, DISC_ID, 3)} == {9, 11}
+    assert {m.msg_id for m in db.get_comment_messages(conn, DISC_ID, NEWS_ID, [3]).get(3, [])} == {
+        9,
+        11,
+    }
 
 
 async def test_only_posts_with_replies_cost_a_getreplies_request(
@@ -1302,7 +1497,11 @@ async def test_refused_comment_thread_switches_comments_off_for_the_run(
     client.failures.clear()
     recovered = await _run(client, conn, paths, cfg)
     assert recovered.warnings == [] and recovered.new == 3
-    assert {m.msg_id: m.topic_id for m in db.get_messages(conn, DISC_ID)} == {1: 1, 2: 1, 9: 3}
+    assert {m.msg_id: m.comment_of_msg_id for m in db.get_messages(conn, DISC_ID)} == {
+        1: 1,
+        2: 1,
+        9: 3,
+    }
 
 
 async def test_link_discussion_chat_resolves_the_group_through_get_entity(
@@ -1329,6 +1528,7 @@ def _discussion_state(conn: sqlite3.Connection, disc_id: int) -> dict[str, objec
         "source_id": chat.source_id,
         "discussion_of": chat.discussion_of,
         "topics": {m.msg_id: m.topic_id for m in db.get_messages(conn, disc_id)},
+        "comments": {m.msg_id: m.comment_of_msg_id for m in db.get_messages(conn, disc_id)},
         "window_topics": {u.topic_id for u in db.get_units(conn, disc_id) if u.kind == "window"},
     }
 
@@ -1361,7 +1561,8 @@ async def test_discussion_group_listed_by_a_source_keeps_its_history_and_the_com
     expected = {
         "source_id": config[-1].id,
         "discussion_of": NEWS_ID,
-        "topics": {1: 1, 2: 1, 9: 3},
+        "topics": {1: None, 2: None, 9: None},
+        "comments": {1: 1, 2: 1, 9: 3},
         "window_topics": {None},
     }
     first = await _run(client, conn, paths, cfg)
@@ -1394,7 +1595,11 @@ async def test_plain_history_refetch_leaves_comments_and_their_post_ids_alone(
         client, conn, group, cfg.sources[0], SyncBudget(), sync_cfg=cfg.sync
     )
     assert again.complete and again.new == 0 and again.new_msg_ids == []
-    assert {m.msg_id: m.topic_id for m in db.get_messages(conn, DISC_ID)} == {1: 1, 2: 1, 9: 3}
+    assert {m.msg_id: m.comment_of_msg_id for m in db.get_messages(conn, DISC_ID)} == {
+        1: 1,
+        2: 1,
+        9: 3,
+    }
 
 
 def _busy_discussion_client(disc: types.Channel) -> FakeClient:
@@ -1533,8 +1738,10 @@ async def test_large_discussion_group_keeps_its_history_across_budgeted_runs(
     assert fourth.warnings == [] and fourth.chats_done == [NEWS_ID, DISC_ID]
     assert fourth.new == 3
     assert db.message_counts(conn) == {DISC_ID: 1200, NEWS_ID: 3}
-    topics = {m.msg_id: m.topic_id for m in db.get_messages(conn, DISC_ID) if m.topic_id}
-    assert topics == {1: 1, 2: 1, 9: 3}
+    posts = {
+        m.msg_id: m.comment_of_msg_id for m in db.get_messages(conn, DISC_ID) if m.comment_of_msg_id
+    }
+    assert posts == {1: 1, 2: 1, 9: 3}
     assert sorted(u.id for u in db.get_units(conn, DISC_ID) if u.id is not None) == units_before
     assert [v.text for v in search.thread(conn, NEWS_ID, 1)] == ["post 1", "g1", "g2"]
 

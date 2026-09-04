@@ -8,10 +8,10 @@ that no rebuild has covered yet, and finally embeds the dirty units when an embe
 :func:`sync_chat` fetches one chat: new messages after ``last_msg_id`` in batches, then a
 re-fetch of the newest messages for edits and reactions. A channel whose source has ``comments``
 also gets the comment threads of its new posts — the ones Telegram reports comments on — stored
-under the linked discussion group with the post id as ``topic_id``, and on every later run the
+under the linked discussion group naming the channel and the post, and on every later run the
 threads of its newest posts that grew since. A source that lists the group itself syncs its
-whole history as well: both paths write the same rows, and a post id already stored survives the
-plain history's upsert (:func:`grepogram.db.upsert_messages`).
+whole history as well: both paths write the same rows, and a comment relation already stored
+survives the plain history's upsert (:func:`grepogram.db.upsert_messages`).
 
 Fetching and indexing are decoupled through ``messages.indexed``: every row a batch commits is
 flagged until :func:`on_chat_synced` has rebuilt its units and ``msg_fts`` entry, and
@@ -547,8 +547,8 @@ async def sync_chat(
     where it stopped. A run that finishes re-fetches the newest ``edit_refetch`` messages for
     edits and reactions (only rows that actually differ are written) and stamps
     ``last_sync_at``. Channels whose source has ``comments`` also get the comment threads of each
-    new post, stored under the linked discussion chat with ``topic_id`` = the channel post id,
-    and the re-fetch pass re-reads the thread of every re-fetched post Telegram reports more
+    new post, stored under the linked discussion chat as comments on that post, and the
+    re-fetch pass re-reads the thread of every re-fetched post Telegram reports more
     replies for than are stored, so comments that arrive after the post was indexed follow.
 
     A chat Telegram refuses (:data:`UNAVAILABLE_ERRORS`) is marked ``unavailable`` and reported,
@@ -684,8 +684,11 @@ async def _store_batch(run: _Run, batch: list[MessageRow], progress: int, seen_u
         run.replies.clear()
         db.set_chat_progress(run.conn, chat.id, seen_up_to, chat.last_sync_at)
         return seen_up_to
-    stored = db.count_topic_messages(
-        run.conn, run.discussion.id, [row.msg_id for row in batch if run.replies.get(row.msg_id)]
+    stored = db.count_comment_messages(
+        run.conn,
+        run.discussion.id,
+        chat.id,
+        [row.msg_id for row in batch if run.replies.get(row.msg_id)],
     )
     try:
         for row in batch:
@@ -709,7 +712,10 @@ async def _fetch_comments(run: _Run, post_id: int) -> list[int]:
 
     Comments live in the discussion group with their own message ids; their reply headers
     point at the discussion-side copy of the post, which Telegram does not return here, so the
-    channel post id is kept in ``topic_id`` to tie the thread back to its post. A post without a
+    channel and the post id are kept in ``comment_of_chat_id`` / ``comment_of_msg_id`` to tie the
+    thread back to its post. They go in columns of their own rather than in ``topic_id``: a
+    discussion group can be a forum, and there a comment's ``topic_id`` is a forum topic drawn
+    from an id space that numbers from 1 just like the channel's posts. A post without a
     thread (``MsgIdInvalidError``) is skipped; a thread Telegram refuses switches the comments
     off for the rest of the run (:meth:`_Run.drop_comments`).
 
@@ -726,7 +732,11 @@ async def _fetch_comments(run: _Run, post_id: int) -> list[int]:
         async for msg in run.client.iter_messages(run.chat.id, reply_to=post_id):
             row = run.map(msg, run.discussion)
             if row is not None:
-                rows.append(dataclasses.replace(row, topic_id=post_id))
+                rows.append(
+                    dataclasses.replace(
+                        row, comment_of_chat_id=run.chat.id, comment_of_msg_id=post_id
+                    )
+                )
             if len(rows) >= BATCH_SIZE:
                 stored += run.store(rows)
                 rows = []
@@ -778,11 +788,15 @@ async def _refetch_edits(run: _Run, sync_cfg: SyncCfg) -> list[int]:
 def _differs(stored: MessageRow, fresh: MessageRow) -> bool:
     """Whether storing ``fresh`` would change ``stored``.
 
-    Compared with the ``topic_id`` the upsert would keep: a comment re-read as part of its
-    discussion group's own history arrives without its post id and must not count as an edit.
+    Compared with the values the upsert would keep: a comment re-read as part of its discussion
+    group's own history arrives with no comment relation — and, outside a forum, with no topic —
+    and must not count as an edit for want of what the upsert would have preserved anyway.
     """
-    topic = stored.topic_id if fresh.topic_id is None else fresh.topic_id
-    return dataclasses.replace(stored, id=None) != dataclasses.replace(fresh, topic_id=topic)
+    kept = {
+        field: getattr(stored, field) if getattr(fresh, field) is None else getattr(fresh, field)
+        for field in ("topic_id", "comment_of_chat_id", "comment_of_msg_id")
+    }
+    return dataclasses.replace(stored, id=None) != dataclasses.replace(fresh, **kept)
 
 
 async def _refresh_comments(
@@ -798,7 +812,7 @@ async def _refresh_comments(
     unit follows the comments that were stored even when the read stops halfway.
     """
     assert run.discussion is not None
-    counted = db.count_topic_messages(run.conn, run.discussion.id, replies)
+    counted = db.count_comment_messages(run.conn, run.discussion.id, run.chat.id, replies)
     grown = [
         post_id
         for post_id, total in replies.items()
@@ -925,9 +939,11 @@ def _relink_discussion(conn: sqlite3.Connection, channel: ChatRow, keep: int | N
     :func:`index_pending` cuts those posts again, with the new group's comments or with none
     (:func:`_drop_comment_units`). Waiting for that rebuild to drop the threads would leave them
     quoting a group that can be deleted in the meantime, and then nothing would say they exist.
-    The comments lose the post id they hung under in the same step
-    (:func:`grepogram.db._clear_comment_topics`) — it names a post in the old channel's id space,
-    and post ids start at 1 in every channel.
+    The comments stop naming the channel and its post in the same step
+    (:func:`grepogram.db._clear_comment_mapping`) — that pair names a post in the old channel's
+    id space, and post ids start at 1 in every channel. Nothing of the group is rebuilt for it:
+    a comment's windows and threads never read the comment relation, so every one of them stays
+    where it is and stays searchable through it from the moment this commits.
 
     A group can only be linked to one channel at a time, so ``keep`` may be the group another
     channel held until now; that channel's post threads, and the mapping that made the group's
