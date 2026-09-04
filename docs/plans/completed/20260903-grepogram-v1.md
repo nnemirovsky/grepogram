@@ -26,7 +26,7 @@ Key benefits: hybrid retrieval over thread-shaped units, hard date filters (chat
   - tests are not optional — they are a required part of the checklist
   - unit tests for new and modified functions; success and error paths
   - all tests run against in-memory SQLite and fake Telegram/embedder objects — no network, no model downloads (except the `@pytest.mark.slow` tests); model-layer tests inject stub modules into `sys.modules` so they pass without the `dense` extra installed
-- **CRITICAL: all tests must pass before starting next task** — `uv run pytest`, `uv run ruff check .`, `uv run ruff format --check .`, `uv run mypy grepogram`
+- **CRITICAL: all tests must pass before starting next task** — `uv run pytest`, `uv run ruff check .`, `uv run ruff format --check .`, `uv run mypy` (the mypy gate covers `grepogram/` and `tests/`)
 - **CRITICAL: update this plan file when scope changes during implementation**
 - MCP server speaks stdio: nothing may print to stdout except the protocol; logs go to stderr and the log file; `main()` redirects stdout to stderr around startup and tool bodies, and a test asserts stdout stays empty
 - message text is never logged above DEBUG; `config.toml` and the session file are written with mode 0600
@@ -524,7 +524,7 @@ Every tool returns one JSON object (list-shaped results are wrapped as above) an
 ### Task 25: Verify acceptance criteria
 - [x] verify all requirements from Overview are implemented: opt-in sources (folder + any chat type), incremental sync with budget, channel comments in their discussion chat, windows/threads/posts, stemmed FTS5 keyed by rowid, bge-m3 dense over units with vector cleanup, RRF + rerank + dedup, date/chat filters, deep links with fallback, MCP tools + instructions, auto-sync on stale with warnings, degradation without models, stdout hygiene, CLI parity
 - [x] verify edge cases: forum topics, channel with `comments=true`, private chat becoming unavailable, empty config (`search` reports no sources), model mismatch, concurrent sync lock, never-embedded DB in hybrid mode
-- [x] run full test suite: `uv run pytest --cov=grepogram && uv run ruff check . && uv run ruff format --check . && uv run mypy grepogram`
+- [x] run full test suite: `uv run pytest --cov=grepogram && uv run ruff check . && uv run ruff format --check . && uv run mypy`
 - [x] run `uv run pytest -m slow` locally
 - [x] review each module's test file against its public functions; coverage report shows no module below 80%
 
