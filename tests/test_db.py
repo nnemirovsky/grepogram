@@ -33,6 +33,10 @@ def _schema(conn: sqlite3.Connection) -> list[tuple[str, str, str | None]]:
     return [(row["type"], row["name"], row["sql"]) for row in rows]
 
 
+def _columns(conn: sqlite3.Connection, table: str) -> set[str]:
+    return {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
+
+
 def _chat(chat_id: int = 1, **overrides: object) -> ChatRow:
     fields: dict[str, object] = {
         "id": chat_id,
@@ -137,11 +141,11 @@ def test_connection_usable_from_second_thread(conn: sqlite3.Connection) -> None:
 def test_fresh_migrate_creates_schema() -> None:
     connection = db.connect(":memory:")
     assert db.schema_version(connection) == 0
-    assert db.migrate(connection) == db.SCHEMA_VERSION == 1
+    assert db.migrate(connection) == db.SCHEMA_VERSION == 5
     assert TABLES <= _names(connection, "table")
     assert INDEXES <= _names(connection, "index")
-    assert db.schema_version(connection) == 1
-    assert db.get_meta(connection, "schema_version") == "1"
+    assert db.schema_version(connection) == 5
+    assert db.get_meta(connection, "schema_version") == "5"
     assert not db.has_vec_table(connection)
     assert not connection.in_transaction
     messages_sql = connection.execute(
@@ -161,9 +165,24 @@ def test_fresh_migrate_creates_schema() -> None:
 
 def test_migrate_twice_is_noop(conn: sqlite3.Connection) -> None:
     before = _schema(conn)
-    assert db.migrate(conn) == 1
+    assert db.migrate(conn) == db.SCHEMA_VERSION
     assert _schema(conn) == before
-    assert db.get_meta(conn, "schema_version") == "1"
+    assert db.get_meta(conn, "schema_version") == str(db.SCHEMA_VERSION)
+
+
+def test_migrate_refuses_a_version_no_chain_of_steps_reaches(
+    conn: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A gap above the base is refused like everything else this build cannot walk: no case is
+    decided by falling through to the loop."""
+    monkeypatch.setitem(
+        db.MIGRATIONS, db.SCHEMA_VERSION + 2, ("ALTER TABLE chats ADD COLUMN note TEXT",)
+    )
+    monkeypatch.setattr(db, "SCHEMA_VERSION", db.SCHEMA_VERSION + 2)
+    with pytest.raises(db.SchemaError, match="is not one this grepogram can upgrade") as excinfo:
+        db.migrate(conn)
+    assert "grepogram sync" in str(excinfo.value)
+    assert "note" not in _columns(conn, "chats")
 
 
 def test_migrate_refuses_newer_schema(conn: sqlite3.Connection) -> None:
@@ -186,10 +205,86 @@ def test_migrate_refuses_a_database_without_a_recorded_version() -> None:
     connection.close()
 
 
+# the schema a development build before the first release created as its version 1, kept here as
+# the shape those files are actually in: a messages table with neither `indexed` nor the
+# comment_of_* columns, and none of the indexes the later steps of that chain added
+_DEV_V1: tuple[str, ...] = (
+    "CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT)",
+    """CREATE TABLE chats(
+        id INTEGER PRIMARY KEY, type TEXT NOT NULL, title TEXT, username TEXT,
+        is_forum INTEGER DEFAULT 0, source_id TEXT, discussion_of INTEGER,
+        last_msg_id INTEGER DEFAULT 0, last_sync_at INTEGER, unavailable INTEGER DEFAULT 0,
+        migrated_to INTEGER)""",
+    "CREATE TABLE users(id INTEGER PRIMARY KEY, display_name TEXT, username TEXT)",
+    """CREATE TABLE messages(
+        id INTEGER PRIMARY KEY,
+        chat_id INTEGER NOT NULL REFERENCES chats(id) ON DELETE CASCADE,
+        msg_id INTEGER NOT NULL, date INTEGER NOT NULL, edit_date INTEGER, from_id INTEGER,
+        from_name TEXT, reply_to_msg_id INTEGER, topic_id INTEGER, fwd_from TEXT,
+        text TEXT NOT NULL DEFAULT '', media_kind TEXT, media_filename TEXT,
+        reactions_total INTEGER DEFAULT 0, UNIQUE (chat_id, msg_id))""",
+    "CREATE INDEX messages_chat_date ON messages(chat_id, date)",
+    "CREATE INDEX messages_reply ON messages(chat_id, reply_to_msg_id)",
+    """CREATE TABLE units(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        chat_id INTEGER NOT NULL REFERENCES chats(id) ON DELETE CASCADE,
+        topic_id INTEGER, kind TEXT NOT NULL, msg_id_start INTEGER, msg_id_end INTEGER,
+        msg_ids TEXT NOT NULL, date_start INTEGER, date_end INTEGER, text TEXT NOT NULL,
+        dirty INTEGER DEFAULT 1, embedded_model TEXT)""",
+    "CREATE INDEX units_chat_kind_range ON units(chat_id, kind, msg_id_start, msg_id_end)",
+    f"""CREATE VIRTUAL TABLE msg_fts USING fts5(
+        raw, stemmed, chat_id UNINDEXED, date UNINDEXED, tokenize='{db.FTS_TOKENIZE}')""",
+    f"""CREATE VIRTUAL TABLE unit_fts USING fts5(
+        raw, stemmed, chat_id UNINDEXED, date_start UNINDEXED, tokenize='{db.FTS_TOKENIZE}')""",
+)
+
+
+def _development_index(recorded: int) -> sqlite3.Connection:
+    """A database in the development chain's v1 shape that records ``recorded`` as its version."""
+    connection = db.connect(":memory:")
+    for statement in _DEV_V1:
+        connection.execute(statement)
+    connection.execute(
+        "INSERT INTO meta(key, value) VALUES ('schema_version', ?)", (str(recorded),)
+    )
+    return connection
+
+
+@pytest.mark.parametrize("recorded", [1, 2, 3, 4])
+def test_migrate_refuses_a_pre_release_development_index(recorded: int) -> None:
+    """Every number the development chain wrote — 1 through 4 — names a schema this build cannot
+    read, which is why :data:`db.BASE_VERSION` sits above all of them. Deciding on the number
+    alone would leave such a file short of `messages.indexed` and the comment columns and hand
+    the rest of the code a table it cannot query."""
+    connection = _development_index(recorded)
+    with pytest.raises(db.SchemaError, match="development build") as excinfo:
+        db.migrate(connection)
+    assert "grepogram sync" in str(excinfo.value)
+    assert "indexed" not in _columns(connection, "messages")
+    assert "comment_of_chat_id" not in _columns(connection, "messages")
+    assert "messages_comments" not in _names(connection, "index")
+    assert db.schema_version(connection) == recorded
+    connection.close()
+
+
+def test_migrate_walks_up_a_version_it_holds_every_step_for(
+    conn: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The versioned loop is what the first real migration will use: a step keyed above the
+    version a database records upgrades it instead of refusing it."""
+    monkeypatch.setitem(
+        db.MIGRATIONS, db.SCHEMA_VERSION + 1, ("ALTER TABLE chats ADD COLUMN note TEXT",)
+    )
+    monkeypatch.setattr(db, "SCHEMA_VERSION", db.SCHEMA_VERSION + 1)
+    assert db.migrate(conn) == db.SCHEMA_VERSION
+    assert "note" in _columns(conn, "chats")
+    assert db.get_meta(conn, "schema_version") == str(db.SCHEMA_VERSION)
+
+
 def test_migrate_rolls_back_on_failure(monkeypatch: pytest.MonkeyPatch) -> None:
     connection = db.connect(":memory:")
-    monkeypatch.setattr(db, "MIGRATIONS", ((*db.MIGRATIONS[0][:3], "CREATE TABLE ?"),))
-    monkeypatch.setattr(db, "SCHEMA_VERSION", 1)
+    broken = (*db.MIGRATIONS[db.SCHEMA_VERSION][:3], "CREATE TABLE ?")
+    monkeypatch.setattr(db, "MIGRATIONS", {db.SCHEMA_VERSION: broken})
     with pytest.raises(sqlite3.OperationalError):
         db.migrate(connection)
     assert _names(connection, "table") == set()

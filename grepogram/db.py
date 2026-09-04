@@ -48,7 +48,7 @@ META_SCHEMA_VERSION = "schema_version"
 META_EMBED_MODEL = "embed_model"
 META_LAST_SYNC_RUN = "last_sync_run"
 
-_V1: tuple[str, ...] = (
+_V5: tuple[str, ...] = (
     "CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT)",
     """CREATE TABLE chats(
         id INTEGER PRIMARY KEY,
@@ -120,12 +120,26 @@ _V1: tuple[str, ...] = (
         raw, stemmed, chat_id UNINDEXED, date_start UNINDEXED, tokenize='{FTS_TOKENIZE}')""",
 )
 
-MIGRATIONS: tuple[tuple[str, ...], ...] = (_V1,)
-"""The schema, one step per version: :data:`SCHEMA_VERSION` is the last of them, and a release
-that has to change the schema of a database in the field appends a step rather than editing one.
-There is no step that transforms rows written by a development build — an index whose version
-this build does not know is rebuilt from Telegram, see :func:`migrate`."""
-SCHEMA_VERSION = len(MIGRATIONS)
+BASE_VERSION = 5
+"""The version :data:`_V5` alone produces — the lowest number this build ever records.
+
+It is an identity, not a count. Development builds before the first release walked a database up
+through versions 1, 2, 3 and 4, and their ``schema_version = 1`` names a ``messages`` table with
+neither ``indexed`` nor the ``comment_of_*`` columns. A number the old chain also wrote could not
+tell such a file from a finished one, and :func:`migrate` would take it for one and leave the
+rest of the code querying columns that are not there. Every version below this one therefore
+belongs to that chain and is refused outright; :func:`migrate` upgrades only from a version this
+build itself wrote."""
+
+MIGRATIONS: dict[int, tuple[str, ...]] = {BASE_VERSION: _V5}
+"""The schema, keyed by the version each step brings a database to.
+
+:data:`BASE_VERSION` builds it from nothing and only an empty file gets that step;
+:data:`SCHEMA_VERSION` is the last of them, and a release that has to change the schema of a
+database in the field appends a step above the base rather than editing one. There is no step
+that transforms rows written by a development build — an index whose version this build did not
+write is rebuilt from Telegram, see :func:`migrate`."""
+SCHEMA_VERSION = max(MIGRATIONS)
 _REBUILD_HINT = "delete index.db and run `grepogram sync` to build it again"
 
 _VEC_DIM_RE = re.compile(r"FLOAT\[(\d+)\]")
@@ -310,31 +324,57 @@ def _is_empty(conn: sqlite3.Connection) -> bool:
     return conn.execute("SELECT 1 FROM sqlite_master LIMIT 1").fetchone() is None
 
 
-def migrate(conn: sqlite3.Connection) -> int:
-    """Apply the steps a database is missing and return the schema version now in place.
+def _apply(conn: sqlite3.Connection, steps: Sequence[tuple[str, ...]]) -> int:
+    """Run ``steps`` and record :data:`SCHEMA_VERSION` in one transaction, all of it or none."""
+    with transaction(conn):
+        for step in steps:
+            for statement in step:
+                conn.execute(statement)
+        set_meta(conn, META_SCHEMA_VERSION, str(SCHEMA_VERSION))
+    return SCHEMA_VERSION
 
-    An empty file gets the whole schema; one already at :data:`SCHEMA_VERSION` is left untouched;
-    one below it is walked up by the steps in :data:`MIGRATIONS`. Every other database raises
-    :class:`SchemaError` telling the user to rebuild the index — one written by a newer
-    grepogram, and one holding rows from before the version was recorded. Rows are never
-    transformed on a guess: the index is derived from Telegram and a rebuild costs a sync.
+
+def migrate(conn: sqlite3.Connection) -> int:
+    """Bring a database to :data:`SCHEMA_VERSION`, or refuse it, and return the version in place.
+
+    Every database lands in exactly one of these cases, none of them by falling through:
+
+    * a file with no schema objects at all gets the whole schema and the version recorded;
+    * one already at :data:`SCHEMA_VERSION` is used as it is;
+    * one between :data:`BASE_VERSION` and :data:`SCHEMA_VERSION` that :data:`MIGRATIONS` holds
+      every step for is walked up to it;
+    * anything else raises :class:`SchemaError` telling the user to rebuild the index: tables
+      carrying no recorded version, a version newer than this build knows, a version below
+      :data:`BASE_VERSION` (every number the pre-release development chain wrote — a different
+      schema behind numbers this build no longer uses), and a version no chain of steps reaches.
+
+    Rows are never transformed on a guess: the index is derived from Telegram and a rebuild costs
+    one sync.
     """
     current = schema_version(conn)
     if current == SCHEMA_VERSION:
         return current
+    if current == 0:
+        if not _is_empty(conn):
+            raise SchemaError(f"database records no schema version; {_REBUILD_HINT}")
+        return _apply(conn, [MIGRATIONS[version] for version in sorted(MIGRATIONS)])
     if current > SCHEMA_VERSION:
         raise SchemaError(
             f"database schema v{current} is newer than this grepogram supports "
             f"(v{SCHEMA_VERSION}); {_REBUILD_HINT}"
         )
-    if current == 0 and not _is_empty(conn):
-        raise SchemaError(f"database records no schema version; {_REBUILD_HINT}")
-    with transaction(conn):
-        for version in range(current + 1, SCHEMA_VERSION + 1):
-            for statement in MIGRATIONS[version - 1]:
-                conn.execute(statement)
-            set_meta(conn, META_SCHEMA_VERSION, str(version))
-    return SCHEMA_VERSION
+    if current < BASE_VERSION:
+        raise SchemaError(
+            f"database schema v{current} was written by a development build from before the "
+            f"first release and is not the schema behind that number any more; {_REBUILD_HINT}"
+        )
+    pending = range(current + 1, SCHEMA_VERSION + 1)
+    if any(version not in MIGRATIONS for version in pending):
+        raise SchemaError(
+            f"database schema v{current} is not one this grepogram can upgrade to "
+            f"v{SCHEMA_VERSION}; {_REBUILD_HINT}"
+        )
+    return _apply(conn, [MIGRATIONS[version] for version in pending])
 
 
 def has_vec_table(conn: sqlite3.Connection) -> bool:
@@ -455,7 +495,7 @@ def get_chat(conn: sqlite3.Connection, chat_id: int) -> ChatRow | None:
 def get_discussion_chat(conn: sqlite3.Connection, channel_id: int) -> ChatRow | None:
     """The discussion group linked to a channel (``discussion_of = channel_id``), if stored.
 
-    There is at most one: the partial unique index on ``discussion_of`` (schema v3) says so, and
+    There is at most one: the partial unique index on ``discussion_of`` says so, and
     :func:`set_discussion_chat` is the one way the link moves or goes away.
     """
     row = conn.execute("SELECT * FROM chats WHERE discussion_of = ?", (channel_id,)).fetchone()

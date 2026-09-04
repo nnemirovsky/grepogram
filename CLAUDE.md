@@ -57,12 +57,20 @@ never change the git identity.
   `AppState.editing_config()` takes it inside the process-wide lock. Never save a config derived
   from a snapshot read before a network round trip; re-read under the lock and apply the delta
   (`sources.with_source`, drop by id). Lock order is `SyncLock` → `ConfigLock` → thread lock.
-- `db.MIGRATIONS` holds one step per schema version and `_V1` is the whole schema as the code
-  queries it; `db.migrate` creates it on an empty file and refuses every database it cannot
-  reach — a newer version, or rows written before the version was recorded — with a `SchemaError`
-  telling the user to delete `index.db` and sync again. Nothing has shipped, so no step
-  transforms rows: an index is derived from Telegram and a rebuild costs one sync. Change the
-  schema by editing `_V1` until the first release; after it, append a step and leave `_V1` alone.
+- `db.MIGRATIONS` maps a schema version to the step that brings a database to it, and `_V5` —
+  keyed by `db.BASE_VERSION` — is the whole schema as the code queries it. The numbering starts
+  at 5 because it is an identity, not a count: development builds walked a database up through 1,
+  2, 3 and 4, and a number one of them also wrote could not say a dev index apart from a finished
+  one — `schema_version = 1` on the old chain names a `messages` table with no `indexed` and no
+  `comment_of_*`. `db.migrate` decides every database explicitly, never by falling through: a
+  file with no schema objects gets the whole schema and the version, one at `SCHEMA_VERSION` is
+  used as it is, one between `BASE_VERSION` and `SCHEMA_VERSION` that `MIGRATIONS` holds every
+  step for is walked up, and everything else — tables with no recorded version, a newer version,
+  anything below `BASE_VERSION` (the dev chain's 1 through 4), a version no chain of steps
+  reaches — raises `SchemaError` telling the user to delete `index.db` and sync again. Nothing
+  has shipped, so no step transforms rows: an index is derived from Telegram and a rebuild costs
+  one sync. Change the schema by editing `_V5` until the first release; after it, append a step
+  above `BASE_VERSION` and leave `_V5` alone.
 - `messages.indexed` is 0 for a row whose units and `msg_fts` entry are behind: every
   `upsert_messages` sets it, `db.mark_unindexed` raises it for a post whose thread grew, and
   `sync.on_chat_synced` clears it after the rebuild. `sync._sync_chats` runs `index_pending` for
