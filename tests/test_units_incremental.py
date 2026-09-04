@@ -798,7 +798,9 @@ async def test_sync_all_builds_channel_posts_threads_and_discussion_units(
     conn: sqlite3.Connection, paths: Paths
 ) -> None:
     client = _client(
-        messages={NEWS_ID: [tl.channel_post(NEWS_ID, i, f"post {i}") for i in (1, 2)]},
+        messages={
+            NEWS_ID: [tl.channel_post(NEWS_ID, i, f"post {i}", replies=2 - i) for i in (1, 2)]
+        },
         comments={
             (NEWS_ID, 1): [
                 tl.message(DISC_ID, 1, "comment one", sender=1, reply_to=tl.reply_header(7)),

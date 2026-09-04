@@ -669,7 +669,7 @@ async def test_sync_warnings_include_refused_comment_threads(
     state: tools.AppState, fake: FakeClient, conn: sqlite3.Connection
 ) -> None:
     db.upsert_chat(conn, ChatRow(id=NEWS_ID, type="channel", title="News", username="news"))
-    fake.messages[NEWS_ID] = [tl.channel_post(NEWS_ID, 1, "post 1")]
+    fake.messages[NEWS_ID] = [tl.channel_post(NEWS_ID, 1, "post 1", replies=1)]
     fake.failures[(NEWS_ID, 1)] = errors.ChannelPrivateError(request=None)
     fake.responses[functions.channels.GetFullChannelRequest] = tl_messages.ChatFull(
         full_chat=types.ChannelFull(

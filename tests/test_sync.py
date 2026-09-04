@@ -114,10 +114,19 @@ def _comments(disc_id: int = DISC_ID) -> dict[tuple[int, int], list[types.Messag
     }
 
 
+def _posts(*counts: int | None) -> list[types.Message]:
+    """Posts 1..n of the News channel; ``counts`` are the reply counts Telegram reports on them
+    (``None`` for a post without a ``MessageReplies`` header). By default the three posts
+    :func:`_comments` has threads for: two comments on post 1, none on 2, one on 3."""
+    counts = counts or (2, 0, 1)
+    return [
+        tl.channel_post(NEWS_ID, i, f"post {i}", replies=count)
+        for i, count in enumerate(counts, start=1)
+    ]
+
+
 def _news_client(linked: int | None = 201, **kwargs: object) -> FakeClient:
-    kwargs.setdefault(
-        "messages", {NEWS_ID: [tl.channel_post(NEWS_ID, i, f"post {i}") for i in (1, 2, 3)]}
-    )
+    kwargs.setdefault("messages", {NEWS_ID: _posts()})
     kwargs.setdefault("comments", _comments())
     kwargs.setdefault(
         "responses", {functions.channels.GetFullChannelRequest: _full_channel(linked)}
@@ -135,7 +144,7 @@ def _discussion_client(disc: types.Channel) -> FakeClient:
         me=ME,
         folders=[make_folder(3, "News", include=[NEWS, disc])],
         messages={
-            NEWS_ID: [tl.channel_post(NEWS_ID, i, f"post {i}") for i in (1, 2, 3)],
+            NEWS_ID: _posts(),
             disc_id: [m for pool in comments.values() for m in pool],
         },
         comments=comments,
@@ -579,7 +588,7 @@ async def test_comments_are_stored_under_the_discussion_chat(conn: sqlite3.Conne
     assert set(synced.discussion.new_msg_ids) == {m.id for m in comments.values()}
     assert isinstance(client.requests[0], functions.channels.GetFullChannelRequest)
     threads = [c["reply_to"] for c in _fetch_calls(client, NEWS_ID) if c["reply_to"] is not None]
-    assert threads == [1, 2, 3]
+    assert threads == [1, 3]
 
 
 async def test_comment_with_the_same_id_as_a_post_does_not_overwrite_it(
@@ -639,7 +648,7 @@ async def test_comment_budget_expiry_resumes_from_the_last_finished_post(
     assert resumed.discussion is not None and resumed.discussion.new == 1
     assert {m.msg_id for m in db.get_messages(conn, DISC_ID)} == {1, 2, 9}
     threads = [c["reply_to"] for c in _fetch_calls(client, NEWS_ID) if c["reply_to"] is not None]
-    assert threads == [1, 2, 3]
+    assert threads == [1, 3]
 
 
 async def test_threads_that_grew_are_re_read_on_later_runs(
@@ -659,14 +668,14 @@ async def test_threads_that_grew_are_re_read_on_later_runs(
     unchanged = await _run(client, conn, paths, cfg)
     assert unchanged.new == 0
     threads = [c["reply_to"] for c in _fetch_calls(client, NEWS_ID) if c["reply_to"] is not None]
-    assert threads == [1, 2, 3]
+    assert threads == [1, 3]
     client.messages[NEWS_ID][1] = tl.channel_post(NEWS_ID, 2, "post 2", replies=1)
     client.comments[(NEWS_ID, 2)] = [tl.message(DISC_ID, 5, "new comment", sender=1)]
     client.comments[(NEWS_ID, 3)].append(tl.message(DISC_ID, 11, "another", sender=1))
     grown = await _run(client, conn, paths, cfg)
     assert grown.new == 1 and grown.chats_done == [NEWS_ID]
     threads = [c["reply_to"] for c in _fetch_calls(client, NEWS_ID) if c["reply_to"] is not None]
-    assert threads == [1, 2, 3, 2]
+    assert threads == [1, 3, 2]
     comments = {m.msg_id: m.topic_id for m in db.get_messages(conn, DISC_ID)}
     assert comments == {1: 1, 2: 1, 5: 2, 9: 3}
     (thread,) = [u for u in db.get_units(conn, NEWS_ID) if u.kind == "thread" and u.msg_ids == [2]]
@@ -677,6 +686,25 @@ async def test_threads_that_grew_are_re_read_on_later_runs(
     again = await _run(client, conn, paths, cfg)
     assert again.new == 1
     assert {m.msg_id for m in db.get_messages_in_topic(conn, DISC_ID, 3)} == {9, 11}
+
+
+async def test_only_posts_with_replies_cost_a_getreplies_request(
+    conn: sqlite3.Connection, paths: Paths
+) -> None:
+    """A post Telegram reports no comments on — or without a ``MessageReplies`` header at
+    all — is stored without a thread request; the posts with comments still get theirs."""
+    client = _news_client(
+        messages={NEWS_ID: _posts(2, 0, 1, None, 0)},
+        comments={**_comments(), (NEWS_ID, 4): [tl.message(DISC_ID, 40, "unreported", sender=1)]},
+    )
+    report = await _run(client, conn, paths, _cfg(NEWS_SOURCE))
+    assert report.chats_done == [NEWS_ID] and report.warnings == []
+    assert _texts(conn, NEWS_ID) == {i: f"post {i}" for i in range(1, 6)}
+    threads = [c["reply_to"] for c in _fetch_calls(client, NEWS_ID) if c["reply_to"] is not None]
+    assert threads == [1, 3]
+    assert {m.msg_id for m in db.get_messages(conn, DISC_ID)} == {1, 2, 9}
+    news = db.get_chat(conn, NEWS_ID)
+    assert news is not None and news.last_msg_id == 5
 
 
 async def test_private_discussion_group_disables_comments_and_keeps_the_posts(
@@ -834,7 +862,7 @@ def _busy_discussion_client(disc: types.Channel) -> FakeClient:
         me=ME,
         folders=[make_folder(3, "News", include=[NEWS, disc])],
         messages={
-            NEWS_ID: [tl.channel_post(NEWS_ID, i, f"post {i}") for i in (1, 2, 3)],
+            NEWS_ID: _posts(),
             disc_id: list(history.values()),
         },
         comments={(NEWS_ID, 1): [history[1], history[2]], (NEWS_ID, 3): [history[25]]},
@@ -921,7 +949,7 @@ def _big_discussion_client(count: int) -> FakeClient:
         me=ME,
         folders=[make_folder(3, "News", include=[NEWS, DISC])],
         messages={
-            NEWS_ID: [tl.channel_post(NEWS_ID, i, f"post {i}") for i in (1, 2, 3)],
+            NEWS_ID: _posts(),
             DISC_ID: list(history.values()),
         },
         comments={(NEWS_ID, 1): [history[1], history[2]], (NEWS_ID, 3): [history[9]]},
@@ -1070,7 +1098,7 @@ async def test_sync_all_resolves_sources_and_runs_hooks(
     client = _news_client(
         messages={
             ARG_ID: [tl.message(ARG_ID, i, f"m{i}", sender=1) for i in (1, 2)],
-            NEWS_ID: [tl.channel_post(NEWS_ID, 1, "post 1")],
+            NEWS_ID: _posts(2),
             ALICE_ID: [],
         }
     )

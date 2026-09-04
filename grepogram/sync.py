@@ -462,7 +462,9 @@ class _Run:
     in the chat and in its discussion chat (dicts used as ordered sets); ``inserted`` counts the
     rows stored for the first time per chat id. ``discussion`` is the linked discussion chat of
     a channel with comments, ``None`` when there is none or comments are off; it is dropped when
-    Telegram refuses a thread mid-run, with the reason kept in ``warnings``.
+    Telegram refuses a thread mid-run, with the reason kept in ``warnings``. ``replies`` holds,
+    per post the incremental pass mapped and has not stored yet, the reply count Telegram
+    reported on it, so :func:`_store_batch` asks for the threads of posts that have one.
     """
 
     client: Any
@@ -476,6 +478,7 @@ class _Run:
     changes: dict[int, None] = field(default_factory=dict)
     comment_ids: dict[int, None] = field(default_factory=dict)
     inserted: dict[int, int] = field(default_factory=dict)
+    replies: dict[int, int] = field(default_factory=dict)
     warnings: list[str] = field(default_factory=list)
 
     def map(self, msg: Any, chat: ChatRow) -> MessageRow | None:
@@ -628,6 +631,8 @@ async def _fetch_new(run: _Run) -> _Fetched:
         row = run.map(msg, chat)
         if row is not None:
             batch.append(row)
+            if discussion is not None:
+                run.replies[row.msg_id] = replies_count(msg)
         if len(batch) < BATCH_SIZE:
             continue
         progress = await _store_batch(run, batch, progress, seen_up_to)
@@ -647,11 +652,15 @@ async def _store_batch(run: _Run, batch: list[MessageRow], progress: int, seen_u
     Returns the new progress. Without comments it jumps to the highest message id seen, skipped
     service messages included. With comments it advances post by post, so a budget expiry
     between two posts leaves the later posts to be re-fetched next time together with their
-    threads; when Telegram refuses the threads on the way the posts count as done.
+    threads; when Telegram refuses the threads on the way the posts count as done. Only a post
+    Telegram reports replies on costs a ``GetReplies`` request: a channel of thousands of posts
+    with a handful of threads makes a handful of them, not thousands, and a post whose thread
+    starts later is caught by :func:`_refresh_comments` while it is among the newest.
     """
     chat = run.chat
     _track(run.changes, run.store(batch))
     if run.discussion is None:
+        run.replies.clear()
         db.set_chat_progress(run.conn, chat.id, seen_up_to, chat.last_sync_at)
         return seen_up_to
     for row in batch:
@@ -660,7 +669,8 @@ async def _store_batch(run: _Run, batch: list[MessageRow], progress: int, seen_u
         if run.discussion is None:
             progress = seen_up_to
             break
-        _track(run.comment_ids, await _fetch_comments(run, row.msg_id))
+        if run.replies.pop(row.msg_id, 0) > 0:
+            _track(run.comment_ids, await _fetch_comments(run, row.msg_id))
         progress = row.msg_id
     else:
         progress = seen_up_to
