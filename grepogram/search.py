@@ -561,6 +561,9 @@ def _rerank(
         warnings.append(f"reranking unavailable: {exc}")
         return candidates
     if len(scores) != len(candidates):
+        # not redundant with the model's own check: any Reranker may answer the wrong number of
+        # scores, and only a RuntimeError says "bug" — a ValueError out of zip(strict=True) is a
+        # tool error the MCP server would report to the caller as its own fault.
         raise RuntimeError(
             f"reranker {reranker.name} returned {len(scores)} scores for {len(candidates)} texts"
         )

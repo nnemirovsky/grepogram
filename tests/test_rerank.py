@@ -287,7 +287,7 @@ def test_bge_download_failure_becomes_model_unavailable(stubs: Install) -> None:
 def test_bge_rejects_a_short_answer(stubs: Install) -> None:
     stubs(model=ShortCrossEncoder)
     reranker = BgeReranker("BAAI/bge-reranker-v2-m3")
-    with pytest.raises(ModelUnavailable, match="1 scores for 2 texts"):
+    with pytest.raises(RuntimeError, match="1 scores for 2 texts"):
         reranker.score("q", ["a", "b"])
 
 

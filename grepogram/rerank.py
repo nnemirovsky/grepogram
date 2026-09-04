@@ -113,7 +113,7 @@ class BgeReranker:
             )
         scores = as_scores(raw)
         if len(scores) != len(texts):
-            raise ModelUnavailable(
+            raise RuntimeError(
                 f"reranker model {self.name!r} returned {len(scores)} scores for {len(texts)} texts"
             )
         return scores
