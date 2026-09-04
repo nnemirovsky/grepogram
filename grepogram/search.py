@@ -42,7 +42,7 @@ chat) and :func:`context` the messages around one in its topic, both as
 import logging
 import sqlite3
 import time
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 
 from grepogram import db, embed, index, links
@@ -75,6 +75,12 @@ NO_SOURCES = (
 NOTHING_INDEXED = "nothing is indexed yet: run `grepogram sync`"
 NO_VECTORS = "no units are embedded yet; run `grepogram sync` or `grepogram embed`"
 _OPS: tuple[FtsOp, ...] = ("AND", "OR")
+
+EmbedderLoader = Callable[[Config], Embedder]
+RerankerLoader = Callable[[Config], Reranker]
+"""How :func:`search` obtains a model it was not handed: :func:`grepogram.embed.load_embedder`
+and :func:`grepogram.rerank.load_reranker` by default; the MCP server passes loaders that keep
+the loaded model and remember a failure, so a model that cannot load is tried once."""
 
 
 class DenseUnavailable(Exception):
@@ -200,14 +206,17 @@ def dense_units(
     filters: Filters,
     limit: int,
     embedder: Embedder | None = None,
+    *,
+    load_embedder: EmbedderLoader | None = None,
 ) -> list[Match]:
     """Up to ``limit`` units nearest to ``query`` in the dense index, best first, scored by
     cosine similarity; a unit with no similarity at all (cosine ≤ 0) is not a match.
 
-    ``embedder`` defaults to :func:`grepogram.embed.load_embedder`, which is not called while
-    ``unit_vec`` is missing or empty — nothing to search, no point loading a model. Raises
-    :class:`DenseUnavailable` in that case, when the model cannot load, and when the stored
-    vectors come from another model or width than the embedder.
+    Without an ``embedder`` one is loaded through ``load_embedder`` (default
+    :func:`grepogram.embed.load_embedder`), which is not called while ``unit_vec`` is missing or
+    empty — nothing to search, no point loading a model. Raises :class:`DenseUnavailable` in
+    that case, when the model cannot load, and when the stored vectors come from another model
+    or width than the embedder.
     """
     if not db.has_vectors(conn):
         raise DenseUnavailable(NO_VECTORS)
@@ -215,7 +224,7 @@ def dense_units(
         return []
     if embedder is None:
         try:
-            embedder = embed.load_embedder(cfg)
+            embedder = (embed.load_embedder if load_embedder is None else load_embedder)(cfg)
         except ModelUnavailable as exc:
             raise DenseUnavailable(str(exc)) from exc
     try:
@@ -394,6 +403,8 @@ def search(
     rerank: bool = True,
     embedder: Embedder | None = None,
     reranker: Reranker | None = None,
+    load_embedder: EmbedderLoader | None = None,
+    load_reranker: RerankerLoader | None = None,
 ) -> SearchResult:
     """Run ``query`` over the index and return the top ``k`` hits (``[search] k`` by default).
 
@@ -409,9 +420,10 @@ def search(
     when ``rerank`` is set and it loads (a hit's ``score`` is then the reranker's, otherwise the
     fused score), :func:`dedup` drops the near-duplicates at ``dedup_overlap``, and the top
     ``k`` survivors become hits. ``embedder`` and ``reranker`` stand in for the models
-    :func:`grepogram.embed.load_embedder` and :func:`grepogram.rerank.load_reranker` would load.
-    An index with no chats yields no hits and a warning — that no source is configured, or that
-    the configured ones are not synced yet; ``index_age_min`` is filled in either way.
+    ``load_embedder`` and ``load_reranker`` (:data:`EmbedderLoader`, :data:`RerankerLoader`;
+    the package loaders by default) would load. An index with no chats yields no hits and a
+    warning — that no source is configured, or that the configured ones are not synced yet;
+    ``index_age_min`` is filled in either way.
     """
     if mode not in MODES:
         raise ValueError(f"unknown search mode {mode!r}; expected one of {', '.join(MODES)}")
@@ -428,7 +440,9 @@ def search(
     dense: list[Match] = []
     if mode != "lexical":
         try:
-            dense = dense_units(conn, cfg, query, filters, limit, embedder)
+            dense = dense_units(
+                conn, cfg, query, filters, limit, embedder, load_embedder=load_embedder
+            )
         except DenseUnavailable as exc:
             warnings.append(f"dense search unavailable: {exc}")
             mode = "lexical"
@@ -462,7 +476,7 @@ def search(
             continue
         candidates.append(_Candidate(unit_id, unit, fused[unit_id]))
     if rerank and candidates:
-        candidates = _rerank(cfg, query, candidates, reranker, warnings)
+        candidates = _rerank(cfg, query, candidates, reranker, warnings, load_reranker)
     anchors = {m.unit_id: m.anchor_msg_id for m in message_matches}
     hits: list[Hit] = []
     for candidate in candidates:
@@ -489,13 +503,14 @@ def _rerank(
     candidates: list[_Candidate],
     reranker: Reranker | None,
     warnings: list[str],
+    load_reranker: RerankerLoader | None = None,
 ) -> list[_Candidate]:
     """The candidates re-scored by the cross-encoder and sorted by that score, ties keeping
     their fused order; when the reranker cannot load or score, a warning is added and the
     candidates come back untouched."""
     try:
         if reranker is None:
-            reranker = reranking.load_reranker(cfg)
+            reranker = (reranking.load_reranker if load_reranker is None else load_reranker)(cfg)
         scores = reranker.score(query, [candidate.unit.text for candidate in candidates])
     except ModelUnavailable as exc:
         warnings.append(f"reranking unavailable: {exc}")

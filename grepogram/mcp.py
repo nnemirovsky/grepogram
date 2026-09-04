@@ -16,11 +16,13 @@ stdout to stderr while the server starts, and :data:`stdout_to_stderr` does the 
 every tool body (:func:`guarded` / :func:`guarded_async`), so a stray ``print`` deep in a library
 cannot corrupt a JSON-RPC frame.
 
-The tools that talk to Telegram (``sync``, ``dialogs``, ``sources_add``) and ``search``, which
-may refresh a stale index first, are coroutines; the offline readers are plain functions. The
-retrieval itself runs in a worker thread so the event loop keeps answering while the models
-compute — the SQLite connection is opened with ``check_same_thread=False`` and the models
-serialise their own calls.
+The tools that talk to Telegram (``sync``, ``dialogs``, ``sources_add``), ``search``, which may
+refresh a stale index first, and ``open_message``, which waits for macOS ``open``, are
+coroutines; the offline readers are plain functions. Retrieval, embedding and ``open`` run in
+worker threads so the event loop keeps answering while they work — the SQLite connection
+serialises its statements across threads (:class:`grepogram.db.Connection`) and the models
+serialise their own calls. Tool calls arrive concurrently, so nothing that one call could close
+under another is shared: every Telegram-using block builds and disconnects its own client.
 """
 
 import argparse
@@ -33,6 +35,7 @@ import logging
 import sqlite3
 import sys
 import threading
+import time
 from collections.abc import AsyncIterator, Awaitable, Callable, Coroutine, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import asdict
@@ -122,9 +125,14 @@ TOOL_ERRORS: tuple[type[Exception], ...] = (
     OpenFailed,
     ValueError,
     tg_errors.RPCError,
-    OSError,
+    ConnectionError,
 )
-"""Failures a tool answers with ``error``/``hint``; anything else is a bug and propagates."""
+"""Failures a tool answers with ``error``/``hint``; anything else is a bug and propagates.
+
+``ValueError`` covers the argument checks the library raises (an unknown search mode, ``k`` or
+``budget_s`` at zero, a negative ``context`` count); ``ConnectionError`` is what Telethon raises
+when Telegram cannot be reached at all. Other ``OSError`` are environment failures and propagate.
+"""
 
 AUTO_SYNC_ERRORS: tuple[type[Exception], ...] = (
     AuthRequired,
@@ -133,7 +141,11 @@ AUTO_SYNC_ERRORS: tuple[type[Exception], ...] = (
     tg_errors.RPCError,
     OSError,
 )
-"""Failures of the automatic refresh inside ``search``; they become warnings, the search runs."""
+"""Failures of the automatic refresh inside ``search``; they become warnings, the search runs.
+
+Wider than :data:`TOOL_ERRORS` on purpose: a refresh is a courtesy, and no I/O failure in it
+may cost the caller the search itself.
+"""
 
 
 class NotConfigured(ConfigError):
@@ -160,10 +172,6 @@ class StdoutGuard:
         self._lock = threading.Lock()
         self._depth = 0
         self._redirect: contextlib.redirect_stdout[TextIO] | None = None
-
-    @property
-    def active(self) -> bool:
-        return self._depth > 0
 
     def __enter__(self) -> None:
         with self._lock:
@@ -193,14 +201,15 @@ stdout_to_stderr = StdoutGuard()
 
 
 class AppState:
-    """What the tools share: paths, config and the database, plus the Telegram client, the
-    dialog catalog, the embedder and the reranker, each built on first use and kept.
+    """What the tools share: paths, config and the database, plus the embedder and the reranker,
+    each loaded on first use and kept.
 
-    ``config()`` re-reads ``config.toml`` when the file changed on disk, so a source added with
-    the CLI (or by hand) while the server runs is picked up by the next tool call. A model that
-    fails to load is not retried: the reason is kept in ``embed_error`` / ``rerank_error`` and
-    repeated in every result's ``warnings`` until the server restarts. ``client_factory`` is
-    :func:`grepogram.tg.make_client` unless a test injects a fake.
+    ``config()`` re-reads ``config.toml`` on every call, so a source added with the CLI (or by
+    hand) while the server runs is picked up by the next tool call. A model that fails to load
+    is not retried: the reason is kept in ``embed_error`` / ``rerank_error`` and repeated in
+    every result's ``warnings`` until the server restarts. Telegram clients are not kept:
+    :meth:`telegram` builds one per block through ``client_factory``
+    (:func:`grepogram.tg.make_client` unless a test injects a fake).
     """
 
     def __init__(
@@ -215,9 +224,6 @@ class AppState:
         self.cfg = cfg
         self.conn = conn
         self.client_factory = client_factory
-        self._config_stamp = _stamp(paths.config_file)
-        self._client: Any = None
-        self._catalog: DialogCatalog | None = None
         self._embedder: Embedder | None = None
         self._reranker: Reranker | None = None
         self.embed_error: str | None = None
@@ -236,78 +242,75 @@ class AppState:
         self.conn.close()
 
     def config(self) -> Config:
-        """The current config, reloaded when ``config.toml`` changed since it was last read."""
-        stamp = _stamp(self.paths.config_file)
-        if stamp is not None and stamp != self._config_stamp:
+        """The current config: ``config.toml`` as it is now, or the one given when there is no
+        file yet."""
+        if self.paths.config_file.exists():
             self.cfg = config.load(self.paths)
-            self._config_stamp = stamp
-            log.info("config reloaded from %s", self.paths.config_file)
         return self.cfg
 
     def save_config(self, cfg: Config) -> None:
         """Write ``cfg`` to ``config.toml`` and make it the current one."""
         config.save(cfg, self.paths)
         self.cfg = cfg
-        self._config_stamp = _stamp(self.paths.config_file)
 
     @asynccontextmanager
     async def telegram(self) -> AsyncIterator[Any]:
-        """A connected, authorized client for the block; disconnected on exit.
+        """A connected, authorized client for the block, built for it and disconnected on exit.
 
-        Raises :class:`NotConfigured` without API keys and
-        :class:`~grepogram.tg.AuthRequired` without a session file or an authorized session.
+        A fresh ``TelegramClient`` per block reads the session file as it is now — so a session
+        created with ``grepogram auth`` after a failed call works without a restart, and a
+        client that once found itself unauthorized (Telethon remembers that per instance) is
+        never asked again — and gives concurrent tool calls nothing to disconnect under each
+        other. Raises :class:`NotConfigured` without API keys,
+        :class:`~grepogram.tg.SessionMissing` before any client is built when there is no
+        session file, and :class:`~grepogram.tg.AuthRequired` for a session Telegram rejects.
         """
-        client = self._ensure_client()
+        cfg = self.config()
+        if cfg.telegram.api_id == 0 or not cfg.telegram.api_hash:
+            raise NotConfigured(self.paths.config_file)
         tg.ensure_session_mode(self.paths)
+        client = self.client_factory(cfg, self.paths)
         async with tg.connected(client) as connected:
             yield connected
 
-    @property
-    def catalog(self) -> DialogCatalog:
-        """The dialog memo bound to the client; valid inside :meth:`telegram`."""
-        self._ensure_client()
-        assert self._catalog is not None
-        return self._catalog
+    def load_embedder(self, cfg: Config) -> Embedder:
+        """The embedding model, loaded once and kept (a :data:`grepogram.search.EmbedderLoader`).
 
-    def _ensure_client(self) -> Any:
-        if self._client is None:
-            cfg = self.config()
-            if cfg.telegram.api_id == 0 or not cfg.telegram.api_hash:
-                raise NotConfigured(self.paths.config_file)
-            self._client = self.client_factory(cfg, self.paths)
-            self._catalog = DialogCatalog(self._client)
-        return self._client
-
-    def embedder(self) -> Embedder | None:
-        """The embedding model, loaded once; ``None`` (see ``embed_error``) when it cannot load."""
+        A load that failed is not retried: the same :class:`~grepogram.embed.ModelUnavailable`
+        is raised again from ``embed_error``.
+        """
         with self._models_lock:
-            if self._embedder is None and self.embed_error is None:
+            if self._embedder is None:
+                if self.embed_error is not None:
+                    raise ModelUnavailable(self.embed_error)
                 try:
-                    self._embedder = embed.load_embedder(self.config())
+                    self._embedder = embed.load_embedder(cfg)
                 except ModelUnavailable as exc:
                     self.embed_error = str(exc)
                     log.warning("embedding model unavailable: %s", exc)
+                    raise
             return self._embedder
 
-    def reranker(self) -> Reranker | None:
-        """The cross-encoder, loaded once; ``None`` (see ``rerank_error``) when it cannot load."""
+    def load_reranker(self, cfg: Config) -> Reranker:
+        """The cross-encoder, loaded once and kept; a failure is remembered like the embedder's."""
         with self._models_lock:
-            if self._reranker is None and self.rerank_error is None:
+            if self._reranker is None:
+                if self.rerank_error is not None:
+                    raise ModelUnavailable(self.rerank_error)
                 try:
-                    self._reranker = reranking.load_reranker(self.config())
+                    self._reranker = reranking.load_reranker(cfg)
                 except ModelUnavailable as exc:
                     self.rerank_error = str(exc)
                     log.warning("reranker model unavailable: %s", exc)
+                    raise
             return self._reranker
 
-
-def _stamp(path: Path) -> tuple[int, int] | None:
-    """``(mtime_ns, size)`` of a file, ``None`` when it does not exist."""
-    try:
-        info = path.stat()
-    except FileNotFoundError:
-        return None
-    return info.st_mtime_ns, info.st_size
+    def embedder(self) -> Embedder | None:
+        """The embedding model for a sync, ``None`` (see ``embed_error``) when it cannot load."""
+        try:
+            return self.load_embedder(self.config())
+        except ModelUnavailable:
+            return None
 
 
 _bound: AppState | None = None
@@ -448,8 +451,14 @@ async def search(
 
 
 def _stale(state: AppState, cfg: Config) -> bool:
-    age = retrieval.index_age_min(state.conn)
-    return age is not None and age > cfg.search.auto_sync_after_min
+    """Whether the last sync run — or, before any run was stamped, the last completed chat sync —
+    is older than ``auto_sync_after_min``; a never-synced index is not stale, it is empty."""
+    latest = db.last_sync_run(state.conn)
+    if latest is None:
+        latest = db.last_sync_at(state.conn)
+    if latest is None:
+        return False
+    return max(0, int(time.time()) - latest) // 60 > cfg.search.auto_sync_after_min
 
 
 async def _auto_sync(state: AppState, cfg: Config) -> tuple[bool, list[str]]:
@@ -474,6 +483,12 @@ async def _auto_sync(state: AppState, cfg: Config) -> tuple[bool, list[str]]:
             f"auto-sync stopped after {budget_s}s with {len(report.chats_remaining)} chats "
             "still behind; call sync to finish"
         )
+    if report.unavailable:
+        ids = ", ".join(str(chat_id) for chat_id in report.unavailable)
+        warnings.append(
+            f"auto-sync: {len(report.unavailable)} chats are unavailable on Telegram ({ids}); "
+            "their stored messages are still searched"
+        )
     log.info(
         "auto-sync: %d new messages, %d chats done, %d remaining",
         report.new,
@@ -493,26 +508,13 @@ def _retrieve(
     rerank: bool,
     full: bool,
 ) -> SearchResult:
-    """The search proper, on a worker thread, with the state's cached models.
+    """The search proper, on a worker thread, with the state's model loaders.
 
-    The embedder is asked for only when there are vectors to search and the mode wants them;
-    a model that is unavailable turns into the same warning :func:`grepogram.search.search`
-    would produce had it tried to load one, and the search degrades the same way.
+    :func:`grepogram.search.search` asks for a model only when it needs one (no vectors, no
+    embedder) and degrades with a warning when the loader raises; the state's loaders keep a
+    loaded model and remember a failure, so the degradation is the same on every call.
     """
-    warnings: list[str] = []
-    embedder: Embedder | None = None
-    reranker: Reranker | None = None
-    if mode != "lexical" and db.has_vectors(state.conn):
-        embedder = state.embedder()
-        if embedder is None:
-            warnings.append(f"dense search unavailable: {state.embed_error}")
-            mode = "lexical"
-    if rerank:
-        reranker = state.reranker()
-        if reranker is None:
-            warnings.append(f"reranking unavailable: {state.rerank_error}")
-            rerank = False
-    result = retrieval.search(
+    return retrieval.search(
         state.conn,
         cfg,
         query,
@@ -521,10 +523,9 @@ def _retrieve(
         mode=mode,
         full=full,
         rerank=rerank,
-        embedder=embedder,
-        reranker=reranker,
+        load_embedder=state.load_embedder,
+        load_reranker=state.load_reranker,
     )
-    return dataclasses.replace(result, warnings=[*warnings, *result.warnings])
 
 
 @guarded
@@ -605,8 +606,8 @@ async def dialogs(query: str) -> ToolResult:
     `sources_add`. Use it when the user names a chat that is not indexed yet.
     """
     state = _app()
-    async with state.telegram():
-        catalog = state.catalog
+    async with state.telegram() as client:
+        catalog = DialogCatalog(client)
         found = match_dialogs(query, await catalog.list_dialogs(), await catalog.list_folders())
     return {"query": query, "matches": [_match_dict(found_match) for found_match in found]}
 
@@ -649,11 +650,10 @@ async def sources_add(target: str, since: str | None = None, comments: bool = Fa
     state = _app()
     cfg = state.config()
     parsed = sourcing.parse_target(target)
-    async with state.telegram():
-        catalog = state.catalog
+    async with state.telegram() as client:
+        catalog = DialogCatalog(client)
         added = await sourcing.add_source(cfg, parsed, catalog, since=since, comments=comments)
     state.save_config(added.config)
-    catalog.invalidate()
     log.info("source %s added (%s)", added.source.id, added.title)
     return {
         "source": {"id": added.source.id, **asdict(added.source)},
@@ -683,8 +683,8 @@ def sources_remove(target: str) -> ToolResult:
     }
 
 
-@guarded
-def open_message(chat_id: int, msg_id: int) -> ToolResult:
+@guarded_async
+async def open_message(chat_id: int, msg_id: int) -> ToolResult:
     """Open a stored message in the Telegram app on this Mac and return the `url` used
     (`opened=true`). When the app cannot be launched the result still carries the `url` (and
     `fallback_url` for private chats) with `error` and `hint`, so the link can be shown instead.
@@ -702,7 +702,7 @@ def open_message(chat_id: int, msg_id: int) -> ToolResult:
         "fallback_url": link.fallback_url,
     }
     try:
-        result["url"] = links.open_link(link)
+        result["url"] = await asyncio.to_thread(links.open_link, link)
     except (OpenFailed, NotImplementedError) as exc:
         log.warning("cannot open %s: %s", link.url, exc)
         result.update(opened=False, error=str(exc), hint=OPEN_HINT)
@@ -722,7 +722,6 @@ TOOLS: tuple[Callable[..., Any], ...] = (
     sources_remove,
     open_message,
 )
-TOOL_NAMES = tuple(tool.__name__ for tool in TOOLS)
 
 
 # --- server ----------------------------------------------------------------------------------

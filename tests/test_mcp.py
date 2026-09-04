@@ -1,19 +1,23 @@
 import asyncio
+import dataclasses
 import json
 import logging
+import os
 import sqlite3
 import stat
+import subprocess
 import sys
 import threading
 import time
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Sequence
 from pathlib import Path
 
 import pytest
 from mcp.server.fastmcp import FastMCP
 from mcp.shared.memory import create_connected_server_and_client_session
 from telethon import errors
-from telethon.tl import functions
+from telethon.tl import functions, types
+from telethon.tl.types import messages as tl_messages
 
 from grepogram import config, db, embed, filters, index, links
 from grepogram import mcp as tools
@@ -201,6 +205,20 @@ async def test_search_without_vectors_never_loads_the_embedder(
     assert dense["hits"] and dense["warnings"] == [NO_VECTORS]
 
 
+async def test_search_without_rerank_never_loads_the_reranker(
+    state: tools.AppState, conn: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    index.embed_dirty_units(conn, FakeEmbedder())
+
+    def never(cfg: Config) -> FakeReranker:
+        raise AssertionError("rerank=False must not load the reranker")
+
+    monkeypatch.setattr(reranking, "load_reranker", never)
+    result = await tools.search(PAIR.query_en, rerank=False)
+    assert result["hits"] and result["warnings"] == []
+    assert state.rerank_error is None
+
+
 async def test_search_without_models_warns_and_does_not_retry(
     state: tools.AppState, conn: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -271,15 +289,10 @@ async def test_stale_index_is_synced_once_before_searching(
     assert _connects(fake) == 1
 
 
-async def test_failing_auto_sync_yields_warnings_not_errors(
-    stale: tools.AppState,
-    fake: FakeClient,
-    paths: Paths,
-    bind: Callable[..., tools.AppState],
-    monkeypatch: pytest.MonkeyPatch,
+async def test_auto_sync_under_a_held_lock_is_a_warning(
+    stale: tools.AppState, fake: FakeClient, paths: Paths, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     calls: list[tuple[object, ...]] = []
-    real_sync = syncing.sync_all
 
     async def busy(*args: object) -> SyncReport:
         calls.append(args)
@@ -297,6 +310,10 @@ async def test_failing_auto_sync_yields_warnings_not_errors(
     assert budget.seconds == CFG.search.auto_sync_budget_s
     assert isinstance(calls[0][5], FakeEmbedder)
 
+
+async def test_auto_sync_flood_wait_is_a_warning(
+    stale: tools.AppState, monkeypatch: pytest.MonkeyPatch
+) -> None:
     async def flooded(*args: object) -> SyncReport:
         raise errors.FloodWaitError(request=None, capture=30)
 
@@ -306,8 +323,14 @@ async def test_failing_auto_sync_yields_warnings_not_errors(
     assert result["warnings"][0].startswith("auto-sync skipped: telegram error: ")
     assert "30" in result["warnings"][0]
 
+
+async def test_auto_sync_reports_what_a_partial_run_left(
+    stale: tools.AppState, monkeypatch: pytest.MonkeyPatch
+) -> None:
     async def partial(*args: object) -> SyncReport:
-        return SyncReport(new=3, chats_done=[GEO], chats_remaining=[ARG], warnings=["slow"])
+        return SyncReport(
+            new=3, chats_done=[GEO], chats_remaining=[ARG], unavailable=[7], warnings=["slow"]
+        )
 
     monkeypatch.setattr(syncing, "sync_all", partial)
     result = await tools.search("DNI", mode="lexical")
@@ -316,26 +339,81 @@ async def test_failing_auto_sync_yields_warnings_not_errors(
         "auto-sync: slow",
         f"auto-sync stopped after {CFG.search.auto_sync_budget_s}s with 1 chats still behind; "
         "call sync to finish",
+        "auto-sync: 1 chats are unavailable on Telegram (7); their stored messages are still "
+        "searched",
     ]
 
-    monkeypatch.setattr(syncing, "sync_all", real_sync)
+
+async def test_auto_sync_without_a_session_is_a_warning(
+    stale: tools.AppState, fake: FakeClient, paths: Paths, bind: Callable[..., tools.AppState]
+) -> None:
     fake.authorized = False
     result = await tools.search("DNI", mode="lexical")
     assert result["hits"] and result["synced"] is False
     assert result["warnings"] == ["auto-sync skipped: Telegram session is not authorized"]
     fake.authorized = True
-
     bind(Config(search=CFG.search, units=CFG.units, sources=CFG.sources))
     result = await tools.search("DNI", mode="lexical")
     assert result["hits"] and result["warnings"] == [
         f"auto-sync skipped: [telegram] api_id and api_hash are not set in {paths.config_file}"
     ]
-
-    bind()
+    built: list[Config] = []
+    tools.bind(
+        tools.AppState(paths, CFG, stale.conn, client_factory=lambda cfg, p: built.append(cfg))
+    )
     paths.session_file.unlink()
     result = await tools.search("DNI", mode="lexical")
     assert result["hits"] and result["synced"] is False
     assert result["warnings"] == [f"auto-sync skipped: no Telegram session at {paths.session_file}"]
+    assert built == []  # the session file is checked before any client exists
+
+
+async def test_auto_sync_is_not_repeated_while_no_chat_can_complete(
+    stale: tools.AppState, fake: FakeClient, conn: sqlite3.Connection
+) -> None:
+    fake.failures[ARG] = errors.ChannelPrivateError(request=None)
+    fake.failures[GEO] = errors.ChannelPrivateError(request=None)
+    first = await tools.search("DNI", mode="lexical")
+    assert first["synced"] is True and first["hits"]
+    assert first["index_age_min"] > CFG.search.auto_sync_after_min
+    assert len(first["warnings"]) == 1 and "2 chats are unavailable" in first["warnings"][0]
+    assert str(ARG) in first["warnings"][0] and str(GEO) in first["warnings"][0]
+    again = await tools.search("DNI", mode="lexical")
+    assert again["synced"] is False and again["warnings"] == [] and again["hits"]
+    assert _connects(fake) == 1
+
+
+async def test_index_exactly_at_the_threshold_is_not_stale(
+    bind: Callable[..., tools.AppState], conn: sqlite3.Connection, fake: FakeClient
+) -> None:
+    chat_ru.load(conn, synced_at=int(time.time()) - CFG.search.auto_sync_after_min * 60)
+    bind()
+    result = await tools.search("DNI", mode="lexical")
+    assert result["synced"] is False and result["hits"]
+    assert result["index_age_min"] == CFG.search.auto_sync_after_min
+    assert _connects(fake) == 0
+
+
+async def test_each_telegram_call_builds_a_fresh_client(
+    paths: Paths, conn: sqlite3.Connection
+) -> None:
+    chat_ru.load(conn)
+    clients = [_client(authorized=False), _client()]
+    built: list[FakeClient] = []
+
+    def factory(cfg: Config, p: Paths) -> FakeClient:
+        built.append(clients[len(built)])
+        return built[-1]
+
+    tools.bind(tools.AppState(paths, CFG, conn, client_factory=factory))
+    denied = await tools.dialogs("arg")
+    assert denied["error"] == "Telegram session is not authorized"
+    assert denied["hint"] == tools.AUTH_HINT
+    recovered = await tools.dialogs("arg")
+    assert "error" not in recovered and recovered["matches"]
+    assert built == clients
+    assert all(not client.is_connected() for client in clients)
+    assert [name for name, _ in clients[0].calls] == ["connect", "is_user_authorized", "disconnect"]
 
 
 # --- sync ------------------------------------------------------------------------------------
@@ -369,57 +447,116 @@ async def test_sync_without_the_model_warns(
     assert not db.has_vectors(state.conn)
 
 
-async def test_sync_errors_carry_hints(
-    state: tools.AppState,
-    fake: FakeClient,
-    paths: Paths,
-    bind: Callable[..., tools.AppState],
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+async def test_sync_rejects_a_non_positive_budget(state: tools.AppState) -> None:
     assert (await tools.sync(budget_s=0))["error"].startswith("budget_s must be")
+
+
+async def test_sync_under_a_held_lock_carries_the_lock_hint(
+    state: tools.AppState, paths: Paths
+) -> None:
     with SyncLock(paths):
         busy = await tools.sync()
     assert busy["error"].startswith("another sync is running")
     assert busy["hint"] == tools.LOCK_HINT
-    fake.authorized = False
-    assert await tools.sync() == {
-        "error": "Telegram session is not authorized",
-        "hint": tools.AUTH_HINT,
-    }
-    fake.authorized = True
-    flooded = _client(
+
+
+def _offline() -> FakeClient:
+    client = _client()
+
+    async def failing_connect() -> None:
+        raise ConnectionError("offline")
+
+    client.connect = failing_connect  # type: ignore[method-assign]
+    return client
+
+
+def _flooded() -> FakeClient:
+    return _client(
         responses={
             functions.messages.GetDialogFiltersRequest: errors.FloodWaitError(
                 request=None, capture=30
             )
         }
     )
-    bind(CFG, flooded)
+
+
+UNSET = Config(search=CFG.search, units=CFG.units, sources=CFG.sources)
+
+
+@pytest.mark.parametrize(
+    ("cfg", "client", "error", "hint"),
+    [
+        pytest.param(
+            CFG,
+            lambda: _client(authorized=False),
+            "Telegram session is not authorized",
+            tools.AUTH_HINT,
+            id="unauthorized",
+        ),
+        pytest.param(CFG, _flooded, "telegram error: ", None, id="flood-wait"),
+        pytest.param(CFG, _offline, "connection error: offline", None, id="offline"),
+        pytest.param(UNSET, _client, "[telegram] api_id and api_hash", tools.SETUP_HINT, id="keys"),
+        pytest.param(
+            Config(telegram=KEYS),
+            _client,
+            "no sources are configured",
+            tools.NO_SOURCES_HINT,
+            id="no-sources",
+        ),
+    ],
+)
+async def test_sync_errors_carry_hints(
+    state: tools.AppState,
+    bind: Callable[..., tools.AppState],
+    cfg: Config,
+    client: Callable[[], FakeClient],
+    error: str,
+    hint: str | None,
+) -> None:
+    bind(cfg, client())
     result = await tools.sync()
-    assert result["error"].startswith("telegram error: ") and "30" in result["error"]
-    assert result["hint"] is None
-    offline = _client()
+    assert result["error"].startswith(error)
+    assert result["hint"] == hint
+    assert "new" not in result
 
-    async def failing_connect() -> None:
-        raise ConnectionError("offline")
 
-    monkeypatch.setattr(offline, "connect", failing_connect)
-    bind(CFG, offline)
-    assert (await tools.sync())["error"] == "connection error: offline"
-    bind(Config(search=CFG.search, units=CFG.units, sources=CFG.sources))
-    unset = await tools.sync()
-    assert "api_id and api_hash are not set" in unset["error"]
-    assert "my.telegram.org" in unset["hint"]
-    bind(Config(telegram=KEYS))
-    assert await tools.sync() == {
-        "error": "no sources are configured",
-        "hint": tools.NO_SOURCES_HINT,
-    }
-    bind()
+async def test_sync_without_a_session_file_carries_the_auth_hint(
+    state: tools.AppState, paths: Paths
+) -> None:
     paths.session_file.unlink()
     missing = await tools.sync()
     assert missing["error"] == f"no Telegram session at {paths.session_file}"
     assert missing["hint"] == tools.AUTH_HINT
+
+
+async def test_sync_warnings_include_refused_comment_threads(
+    state: tools.AppState, fake: FakeClient, conn: sqlite3.Connection
+) -> None:
+    db.upsert_chat(conn, ChatRow(id=NEWS_ID, type="channel", title="News", username="news"))
+    fake.messages[NEWS_ID] = [tl.channel_post(NEWS_ID, 1, "post 1")]
+    fake.failures[(NEWS_ID, 1)] = errors.ChannelPrivateError(request=None)
+    fake.responses[functions.channels.GetFullChannelRequest] = tl_messages.ChatFull(
+        full_chat=types.ChannelFull(
+            id=1000000300,
+            about="",
+            read_inbox_max_id=0,
+            read_outbox_max_id=0,
+            unread_count=0,
+            chat_photo=types.PhotoEmpty(0),
+            notify_settings=types.PeerNotifySettings(),
+            bot_info=[],
+            pts=0,
+            linked_chat_id=1000000400,
+        ),
+        chats=[NEWS, make_channel(1000000400, "News chat", megagroup=True)],
+        users=[],
+    )
+    cfg = dataclasses.replace(CFG, sources=[*CFG.sources, Source(chat="@news", comments=True)])
+    state.cfg = cfg
+    report = await tools.sync(budget_s=10)
+    assert "error" not in report and NEWS_ID in report["chats_done"]
+    assert len(report["warnings"]) == 1 and "comments of channel" in report["warnings"][0]
+    assert db.get_message(conn, NEWS_ID, 1) is not None
 
 
 # --- sources and dialogs ---------------------------------------------------------------------
@@ -463,14 +600,14 @@ async def test_dialogs_matches_chats_and_folders(state: tools.AppState, fake: Fa
     assert (await tools.dialogs("zzz"))["matches"] == []
     georgia = (await tools.dialogs("georgia"))["matches"]
     assert [m["target"] for m in georgia] == [str(GEO)]
-    assert _dialog_reads(fake) == 1
+    assert _dialog_reads(fake) == 3
     assert _connects(fake) == 3
     fake.authorized = False
     denied = await tools.dialogs("arg")
     assert denied["hint"] == tools.AUTH_HINT and "matches" not in denied
 
 
-async def test_sources_add_fuzzy_writes_config_and_invalidates_the_catalog(
+async def test_sources_add_fuzzy_writes_config_and_reads_dialogs_afresh(
     bind: Callable[..., tools.AppState], paths: Paths, fake: FakeClient
 ) -> None:
     state = bind(Config(telegram=KEYS))
@@ -491,9 +628,9 @@ async def test_sources_add_fuzzy_writes_config_and_invalidates_the_catalog(
     assert config.load(paths).sources == [Source(chat=GEO)]
     assert state.cfg.sources == [Source(chat=GEO)]
     assert stat.S_IMODE(paths.config_file.stat().st_mode) == 0o600
-    assert _dialog_reads(fake) == 1
-    await tools.dialogs("arg")
     assert _dialog_reads(fake) == 2
+    await tools.dialogs("arg")
+    assert _dialog_reads(fake) == 3
     folder = await tools.sources_add("folder:Argentina", since="2024-01-01", comments=True)
     assert folder["kind"] == "folder" and folder["source"]["id"] == "folder:Argentina"
     assert folder["title"] == "Argentina" and [c["id"] for c in folder["chats"]] == [ARG]
@@ -587,7 +724,7 @@ def test_thread_and_context_read_messages(state: tools.AppState) -> None:
     assert "negative" in tools.context(ARG, 5, before=-1)["error"]
 
 
-def test_open_message_returns_the_url_used(
+async def test_open_message_returns_the_url_used(
     state: tools.AppState, conn: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     opened: list[Link] = []
@@ -597,7 +734,7 @@ def test_open_message_returns_the_url_used(
         return link.url
 
     monkeypatch.setattr(links, "open_link", open_link)
-    assert tools.open_message(ARG, 5) == {
+    assert await tools.open_message(ARG, 5) == {
         "chat_id": ARG,
         "msg_id": 5,
         "url": "https://t.me/arg_chat/5",
@@ -605,7 +742,7 @@ def test_open_message_returns_the_url_used(
         "opened": True,
     }
     assert opened == [Link("https://t.me/arg_chat/5")]
-    assert tools.open_message(GEO, 3)["url"] == "https://t.me/c/1000000200/3"
+    assert (await tools.open_message(GEO, 3))["url"] == "https://t.me/c/1000000200/3"
     db.upsert_chat(
         conn,
         ChatRow(id=FORUM, type="supergroup", title="Forum", username="forum_chat", is_forum=True),
@@ -618,22 +755,22 @@ def test_open_message_returns_the_url_used(
             MessageRow(chat_id=7, msg_id=9, date=1_700_000_000, text="hi"),
         ],
     )
-    assert tools.open_message(FORUM, 105)["url"] == "https://t.me/forum_chat/100/105"
-    private = tools.open_message(7, 9)
+    assert (await tools.open_message(FORUM, 105))["url"] == "https://t.me/forum_chat/100/105"
+    private = await tools.open_message(7, 9)
     assert private["url"] == "tg://openmessage?user_id=7&message_id=9"
     assert private["fallback_url"] == "tg://user?id=7"
-    assert tools.open_message(ARG, 999)["hint"] == tools.MESSAGE_HINT
+    assert (await tools.open_message(ARG, 999))["hint"] == tools.MESSAGE_HINT
     assert len(opened) == 4
 
 
-def test_open_message_keeps_the_url_when_open_fails(
+async def test_open_message_keeps_the_url_when_open_fails(
     state: tools.AppState, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     def broken(link: Link) -> str:
         raise OpenFailed(f"open failed for {link.url}: no application")
 
     monkeypatch.setattr(links, "open_link", broken)
-    result = tools.open_message(ARG, 5)
+    result = await tools.open_message(ARG, 5)
     assert result["url"] == "https://t.me/arg_chat/5" and result["opened"] is False
     assert result["error"].startswith("open failed") and result["hint"] == tools.OPEN_HINT
 
@@ -641,9 +778,24 @@ def test_open_message_keeps_the_url_when_open_fails(
         raise NotImplementedError("opening links needs macOS 'open' (linux)")
 
     monkeypatch.setattr(links, "open_link", elsewhere)
-    result = tools.open_message(ARG, 5)
+    result = await tools.open_message(ARG, 5)
     assert result["opened"] is False and "macOS" in result["error"]
     assert result["url"] == "https://t.me/arg_chat/5"
+
+
+async def test_open_message_reports_a_hung_open_with_the_url(
+    state: tools.AppState, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def hung(args: Sequence[str]) -> subprocess.CompletedProcess[bytes]:
+        raise subprocess.TimeoutExpired(list(args), links.OPEN_TIMEOUT_S)
+
+    real_open = links.open_link
+    monkeypatch.setattr(
+        links, "open_link", lambda link: real_open(link, runner=hung, platform="darwin")
+    )
+    result = await tools.open_message(ARG, 5)
+    assert result["url"] == "https://t.me/arg_chat/5" and result["opened"] is False
+    assert "did not finish within" in result["error"] and result["hint"] == tools.OPEN_HINT
 
 
 # --- failures --------------------------------------------------------------------------------
@@ -713,6 +865,28 @@ def test_unexpected_errors_propagate(
 # --- threads and stdout ----------------------------------------------------------------------
 
 
+async def test_concurrent_tool_calls_share_the_connection_safely(
+    state: tools.AppState, conn: sqlite3.Connection, fake: FakeClient
+) -> None:
+    index.embed_dirty_units(conn, FakeEmbedder())
+    queries = ["DNI", "Brubank", PAIR.query_en, "TBC", "SIM", "Galicia", "Santander", "visa"]
+    for round_ in range(3):
+        fake.messages[ARG] = [tl.message(ARG, 43 + round_, f"{NEW_TEXT} {round_}", sender=1)]
+        results = await asyncio.gather(
+            *(tools.search(query) for query in queries),
+            tools.sync(budget_s=10),
+            asyncio.to_thread(tools.thread, ARG, 5),
+            asyncio.to_thread(tools.sources),
+            asyncio.to_thread(tools.context, GEO, 3),
+        )
+        for result in results:
+            assert "error" not in result, result
+        searches = results[: len(queries)]
+        assert all(result["hits"] for result in searches)
+        assert results[len(queries)]["new"] == 1
+    assert db.get_message(conn, ARG, 45) is not None
+
+
 def test_tools_work_from_a_worker_thread(state: tools.AppState) -> None:
     results: dict[str, dict[str, object]] = {}
 
@@ -758,7 +932,7 @@ async def test_tools_never_write_to_stdout(
     assert captured.out == ""
     noise = [line for line in captured.err.splitlines() if line.endswith("noise")]
     assert noise == ["search noise", "sync noise", "add noise"]
-    assert not tools.stdout_to_stderr.active
+    assert sys.stdout is not sys.stderr
     print("after")
     assert capfd.readouterr().out == "after\n"
 
@@ -771,9 +945,9 @@ def test_stdout_guard_holds_until_the_last_block_exits(
     with guard:
         with guard:
             pass
-        assert guard.active and sys.stdout is sys.stderr
+        assert sys.stdout is sys.stderr
         print("inside")
-    assert not guard.active and sys.stdout is before
+    assert sys.stdout is before
     print("outside")
     captured = capsys.readouterr()
     assert captured.out == "outside\n" and captured.err == "inside\n"
@@ -804,7 +978,8 @@ async def test_server_lists_the_nine_tools_over_a_session(state: tools.AppState)
     async with create_connected_server_and_client_session(server) as session:
         listed = await session.list_tools()
         by_name = {tool.name: tool for tool in listed.tools}
-        assert len(by_name) == 9 and sorted(by_name) == sorted(tools.TOOL_NAMES)
+        assert len(by_name) == 9
+        assert sorted(by_name) == sorted(tool.__name__ for tool in tools.TOOLS)
         search_tool = by_name["search"]
         assert search_tool.description is not None
         assert search_tool.description.startswith("Search the indexed Telegram chats")
@@ -886,3 +1061,42 @@ def test_main_stops_on_a_broken_config(tmp_home: Path, capfd: pytest.CaptureFixt
     assert "invalid TOML" in str(info.value)
     assert tools._bound is None
     assert capfd.readouterr().out == ""
+
+
+def _rpc(method: str, request_id: int | None = None, **params: object) -> str:
+    frame: dict[str, object] = {"jsonrpc": "2.0", "method": method, "params": params}
+    if request_id is not None:
+        frame["id"] = request_id
+    return json.dumps(frame)
+
+
+def test_server_speaks_json_rpc_over_real_stdio(tmp_home: Path) -> None:
+    config.save(Config(telegram=KEYS), Paths.from_env())
+    frames = [
+        _rpc(
+            "initialize",
+            1,
+            protocolVersion="2025-06-18",
+            capabilities={},
+            clientInfo={"name": "test", "version": "0"},
+        ),
+        _rpc("notifications/initialized"),
+        _rpc("tools/list", 2),
+    ]
+    completed = subprocess.run(
+        [sys.executable, "-c", "from grepogram.mcp import main; main()"],
+        input="\n".join(frames) + "\n",
+        capture_output=True,
+        text=True,
+        timeout=120,
+        env={**os.environ, "GREPOGRAM_HOME": str(tmp_home), "GREPOGRAM_FAKE_MODELS": "1"},
+    )
+    assert completed.returncode == 0, completed.stderr
+    lines = [line for line in completed.stdout.splitlines() if line.strip()]
+    replies = [json.loads(line) for line in lines]
+    by_id = {reply["id"]: reply for reply in replies if "id" in reply}
+    assert by_id[1]["result"]["serverInfo"]["name"] == "grepogram"
+    assert by_id[1]["result"]["instructions"] == tools.INSTRUCTIONS
+    listed = by_id[2]["result"]["tools"]
+    assert sorted(tool["name"] for tool in listed) == sorted(tool.__name__ for tool in tools.TOOLS)
+    assert "grepogram-mcp serving" in completed.stderr

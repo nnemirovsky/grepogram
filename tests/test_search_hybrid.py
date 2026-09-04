@@ -2,7 +2,7 @@ import json
 import sqlite3
 from collections.abc import Iterator
 from pathlib import Path
-from typing import Any
+from typing import Any, NoReturn
 
 import pytest
 from typer.testing import CliRunner
@@ -603,3 +603,71 @@ def test_cli_search_without_the_model_falls_back_and_warns(
     assert "warning: dense search unavailable: torch is not installed" in result.stderr
     hits, warnings = _hits(["DNI"])
     assert hits and warnings == ["dense search unavailable: torch is not installed"]
+
+
+# --- added by the review fixes --------------------------------------------------------------
+
+
+class FailingReranker(FakeReranker):
+    """Loads fine, cannot score."""
+
+    def score(self, query: str, texts: list[str]) -> list[float]:
+        raise ModelUnavailable("scoring failed on mps")
+
+
+def test_reranker_failing_at_score_time_keeps_the_fused_order(
+    conn: sqlite3.Connection, loaded: chat_ru.Loaded, embedded: CountingEmbedder
+) -> None:
+    plain = search.search(conn, RAW, "Recoleta", ALL, rerank=False)
+    degraded = search.search(conn, RAW, "Recoleta", ALL, reranker=FailingReranker())
+    assert degraded.warnings == ["reranking unavailable: scoring failed on mps"]
+    assert _keys(degraded.hits) == _keys(plain.hits)
+    assert [h.score for h in degraded.hits] == [h.score for h in plain.hits]
+
+
+def test_k_above_rerank_top_still_returns_k_hits(
+    conn: sqlite3.Connection, loaded: chat_ru.Loaded
+) -> None:
+    shallow = Config(search=SearchCfg(rerank_top=5), units=CFG.units, sources=CFG.sources)
+    wide = search.search(conn, shallow, "счёт банк DNI", ALL, 60, mode="lexical")
+    assert len(wide.hits) > 5
+    assert len(wide.hits) == len(
+        search.search(conn, CFG, "счёт банк DNI", ALL, 60, mode="lexical").hits
+    )
+
+
+def test_loader_hooks_replace_the_package_loaders(
+    conn: sqlite3.Connection, loaded: chat_ru.Loaded, embedded: CountingEmbedder
+) -> None:
+    loads: list[str] = []
+
+    def load_embedder(cfg: Config) -> CountingEmbedder:
+        loads.append("embed")
+        return embedded
+
+    def load_reranker(cfg: Config) -> CountingReranker:
+        loads.append("rerank")
+        return CountingReranker()
+
+    result = search.search(
+        conn, CFG, "Recoleta", ALL, load_embedder=load_embedder, load_reranker=load_reranker
+    )
+    assert result.hits and result.warnings == [] and loads == ["embed", "rerank"]
+
+    def offline(cfg: Config) -> NoReturn:
+        raise ModelUnavailable("no torch")
+
+    degraded = search.search(
+        conn, CFG, "Recoleta", ALL, load_embedder=offline, load_reranker=offline
+    )
+    assert degraded.warnings == [
+        "dense search unavailable: no torch",
+        "reranking unavailable: no torch",
+    ]
+    assert _keys(degraded.hits) == _keys(
+        search.search(conn, CFG, "Recoleta", ALL, mode="lexical", rerank=False).hits
+    )
+    handed = search.search(
+        conn, CFG, "Recoleta", ALL, embedder=embedded, load_embedder=offline, rerank=False
+    )
+    assert handed.warnings == []

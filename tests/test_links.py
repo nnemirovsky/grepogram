@@ -269,3 +269,41 @@ def test_run_command_captures_output_and_never_raises() -> None:
     assert result.stderr == b"nope"
     ok = links.run_command([sys.executable, "-c", "pass"])
     assert ok.returncode == 0
+
+
+# --- added by the review fixes --------------------------------------------------------------
+
+
+class Scripted:
+    """A :class:`links.Runner` whose answers are exit codes or exceptions to raise, in order."""
+
+    def __init__(self, *answers: int | BaseException) -> None:
+        self.answers = list(answers)
+        self.calls: list[list[str]] = []
+
+    def __call__(self, args: Sequence[str], /) -> subprocess.CompletedProcess[bytes]:
+        self.calls.append(list(args))
+        answer = self.answers.pop(0)
+        if isinstance(answer, BaseException):
+            raise answer
+        return subprocess.CompletedProcess(list(args), answer, b"", b"")
+
+
+def _hang(args: Sequence[str] = ("open",)) -> subprocess.TimeoutExpired:
+    return subprocess.TimeoutExpired(list(args), links.OPEN_TIMEOUT_S)
+
+
+def test_open_link_treats_a_hung_open_as_a_failure() -> None:
+    runner = Scripted(_hang(), _hang())
+    with pytest.raises(links.OpenFailed) as info:
+        links.open_link(PRIVATE, runner=runner, platform="darwin")
+    message = str(info.value)
+    assert PRIVATE.url in message and str(PRIVATE.fallback_url) in message
+    assert f"did not finish within {links.OPEN_TIMEOUT_S}s" in message
+    assert len(runner.calls) == 2
+
+
+def test_open_link_falls_back_when_the_primary_open_hangs() -> None:
+    runner = Scripted(_hang(), 0)
+    assert links.open_link(PRIVATE, runner=runner, platform="darwin") == PRIVATE.fallback_url
+    assert runner.calls == [["open", PRIVATE.url], ["open", PRIVATE.fallback_url]]

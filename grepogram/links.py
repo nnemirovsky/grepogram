@@ -80,8 +80,9 @@ def open_link(link: Link, *, runner: Runner = run_command, platform: str = sys.p
     """Open ``link`` with macOS ``open`` and return the url that worked.
 
     The fallback url is tried when ``open`` rejects the primary one (no application registered
-    for its scheme); :class:`OpenFailed` carries ``open``'s stderr when both fail. Other
-    platforms get ``NotImplementedError`` and the link is left to the caller to display.
+    for its scheme) or hangs past :data:`OPEN_TIMEOUT_S`; :class:`OpenFailed` carries ``open``'s
+    stderr (or the timeout) when both fail. Other platforms get ``NotImplementedError`` and the
+    link is left to the caller to display.
     """
     if platform != "darwin":
         raise NotImplementedError(f"opening links needs macOS 'open' ({platform}): {link.url}")
@@ -89,7 +90,11 @@ def open_link(link: Link, *, runner: Runner = run_command, platform: str = sys.p
     for url in (link.url, link.fallback_url):
         if url is None:
             continue
-        result = runner(["open", url])
+        try:
+            result = runner(["open", url])
+        except subprocess.TimeoutExpired:
+            errors.append(f"{url}: open did not finish within {OPEN_TIMEOUT_S}s")
+            continue
         if result.returncode == 0:
             return url
         detail = (
