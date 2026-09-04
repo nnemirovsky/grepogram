@@ -470,7 +470,13 @@ four minutes.
   it when one does, and otherwise the source of the channel that links it now — so a group handed
   from one channel to another moves to the new channel's source, and removing the channel it left
   keeps it while removing the new one takes its comments along. A group no channel links any more
-  keeps the source it came in through until that source is removed.
+  keeps the source it came in through until that source is removed. A `chat` entry counts as
+  listing the group under every spelling the field takes — the id, the `@username` and a `t.me`
+  link are the same chat.
+- Removing the source of a discussion group takes its comments out of the channel that stored
+  them: the post threads built from them go with the group, and the posts are rebuilt without
+  them on the next sync. Removing the channel instead leaves the group whole — its own windows
+  and threads are its own messages — and only drops the link between the two.
 - A chat that came in through a folder cannot be removed on its own; remove the folder source or
   take the chat out of the folder in Telegram. Nor can a channel's discussion group be removed
   through the channel's source by naming the group; remove the channel's source.

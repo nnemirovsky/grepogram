@@ -103,6 +103,20 @@ never change the git identity.
   *now*, so it moves along when another channel takes it over — removing the old channel then
   leaves it and removing the new one takes its comments along; a group a channel was unlinked
   from keeps the source it came in through until that source is removed.
+- Never decide what a `chat:` source covers by comparing `source_id` strings. `chat =` takes an
+  id, an `@username`, `https://t.me/<name>` and `t.me/c/<id>`, and all four are one chat:
+  `sources.parse_target` folds them into a `Target`, and `sources._names_chat` / `_same_target`
+  compare that against the `chats` row's `id` and `username` (case-insensitively). `_own_source`,
+  `_same_chat` and `find_source`'s `_named_source` all go through them; a spelling-based
+  comparison silently treats a directly configured group as indirect, which hands its rows to the
+  channel's source. A fuzzy `chat =` value names no identity offline and matches nothing.
+- `db.delete_chat` removes the units of *other* chats that quote the chat going away: a channel's
+  post threads carry the comments of its discussion group, so deleting a group drops those
+  threads with their `unit_fts` and `unit_vec` rows and flags the posts `indexed = 0`. The flag
+  alone is not enough — the channel may never resolve again, and the index must not answer with
+  rows that are gone. Deleting a channel clears the link of a group that outlives it (through
+  `db.set_discussion_chat`, still the only way `discussion_of` is cleared); the group's own
+  windows and threads are its own messages and stay.
 - A partial batch keeps what it earned: `sync._store_batch` writes `set_chat_progress` in a
   `finally` and `_fetch_comments` stores its rows as it reads them, because a flood wait on one
   comment thread leaves the whole run. A thread is only requested while Telegram reports more
