@@ -747,10 +747,13 @@ def sources_remove(target: str) -> ToolResult:
 
 @guarded_async
 async def open_message(chat_id: int, msg_id: int) -> ToolResult:
-    """Open a stored message in the Telegram app on this Mac and return the `url` used
-    (`opened=true`). When the app cannot be launched — or opening is switched off with
-    `GREPOGRAM_NO_OPEN` — the result still carries the `url` (and `fallback_url` for private
-    chats) with `error` and `hint`, so the link can be shown instead.
+    """Open a stored message in the Telegram app on this Mac. `url` is the message's link as
+    hits and message views show it (`https://t.me/…` where Telegram has one); `app_url` is the
+    `tg://` form the app takes directly, which is what gets launched — the `url` and then the
+    `fallback_url` (private chats) are tried only when the app form is rejected — and
+    `opened_with` says which one worked (`opened=true`). When nothing can be launched, or
+    opening is switched off with `GREPOGRAM_NO_OPEN`, the result still carries the links with
+    `error` and `hint`, so the link can be shown instead.
     """
     state = _app()
     chat = db.get_chat(state.conn, chat_id)
@@ -763,17 +766,18 @@ async def open_message(chat_id: int, msg_id: int) -> ToolResult:
         "msg_id": msg_id,
         "url": link.url,
         "fallback_url": link.fallback_url,
+        "app_url": link.app_url,
     }
     if links.opening_disabled():
         result.update(opened=False, error=NO_OPEN_ERROR, hint=OPEN_HINT)
         return result
     try:
-        result["url"] = await asyncio.to_thread(links.open_link, link)
+        opened_with = await asyncio.to_thread(links.open_link, link)
     except (OpenFailed, NotImplementedError) as exc:
         log.warning("cannot open %s: %s", link.url, exc)
         result.update(opened=False, error=str(exc), hint=OPEN_HINT)
         return result
-    result["opened"] = True
+    result.update(opened=True, opened_with=opened_with)
     return result
 
 

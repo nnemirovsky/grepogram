@@ -57,115 +57,124 @@ def test_strip_channel_prefix_rejects_non_channel_ids(chat_id: int) -> None:
 # --- message_url -----------------------------------------------------------------------------
 
 
+PUBLIC_APP = "tg://resolve?domain=ru_georgia&post=42"
+PRIVATE_APP = "tg://privatepost?channel=1234567890&post=42"
+USER_APP = "tg://openmessage?user_id=777000&message_id=42"
+GROUP_APP = "tg://openmessage?chat_id=4567&message_id=42"
+
+
 @pytest.mark.parametrize(
     ("chat", "topic_id", "expected"),
     [
         pytest.param(
             _chat(SUPERGROUP, "supergroup", "ru_georgia"),
             None,
-            Link("https://t.me/ru_georgia/42"),
+            Link("https://t.me/ru_georgia/42", app_url=PUBLIC_APP),
             id="supergroup-public",
         ),
         pytest.param(
             _chat(SUPERGROUP, "supergroup", "ru_georgia", forum=True),
             TOPIC,
-            Link("https://t.me/ru_georgia/7/42"),
+            Link("https://t.me/ru_georgia/7/42", app_url=f"{PUBLIC_APP}&thread=7"),
             id="supergroup-public-forum-topic",
         ),
         pytest.param(
             _chat(SUPERGROUP, "supergroup", "ru_georgia", forum=True),
             None,
-            Link("https://t.me/ru_georgia/42"),
+            Link("https://t.me/ru_georgia/42", app_url=PUBLIC_APP),
             id="supergroup-public-forum-general",
         ),
         pytest.param(
             _chat(SUPERGROUP, "supergroup", "ru_georgia"),
             TOPIC,
-            Link("https://t.me/ru_georgia/42"),
+            Link("https://t.me/ru_georgia/42", app_url=PUBLIC_APP),
             id="supergroup-public-not-forum-ignores-topic",
         ),
         pytest.param(
             _chat(SUPERGROUP, "supergroup"),
             None,
-            Link("https://t.me/c/1234567890/42"),
+            Link("https://t.me/c/1234567890/42", app_url=PRIVATE_APP),
             id="supergroup-private",
         ),
         pytest.param(
             _chat(SUPERGROUP, "supergroup", forum=True),
             TOPIC,
-            Link("https://t.me/c/1234567890/7/42"),
+            Link("https://t.me/c/1234567890/7/42", app_url=f"{PRIVATE_APP}&thread=7"),
             id="supergroup-private-forum-topic",
         ),
         pytest.param(
             _chat(SUPERGROUP, "supergroup", forum=True),
             None,
-            Link("https://t.me/c/1234567890/42"),
+            Link("https://t.me/c/1234567890/42", app_url=PRIVATE_APP),
             id="supergroup-private-forum-general",
         ),
         pytest.param(
             _chat(SUPERGROUP, "supergroup"),
             TOPIC,
-            Link("https://t.me/c/1234567890/42"),
+            Link("https://t.me/c/1234567890/42", app_url=PRIVATE_APP),
             id="supergroup-private-not-forum-ignores-topic",
         ),
         pytest.param(
             _chat(CHANNEL, "channel", "durov"),
             None,
-            Link("https://t.me/durov/42"),
+            Link("https://t.me/durov/42", app_url="tg://resolve?domain=durov&post=42"),
             id="channel-public",
         ),
         pytest.param(
             _chat(CHANNEL, "channel"),
             None,
-            Link("https://t.me/c/9876543210/42"),
+            Link(
+                "https://t.me/c/9876543210/42",
+                app_url="tg://privatepost?channel=9876543210&post=42",
+            ),
             id="channel-private",
         ),
         pytest.param(
             _chat(CHANNEL, "channel", "durov"),
             TOPIC,
-            Link("https://t.me/durov/42"),
+            Link("https://t.me/durov/42", app_url="tg://resolve?domain=durov&post=42"),
             id="channel-public-ignores-topic",
         ),
         pytest.param(
             _chat(USER, "user"),
             None,
-            Link("tg://openmessage?user_id=777000&message_id=42", "tg://user?id=777000"),
+            Link(USER_APP, "tg://user?id=777000", app_url=USER_APP),
             id="user",
         ),
         pytest.param(
             _chat(USER, "user", "alice"),
             None,
-            Link("tg://openmessage?user_id=777000&message_id=42", "tg://user?id=777000"),
+            Link(USER_APP, "tg://user?id=777000", app_url=USER_APP),
             id="user-username-ignored",
         ),
         pytest.param(
             _chat(USER, "user"),
             TOPIC,
-            Link("tg://openmessage?user_id=777000&message_id=42", "tg://user?id=777000"),
+            Link(USER_APP, "tg://user?id=777000", app_url=USER_APP),
             id="user-ignores-topic",
         ),
         pytest.param(
             _chat(USER, "bot"),
             None,
-            Link("tg://openmessage?user_id=777000&message_id=42", "tg://user?id=777000"),
+            Link(USER_APP, "tg://user?id=777000", app_url=USER_APP),
             id="bot",
         ),
         pytest.param(
             _chat(USER, "bot", "some_bot"),
             None,
-            Link("tg://openmessage?user_id=777000&message_id=42", "tg://user?id=777000"),
+            Link(USER_APP, "tg://user?id=777000", app_url=USER_APP),
             id="bot-username-ignored",
         ),
         pytest.param(
             _chat(GROUP, "group"),
             None,
-            Link("tg://openmessage?chat_id=4567&message_id=42"),
+            Link(GROUP_APP, app_url=GROUP_APP),
             id="group",
         ),
         pytest.param(
             _chat(GROUP, "group", "legacy"),
             TOPIC,
-            Link("tg://openmessage?chat_id=4567&message_id=42"),
+            Link(GROUP_APP, app_url=GROUP_APP),
             id="group-username-and-topic-ignored",
         ),
     ],
@@ -176,13 +185,25 @@ def test_message_url(chat: ChatRow, topic_id: int | None, expected: Link) -> Non
 
 def test_message_url_topic_is_keyword_optional() -> None:
     chat = _chat(SUPERGROUP, "supergroup", "ru_georgia", forum=True)
-    assert links.message_url(chat, MSG) == Link("https://t.me/ru_georgia/42")
-    assert links.message_url(chat, MSG, topic_id=TOPIC) == Link("https://t.me/ru_georgia/7/42")
+    assert links.message_url(chat, MSG) == Link("https://t.me/ru_georgia/42", app_url=PUBLIC_APP)
+    assert links.message_url(chat, MSG, topic_id=TOPIC) == Link(
+        "https://t.me/ru_georgia/7/42", app_url=f"{PUBLIC_APP}&thread=7"
+    )
 
 
-def test_message_url_web_links_have_no_fallback() -> None:
+def test_message_url_web_links_have_no_fallback_and_every_link_has_an_app_form() -> None:
     for chat in (_chat(SUPERGROUP, "supergroup", "x"), _chat(CHANNEL, "channel")):
-        assert links.message_url(chat, MSG).fallback_url is None
+        link = links.message_url(chat, MSG)
+        assert link.fallback_url is None
+        assert link.url.startswith("https://t.me/")
+    for chat in (
+        _chat(SUPERGROUP, "supergroup", "x"),
+        _chat(CHANNEL, "channel"),
+        _chat(USER, "user"),
+        _chat(GROUP, "group"),
+    ):
+        app_url = links.message_url(chat, MSG).app_url
+        assert app_url is not None and app_url.startswith("tg://")
 
 
 def test_message_url_private_supergroup_with_bad_id_raises() -> None:
@@ -216,6 +237,30 @@ class Recorder:
 
 WEB = Link("https://t.me/ru_georgia/42")
 PRIVATE = Link("tg://openmessage?user_id=777000&message_id=42", "tg://user?id=777000")
+PUBLIC = Link("https://t.me/ru_georgia/42", app_url=PUBLIC_APP)
+USER_LINK = Link(USER_APP, "tg://user?id=777000", app_url=USER_APP)
+
+
+def test_open_link_launches_the_app_url_before_the_web_url() -> None:
+    runner = Recorder()
+    assert links.open_link(PUBLIC, runner=runner, platform="darwin") == PUBLIC_APP
+    assert runner.calls == [["open", PUBLIC_APP]]
+
+
+def test_open_link_falls_back_to_the_web_url_when_the_app_url_is_rejected() -> None:
+    runner = Recorder(1, stderr=b"no application knows how to open URL")
+    assert links.open_link(PUBLIC, runner=runner, platform="darwin") == PUBLIC.url
+    assert runner.calls == [["open", PUBLIC_APP], ["open", PUBLIC.url]]
+
+
+def test_open_link_tries_a_repeated_url_once() -> None:
+    runner = Recorder(1, 0)
+    assert links.open_link(USER_LINK, runner=runner, platform="darwin") == "tg://user?id=777000"
+    assert runner.calls == [["open", USER_APP], ["open", "tg://user?id=777000"]]
+    failing = Recorder(1, 1)
+    with pytest.raises(links.OpenFailed) as excinfo:
+        links.open_link(USER_LINK, runner=failing, platform="darwin")
+    assert str(excinfo.value).count(USER_APP) == 1 and len(failing.calls) == 2
 
 
 def test_open_link_runs_open_with_the_url() -> None:

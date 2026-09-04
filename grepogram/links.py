@@ -10,11 +10,19 @@ the message on mobile, and the desktop clients at least open the conversation th
 ``tg://user?id=`` — which is why :class:`~grepogram.models.Link` carries a ``fallback_url`` and
 every hit and message view passes both on.
 
-:func:`open_link` is the macOS side: ``open <url>`` hands the link to whatever owns the scheme
-(the Telegram app, or a browser that redirects to it). The command runner is injectable so tests
-never launch anything, and ``GREPOGRAM_NO_OPEN=1`` (:func:`opening_disabled`) makes
-:func:`open_link` return the url without running anything at all — the test environment sets
-it, so a probe or a smoke test that reaches the real runner still opens nothing on the machine.
+The web link is what results show and cite, but it is not what opens the app: ``open
+https://t.me/…`` on macOS lands on the t.me page in the browser. Every link therefore also
+carries an ``app_url`` in the ``tg://`` scheme the desktop app is registered for —
+``tg://resolve?domain=<username>&post=<msg>`` for public chats,
+``tg://privatepost?channel=<id>&post=<msg>`` for private ones, both with ``&thread=<topic>`` in a
+forum topic, and the ``tg://openmessage`` forms as they are — and :func:`open_link` tries that
+first, the web link second and the fallback last.
+
+:func:`open_link` is the macOS side: ``open <url>`` hands the link to whatever owns the scheme.
+The command runner is injectable so tests never launch anything, and ``GREPOGRAM_NO_OPEN=1``
+(:func:`opening_disabled`) makes :func:`open_link` return the url without running anything at
+all — the test environment sets it, so a probe or a smoke test that reaches the real runner
+still opens nothing on the machine.
 """
 
 import logging
@@ -55,26 +63,30 @@ def strip_channel_prefix(chat_id: int) -> int:
 
 
 def message_url(chat: ChatRow, msg_id: int, topic_id: int | None = None) -> Link:
-    """The link that opens ``msg_id`` in ``chat`` (plus a fallback where the link is mobile-only).
+    """The links that open ``msg_id`` in ``chat``: the web form to show, the ``tg://`` form the
+    app takes, and a fallback where the link is mobile-only.
 
     ``topic_id`` is inserted only for forum supergroups; a discussion chat stores each comment's
     channel post id in the same column, and that must not end up in the URL.
     """
     if chat.type in ("channel", "supergroup"):
+        topic = topic_id if chat.is_forum and topic_id is not None else None
+        thread = "" if topic is None else f"&thread={topic}"
         if chat.username:
             base = f"https://t.me/{chat.username}"
+            app = f"tg://resolve?domain={chat.username}&post={msg_id}{thread}"
         else:
-            base = f"https://t.me/c/{strip_channel_prefix(chat.id)}"
-        if chat.is_forum and topic_id is not None:
-            return Link(f"{base}/{topic_id}/{msg_id}")
-        return Link(f"{base}/{msg_id}")
+            bare = strip_channel_prefix(chat.id)
+            base = f"https://t.me/c/{bare}"
+            app = f"tg://privatepost?channel={bare}&post={msg_id}{thread}"
+        web = f"{base}/{msg_id}" if topic is None else f"{base}/{topic}/{msg_id}"
+        return Link(web, app_url=app)
     if chat.type in ("user", "bot"):
-        return Link(
-            f"tg://openmessage?user_id={chat.id}&message_id={msg_id}",
-            f"tg://user?id={chat.id}",
-        )
+        app = f"tg://openmessage?user_id={chat.id}&message_id={msg_id}"
+        return Link(app, f"tg://user?id={chat.id}", app_url=app)
     if chat.type == "group":
-        return Link(f"tg://openmessage?chat_id={abs(chat.id)}&message_id={msg_id}")
+        app = f"tg://openmessage?chat_id={abs(chat.id)}&message_id={msg_id}"
+        return Link(app, app_url=app)
     raise ValueError(f"unknown chat type: {chat.type!r}")
 
 
@@ -92,11 +104,12 @@ def opening_disabled() -> bool:
 def open_link(link: Link, *, runner: Runner = run_command, platform: str = sys.platform) -> str:
     """Open ``link`` with macOS ``open`` and return the url that worked.
 
-    The fallback url is tried when ``open`` rejects the primary one (no application registered
-    for its scheme) or hangs past :data:`OPEN_TIMEOUT_S`; :class:`OpenFailed` carries ``open``'s
-    stderr (or the timeout) when both fail. Other platforms get ``NotImplementedError`` and the
-    link is left to the caller to display. With ``GREPOGRAM_NO_OPEN`` set nothing runs and the
-    primary url comes back as it is.
+    The ``app_url`` goes first — it is what reaches the Telegram app — then the web ``url``,
+    then the fallback, each tried when ``open`` rejects the one before (no application
+    registered for its scheme) or hangs past :data:`OPEN_TIMEOUT_S`; a url the link repeats is
+    tried once. :class:`OpenFailed` carries ``open``'s stderr (or the timeout) when all fail.
+    Other platforms get ``NotImplementedError`` and the link is left to the caller to display.
+    With ``GREPOGRAM_NO_OPEN`` set nothing runs and the web url comes back as it is.
     """
     if opening_disabled():
         log.info("%s is set; not opening %s", NO_OPEN_ENV, link.url)
@@ -104,9 +117,11 @@ def open_link(link: Link, *, runner: Runner = run_command, platform: str = sys.p
     if platform != "darwin":
         raise NotImplementedError(f"opening links needs macOS 'open' ({platform}): {link.url}")
     errors: list[str] = []
-    for url in (link.url, link.fallback_url):
-        if url is None:
+    tried: list[str] = []
+    for url in (link.app_url, link.url, link.fallback_url):
+        if url is None or url in tried:
             continue
+        tried.append(url)
         try:
             result = runner(["open", url])
         except subprocess.TimeoutExpired:

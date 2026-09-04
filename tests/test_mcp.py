@@ -922,10 +922,16 @@ async def test_open_message_returns_the_url_used(
         "msg_id": 5,
         "url": "https://t.me/arg_chat/5",
         "fallback_url": None,
+        "app_url": "tg://resolve?domain=arg_chat&post=5",
         "opened": True,
+        "opened_with": "https://t.me/arg_chat/5",
     }
-    assert opened == [Link("https://t.me/arg_chat/5")]
-    assert (await tools.open_message(GEO, 3))["url"] == "https://t.me/c/1000000200/3"
+    assert opened == [
+        Link("https://t.me/arg_chat/5", app_url="tg://resolve?domain=arg_chat&post=5")
+    ]
+    geo = await tools.open_message(GEO, 3)
+    assert geo["url"] == "https://t.me/c/1000000200/3"
+    assert geo["app_url"] == "tg://privatepost?channel=1000000200&post=3"
     db.upsert_chat(
         conn,
         ChatRow(id=FORUM, type="supergroup", title="Forum", username="forum_chat", is_forum=True),
@@ -938,10 +944,13 @@ async def test_open_message_returns_the_url_used(
             MessageRow(chat_id=7, msg_id=9, date=1_700_000_000, text="hi"),
         ],
     )
-    assert (await tools.open_message(FORUM, 105))["url"] == "https://t.me/forum_chat/100/105"
+    forum = await tools.open_message(FORUM, 105)
+    assert forum["url"] == "https://t.me/forum_chat/100/105"
+    assert forum["app_url"] == "tg://resolve?domain=forum_chat&post=105&thread=100"
     private = await tools.open_message(7, 9)
     assert private["url"] == "tg://openmessage?user_id=7&message_id=9"
     assert private["fallback_url"] == "tg://user?id=7"
+    assert private["app_url"] == private["url"]
     assert (await tools.open_message(ARG, 999))["hint"] == tools.MESSAGE_HINT
     assert len(opened) == 4
 
@@ -983,6 +992,32 @@ async def test_open_message_reports_a_hung_open_with_the_url(
     result = await tools.open_message(ARG, 5)
     assert result["url"] == "https://t.me/arg_chat/5" and result["opened"] is False
     assert "did not finish within" in result["error"] and result["hint"] == tools.OPEN_HINT
+    assert "tg://resolve?domain=arg_chat&post=5" in result["error"]
+
+
+async def test_open_message_reports_the_link_open_accepted(
+    state: tools.AppState, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The app form is launched first and reported in ``opened_with``; when ``open`` rejects it
+    the web link follows, and ``url`` stays the web form for showing either way."""
+    monkeypatch.delenv(links.NO_OPEN_ENV)
+    launched: list[str] = []
+    codes = iter([1, 0])
+
+    def runner(args: Sequence[str]) -> subprocess.CompletedProcess[bytes]:
+        launched.append(args[1])
+        return subprocess.CompletedProcess(list(args), next(codes, 0), b"", b"rejected")
+
+    real_open = links.open_link
+    monkeypatch.setattr(
+        links, "open_link", lambda link: real_open(link, runner=runner, platform="darwin")
+    )
+    result = await tools.open_message(ARG, 5)
+    assert result["opened"] is True and result["opened_with"] == "https://t.me/arg_chat/5"
+    assert result["url"] == "https://t.me/arg_chat/5"
+    assert launched == ["tg://resolve?domain=arg_chat&post=5", "https://t.me/arg_chat/5"]
+    again = await tools.open_message(ARG, 5)
+    assert again["opened_with"] == "tg://resolve?domain=arg_chat&post=5"
 
 
 async def test_open_message_only_returns_the_url_while_opening_is_switched_off(
@@ -1000,6 +1035,7 @@ async def test_open_message_only_returns_the_url_while_opening_is_switched_off(
         "msg_id": 5,
         "url": "https://t.me/arg_chat/5",
         "fallback_url": None,
+        "app_url": "tg://resolve?domain=arg_chat&post=5",
         "opened": False,
         "error": tools.NO_OPEN_ERROR,
         "hint": tools.OPEN_HINT,
