@@ -41,6 +41,8 @@ ARG = make_channel(100, "Argentina chat", username="arg_chat", megagroup=True)
 GEORGIA = make_channel(101, "Georgia chat", megagroup=True)
 NEWS = make_channel(200, "News", username="news")
 DISC = make_channel(201, "News chat", username="news_chat", megagroup=True)
+DISC2 = make_channel(202, "Second news chat", username="news_chat2", megagroup=True)
+OTHER = make_channel(203, "Other news", username="other_news")
 
 ALICE_ID = 1
 OLD_ID = -10
@@ -48,6 +50,8 @@ ARG_ID = -1000000000100
 GEORGIA_ID = -1000000000101
 NEWS_ID = -1000000000200
 DISC_ID = -1000000000201
+DISC2_ID = -1000000000202
+OTHER_ID = -1000000000203
 
 TELEGRAM = TelegramCfg(api_id=12345, api_hash="fakehash")
 ARG_SOURCE = Source(folder="Argentina")
@@ -208,6 +212,19 @@ def test_budget_expires_by_its_clock() -> None:
 
 def test_budget_zero_is_expired_at_once() -> None:
     assert SyncBudget(0).expired
+
+
+def test_a_cancelled_budget_is_expired_whatever_its_clock_says() -> None:
+    """What a cancelled run uses to stop the worker thread it is waiting for."""
+    unlimited = SyncBudget()
+    unlimited.cancel()
+    assert unlimited.expired
+    assert unlimited.remaining == 0
+    timed = SyncBudget(5, clock=_clock(0))
+    assert not timed.expired
+    timed.cancel()
+    assert timed.expired
+    assert timed.remaining == 0
 
 
 # --- lock ------------------------------------------------------------------------------------
@@ -418,6 +435,39 @@ async def test_since_skips_older_history_on_the_first_run_only(conn: sqlite3.Con
     assert _texts(conn, ALICE_ID) == {2: "new", 3: "newer"}
 
 
+async def test_since_keeps_a_message_stamped_at_its_very_midnight(
+    conn: sqlite3.Connection,
+) -> None:
+    """``since`` is passed as that day's UTC midnight and the bound is inclusive there.
+
+    Telethon 1.44 hands ``offset_date`` to ``GetHistoryRequest`` untouched and filters no message
+    by date of its own (``_MessagesIter._init``, ``_message_in_range``), so a reversed chunk is
+    the complement of the server's exclusive "before this date" cut. The *id* offset is the one
+    ``_init`` compensates by hand to stay exclusive under ``reverse`` (``offset_id += 1``), which
+    is what shows an uncompensated reversed bound keeps its boundary.
+    """
+    client = _client(
+        messages={
+            ALICE_ID: [
+                tl.message(
+                    ALICE_ID,
+                    1,
+                    "a second too early",
+                    sender=1,
+                    date=dt.datetime(2024, 12, 31, 23, 59, 59, tzinfo=dt.UTC),
+                ),
+                tl.message(
+                    ALICE_ID, 2, "midnight", sender=1, date=dt.datetime(2025, 1, 1, tzinfo=dt.UTC)
+                ),
+            ]
+        }
+    )
+    source = Source(chat="@alice", since="2025-01-01")
+    chat = db.upsert_chat(conn, ChatRow(id=ALICE_ID, type="user"))
+    await sync.sync_chat(client, conn, chat, source, SyncBudget())
+    assert _texts(conn, ALICE_ID) == {2: "midnight"}
+
+
 async def test_bad_since_is_a_config_error(conn: sqlite3.Connection) -> None:
     chat = db.upsert_chat(conn, ChatRow(id=ALICE_ID, type="user"))
     with pytest.raises(ConfigError, match="since must be an ISO date"):
@@ -610,6 +660,80 @@ async def test_channel_without_discussion_group_stores_posts_only(conn: sqlite3.
     assert db.get_chat(conn, DISC_ID) is None
     assert _texts(conn, NEWS_ID) == {1: "post 1", 2: "post 2", 3: "post 3"}
     assert all(c["reply_to"] is None for c in _fetch_calls(client, NEWS_ID))
+
+
+async def test_a_channel_that_lost_its_discussion_group_stops_carrying_its_comments(
+    conn: sqlite3.Connection, paths: Paths
+) -> None:
+    """``GetFullChannelRequest`` answers a channel without a linked group with
+    ``linked_chat_id = None``, and the stored link has to go with it: the group's messages stay
+    what they are, they just stop being this channel's comments."""
+    client = _news_client()
+    cfg = _cfg(NEWS_SOURCE)
+    await _run(client, conn, paths, cfg)
+    assert _thread_texts(conn, NEWS_ID) == {
+        1: ["post 1", "comment one", "reply"],
+        3: ["post 3", "late comment"],
+    }
+    client.responses[functions.channels.GetFullChannelRequest] = _full_channel(None)
+    report = await _run(client, conn, paths, cfg)
+    assert report.warnings == []
+    unlinked = db.get_chat(conn, DISC_ID)
+    assert unlinked is not None and unlinked.discussion_of is None
+    assert db.get_discussion_chat(conn, NEWS_ID) is None
+    assert _thread_texts(conn, NEWS_ID) == {}
+    assert [v.text for v in search.thread(conn, NEWS_ID, 1)] == ["post 1"]
+    assert _texts(conn, DISC_ID) == {1: "comment one", 2: "reply", 9: "late comment"}
+    assert db.unindexed_message_ids(conn, NEWS_ID) == []
+
+
+async def test_a_replaced_discussion_group_hands_the_comments_over(
+    conn: sqlite3.Connection, paths: Paths
+) -> None:
+    """A channel given another discussion group indexes the new one and drops the old link,
+    keeping every message both groups hold."""
+    client = _news_client(entities=[DISC, DISC2])
+    cfg = _cfg(NEWS_SOURCE)
+    await _run(client, conn, paths, cfg)
+    client.responses[functions.channels.GetFullChannelRequest] = _full_channel(
+        202, chats=[NEWS, DISC2]
+    )
+    client.messages[NEWS_ID] = _posts(1, 0, 0)
+    client.comments = {(NEWS_ID, 1): [tl.message(DISC2_ID, 4, "fresh comment", sender=1)]}
+    report = await _run(client, conn, paths, cfg)
+    assert report.warnings == []
+    linked = db.get_discussion_chat(conn, NEWS_ID)
+    assert linked is not None and linked.id == DISC2_ID
+    old = db.get_chat(conn, DISC_ID)
+    assert old is not None and old.discussion_of is None
+    assert _texts(conn, DISC_ID) == {1: "comment one", 2: "reply", 9: "late comment"}
+    assert _texts(conn, DISC2_ID) == {4: "fresh comment"}
+    assert _thread_texts(conn, NEWS_ID) == {1: ["post 1", "fresh comment"]}
+    assert [v.text for v in search.thread(conn, NEWS_ID, 1)] == ["post 1", "fresh comment"]
+
+
+async def test_a_group_two_channels_pointed_at_belongs_to_the_last_one(
+    conn: sqlite3.Connection, paths: Paths
+) -> None:
+    """Telegram links a group to one channel at a time, and so does the index: the channel that
+    lost it has its posts rebuilt without the comments that are now another channel's."""
+    client = _news_client(entities=[DISC, OTHER])
+    cfg = _cfg(NEWS_SOURCE)
+    await _run(client, conn, paths, cfg)
+    other = db.upsert_chat(
+        conn, ChatRow(id=OTHER_ID, type="channel", title="Other", source_id="chat:@other_news")
+    )
+    linked = await sync.link_discussion_chat(client, conn, other)
+    assert linked is not None and linked.id == DISC_ID
+    assert db.get_discussion_chat(conn, OTHER_ID) == linked
+    assert db.get_discussion_chat(conn, NEWS_ID) is None
+    news = db.get_chat(conn, NEWS_ID)
+    assert news is not None
+    flagged = db.get_messages_by_ids(conn, db.unindexed_message_ids(conn, NEWS_ID))
+    assert [post.msg_id for post in flagged] == [1, 3]  # the posts that held the comments
+    await sync.index_pending(conn, cfg, news)
+    assert _thread_texts(conn, NEWS_ID) == {}
+    assert _texts(conn, DISC_ID) == {1: "comment one", 2: "reply", 9: "late comment"}
 
 
 async def test_comments_are_not_fetched_without_the_flag(conn: sqlite3.Connection) -> None:
@@ -1697,6 +1821,63 @@ async def test_a_cancelled_index_step_joins_its_worker_thread_first() -> None:
     with pytest.raises(asyncio.CancelledError):
         await task
     assert landed == ["job", "unwound"]
+
+
+async def test_a_cancelled_index_step_waits_for_its_worker_however_long_it_takes(
+    caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The wait has no bound, it only logs while it lasts.
+
+    A bounded one would give the :class:`SyncLock` up over a live writer exactly in the case it
+    exists for — the rebuild or the embedding backlog that outlasts the bound — and the next
+    process would start writing against a database this one has not finished with.
+    """
+    monkeypatch.setattr(sync, "JOIN_LOG_EVERY", 0.01)
+    landed: list[str] = []
+
+    def job() -> str:
+        time.sleep(0.2)
+        landed.append("job")
+        return "done"
+
+    async def call() -> None:
+        try:
+            await sync._joined_to_thread(job)
+        finally:
+            landed.append("unwound")
+
+    with caplog.at_level("WARNING", logger="grepogram.sync"):
+        task = asyncio.create_task(call())
+        await asyncio.sleep(0.05)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    assert landed == ["job", "unwound"]
+    waited = [r for r in caplog.records if "still running after the run was cancelled" in r.message]
+    assert len(waited) > 1
+
+
+async def test_a_cancelled_job_that_can_be_aborted_is_asked_to_stop() -> None:
+    """What keeps the unbounded wait short: the embedding step checks its budget between
+    batches, so expiring it ends the job at the next one instead of after the backlog."""
+    budget = SyncBudget()
+    landed: list[str] = []
+
+    def job() -> str:
+        for _ in range(500):  # bounded, so a broken abort fails the test instead of hanging it
+            if budget.expired:
+                landed.append("aborted")
+                return "aborted"
+            time.sleep(0.01)
+        landed.append("ran to the end")
+        return "ran to the end"
+
+    task = asyncio.create_task(sync._joined_to_thread(job, budget.cancel))
+    await asyncio.sleep(0.05)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert landed == ["aborted"]
 
 
 async def test_joined_to_thread_returns_the_result_and_propagates_failures() -> None:

@@ -1,4 +1,7 @@
+import asyncio
 import sqlite3
+import threading
+import time
 from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
@@ -600,6 +603,48 @@ async def test_sync_all_without_an_embedder_leaves_units_dirty(
     assert report.new == 1 and report.warnings == []
     assert db.count_dirty_units(conn) == len(_unit_ids(conn)) > 0
     assert not db.has_vec_table(conn)
+
+
+async def test_a_cancelled_sync_stops_the_embedding_instead_of_detaching_it(
+    conn: sqlite3.Connection, paths: Paths
+) -> None:
+    """Embedding is the long step a cancelled run must not leave running behind its back: the
+    cancellation expires the budget the step paces itself against, so it stops at the batch
+    boundary it is at while the sync lock still covers it."""
+    budget = SyncBudget()
+    entered = threading.Event()
+
+    class BlockingEmbedder(FakeEmbedder):
+        """Holds a batch until the run is cancelled; bounded, so a lost abort fails the test."""
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.aborted = False
+
+        def embed(self, texts: list[str]) -> list[list[float]]:
+            entered.set()
+            for _ in range(500):
+                if budget.expired:
+                    self.aborted = True
+                    break
+                time.sleep(0.01)
+            return super().embed(texts)
+
+    embedder = BlockingEmbedder()
+    client = _client([tl.message(CHAT, 1, "hello", sender=1)])
+    task = asyncio.create_task(_run(client, conn, paths, embedder, budget))
+    for _ in range(500):
+        if entered.is_set():
+            break
+        await asyncio.sleep(0.01)
+    assert entered.is_set()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert embedder.aborted
+    assert _vec_rowids(conn) == sorted(_unit_ids(conn))
+    with SyncLock(paths):  # released, and only once the worker stopped writing
+        pass
 
 
 async def test_sync_all_reports_a_changed_model_as_a_warning(

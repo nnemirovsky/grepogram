@@ -70,7 +70,7 @@ from grepogram.units import UNKNOWN_SENDER
 log = logging.getLogger(__name__)
 
 BATCH_SIZE = 500
-JOIN_TIMEOUT = 60.0
+JOIN_LOG_EVERY = 30.0
 SELF_NAME = "me"
 UNKNOWN_FORWARD = "unknown"
 _LOCATION_MEDIA = (types.MessageMediaGeo, types.MessageMediaGeoLive, types.MessageMediaVenue)
@@ -334,7 +334,7 @@ class SyncInProgress(Exception):
 
 
 class SyncBudget:
-    """Wall-clock allowance for one sync run; ``seconds=None`` never expires.
+    """Wall-clock allowance for one sync run; ``seconds=None`` never expires on its own.
 
     ``clock`` defaults to :func:`time.monotonic` and is injectable for tests.
     """
@@ -345,14 +345,27 @@ class SyncBudget:
         self.seconds = seconds
         self._clock = clock
         self.deadline: float | None = None if seconds is None else clock() + seconds
+        self._cancelled = False
 
     @property
     def expired(self) -> bool:
+        if self._cancelled:
+            return True
         return self.deadline is not None and self._clock() >= self.deadline
+
+    def cancel(self) -> None:
+        """Expire the budget now, whatever the clock says and whatever it was given.
+
+        How a cancelled run stops the work a worker thread is pacing against this budget at its
+        next boundary instead of waiting the whole of it out (:func:`_joined_to_thread`).
+        """
+        self._cancelled = True
 
     @property
     def remaining(self) -> float | None:
-        """Seconds left, ``None`` for an unlimited budget, never negative."""
+        """Seconds left, ``None`` for an unlimited budget, never negative, ``0`` once cancelled."""
+        if self._cancelled:
+            return 0.0
         if self.deadline is None:
             return None
         return max(0.0, self.deadline - self._clock())
@@ -601,7 +614,19 @@ class _Fetched:
 
 
 async def _fetch_new(run: _Run) -> _Fetched:
-    """The incremental pass: everything after ``last_msg_id``, committed batch by batch."""
+    """The incremental pass: everything after ``last_msg_id``, committed batch by batch.
+
+    ``offset_date`` is the source's ``since`` and goes out on the first run only: from the second
+    on there is a ``min_id``, which Telethon turns into an ``offset_id`` the server gives
+    priority over the date. Under ``reverse=True`` the date bound is inclusive, so a message
+    stamped exactly at that midnight is fetched. Telethon 1.44 hands ``offset_date`` straight to
+    ``GetHistoryRequest`` with ``add_offset=-limit`` and filters no message by date itself
+    (``_MessagesIter._init`` / ``_message_in_range``), so a reversed chunk is the complement of
+    the server's exclusive "before this date" cut — everything from that second on. That
+    ``_init`` compensates the *id* offset by hand for the same reason (``offset_id += 1`` under
+    ``reverse``, so it stays exclusive) is what shows an uncompensated reversed bound keeps its
+    boundary message.
+    """
     chat = run.chat
     discussion = run.discussion
     progress = chat.last_msg_id
@@ -838,10 +863,16 @@ async def link_discussion_chat(
     together with the channel. ``None`` when the channel has no discussion group;
     :class:`DiscussionUnavailable` when Telegram will not resolve the group (private, or the
     account is not a member) — the channel's own errors propagate.
+
+    ``GetFullChannelRequest`` answers a channel without a discussion group with
+    ``linked_chat_id = None``, and one whose group changed with the new id, so both cases are
+    read off the same field: the link is re-pointed or cleared here (:func:`_unlink_discussion`)
+    rather than left where an earlier run put it.
     """
     full = await client(functions.channels.GetFullChannelRequest(channel.id))
     linked = getattr(full.full_chat, "linked_chat_id", None)
     if not linked:
+        _unlink_discussion(conn, channel, None)
         log.info(
             "channel %s (%s) has no discussion group; comments skipped", channel.id, channel.title
         )
@@ -859,12 +890,48 @@ async def link_discussion_chat(
     source_id = (
         channel.source_id if existing is None or not existing.source_id else existing.source_id
     )
-    return db.upsert_chat(conn, _chat_row_from_entity(entity, source_id, discussion_of=channel.id))
+    with db.transaction(conn):
+        stored = db.upsert_chat(conn, _chat_row_from_entity(entity, source_id))
+        _unlink_discussion(conn, channel, stored.id)
+    return _refresh(conn, stored)
 
 
-def _chat_row_from_entity(
-    entity: Any, source_id: str | None, *, discussion_of: int | None = None
-) -> ChatRow:
+def _unlink_discussion(conn: sqlite3.Connection, channel: ChatRow, keep: int | None) -> None:
+    """Point the channel's ``discussion_of`` at ``keep`` and undo what a former group left.
+
+    A group Telegram unlinked, or replaced with another one, keeps every message it holds: they
+    are a real group's real messages, and the group stays indexed as the chat it is. They stop
+    being the channel's comments, though, so the posts they hang under are flagged for a rebuild
+    — :func:`grepogram.units.build_posts` reads the link and finds none (or the new group), and
+    the post threads the old group fed are dropped by the next :func:`index_pending`.
+
+    A group can only be linked to one channel at a time, so ``keep`` may be the group another
+    channel held until now; that channel's post threads go the same way.
+    """
+    if keep is not None:
+        taken_from = db.get_chat(conn, keep)
+        if taken_from is not None and taken_from.discussion_of not in (None, channel.id):
+            _drop_comment_units(conn, taken_from.discussion_of, keep)
+    for dropped in db.set_discussion_chat(conn, channel.id, keep):
+        _drop_comment_units(conn, channel.id, dropped)
+
+
+def _drop_comment_units(conn: sqlite3.Connection, channel_id: int | None, group_id: int) -> None:
+    """Flag the posts of ``channel_id`` that hold comments from ``group_id`` for a rebuild."""
+    if channel_id is None:
+        return
+    posts = db.get_messages_by_msg_id(conn, channel_id, db.stored_topic_ids(conn, group_id))
+    db.mark_unindexed(conn, [post.id for post in posts.values() if post.id is not None])
+    log.info(
+        "channel %s no longer has discussion group %s; %d of its posts are rebuilt without the "
+        "comments stored there",
+        channel_id,
+        group_id,
+        len(posts),
+    )
+
+
+def _chat_row_from_entity(entity: Any, source_id: str | None) -> ChatRow:
     info = dialogs.dialog_info(entity)
     return ChatRow(
         id=info.id,
@@ -873,7 +940,6 @@ def _chat_row_from_entity(
         username=info.username,
         is_forum=info.is_forum,
         source_id=source_id,
-        discussion_of=discussion_of,
     )
 
 
@@ -911,7 +977,7 @@ def on_chat_synced(
         db.mark_indexed(conn, new_msg_ids)
 
 
-async def _joined_to_thread[T](job: Callable[[], T]) -> T:
+async def _joined_to_thread[T](job: Callable[[], T], abort: Callable[[], None] | None = None) -> T:
     """Run ``job`` on a worker thread and never leave it writing on its own.
 
     ``await asyncio.to_thread(...)`` submits the job before it suspends, so a cancellation —
@@ -919,8 +985,18 @@ async def _joined_to_thread[T](job: Callable[[], T]) -> T:
     while the thread carries on committing, and the :class:`SyncLock` the caller releases on its
     way out no longer covers it. The job is shielded from the cancellation and joined through a
     plain :class:`threading.Event` instead: the wait needs no ``await``, which a cancelled scope
-    would raise out of immediately, and it is bounded, so a thread that hangs stalls the unwind
-    for :data:`JOIN_TIMEOUT` at the most.
+    would raise out of immediately.
+
+    The wait has no bound, it only logs every :data:`JOIN_LOG_EVERY` seconds. A bound would give
+    the lock up over a live writer exactly when the writer is slowest — the rebuild of a huge
+    chat, an embedding backlog — which is the case it exists for; the next process would then
+    start syncing, removing or embedding against a database this one is still writing. ``abort``
+    is what keeps the wait short instead: it asks the job to stop at its next boundary
+    (:meth:`SyncBudget.cancel` for the embedding step, which checks the budget between batches),
+    while the indexing step is a single transaction that ends on its own. A writer is detached
+    only when the process is killed outright, and then the ``messages.indexed`` flags its
+    transaction never cleared make the next run rebuild and repair what it left
+    (:func:`index_pending`, :func:`grepogram.index.repair_unit_index`).
     """
     finished = threading.Event()
 
@@ -934,11 +1010,12 @@ async def _joined_to_thread[T](job: Callable[[], T]) -> T:
     try:
         return await asyncio.shield(future)
     except BaseException:
-        if not finished.wait(JOIN_TIMEOUT):
+        if abort is not None:
+            abort()
+        while not finished.wait(JOIN_LOG_EVERY):
             log.warning(
-                "a background index job has not finished after %ss; "
-                "the sync lock is released while it runs on",
-                JOIN_TIMEOUT,
+                "a background index job is still running after the run was cancelled; "
+                "the sync lock is held until it finishes"
             )
         raise
 
@@ -1013,12 +1090,16 @@ async def _embed_after_sync(
     """Embed what the sync left dirty, off the event loop so the client's keepalives run on.
 
     Joined like the indexing step (:func:`_joined_to_thread`): a cancelled run releases the
-    :class:`SyncLock` only once the worker thread has stopped writing vectors.
+    :class:`SyncLock` only once the worker thread has stopped writing vectors. This is the long
+    job of the two, so the cancellation expires the budget it paces itself against
+    (:meth:`SyncBudget.cancel`) and it stops after the batch it is on rather than after the
+    backlog.
     """
     warnings = list(report.warnings)
     try:
         embedded = await _joined_to_thread(
-            functools.partial(index.embed_dirty_units, conn, embedder, budget=budget)
+            functools.partial(index.embed_dirty_units, conn, embedder, budget=budget),
+            budget.cancel,
         )
     except index.EmbeddingSpaceMismatch as exc:
         log.warning("dense index not updated: %s", exc)
