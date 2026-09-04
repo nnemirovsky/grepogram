@@ -1,45 +1,65 @@
-# grepogram
+# :mag: grepogram — Semantic Search for Your Telegram Chats
 
-grepogram is a local search engine over the Telegram chats you opt in to, exposed to Claude Code
-as an MCP server (plus a CLI). It syncs messages through the Telegram user API (Telethon), stores
-them in one SQLite file, groups them into conversation-sized units (time windows, reply threads,
-channel posts), indexes those units lexically (FTS5 with Russian and English stemming) and densely
-(sqlite-vec with `bge-m3` vectors computed on the local GPU), fuses both rankings with Reciprocal
-Rank Fusion, reranks with a local cross-encoder, and returns hits with deep links that open the
-original message in Telegram.
+[![ci](https://github.com/nnemirovsky/grepogram/actions/workflows/ci.yml/badge.svg)](https://github.com/nnemirovsky/grepogram/actions/workflows/ci.yml)
+[![release](https://img.shields.io/github/v/release/nnemirovsky/grepogram)](https://github.com/nnemirovsky/grepogram/releases/latest)
+[![python](https://img.shields.io/badge/python-3.12-blue)](pyproject.toml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-Claude Code is the language model. grepogram has no API token, no hosted service and no telemetry;
-the embedding and reranking models run on your machine.
+Ask your Telegram history a real question and get the conversation that answers it — the whole
+thread, when it was said, and a link that opens the message in Telegram.
 
-## The problem
+## Why grepogram
 
-Telegram's built-in search matches exact words: `счёт` does not find `счета`, `bank` does not
-find `banks`, and a paraphrase finds nothing. Community chats — expat groups, city chats, hobby
-groups — hold answers that no web page has ("how do I open a bank account here without a DNI",
-"which SIM works in the mountains", "is the visa run still possible after the June change"), but
-those answers sit in reply chains, spread over several messages, in two languages, and they go
-stale. Vector search over single messages does not fix this: a single message is too short to
-embed, and the answer usually hinges on an exact token (a bank name, `ВНЖ`, `CUIT`).
+Community chats are where the answers live. Expat groups, city chats, hobby groups hold things no
+web page does — how to open a bank account here without a DNI, which SIM works in the mountains,
+whether the visa run still works after the June rules. Finding any of it again is the hard part.
 
-grepogram indexes conversations rather than messages, combines exact-token search with semantic
-search, filters by date, and hands Claude a playbook for using the tools: run several query
-variants, read the thread before concluding, cite a link per claim.
+**The problem:** Telegram matches exact words. `счёт` misses `счета`, `bank` misses `banks`, and a
+paraphrase misses everything. The answers that matter are worse than a single keyword away: they
+sit in reply chains, spread across several messages, switch between two languages, and go stale
+after a rule change. Embedding single messages does not rescue this either — one chat message is
+too short to carry meaning, and the answer usually turns on an exact token anyway: a bank name,
+`ВНЖ`, `CUIT`.
 
-## How it works
+**The solution:** grepogram indexes *conversations*, not messages. It syncs the chats you opt in
+to through the Telegram user API, groups them into conversation-sized units — time windows, reply
+threads, channel posts — and indexes every unit twice: lexically with FTS5 and Russian/English
+stemming, so exact tokens still win, and densely with `bge-m3` vectors, so a paraphrase lands.
+Both rankings are fused with Reciprocal Rank Fusion, re-scored by a local cross-encoder, and
+returned with dates and deep links. An MCP server hands those tools to your agent along with a
+playbook for using them: run several query variants, read the thread before concluding, cite a
+link per claim.
 
+Your agent supplies the reasoning; grepogram supplies the retrieval. Both models run on your
+machine, and every message, vector and query stays in a SQLite file you own.
+
+## How It Works
+
+```mermaid
+flowchart TD
+    TG["Telegram — your account, via Telethon"]
+    MSG["messages"]
+    UNITS["units — windows · reply threads · channel posts"]
+    FTS["msg_fts · unit_fts<br/>FTS5, raw + Snowball ru/en stems"]
+    VEC["unit_vec<br/>sqlite-vec, bge-m3 1024-d, local GPU"]
+    Q["query + filters (chats, folders, dates)"]
+    FUSE["RRF fusion → cross-encoder rerank → dedup"]
+    HITS["hits — snippet, date range, deep link"]
+
+    TG -->|"sync: messages after last_msg_id,<br/>re-read of the newest edits"| MSG
+    MSG --> UNITS
+    UNITS --> FTS
+    UNITS --> VEC
+    Q --> FTS
+    Q --> VEC
+    FTS --> FUSE
+    VEC --> FUSE
+    FUSE --> HITS
 ```
- Telegram (your account, via Telethon)
-     │  sync: new messages after last_msg_id, re-read of the newest edits
-     ▼
- messages ──▶ units: windows · threads · posts
- (SQLite)         │
-                  ├──▶ msg_fts, unit_fts   FTS5, raw + stemmed text (Snowball ru/en)
-                  └──▶ unit_vec            sqlite-vec, bge-m3 vectors (local GPU)
-                                │
- query ─▶ filters ─▶ BM25 lists + KNN list ─▶ RRF ─▶ cross-encoder rerank ─▶ dedup ─▶ hits + links
-                                │
-      Claude Code ◀── MCP over stdio ── grepogram-mcp         grepogram CLI
-```
+
+Two front ends share that index: `grepogram-mcp`, a stdio MCP server for Claude Code, Cursor,
+Codex or any other MCP client, and the `grepogram` CLI for the same searches in a terminal.
+Everything lives in one SQLite file.
 
 ## Requirements
 
@@ -53,14 +73,14 @@ variants, read the thread before concluding, cite a link per claim.
 - Optional: about 4.5 GB of disk for the two models (`BAAI/bge-m3`, `BAAI/bge-reranker-v2-m3`),
   downloaded from Hugging Face on first use. Without them every search runs lexical-only.
 
-## Setup in five minutes
+## Setup in Five Minutes
 
 1. Create an application at https://my.telegram.org/apps and note the `api_id` and `api_hash`.
 
 2. Install. Either as a tool, from a checkout:
 
    ```sh
-   git clone <this repository> grepogram
+   git clone https://github.com/nnemirovsky/grepogram
    cd grepogram
    uv tool install '.[dense]'     # or `uv tool install .` for lexical-only search
    ```
@@ -109,7 +129,8 @@ variants, read the thread before concluding, cite a link per claim.
    grepogram search "открыть счёт без DNI"
    ```
 
-7. Register the MCP server in Claude Code. With a checkout at `<path>`:
+7. Connect your agent. `grepogram-mcp` speaks MCP over stdio, so any client that launches a
+   command works. In Claude Code, with a checkout at `<path>`:
 
    ```sh
    claude mcp add grepogram -s user -- uv run --project <path> grepogram-mcp
@@ -121,16 +142,24 @@ variants, read the thread before concluding, cite a link per claim.
    claude mcp add grepogram -s user -- "$(uv tool dir --bin)/grepogram-mcp"
    ```
 
-   Start `claude`, check `/mcp` shows `grepogram` connected, and ask something like "what do
-   people in the Argentina chat say about opening a bank account without a DNI?". The first
-   search downloads the reranker if it is not cached yet.
+   Clients that take a JSON config (Cursor, Windsurf, Codex and others) want the same command:
+
+   ```json
+   {
+     "mcpServers": {
+       "grepogram": { "command": "/absolute/path/to/grepogram-mcp", "args": [] }
+     }
+   }
+   ```
+
+   Then ask something like "what do people in the Argentina chat say about opening a bank account
+   without a DNI?". The first search downloads the reranker if it is not cached yet.
 
 Run `grepogram sync` whenever you want the index current; the MCP `search` tool also refreshes an
 index older than an hour on its own (see below). A `launchd` job or a cron entry calling
 `grepogram sync --budget 300` works fine next to a running MCP server: only one sync runs at a
 time, and the two never contend for the session file.
-
-## CLI reference
+## CLI Reference
 
 Global options: `--version`, `--verbose` / `-v` (DEBUG logging). Command output goes to stdout,
 diagnostics and logs to stderr and the log file.
@@ -147,7 +176,7 @@ diagnostics and logs to stderr and the log file.
 | `grepogram sync [--budget S]` | fetch new messages from every source, rebuild units, index and embed; stops cleanly after `S` seconds (at least 1) |
 | `grepogram embed [--reembed]` | embed units the dense index does not hold yet; `--reembed` drops every vector and starts over (needed after changing `[models] embed`); refuses while a sync is running |
 | `grepogram search <query> …` | search the index, see below |
-| `grepogram-mcp [-v]` | the MCP server over stdio (what Claude Code launches) |
+| `grepogram-mcp [-v]` | the MCP server over stdio (what an MCP client launches) |
 
 Chat ids are negative for groups, supergroups and channels (`-100…`); when one is a positional
 argument, put `--` before it: `grepogram sources add --since 2024-01-01 -- -1001234567890`.
@@ -167,12 +196,12 @@ argument, put `--` before it: `grepogram sources add --since 2024-01-01 -- -1001
 Text output prints one block per hit — rank, score, unit kind, chat, UTC date range, the deep link
 (and a fallback link for private chats), then the snippet.
 
-## MCP tools
+## MCP Tools
 
 The server is named `grepogram`. Every tool returns one JSON object. Expected failures — no
 session, another sync running, an unknown chat or message, a model that cannot load, an
 ambiguous target — come back as `{"error": …, "hint": …}` (plus `candidates` when there is
-something to choose from) rather than a tool error, so Claude can act on them. `warnings` are
+something to choose from) rather than a tool error, so the agent can act on them. `warnings` are
 advisory; the data next to them is valid.
 
 | tool | arguments | returns |
@@ -190,7 +219,7 @@ advisory; the data next to them is valid.
 Messages in `thread` and `context` have `msg_id`, `date`, `from_name`, `text` (a `[photo]`-style
 placeholder for media without a caption), `url`, `fallback_url` and `reply_to_msg_id`.
 
-The server's `instructions` tell Claude how to use the tools: run two or three query variants
+The server's `instructions` tell the agent how to use the tools: run two or three query variants
 (Russian and English, the specific term and the concept, synonyms), prefer `lexical` for exact
 tokens such as bank names or IDs, prefer recent hits for anything regulatory or price-related and
 state the date of the evidence, call `thread` or `context` before concluding from a snippet, cite
@@ -198,7 +227,7 @@ the hit's `url` per claim, say so when nothing relevant comes back, and use `sou
 / `sources_add` / `sync` when the user names a chat that is not indexed yet.
 
 The server re-reads `config.toml` when the file changes, so a source added with the CLI while
-Claude Code runs is picked up by the next tool call. Every change to the file — by the server or
+an agent session runs is picked up by the next tool call. Every change to the file — by the server or
 by `grepogram sources add` / `rm` in a terminal — is a read-modify-write under `config.lock`, so
 one side's save never undoes the other's. Models are loaded once per server process; a model that
 fails to load is not retried until the server restarts.
@@ -278,7 +307,7 @@ swaps both models for deterministic fakes (tests and CI only). `GREPOGRAM_NO_OPE
 `open_message` return the link without launching anything; the test environment sets it, so
 nothing run under it can open Telegram or a browser on the machine.
 
-## How search works
+## How Search Works
 
 **Units.** Single messages are too short to embed, and the answer to a question usually spans
 several of them. The index therefore holds *units*: per chat (and per forum topic) the history is
@@ -393,7 +422,7 @@ on one file would block each other for the SQLite busy timeout and then fail wit
 locked`. A cron `grepogram sync` and the MCP server therefore never get in each other's way, and
 a session created with `grepogram auth` while the server runs is picked up by its next call.
 
-## Files and privacy
+## Files and Privacy
 
 | file | purpose | mode |
 |---|---|---|
@@ -409,16 +438,17 @@ Directories are created with mode 0700. The session file grants full access to t
 account; treat it like a password and delete it (or terminate the session in Telegram's settings)
 when you stop using grepogram.
 
-What leaves the machine: MTProto traffic to Telegram from your own account (the same requests a
-client makes when you scroll a chat), and one download per model from `huggingface.co` when the
-`dense` extra is installed. Nothing else. Message text, embeddings, queries and results stay in
-the SQLite file and in the conversation with Claude Code on your machine; the log never contains
-message text above DEBUG level (text is replaced with its length and a short digest). There is no
-API key for any language model in the project: the model is whatever runs Claude Code. The one
-thing grepogram launches is macOS `open`, for `open_message`; `GREPOGRAM_NO_OPEN=1` turns that
-into returning the link.
+Two kinds of traffic leave the machine: MTProto requests to Telegram from your own account — the
+same ones a client makes when you scroll a chat — and a single download per model from
+`huggingface.co` the first time the `dense` extra needs one. Message text, embeddings, queries and
+results stay in the SQLite file and in the conversation with your agent, both on your machine.
+Embedding and reranking run locally, so a search costs a Telegram round trip at most; the language
+model is whichever agent you connect, and grepogram itself needs only your Telegram credentials.
+Logs keep message text below DEBUG level, where it is replaced by its length and a short digest.
+The one thing grepogram launches is macOS `open`, for `open_message`; `GREPOGRAM_NO_OPEN=1` makes
+that return the link instead.
 
-## Local model throughput
+## Local Model Throughput
 
 Measured with `uv run pytest -m slow` on an Apple M1 Pro (16 GB) with both models already in
 the Hugging Face cache (`HF_HUB_OFFLINE=1`), fp16 on MPS, `max_seq_length = 512`:
@@ -432,7 +462,7 @@ Loading takes about 8 s for the embedder and 3.5 s for the reranker, once per pr
 rates a query has its 40 candidates reranked in about a second, and 10 000 units embed in about
 four minutes.
 
-## Known limitations
+## Known Limitations
 
 - Deep links into private chats and legacy groups use the `tg://openmessage` scheme, which
   Telegram's mobile apps honour; the desktop apps open the conversation through the
