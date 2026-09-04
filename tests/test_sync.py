@@ -1282,7 +1282,7 @@ async def test_rows_stranded_in_an_unlinked_group_are_rebuilt_by_the_sweep(
 async def test_the_stranded_sweep_repairs_at_most_its_limit_of_chats_per_run(
     conn: sqlite3.Connection, paths: Paths
 ) -> None:
-    """A backlog — every row is flagged right after the schema v2 upgrade — heals over a few
+    """A backlog — a killed run leaves every chat it had reached flagged — heals over a few
     runs instead of turning one into a full rebuild; chats are taken in id order."""
     client = _news_client()
     cfg = _cfg(NEWS_SOURCE)

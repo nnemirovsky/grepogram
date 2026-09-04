@@ -1111,10 +1111,10 @@ async def index_stranded(
     where the work is whatever stranded it (:func:`grepogram.db.chats_with_unindexed`), and this
     is the sweep that acts on it.
 
-    At most ``limit`` chats per run, in id order, so a database with a wide backlog — every row
-    is flagged right after the schema v2 upgrade — heals over a few runs instead of turning each
-    one into a full rebuild. It runs after the per-chat passes, which have cleared the run's own
-    chats by then, so what is left is genuinely stranded.
+    At most ``limit`` chats per run, in id order, so a database with a wide backlog — a run
+    killed mid-rebuild leaves every chat it had reached flagged — heals over a few runs instead
+    of turning each one into a full rebuild. It runs after the per-chat passes, which have
+    cleared the run's own chats by then, so what is left is genuinely stranded.
     """
     for chat_id in db.chats_with_unindexed(conn)[:limit]:
         chat = db.get_chat(conn, chat_id)
