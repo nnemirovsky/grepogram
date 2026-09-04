@@ -84,7 +84,14 @@ class Paths:
         return cls.macos_default(Path.home())
 
     def ensure_dirs(self) -> None:
-        """Create every directory with mode 0700; safe to call repeatedly."""
+        """Create the directories that do not exist yet with mode 0700; safe to call repeatedly.
+
+        A directory that already exists — a ``GREPOGRAM_HOME`` the user made, say — keeps its
+        mode: grepogram protects what it creates and leaves other people's directories alone.
+        """
         for directory in self.directories:
-            directory.mkdir(mode=DIR_MODE, parents=True, exist_ok=True)
+            try:
+                directory.mkdir(mode=DIR_MODE, parents=True)
+            except FileExistsError:
+                continue
             directory.chmod(DIR_MODE)

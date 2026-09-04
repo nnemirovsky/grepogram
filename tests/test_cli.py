@@ -9,10 +9,10 @@ import pytest
 import typer
 from typer.testing import CliRunner
 
-from grepogram import __version__, cli, config, db
+from grepogram import __version__, cli, config, db, index, units
 from grepogram.config import TEMPLATE
 from grepogram.log import shutdown_logging
-from grepogram.models import Config
+from grepogram.models import ChatRow, Config, MessageRow
 from grepogram.paths import Paths
 
 runner = CliRunner()
@@ -210,3 +210,53 @@ def test_fail_writes_to_stderr_and_exits(capsys: pytest.CaptureFixture[str]) -> 
     captured = capsys.readouterr()
     assert captured.out == ""
     assert captured.err == "error: nope\n"
+
+
+# --- added by the review fixes --------------------------------------------------------------
+
+
+def test_load_creates_the_home_on_a_fresh_machine(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "none" / "yet"
+    monkeypatch.setenv("GREPOGRAM_HOME", str(home))
+    paths, cfg, conn = cli._load()
+    try:
+        assert paths.db_file.is_file() and cfg == Config()
+        assert _mode(home) == 0o700
+    finally:
+        conn.close()
+    result = runner.invoke(cli.app, ["sources", "ls"])
+    assert result.exit_code == 0, result.output
+    assert "no sources configured" in result.stdout
+
+
+@pytest.mark.parametrize(
+    ("start", "end", "expected"),
+    [
+        (1_705_314_600, 1_705_318_200, "2024-01-15 10:30–11:30 UTC"),
+        (1_705_314_600, 1_705_401_000, "2024-01-15 10:30 – 2024-01-16 10:30 UTC"),
+    ],
+    ids=["same-day", "across-days"],
+)
+def test_span_formats_same_day_and_multi_day_ranges(start: int, end: int, expected: str) -> None:
+    assert cli._span(start, end) == expected
+
+
+def test_search_text_output_prints_the_fallback_link_for_private_chats(tmp_home: Path) -> None:
+    paths = Paths.from_env()
+    conn = db.connect(paths)
+    try:
+        db.migrate(conn)
+        chat = db.upsert_chat(conn, ChatRow(id=7, type="user", title="Bob", source_id="chat:7"))
+        ids = db.upsert_messages(
+            conn, [MessageRow(chat_id=7, msg_id=9, date=1_705_314_600, text="hello there")]
+        )
+        delta = units.rebuild_for_chat(conn, chat, Config(), ids)
+        index.index_chat(conn, chat, ids, delta)
+    finally:
+        conn.close()
+    result = runner.invoke(cli.app, ["search", "hello", "--mode", "lexical", "--no-rerank"])
+    assert result.exit_code == 0, result.output
+    assert "   tg://openmessage?user_id=7&message_id=9" in result.stdout
+    assert "   fallback: tg://user?id=7" in result.stdout

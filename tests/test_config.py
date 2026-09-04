@@ -1,4 +1,5 @@
 import logging
+import os
 import re
 import stat
 import sys
@@ -153,6 +154,7 @@ def test_unknown_key_names_the_key(text: str, key: str) -> None:
         ("[[sources]]\nfolder = 'x'\ncomments = 'yes'\n", r"sources\[0\].comments"),
         ("search = 1\n", "search"),
         ("sources = 1\n", "sources"),
+        ("sources = [1]\n", r"sources\[0\]"),
     ],
 )
 def test_wrong_type_names_the_key(text: str, key: str) -> None:
@@ -161,7 +163,8 @@ def test_wrong_type_names_the_key(text: str, key: str) -> None:
 
 
 def test_float_field_accepts_integer_literal() -> None:
-    assert config.loads("[search]\ndedup_overlap = 1\n").search.dedup_overlap == 1.0
+    value = config.loads("[search]\ndedup_overlap = 1\n").search.dedup_overlap
+    assert value == 1.0 and isinstance(value, float)
 
 
 @pytest.mark.parametrize(
@@ -260,3 +263,40 @@ def test_redact_hides_content_but_stays_stable() -> None:
     assert out != redact(text + "!")
     assert out.startswith(f"<{len(text)} chars #")
     assert redact("") == redact(None) == "<empty>"
+
+
+# --- added by the review fixes --------------------------------------------------------------
+
+
+def test_ensure_dirs_leaves_an_existing_directory_alone(tmp_path: Path) -> None:
+    paths = Paths.macos_default(tmp_path / "home")
+    paths.log_dir.mkdir(parents=True)
+    paths.log_dir.chmod(0o755)
+    paths.ensure_dirs()
+    assert _mode(paths.log_dir) == 0o755
+    assert _mode(paths.config_file.parent) == 0o700
+    assert _mode(paths.db_file.parent) == 0o700
+
+
+def test_save_creates_the_directories_on_a_fresh_machine(tmp_path: Path) -> None:
+    paths = Paths.under(tmp_path / "new" / "home")
+    config.save(Config(telegram=TelegramCfg(api_id=1, api_hash="h")), paths)
+    assert config.load(paths).telegram.api_id == 1
+    assert _mode(paths.config_file) == 0o600
+    assert _mode(paths.config_file.parent) == 0o700
+
+
+def test_write_private_cleans_up_when_writing_fails(
+    paths: Paths, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    paths.config_file.write_text("original")
+
+    def broken(fd: int, *args: object, **kwargs: object) -> object:
+        os.close(fd)
+        raise OSError("disk full")
+
+    monkeypatch.setattr(os, "fdopen", broken)
+    with pytest.raises(OSError, match="disk full"):
+        config.write_private(paths.config_file, "new")
+    assert paths.config_file.read_text() == "original"
+    assert list(paths.config_file.parent.iterdir()) == [paths.config_file]
