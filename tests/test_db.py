@@ -804,6 +804,58 @@ def test_open_window_is_the_last_window_of_the_topic(conn: sqlite3.Connection) -
     assert db.open_window(conn, 2, None) is None
 
 
+def test_windowed_msg_ids_is_membership_within_the_topic(conn: sqlite3.Connection) -> None:
+    """A window over 1, 2 and 25 spans 3..24 without holding them; only listed ids count."""
+    db.upsert_chat(conn, _chat(1))
+    db.insert_units(
+        conn,
+        [
+            _unit(1, [1, 2, 25]),
+            _unit(1, [40, 41]),
+            _unit(1, [3, 4], topic_id=9),
+            _unit(1, [5, 6], kind="thread"),
+        ],
+    )
+    assert db.windowed_msg_ids(conn, 1, None, range(1, 45)) == {1, 2, 25, 40, 41}
+    assert db.windowed_msg_ids(conn, 1, None, [3, 4, 5, 6]) == set()
+    assert db.windowed_msg_ids(conn, 1, 9, [3, 4, 5]) == {3, 4}
+    assert db.windowed_msg_ids(conn, 1, None, []) == set()
+    assert db.windowed_msg_ids(conn, 2, None, [1]) == set()
+
+
+def test_window_before_and_windows_from(conn: sqlite3.Connection) -> None:
+    db.upsert_chat(conn, _chat(1))
+    ids = db.insert_units(
+        conn,
+        [
+            _unit(1, [1, 2]),
+            _unit(1, [10, 12]),
+            _unit(1, [30]),
+            _unit(1, [5], topic_id=9),
+            _unit(1, [11], kind="thread"),
+        ],
+    )
+
+    def before(msg_id: int, topic_id: int | None = None) -> int | None:
+        unit = db.window_before(conn, 1, topic_id, msg_id)
+        return None if unit is None else unit.id
+
+    assert before(0) is None
+    assert before(1) == ids[0]
+    assert before(3) == ids[0]
+    assert before(10) == ids[1]
+    assert before(11) == ids[1]
+    assert before(99) == ids[2]
+    assert before(5) == ids[0]
+    assert before(5, 9) == ids[3]
+    assert [u.id for u in db.windows_from(conn, 1, None, 0)] == ids[:3]
+    assert [u.id for u in db.windows_from(conn, 1, None, 2)] == ids[:3]
+    assert [u.id for u in db.windows_from(conn, 1, None, 3)] == ids[1:3]
+    assert [u.id for u in db.windows_from(conn, 1, None, 12)] == ids[1:3]
+    assert db.windows_from(conn, 1, None, 31) == []
+    assert [u.id for u in db.windows_from(conn, 1, 9, 1)] == [ids[3]]
+
+
 def test_threads_touching_matches_any_listed_message(conn: sqlite3.Connection) -> None:
     db.upsert_chat(conn, _chat(1))
     db.upsert_chat(conn, _chat(2))

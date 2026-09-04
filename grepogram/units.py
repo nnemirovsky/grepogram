@@ -355,9 +355,12 @@ def rebuild_for_chat(
     ``new_msg_ids`` are what a sync reports: inserted and edited rows alike. Windows: for every
     touched ``(chat, topic)`` the open window — the last one — is deleted and re-cut from its
     ``msg_id_start`` over everything stored since, so a message that continues it joins it and
-    one after a long pause starts the next. Closed windows are never re-cut: an edit to a
-    message inside one does not reach that window's text (a v1 limitation), though it still
-    rebuilds the reply thread the message belongs to. Threads: every thread reachable from a
+    one after a long pause starts the next; a changed message that arrived below the open window
+    and that no window holds yet (comments a channel stored ahead of its group's history, a late
+    comment on an old post) re-cuts from the window before it instead (:func:`_recut_windows`).
+    Closed windows are never re-cut for an edit: a changed text inside one does not reach that
+    window (a v1 limitation), though it still rebuilds the reply thread the message belongs to.
+    Threads: every thread reachable from a
     changed message — walking up ``reply_to_msg_id`` to the root — is rebuilt with all its
     replies. Channels: the ``post`` units (and post threads, when comments are on) of the changed
     posts are rebuilt. Units whose content did not change keep their row and embedding; the
@@ -378,7 +381,7 @@ def _rebuild_conversation(
     stale: list[UnitRow] = []
     fresh: list[UnitRow] = []
     for topic_id, group in group_by_topic(chat, changed).items():
-        old, new = _recut_open_window(conn, chat, cfg.units, topic_id, group)
+        old, new = _recut_windows(conn, chat, cfg.units, topic_id, group)
         stale += old
         fresh += new
     old, new = _rebuild_threads(conn, chat, cfg.units, changed)
@@ -394,33 +397,81 @@ def _rebuild_posts(
     return _apply(conn, stale, fresh)
 
 
-def _recut_open_window(
+def _recut_windows(
     conn: sqlite3.Connection,
     chat: ChatRow,
     cfg: UnitsCfg,
     topic_id: int | None,
     changed: Sequence[MessageRow],
 ) -> tuple[list[UnitRow], list[UnitRow]]:
-    """The open window of ``(chat, topic)`` and its replacements, cut over the messages since
-    its start; nothing when every changed message sits inside a closed window."""
+    """The windows of ``(chat, topic)`` a rebuild replaces and their replacements.
+
+    The recut starts at the open window — the last one — and runs over every message stored
+    from its ``msg_id_start`` on, so a message that continues it joins it and one after a long
+    pause starts the next; nothing is recut when every changed message sits inside a closed
+    window. Messages do not always arrive in id order, though: a channel stores a comment in its
+    discussion group before the group's own history reaches that id, and a late comment on an
+    old post lands below comments already windowed. A changed message that no window holds and
+    that lies below the open window's start therefore moves the start down to the window before
+    it (:func:`_recut_start`), and every window from there on is recut.
+    """
     window = db.open_window(conn, chat.id, topic_id)
-    start = None if window is None else window.msg_id_start
-    if start is not None and all(msg.msg_id < start for msg in changed):
+    if window is None:
+        return [], cut_windows(_stored_since(conn, chat, topic_id, None), cfg, chat.id, topic_id)
+    start = _recut_start(conn, chat.id, topic_id, window, changed)
+    if start is None:
         return [], []
+    stale = db.windows_from(conn, chat.id, topic_id, start)
+    return stale, cut_windows(_stored_since(conn, chat, topic_id, start), cfg, chat.id, topic_id)
+
+
+def _recut_start(
+    conn: sqlite3.Connection,
+    chat_id: int,
+    topic_id: int | None,
+    window: UnitRow,
+    changed: Sequence[MessageRow],
+) -> int | None:
+    """Where the recut of ``(chat, topic)`` begins given its open ``window``; ``None`` when
+    every changed message is held by a closed window.
+
+    Normally the open window's start. When a changed message no window holds lies below it,
+    the start of the window before that message — its boundary depends only on older messages,
+    which are all in place — or the message itself when no window precedes it.
+    """
+    ids = sorted({msg.msg_id for msg in changed})
+    held = db.windowed_msg_ids(conn, chat_id, topic_id, ids)
+    loose = next((msg_id for msg_id in ids if msg_id not in held), None)
+    if loose is not None and loose < window.msg_id_start:
+        before = db.window_before(conn, chat_id, topic_id, loose)
+        return loose if before is None else before.msg_id_start
+    if ids[-1] < window.msg_id_start:
+        return None
+    return window.msg_id_start
+
+
+def _stored_since(
+    conn: sqlite3.Connection, chat: ChatRow, topic_id: int | None, start: int | None
+) -> list[MessageRow]:
+    """The messages of ``(chat, topic)`` from ``start`` on (everything when ``None``)."""
     if chat.is_forum:
-        messages = db.get_messages_in_topic(conn, chat.id, topic_id, since_msg_id=start)
-    else:
-        messages = db.get_messages(conn, chat.id, since_msg_id=start)
-    stale = [] if window is None else [window]
-    return stale, cut_windows(messages, cfg, chat.id, topic_id)
+        return db.get_messages_in_topic(conn, chat.id, topic_id, since_msg_id=start)
+    return db.get_messages(conn, chat.id, since_msg_id=start)
 
 
 def _rebuild_threads(
     conn: sqlite3.Connection, chat: ChatRow, cfg: UnitsCfg, changed: Sequence[MessageRow]
 ) -> tuple[list[UnitRow], list[UnitRow]]:
-    """The thread units the changed messages belong to and their rebuilt replacements."""
+    """The thread units the changed messages belong to and their rebuilt replacements.
+
+    Stale are the units holding a changed message or any member of a rebuilt thread — not only
+    its root: when a root arrives after its replies (the group's copy of a post, stored after
+    the comments the channel put under it), the unit its first reply used to head shares no
+    message with the changed root and would linger next to the rebuilt thread otherwise.
+    """
     threads = _thread_members(conn, chat.id, changed)
-    touched = [msg.msg_id for msg in changed] + list(threads)
+    touched = [msg.msg_id for msg in changed]
+    touched += [member.msg_id for members in threads.values() for member in members]
     stale = db.threads_touching(conn, chat.id, touched)
     fresh = [
         unit

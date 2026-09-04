@@ -254,6 +254,73 @@ def test_messages_without_a_window_are_covered_on_the_next_rebuild(
     assert [u.msg_ids for u in db.get_units(conn, chat.id)] == [[1, 2, 3]]
 
 
+def test_messages_below_the_open_window_recut_from_the_window_before_them(
+    conn: sqlite3.Connection, chat: ChatRow
+) -> None:
+    """Rows stored out of id order — the comments a channel puts into its discussion group
+    before the group's own history gets there — must not stay outside every window."""
+    _sync(conn, chat, [_msg(1, 0), _msg(2, 1)])
+    (later,) = _sync(conn, chat, [_msg(25, 120)]).inserted_ids
+    delta = _sync(conn, chat, [_msg(i, i) for i in range(3, 21)])
+    windows = _by_msg_ids(conn, "window")
+    assert sorted(windows) == [
+        (1, 2, 3, 4, 5),
+        (6, 7, 8, 9, 10),
+        (11, 12, 13, 14, 15),
+        (16, 17, 18, 19, 20),
+        (25,),
+    ]
+    assert windows[(25,)].id == later and later not in delta.deleted_ids
+    assert all(db.containing_unit(conn, chat.id, i, None) is not None for i in range(1, 21))
+    assert _stored(conn) == _expected(conn, chat)
+
+
+def test_late_message_between_closed_windows_joins_the_window_before_it(
+    conn: sqlite3.Connection, chat: ChatRow
+) -> None:
+    """A late comment on an old post lands below comments that are already windowed."""
+    _sync(conn, chat, [_msg(1, 0), _msg(2, 1)])
+    (later,) = _sync(conn, chat, [_msg(25, 120)]).inserted_ids
+    delta = _sync(conn, chat, [_msg(22, 10)])
+    windows = _by_msg_ids(conn, "window")
+    assert sorted(windows) == [(1, 2, 22), (25,)]
+    assert windows[(25,)].id == later and len(delta.deleted_ids) == 1
+    assert _stored(conn) == _expected(conn, chat)
+
+
+def test_messages_spanned_by_a_closed_window_but_not_held_are_recut_into_it(
+    conn: sqlite3.Connection, chat: ChatRow
+) -> None:
+    """Range is not membership: a window cut over 1, 2 and 25 spans 3..20 without holding them,
+    and a later window makes it a closed one."""
+    _sync(conn, chat, [_msg(1, 0), _msg(2, 1), _msg(25, 25)])
+    _sync(conn, chat, [_msg(40, 200)])
+    assert sorted(_by_msg_ids(conn, "window")) == [(1, 2, 25), (40,)]
+    _sync(conn, chat, [_msg(i, i) for i in range(3, 21)])
+    assert sorted(_by_msg_ids(conn, "window")) == [
+        (1, 2, 3, 4, 5),
+        (6, 7, 8, 9, 10),
+        (11, 12, 13, 14, 15),
+        (16, 17, 18, 19, 20),
+        (25,),
+        (40,),
+    ]
+    assert _stored(conn) == _expected(conn, chat)
+
+
+def test_out_of_order_forum_messages_recut_their_own_topic_only(conn: sqlite3.Connection) -> None:
+    forum = db.upsert_chat(conn, _chat(is_forum=True))
+    _sync(conn, forum, [_msg(1, 0, topic_id=5), _msg(2, 1, topic_id=8)])
+    _sync(conn, forum, [_msg(30, 100, topic_id=5), _msg(31, 101, topic_id=8)])
+    ids = _ids_by_shape(conn)
+    _sync(conn, forum, [_msg(10, 5, topic_id=5)])
+    windows = _by_msg_ids(conn, "window")
+    assert {k: u.topic_id for k, u in windows.items()} == {(1, 10): 5, (30,): 5, (2,): 8, (31,): 8}
+    assert windows[(2,)].id == ids[_shape_of(windows[(2,)])]
+    assert windows[(31,)].id == ids[_shape_of(windows[(31,)])]
+    assert _stored(conn) == _expected(conn, forum)
+
+
 # --- threads ---------------------------------------------------------------------------------
 
 
@@ -275,6 +342,20 @@ def test_first_reply_turns_a_message_into_a_root(conn: sqlite3.Connection, chat:
     assert _by_msg_ids(conn, "thread") == {}
     _sync(conn, chat, [_msg(3, 2, reply_to=2)])
     assert list(_by_msg_ids(conn, "thread")) == [(2, 3)]
+
+
+def test_root_arriving_after_its_replies_replaces_the_unit_its_first_reply_headed(
+    conn: sqlite3.Connection, chat: ChatRow
+) -> None:
+    """Comments reply to the group's copy of the post, which the channel's comment fetch does
+    not return; when the group's history brings it, the thread the first comment headed so far
+    must go rather than sit next to the rebuilt one."""
+    _sync(conn, chat, [_msg(2, 1, reply_to=1), _msg(3, 2, reply_to=2)])
+    assert sorted(_by_msg_ids(conn, "thread")) == [(2, 3)]
+    delta = _sync(conn, chat, [_msg(1, 0)])
+    assert sorted(_by_msg_ids(conn, "thread")) == [(1, 2, 3)]
+    assert len(delta.deleted_ids) == 2  # the (2, 3) thread and the (2, 3) window
+    assert _stored(conn) == _expected(conn, chat)
 
 
 def test_reply_to_a_missing_parent_heads_a_thread_once_replied_to(
@@ -405,6 +486,54 @@ def test_chunked_syncs_match_a_one_pass_rebuild(conn: sqlite3.Connection, chat: 
     fresh.close()
 
 
+def _sync_shuffled(
+    conn: sqlite3.Connection,
+    chat: ChatRow,
+    rows: Sequence[MessageRow],
+    sizes: Iterable[int],
+    seed: int,
+) -> None:
+    """``rows`` in chunks of ``sizes`` (the rest in one more), stored in a random chunk order."""
+    chunks: list[Sequence[MessageRow]] = []
+    start = 0
+    for size in sizes:
+        chunks.append(rows[start : start + size])
+        start += size
+    if start < len(rows):
+        chunks.append(rows[start:])
+    random.Random(seed).shuffle(chunks)
+    for chunk in chunks:
+        if chunk:
+            _sync(conn, chat, chunk)
+
+
+@pytest.mark.parametrize("seed", [1, 2, 3])
+@pytest.mark.parametrize(
+    "sizes",
+    [[60, 60], [40, 40, 40], [1] * 120, [3, 17, 1, 50, 9, 2]],
+    ids=lambda s: "+".join(map(str, s)) if len(s) < 8 else f"{len(s)}x{s[0]}",
+)
+def test_chunks_stored_out_of_order_match_one_pass(
+    conn: sqlite3.Connection, chat: ChatRow, seed: int, sizes: list[int]
+) -> None:
+    """Comments reach a discussion group ahead of its history and late comments fall below
+    windowed ones: whatever order the chunks arrive in, the units are those of a single pass."""
+    rows = _history(120, seed)
+    _sync_shuffled(conn, chat, rows, sizes, seed)
+    assert _stored(conn) == _expected(conn, chat)
+    assert len(db.get_units(conn, chat.id)) == len(_expected(conn, chat))
+
+
+@pytest.mark.parametrize("sizes", [[40, 40], [10] * 8, [1] * 80])
+def test_chunks_stored_out_of_order_match_one_pass_in_a_forum(
+    conn: sqlite3.Connection, sizes: list[int]
+) -> None:
+    forum = db.upsert_chat(conn, _chat(is_forum=True))
+    rows = _history(80, 7, topics=(None, 5, 8))
+    _sync_shuffled(conn, forum, rows, sizes, 7)
+    assert _stored(conn) == _expected(conn, forum)
+
+
 # --- channels --------------------------------------------------------------------------------
 
 
@@ -483,6 +612,44 @@ def test_channel_with_comments_builds_post_threads_and_discussion_windows(
         ("window", None, [1, 2, 3]),
         ("thread", 10, [1, 2]),
     ]
+    assert _stored(conn, DISC) == _expected(conn, discussion)
+
+
+def test_comments_stored_ahead_of_the_group_history_leave_no_hole(conn: sqlite3.Connection) -> None:
+    """The channel syncs first and stores comments 1, 2 and 25 in the group; the group's own
+    history 3..20 then arrives below the open window and must be windowed too."""
+    _channel(conn)
+    discussion = _discussion(conn)
+    _sync(conn, discussion, [_comment(1, 10, 0), _comment(2, 10, 1), _comment(25, 12, 200)])
+    assert sorted(_by_msg_ids(conn, "window", DISC)) == [(1, 2), (25,)]
+    _sync(conn, discussion, [_msg(i, i, chat_id=DISC) for i in range(3, 21)])
+    windows = _by_msg_ids(conn, "window", DISC)
+    assert set().union(*windows) == set(range(1, 21)) | {25}
+    assert all(db.containing_unit(conn, DISC, i, None) is not None for i in range(1, 21))
+    assert _stored(conn, DISC) == _expected(conn, discussion)
+
+
+def test_late_comment_below_windowed_comments_gets_a_window(conn: sqlite3.Connection) -> None:
+    _channel(conn)
+    discussion = _discussion(conn)
+    _sync(conn, discussion, [_comment(1, 10, 0), _comment(2, 10, 1)])
+    _sync(conn, discussion, [_comment(25, 12, 200)])
+    _sync(conn, discussion, [_comment(22, 10, 10)])
+    assert sorted(_by_msg_ids(conn, "window", DISC)) == [(1, 2, 22), (25,)]
+    assert db.containing_unit(conn, DISC, 22, None) is not None
+    assert _stored(conn, DISC) == _expected(conn, discussion)
+
+
+def test_group_copy_of_a_post_arriving_after_its_comments_heads_their_thread(
+    conn: sqlite3.Connection,
+) -> None:
+    _channel(conn)
+    discussion = _discussion(conn)
+    _sync(conn, discussion, [_comment(8, 10, 1), _comment(9, 10, 2, reply_to=8)])
+    assert sorted(_by_msg_ids(conn, "thread", DISC)) == [(8, 9)]
+    _sync(conn, discussion, [_msg(7, 0, chat_id=DISC, text="post 10, forwarded")])
+    assert sorted(_by_msg_ids(conn, "thread", DISC)) == [(7, 8, 9)]
+    assert sorted(_by_msg_ids(conn, "window", DISC)) == [(7, 8, 9)]
     assert _stored(conn, DISC) == _expected(conn, discussion)
 
 

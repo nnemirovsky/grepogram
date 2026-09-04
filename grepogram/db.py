@@ -796,6 +796,54 @@ def open_window(conn: sqlite3.Connection, chat_id: int, topic_id: int | None) ->
     return None if row is None else _unit_row(row)
 
 
+def windowed_msg_ids(
+    conn: sqlite3.Connection, chat_id: int, topic_id: int | None, msg_ids: Iterable[int]
+) -> set[int]:
+    """Those of ``msg_ids`` that a window of ``(chat, topic)`` lists in its ``msg_ids``.
+
+    Membership, not range: a window cut while some ids in its span were not stored yet reaches
+    across them without holding them, and those are exactly the messages a rebuild must still
+    reach. Only windows whose range overlaps the ids are expanded.
+    """
+    found: set[int] = set()
+    for chunk in _chunks(msg_ids):
+        rows = conn.execute(
+            "SELECT json_each.value AS msg_id FROM units, json_each(units.msg_ids) "
+            "WHERE units.chat_id = ? AND units.kind = 'window' AND units.topic_id IS ? "
+            "AND units.msg_id_start <= ? AND units.msg_id_end >= ? "
+            f"AND json_each.value IN ({_marks(chunk)})",
+            [chat_id, topic_id, max(chunk), min(chunk), *chunk],
+        )
+        found.update(int(row["msg_id"]) for row in rows)
+    return found
+
+
+def window_before(
+    conn: sqlite3.Connection, chat_id: int, topic_id: int | None, msg_id: int
+) -> UnitRow | None:
+    """The window of ``(chat, topic)`` that starts last among those starting at or before
+    ``msg_id``; ``None`` when ``msg_id`` precedes every window."""
+    row = conn.execute(
+        "SELECT * FROM units WHERE chat_id = ? AND kind = 'window' AND topic_id IS ? "
+        "AND msg_id_start <= ? ORDER BY msg_id_start DESC, id DESC LIMIT 1",
+        (chat_id, topic_id, msg_id),
+    ).fetchone()
+    return None if row is None else _unit_row(row)
+
+
+def windows_from(
+    conn: sqlite3.Connection, chat_id: int, topic_id: int | None, msg_id: int
+) -> list[UnitRow]:
+    """Windows of ``(chat, topic)`` that reach ``msg_id`` or beyond (``msg_id_end >= msg_id``),
+    in ``msg_id_start`` order — the ones a recut starting at ``msg_id`` replaces."""
+    rows = conn.execute(
+        "SELECT * FROM units WHERE chat_id = ? AND kind = 'window' AND topic_id IS ? "
+        "AND msg_id_end >= ? ORDER BY msg_id_start, id",
+        (chat_id, topic_id, msg_id),
+    )
+    return [_unit_row(row) for row in rows]
+
+
 def containing_unit(
     conn: sqlite3.Connection, chat_id: int, msg_id: int, topic_id: int | None
 ) -> UnitRow | None:

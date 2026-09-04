@@ -16,7 +16,7 @@ from typer.testing import CliRunner
 from grepogram import cli, db, search, sources, sync, tg
 from grepogram.config import ConfigError
 from grepogram.log import shutdown_logging
-from grepogram.models import ChatRow, Config, Source, SyncCfg, SyncReport, TelegramCfg
+from grepogram.models import ChatRow, Config, Filters, Source, SyncCfg, SyncReport, TelegramCfg
 from grepogram.paths import Paths
 from grepogram.sync import SyncBudget, SyncInProgress, SyncLock
 from tests.fakes import FakeClient, make_channel, make_dialog, make_folder, make_group, make_user
@@ -820,6 +820,98 @@ async def test_plain_history_refetch_leaves_comments_and_their_post_ids_alone(
     assert {m.msg_id: m.topic_id for m in db.get_messages(conn, DISC_ID)} == {1: 1, 2: 1, 9: 3}
 
 
+def _busy_discussion_client(disc: types.Channel) -> FakeClient:
+    """:func:`_discussion_client` with general talk around the comments: the group's history is
+    1..20 a minute apart and 25..30 two hours later, where 1 and 2 (post 1) and 25 (post 3) are
+    the comments."""
+    disc_id = -1000000000000 - disc.id
+    history = {
+        i: tl.message(disc_id, i, f"g{i}", sender=1, date=tl.at(i if i <= 20 else 120 + i))
+        for i in [*range(1, 21), *range(25, 31)]
+    }
+    return FakeClient(
+        dialogs=[make_dialog(ALICE), make_dialog(BOB), make_dialog(NEWS), make_dialog(disc)],
+        me=ME,
+        folders=[make_folder(3, "News", include=[NEWS, disc])],
+        messages={
+            NEWS_ID: [tl.channel_post(NEWS_ID, i, f"post {i}") for i in (1, 2, 3)],
+            disc_id: list(history.values()),
+        },
+        comments={(NEWS_ID, 1): [history[1], history[2]], (NEWS_ID, 3): [history[25]]},
+        responses={
+            functions.channels.GetFullChannelRequest: _full_channel(disc.id, chats=[NEWS, disc])
+        },
+    )
+
+
+def _windows(conn: sqlite3.Connection, chat_id: int) -> list[list[int]]:
+    return sorted(u.msg_ids for u in db.get_units(conn, chat_id) if u.kind == "window")
+
+
+@pytest.mark.parametrize(
+    "disc",
+    [
+        pytest.param(DISC, id="group-first"),
+        pytest.param(
+            make_channel(199, "News chat", username="news_chat", megagroup=True),
+            id="channel-first",
+        ),
+    ],
+)
+async def test_discussion_group_history_is_windowed_whichever_side_syncs_first(
+    conn: sqlite3.Connection, paths: Paths, disc: types.Channel
+) -> None:
+    """When the channel syncs first, its comments land in the group at ids 1, 2 and 25 and
+    start the group's windows; the history 3..20 that arrives afterwards lies below the open
+    window and must still end up in windows — and therefore in search."""
+    disc_id = -1000000000000 - disc.id
+    client = _busy_discussion_client(disc)
+    report = await _run(client, conn, paths, _cfg(Source(folder="News", comments=True)))
+    assert report.warnings == [] and sorted(report.chats_done) == sorted([disc_id, NEWS_ID])
+    stored = {m.msg_id for m in db.get_messages(conn, disc_id)}
+    assert len(stored) == 26
+    windows = _windows(conn, disc_id)
+    assert windows == [list(range(1, 21)), list(range(25, 31))]
+    assert {i for ids in windows for i in ids} == stored
+    assert db.containing_unit(conn, disc_id, 10, None) is not None
+    assert [m.anchor_msg_id for m in search.lexical_messages(conn, "g10", Filters(), 10)] == [10]
+    assert [v.text for v in search.thread(conn, NEWS_ID, 1)] == ["post 1", "g1", "g2"]
+
+
+async def test_late_comment_on_an_older_post_is_windowed_in_the_group(
+    conn: sqlite3.Connection, paths: Paths
+) -> None:
+    """Run 1 stores post 1's comments (1, 2) and post 3's (25, two hours later); between the
+    runs comment 22 lands on post 1 — below the group's open window, which starts at 25."""
+    client = _news_client(
+        messages={
+            NEWS_ID: [
+                tl.channel_post(NEWS_ID, 1, "post 1", replies=2),
+                tl.channel_post(NEWS_ID, 2, "post 2"),
+                tl.channel_post(NEWS_ID, 3, "post 3", replies=1, date=tl.at(130)),
+            ]
+        },
+        comments={
+            (NEWS_ID, 1): [
+                tl.message(DISC_ID, 1, "c1", sender=1, date=tl.at(0)),
+                tl.message(DISC_ID, 2, "c2", sender=2, date=tl.at(1)),
+            ],
+            (NEWS_ID, 3): [tl.message(DISC_ID, 25, "c25", sender=1, date=tl.at(131))],
+        },
+    )
+    cfg = _cfg(NEWS_SOURCE, edit_refetch=10)
+    await _run(client, conn, paths, cfg)
+    assert _windows(conn, DISC_ID) == [[1, 2], [25]]
+    client.messages[NEWS_ID][0] = tl.channel_post(NEWS_ID, 1, "post 1", replies=3)
+    client.comments[(NEWS_ID, 1)].append(tl.message(DISC_ID, 22, "c22", sender=2, date=tl.at(10)))
+    grown = await _run(client, conn, paths, cfg)
+    assert grown.new == 1 and grown.warnings == []
+    assert _windows(conn, DISC_ID) == [[1, 2, 22], [25]]
+    assert db.containing_unit(conn, DISC_ID, 22, None) is not None
+    assert [m.anchor_msg_id for m in search.lexical_messages(conn, "c22", Filters(), 10)] == [22]
+    assert [v.text for v in search.thread(conn, NEWS_ID, 1)] == ["post 1", "c1", "c2", "c22"]
+
+
 def _big_discussion_client(count: int) -> FakeClient:
     """:func:`_discussion_client` with a group history of ``count`` messages, three of which
     are the comments of the channel's posts."""
@@ -1104,6 +1196,27 @@ async def test_sync_all_refuses_while_another_sync_holds_the_lock(
     assert _fetch_calls(client, ARG_ID) == []
     report = await _run(client, conn, paths, _cfg(ARG_SOURCE))
     assert report.chats_done == [ARG_ID]
+
+
+async def test_sync_all_reads_a_config_loader_once_the_lock_is_held(
+    conn: sqlite3.Connection, paths: Paths
+) -> None:
+    """The sources come from the config as it is under the lock, so a source removed while the
+    caller was still loading its model or connecting is not resolved and fetched again."""
+    client = _client(messages={ALICE_ID: [tl.message(ALICE_ID, 1, "hi", sender=1)]})
+    loads: list[bool] = []
+
+    def current() -> Config:
+        with pytest.raises(SyncInProgress), SyncLock(paths):
+            pass
+        loads.append(True)
+        return _cfg(ALICE_SOURCE)
+
+    async with tg.connected(client):
+        report = await sync.sync_all(client, conn, current, paths, SyncBudget())
+    assert loads == [True]
+    assert report.chats_done == [ALICE_ID] and report.new == 1
+    assert [c.id for c in db.list_chats(conn)] == [ALICE_ID]
 
 
 async def test_sync_all_syncs_the_supergroup_a_group_migrated_to(
