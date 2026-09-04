@@ -352,10 +352,26 @@ def channel_post(
     *,
     post_author: str | None = None,
     views: int = 100,
+    replies: int | None = None,
     **kw: Any,
 ) -> types.Message:
-    """A broadcast channel post: ``post`` set, no ``from_id``."""
-    return message(channel_id, msg_id, text, post=True, post_author=post_author, views=views, **kw)
+    """A broadcast channel post: ``post`` set, no ``from_id``; ``replies`` is the size of its
+    comment thread as Telegram reports it (``MessageReplies``)."""
+    header = (
+        types.MessageReplies(replies=replies, replies_pts=0, comments=True)
+        if replies is not None
+        else None
+    )
+    return message(
+        channel_id,
+        msg_id,
+        text,
+        post=True,
+        post_author=post_author,
+        views=views,
+        replies=header,
+        **kw,
+    )
 
 
 def service_message(

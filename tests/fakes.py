@@ -184,9 +184,12 @@ class FakeClient:
     messages; ``comments`` maps ``(channel_id, post_id)`` to the discussion-side messages that
     ``iter_messages(channel, reply_to=post_id)`` returns; ``responses`` maps a raw request class
     to a result, an exception to raise, or a callable taking the request; ``failures`` maps a
-    peer id to an exception ``iter_messages`` raises for that chat; ``folders`` registers a
-    ``GetDialogFiltersRequest`` response (the default "All chats" entry first, like Telegram).
-    Every method call is recorded in ``calls`` as ``(name, kwargs)``.
+    peer id — or ``(channel_id, post_id)`` for one comment thread — to an exception
+    ``iter_messages`` raises for it, either at once or, as ``(after, exception)``, once ``after``
+    messages were yielded; ``entity_errors`` maps a ``get_entity`` key to the exception it
+    raises; ``folders`` registers a ``GetDialogFiltersRequest`` response (the default "All
+    chats" entry first, like Telegram). Every method call is recorded in ``calls`` as
+    ``(name, kwargs)``.
     """
 
     def __init__(
@@ -197,7 +200,8 @@ class FakeClient:
         messages: Mapping[int, Iterable[types.Message]] | None = None,
         comments: Mapping[tuple[int, int], Iterable[types.Message]] | None = None,
         responses: Mapping[type, Any] | None = None,
-        failures: Mapping[int, BaseException] | None = None,
+        failures: Mapping[Any, Any] | None = None,
+        entity_errors: Mapping[Any, BaseException] | None = None,
         folders: Iterable[Any] | None = None,
         authorized: bool = True,
         me: types.User | None = None,
@@ -217,11 +221,13 @@ class FakeClient:
                 functions.messages.GetDialogFiltersRequest,
                 tl_messages.DialogFilters(filters=[types.DialogFilterDefault(), *folders]),
             )
-        self.failures = dict(failures or {})
+        self.failures: dict[Any, Any] = dict(failures or {})
+        self.entity_errors: dict[Any, BaseException] = dict(entity_errors or {})
         self.authorized = authorized
         self.me = me
         self.two_factor = two_factor
         self.connected = False
+        self.flood_sleep_threshold = 120
         self.calls: list[tuple[str, dict[str, Any]]] = []
         self.requests: list[Any] = []
         self.start_inputs: dict[str, str] = {}
@@ -268,12 +274,27 @@ class FakeClient:
 
     # --- dialogs and entities --------------------------------------------------------------
 
-    async def get_dialogs(self, *_: Any, **__: Any) -> list[custom.Dialog]:
+    async def get_dialogs(
+        self, *_: Any, ignore_migrated: bool = False, **__: Any
+    ) -> list[custom.Dialog]:
+        """The dialogs; with ``ignore_migrated`` a legacy group upgraded to a supergroup is
+        left out, as Telethon does."""
         self.calls.append(("get_dialogs", {}))
-        return list(self.dialogs)
+        return [
+            dialog
+            for dialog in self.dialogs
+            if not (
+                ignore_migrated
+                and isinstance(dialog.entity, types.Chat)
+                and dialog.entity.migrated_to is not None
+            )
+        ]
 
     async def get_entity(self, key: Any) -> Any:
         self.calls.append(("get_entity", {"key": key}))
+        error = self.entity_errors.get(key) if isinstance(key, int | str) else None
+        if error is not None:
+            raise error
         entity = self._find_entity(key)
         if entity is None:
             raise ValueError(f"Could not find the input entity for {key!r}")
@@ -312,8 +333,12 @@ class FakeClient:
                 },
             )
         )
-        if chat_id in self.failures:
-            raise self.failures[chat_id]
+        failure = self.failures.get(chat_id)
+        if reply_to is not None and (chat_id, reply_to) in self.failures:
+            failure = self.failures[(chat_id, reply_to)]
+        fail_after, error = failure if isinstance(failure, tuple) else (0, failure)
+        if error is not None and fail_after == 0:
+            raise error
         if reply_to is not None:
             try:
                 pool = self.comments[(chat_id, reply_to)]
@@ -329,21 +354,25 @@ class FakeClient:
         selected = [
             m for m in pool if (not min_id or m.id > min_id) and (not max_id or m.id < max_id)
         ]
+        # offset_id (and min_id, which Telethon turns into one) takes priority over offset_date
+        by_date = offset_date is not None and not offset_id and not min_id
         if reverse:
             selected.sort(key=lambda m: m.id)
             if offset_id:
                 selected = [m for m in selected if m.id > offset_id]
-            if offset_date is not None:
-                selected = [m for m in selected if m.date > offset_date]
+            if by_date:
+                selected = [m for m in selected if m.date >= offset_date]
         else:
             selected.sort(key=lambda m: m.id, reverse=True)
             if offset_id:
                 selected = [m for m in selected if m.id < offset_id]
-            if offset_date is not None:
+            if by_date:
                 selected = [m for m in selected if m.date < offset_date]
         if limit is not None:
             selected = selected[: int(limit)]
-        for message in selected:
+        for yielded, message in enumerate(selected):
+            if error is not None and yielded == fail_after:
+                raise error
             self._attach_peers(message)
             yield message
 

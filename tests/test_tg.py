@@ -310,6 +310,7 @@ def test_auth_reports_a_failed_sign_in(tmp_home: Path, monkeypatch: pytest.Monke
     fake = FakeClient(authorized=False)
 
     async def failing_start(*_: object, **__: object) -> FakeClient:
+        fake.connected = True
         raise errors.PhoneNumberInvalidError(request=None)
 
     monkeypatch.setattr(fake, "start", failing_start)
@@ -318,6 +319,7 @@ def test_auth_reports_a_failed_sign_in(tmp_home: Path, monkeypatch: pytest.Monke
     assert result.exit_code == 1
     assert "sign-in failed" in result.stderr
     assert "signed in" not in result.stdout
+    assert not fake.is_connected()
 
 
 # --- FakeClient ------------------------------------------------------------------------------
@@ -356,11 +358,51 @@ async def test_fake_iter_messages_reverse_with_min_id_and_limit() -> None:
     assert client.calls[-1][1]["chat_id"] == GROUP
 
 
-async def test_fake_iter_messages_offset_date_is_exclusive_and_flips_with_reverse() -> None:
+async def test_fake_iter_messages_offset_date_follows_telethon() -> None:
+    """Newest-first, ``offset_date`` is exclusive; reversed it means "from this date on"
+    (inclusive); an ``offset_id`` or ``min_id`` takes priority over it."""
     client = _client()
     cutoff = dt.datetime(2025, 1, 1, tzinfo=dt.UTC) + dt.timedelta(minutes=3)
-    assert await _collect(client, GROUP, offset_date=cutoff, reverse=True) == [4, 5]
+    assert await _collect(client, GROUP, offset_date=cutoff, reverse=True) == [3, 4, 5]
     assert await _collect(client, GROUP, offset_date=cutoff) == [2, 1]
+    assert await _collect(client, GROUP, offset_date=cutoff, min_id=1, reverse=True) == [
+        2,
+        3,
+        4,
+        5,
+    ]
+    assert await _collect(client, GROUP, offset_date=cutoff, offset_id=4) == [3, 2, 1]
+
+
+async def test_fake_iter_messages_can_fail_after_some_messages() -> None:
+    client = _client()
+    client.failures[GROUP] = (2, errors.FloodWaitError(request=None, capture=30))
+    seen: list[int] = []
+    with pytest.raises(errors.FloodWaitError):
+        async for message in client.iter_messages(GROUP, reverse=True):
+            assert message is not None
+            seen.append(message.id)
+    assert seen == [1, 2]
+    client.failures[(CHANNEL, 10)] = errors.ChannelPrivateError(request=None)
+    with pytest.raises(errors.ChannelPrivateError):
+        await _collect(client, CHANNEL, reply_to=10)
+    assert await _collect(client, CHANNEL) == []
+
+
+async def test_fake_get_dialogs_can_hide_migrated_groups() -> None:
+    client = FakeClient(
+        dialogs=[make_dialog(make_group(5, "Old", migrated_to=6)), make_dialog(make_user(7, "B"))]
+    )
+    assert [d.id for d in await client.get_dialogs()] == [-5, 7]
+    assert [d.id for d in await client.get_dialogs(ignore_migrated=True)] == [7]
+
+
+async def test_fake_get_entity_raises_configured_errors() -> None:
+    client = _client()
+    client.entity_errors["@nobody"] = errors.FloodWaitError(request=None, capture=30)
+    with pytest.raises(errors.FloodWaitError):
+        await client.get_entity("@nobody")
+    assert (await client.get_entity(GROUP)).title == "Argentina"
 
 
 async def test_fake_iter_messages_accepts_entities_and_usernames() -> None:
