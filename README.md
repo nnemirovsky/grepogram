@@ -285,6 +285,7 @@ api_hash = ""
 embed = "BAAI/bge-m3"                  # sentence-transformers id; change → full re-embed
 rerank = "BAAI/bge-reranker-v2-m3"
 device = "auto"                        # auto → mps if available else cpu
+max_seq_length = 512                   # token cap for both models; change → `embed --reembed`
 
 [search]
 k = 10
@@ -322,6 +323,7 @@ flood_sleep_threshold = 120
 | `models.embed` | sentence-transformers model for the dense index; the model name and vector width are recorded in the index, and a change is refused until `grepogram embed --reembed` |
 | `models.rerank` | sentence-transformers cross-encoder used when `rerank` is on |
 | `models.device` | `auto`, `mps` or `cpu`; on `mps` the weights run in fp16 |
+| `models.max_seq_length` | how many tokens of a unit either model reads; the rest is truncated. Raising it embeds more of a long unit and costs encode time — see [Unit length and the token cap](#how-search-works). Nothing detects a change, so it takes effect on an existing index only after `grepogram embed --reembed` |
 | `search.k` | default number of hits for the CLI |
 | `search.rrf_k` | the constant in `1 / (rrf_k + rank)` |
 | `search.rerank_top` | how many fused candidates the cross-encoder re-scores; each retrieval list is fetched `max(k, rerank_top)` deep |
@@ -373,11 +375,55 @@ tokens through the English one, everything else is kept as typed; nothing is dro
 with `OR` when fewer rows than wanted match. Ranking is `bm25()` with the `raw` column weighted
 twice the `stemmed` one. Message hits are mapped to the window or post that holds them.
 
-**Dense.** Units are embedded with `bge-m3` (1024-d, normalised, 512-token cap, fp16 on Metal)
-into a sqlite-vec `vec0` table partitioned by chat; the query is embedded the same way and
-searched by cosine distance, with the date bounds as metadata constraints. Vectors are keyed by
-the unit's rowid, so a re-cut window's old vector is deleted with the unit and can never resurface.
-The model name and width are recorded in the index and checked before every query.
+**Dense.** Units are embedded with `bge-m3` (1024-d, normalised, fp16 on Metal, capped at
+`models.max_seq_length` tokens) into a sqlite-vec `vec0` table partitioned by chat; the query is
+embedded the same way and searched by cosine distance, with the date bounds as metadata
+constraints. Vectors are keyed by the unit's rowid, so a re-cut window's old vector is deleted
+with the unit and can never resurface. The model name and width are recorded in the index and
+checked before every query.
+
+**Unit length and the token cap.** `models.max_seq_length` (512 by default) is where both
+models stop reading: everything past it in a unit is dropped before the text is encoded, by the
+embedder and by the cross-encoder alike. The two share one key on purpose — they score the *same*
+unit text, and a cap that let one of them see more of a unit than the other would have the two
+stages rank different documents. (The reranker spends part of that budget on the query, so it sees
+a little less of a long unit than the embedder does.)
+
+512 tokens was chosen on the assumption that a `window_max_chars = 1500` unit fits inside it. It
+does not, for two reasons. First, `window_max_chars` is not a ceiling on the finished text: it is
+the size at which a window *closes*, tested before the next message is added, so a closed window
+holds at least 1500 characters and however much more the message that carried it over the line
+brought with it — measured on a real 159,539-message index, window text runs to 3,453 characters
+at the top end against a median of 1,274. Second, 1500 characters is already about 470 tokens of
+this corpus, so even a window that stops exactly on the threshold has almost no headroom left.
+
+Measured over 400 random windows of that index with `BAAI/bge-m3`'s own tokenizer: median 384
+tokens, p90 547, max 869, and **15.8% of windows are longer than 512 tokens**. Those units are
+embedded and reranked from their first 512 tokens only. Script is not what drives this, contrary
+to what you might expect of a byte-hungry alphabet: bge-m3's SentencePiece vocabulary encodes
+Russian about as compactly as English — 1500 characters of pure Cyrillic message text comes to a
+median 399 tokens against 418 for pure Latin — so what reaches the cap is unit *length*, in any
+language.
+
+A truncated unit is not a lost unit. Its whole text is in the FTS tables, so lexical retrieval
+matches on every word of it and the hit comes back complete — a query whose terms sit in the tail
+still finds it through BM25, just not through the vector. What truncation costs is the dense
+side's half of hybrid retrieval on those units, which is the half that catches a paraphrase.
+
+Raising the cap is the fix, and it is paid for in time. On an Apple M1 Pro, fp16 on MPS, over 128
+random real windows: embedding runs at **12.6 units/s at 512** and **9.9 units/s at 1024** (about
+21% slower), and reranking 40 `(query, unit)` pairs at **10.6 pairs/s at 512** against **6.1 at
+1024** (about 42% slower — a full `rerank_top = 40` goes from ~3.8 s to ~6.6 s, which a reader
+waits through on every search). 1024 tokens covered every one of the 400 sampled windows; the
+shipped default stays 512 so a fresh install behaves as documented.
+
+Nothing detects the change for you. The embedding-space guard (`index.ensure_embedding_space`)
+compares two things: `meta.embed_model` against the configured model name, and the width the
+`unit_vec` table declares against the model's dimension. Changing `max_seq_length` changes
+neither — same model id, same 1024-d vectors — so the stored vectors stay in place and stay
+short-read, and no warning is raised. **After changing `max_seq_length`, run `grepogram embed
+--reembed`**, or the setting applies only to units embedded from then on, leaving the index in
+two halves.
 
 **Fusion, rerank, dedup.** The three lists — units by BM25, messages by BM25 mapped to their
 units, units by cosine — are merged with Reciprocal Rank Fusion, `Σ 1 / (rrf_k + rank)`, which
@@ -482,17 +528,27 @@ one is the reader's own click.
 
 ## Local Model Throughput
 
-Measured with `uv run pytest -m slow` on an Apple M1 Pro (16 GB) with both models already in
-the Hugging Face cache (`HF_HUB_OFFLINE=1`), fp16 on MPS, `max_seq_length = 512`:
+Measured on an Apple M1 Pro (16 GB) with both models already in the Hugging Face cache
+(`HF_HUB_OFFLINE=1`), fp16 on MPS, `max_seq_length = 512`, batch 32. The units are **real**: a
+random sample of window units from a 159,539-message index, whose token lengths run to a median
+of 384 and a p90 of 547. Each figure is the median of three timed rounds after a warm-up round:
 
 | model | work | throughput |
 |---|---|---|
-| `BAAI/bge-m3` | embedding window-sized units (64 units of six lines, batch 32) | 40.9 units/s |
-| `BAAI/bge-reranker-v2-m3` | scoring `(query, unit)` pairs (`rerank_top = 40`) | 37.7 pairs/s |
+| `BAAI/bge-m3` | embedding window units (128 real windows, batch 32) | 12.6 units/s |
+| `BAAI/bge-reranker-v2-m3` | scoring `(query, unit)` pairs (`rerank_top = 40`) | 10.6 pairs/s |
+
+Earlier versions of this table published 40.9 units/s and 37.7 pairs/s. Those were measured on
+the short synthetic units of the test fixtures — six lines of about 60 characters — which run
+roughly a third the token length of a real window, and they overstated both models by three to
+four times. Encoder cost scales with sequence length, so measure on units the size you actually
+index.
 
 Loading takes about 8 s for the embedder and 3.5 s for the reranker, once per process. At these
-rates a query has its 40 candidates reranked in about a second, and 10 000 units embed in about
-four minutes.
+rates a query has its 40 candidates reranked in about four seconds, and 10 000 units embed in
+about thirteen minutes. Raising `max_seq_length` to 1024 costs about a fifth of the embedding
+rate and two fifths of the reranking rate — see
+[Unit length and the token cap](#how-search-works).
 
 Loading reads the local cache and nothing else (see Requirements), which is worth about 8.7 s per
 run on the same machine: a `grepogram search` that loads both models took 24.2 s while the hub was
