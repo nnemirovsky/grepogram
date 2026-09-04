@@ -406,6 +406,102 @@ def test_index_chat_rolls_back_as_a_whole(
     assert _rows(conn, "msg_fts") == {}
 
 
+# --- repairing a torn index ------------------------------------------------------------------
+
+
+def _orphan(conn: sqlite3.Connection, rowid: int, chat_id: int = CHAT) -> None:
+    """An ``unit_fts`` row for a unit that does not exist, the way a torn rebuild leaves one."""
+    with db.transaction(conn):
+        conn.execute(
+            "INSERT INTO unit_fts(rowid, raw, stemmed, chat_id, date_start) VALUES (?, ?, ?, ?, ?)",
+            (rowid, "ghost text", "ghost text", chat_id, BASE),
+        )
+
+
+def _drop_fts(conn: sqlite3.Connection, rowid: int) -> None:
+    with db.transaction(conn):
+        conn.execute("DELETE FROM unit_fts WHERE rowid = ?", (rowid,))
+
+
+def test_unit_index_gaps_reports_both_directions_per_chat(
+    conn: sqlite3.Connection, chat: ChatRow, other: ChatRow
+) -> None:
+    _sync(conn, chat, [_msg(1, text="hello")])
+    _sync(conn, other, [_msg(1, text="hola", chat_id=OTHER)])
+    assert index.unit_index_gaps(conn, CHAT) == index.IndexGaps()
+    assert not index.unit_index_gaps(conn, CHAT)
+
+    (unit,) = db.get_units(conn, CHAT)
+    assert unit.id is not None
+    _drop_fts(conn, unit.id)
+    _orphan(conn, 9001)
+    _orphan(conn, 9002, chat_id=OTHER)
+    gaps = index.unit_index_gaps(conn, CHAT)
+    assert gaps == index.IndexGaps(missing=[unit.id], orphans=[9001])
+    assert bool(gaps)
+    assert index.unit_index_gaps(conn, OTHER) == index.IndexGaps(orphans=[9002])
+
+
+def test_repair_unit_index_restores_missing_rows_and_drops_orphans(
+    conn: sqlite3.Connection, chat: ChatRow
+) -> None:
+    db.ensure_vec_table(conn, 4)
+    _sync(conn, chat, [_msg(1, text="открыть счёт в Galicia")])
+    (unit,) = db.get_units(conn, CHAT)
+    assert unit.id is not None
+    _drop_fts(conn, unit.id)
+    _orphan(conn, 9001)
+    _vec(conn, 9001)
+
+    assert index.repair_unit_index(conn, CHAT) == index.IndexGaps(missing=[unit.id], orphans=[9001])
+    _assert_in_step(conn)
+    assert _match(conn, "unit_fts", stem.fts_query("счета")) == [unit.id]
+    assert _vec_rowids(conn) == []
+    assert index.repair_unit_index(conn, CHAT) == index.IndexGaps()
+
+
+def test_a_rebuild_killed_before_the_index_is_repaired_by_the_next_run(
+    conn: sqlite3.Connection, chat: ChatRow
+) -> None:
+    """The old sequence committed the rebuild and the index apart; a rerun must close the gap.
+
+    The rerun's rebuild re-cuts identical units and reports an empty delta, so only the check
+    against the stored units restores the coverage the killed run never wrote.
+    """
+    rows = [_msg(i, i, text=f"message {i} about durability") for i in range(1, 8)]
+    db.upsert_messages(conn, rows)
+    pending = db.unindexed_message_ids(conn, CHAT)
+    units.rebuild_for_chat(conn, chat, CFG, pending)  # the rebuild commit, then the process dies
+    assert db.get_units(conn, CHAT) and _rows(conn, "unit_fts") == {}
+    assert db.unindexed_message_ids(conn, CHAT) == pending
+
+    sync.on_chat_synced(conn, chat, CFG, db.unindexed_message_ids(conn, CHAT))
+    _assert_in_step(conn)
+    assert db.unindexed_message_ids(conn, CHAT) == []
+    assert _match(conn, "unit_fts", stem.fts_query("durability")) == sorted(
+        u.id for u in db.get_units(conn, CHAT) if u.id is not None
+    )
+
+
+def test_a_killed_incremental_rebuild_leaves_no_orphan_behind(
+    conn: sqlite3.Connection, chat: ChatRow
+) -> None:
+    _sync(conn, chat, [_msg(1, text="alpha")])
+    (before,) = db.get_units(conn, CHAT)
+
+    db.upsert_messages(conn, [_msg(2, 1, text="bravocode")])
+    units.rebuild_for_chat(conn, chat, CFG, db.unindexed_message_ids(conn, CHAT))
+    assert before.id not in {u.id for u in db.get_units(conn, CHAT)}
+    assert index.unit_index_gaps(conn, CHAT).orphans == [before.id]
+
+    sync.on_chat_synced(conn, chat, CFG, db.unindexed_message_ids(conn, CHAT))
+    _assert_in_step(conn)
+    assert index.unit_index_gaps(conn, CHAT) == index.IndexGaps()
+    assert _match(conn, "unit_fts", stem.fts_query("bravocode")) == [
+        _unit_ids(conn, CHAT, "window")[(1, 2)]
+    ]
+
+
 # --- wiring into sync ------------------------------------------------------------------------
 
 
@@ -428,6 +524,29 @@ def test_on_chat_synced_rebuilds_then_indexes_with_the_delta(
     monkeypatch.setattr(index, "index_chat", fake_index)
     sync.on_chat_synced(conn, chat, CFG, [11, 12])
     assert calls == [("rebuild", (CHAT, CFG, [11, 12])), ("index", (CHAT, [11, 12], delta))]
+
+
+def test_on_chat_synced_is_one_transaction(
+    conn: sqlite3.Connection, chat: ChatRow, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The rebuild, the indexing and the flag commit together, so nothing half-derived survives
+    a run that dies in between and the next run picks the rows up again."""
+    ids = db.upsert_messages(conn, [_msg(1, text="hello")])
+
+    def explode(*_: object) -> None:
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(index, "index_chat", explode)
+    with pytest.raises(RuntimeError, match="boom"):
+        sync.on_chat_synced(conn, chat, CFG, ids)
+    assert not conn.in_transaction
+    assert db.get_units(conn, CHAT) == []
+    assert db.unindexed_message_ids(conn, CHAT) == ids
+
+    monkeypatch.undo()
+    sync.on_chat_synced(conn, chat, CFG, ids)
+    _assert_in_step(conn)
+    assert db.unindexed_message_ids(conn, CHAT) == []
 
 
 def test_on_chat_synced_populates_both_indexes(conn: sqlite3.Connection, chat: ChatRow) -> None:

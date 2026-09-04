@@ -9,9 +9,15 @@ unlike a delete by an UNINDEXED column, which scans the whole table, and an edit
 replaces the row in place under the rowid the message or unit has always had.
 
 :func:`index_chat` is the per-chat step :func:`grepogram.sync.on_chat_synced` runs right after
-the unit rebuild: it indexes the messages a sync inserted or edited and applies the rebuild's
-:class:`~grepogram.units.UnitDelta` to ``unit_fts``, dropping the vectors of deleted units as
-well once ``unit_vec`` exists so a re-cut window's stale embedding can never resurface in a KNN.
+the unit rebuild, in the same transaction: it indexes the messages a sync inserted or edited and
+applies the rebuild's :class:`~grepogram.units.UnitDelta` to ``unit_fts``, dropping the vectors of
+deleted units as well once ``unit_vec`` exists so a re-cut window's stale embedding can never
+resurface in a KNN. It ends with :func:`repair_unit_index`, the delta-independent half: a delta
+only describes what *this* rebuild changed, so an index torn by an older grepogram — one that
+committed the rebuild and died before the indexing — would never be repaired by a rerun, whose
+rebuild re-cuts the very same units and reports nothing to index. :func:`unit_index_gaps` compares
+``units`` with ``unit_fts`` by rowid in both directions instead, and the repair indexes the units
+that have no row and drops the rows whose unit is gone.
 
 The dense side is ``unit_vec``, a ``vec0`` table keyed by ``units.id`` as well, with ``chat_id``
 as its partition key and ``date_start`` as metadata. Units are inserted ``dirty`` and
@@ -30,7 +36,7 @@ single KNN over-fetched :data:`KNN_OVERFETCH` times deeper and drops the other c
 import logging
 import sqlite3
 from collections.abc import Iterable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Protocol
 
 import sqlite_vec
@@ -117,19 +123,98 @@ def delete_unit_vectors(conn: sqlite3.Connection, ids: Iterable[int]) -> None:
         conn.executemany(_VEC_DELETE, rows)
 
 
+@dataclass(frozen=True, slots=True)
+class IndexGaps:
+    """Where ``units`` and ``unit_fts`` disagree in one chat: the two halves of a torn rebuild.
+
+    ``missing`` are units with no ``unit_fts`` row — invisible to lexical unit search though the
+    messages behind them are indexed; ``orphans`` are ``unit_fts`` rows whose unit is gone —
+    stale text that matches queries and resolves to nothing.
+    """
+
+    missing: list[int] = field(default_factory=list)
+    orphans: list[int] = field(default_factory=list)
+
+    def __bool__(self) -> bool:
+        return bool(self.missing or self.orphans)
+
+
+def unit_index_gaps(conn: sqlite3.Connection, chat_id: int) -> IndexGaps:
+    """Units of ``chat_id`` without a ``unit_fts`` row, and ``unit_fts`` rows without a unit.
+
+    Both halves are rowid anti-joins: the first probes ``unit_fts`` by rowid once per unit of the
+    chat, the second walks the index's rowids once (a few milliseconds per ten thousand units),
+    which is what makes the check cheap enough to run on every sync rather than on demand.
+    """
+    missing = conn.execute(
+        "SELECT id FROM units WHERE chat_id = ? "
+        "AND NOT EXISTS (SELECT 1 FROM unit_fts WHERE unit_fts.rowid = units.id)",
+        (chat_id,),
+    ).fetchall()
+    orphans = conn.execute(
+        "SELECT rowid AS id FROM unit_fts WHERE chat_id = ? "
+        "AND NOT EXISTS (SELECT 1 FROM units WHERE units.id = unit_fts.rowid)",
+        (chat_id,),
+    ).fetchall()
+    return IndexGaps(
+        missing=[int(row["id"]) for row in missing], orphans=[int(row["id"]) for row in orphans]
+    )
+
+
+def repair_unit_index(conn: sqlite3.Connection, chat_id: int) -> IndexGaps:
+    """Close the gaps :func:`unit_index_gaps` reports; returns what had to be repaired.
+
+    A rebuild and the indexing that follows it are one transaction, so a run of this code leaves
+    no gap behind — this repairs an index an older grepogram tore, and it is what makes a rerun
+    over the same ``messages.indexed`` rows a real repair: the rebuild finds its units unchanged
+    and reports an empty delta, and only a check against the stored units notices that their
+    index rows are missing. Orphans lose their vectors too, the way a deleted unit does.
+    """
+    gaps = unit_index_gaps(conn, chat_id)
+    if not gaps:
+        return gaps
+    with db.transaction(conn):
+        conn.executemany(
+            "DELETE FROM unit_fts WHERE rowid = ?", [(unit_id,) for unit_id in gaps.orphans]
+        )
+        delete_unit_vectors(conn, gaps.orphans)
+        conn.executemany(
+            _UNIT_INSERT,
+            [
+                (unit.id, unit.text, stem_text(unit.text), unit.chat_id, unit.date_start)
+                for unit in db.get_units_by_ids(conn, gaps.missing)
+            ],
+        )
+    log.info(
+        "chat %s: repaired the unit index (%d units were missing, %d index rows were orphaned)",
+        chat_id,
+        len(gaps.missing),
+        len(gaps.orphans),
+    )
+    return gaps
+
+
 def index_chat(
     conn: sqlite3.Connection, chat: ChatRow, message_ids: Iterable[int], delta: UnitDelta
 ) -> None:
-    """Index what one sync changed in ``chat``: its messages and the units the rebuild reported."""
+    """Index what one sync changed in ``chat``: its messages and the units the rebuild reported.
+
+    The delta covers what this rebuild changed; :func:`repair_unit_index` then covers what an
+    earlier one left torn, so re-running over the same messages restores full lexical coverage
+    instead of finding an empty delta and clearing the flag on rows that were never indexed.
+    """
     with db.transaction(conn):
         messages = index_messages(conn, message_ids)
         indexed = index_units(conn, delta)
+        gaps = repair_unit_index(conn, chat.id)
     log.debug(
-        "chat %s: indexed %d messages, %d units (%d deleted)",
+        "chat %s: indexed %d messages, %d units (%d deleted, %d repaired, %d orphans dropped)",
         chat.id,
         messages,
         indexed,
         len(delta.deleted_ids),
+        len(gaps.missing),
+        len(gaps.orphans),
     )
 
 
