@@ -1433,13 +1433,19 @@ def test_cli_sync_prints_the_report(tmp_home: Path, monkeypatch: pytest.MonkeyPa
         conn.close()
 
 
-def test_cli_sync_budget_zero_reports_remaining(
+def test_cli_sync_smallest_budget_reports_remaining(
     tmp_home: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """One second is the smallest budget the CLI takes; an expired one leaves every chat behind."""
     _setup(tmp_home)
     fake = _client(messages={ALICE_ID: [tl.message(ALICE_ID, 1, "m1", sender=1)]})
     monkeypatch.setattr(tg, "make_client", lambda cfg, paths: fake)
-    result = runner.invoke(cli.app, ["sync", "--budget", "0"])
+
+    def expired(seconds: float) -> SyncBudget:
+        return SyncBudget(seconds, clock=_clock(0, seconds + 1))
+
+    monkeypatch.setattr(sync, "SyncBudget", expired)
+    result = runner.invoke(cli.app, ["sync", "--budget", "1"])
     assert result.exit_code == 0, result.output
     assert "new messages: 0" in result.stdout
     assert f"chats remaining: 1 ({ALICE_ID}); run sync again" in result.stdout
@@ -1492,9 +1498,12 @@ def test_cli_sync_reports_lock_and_auth_errors(
     assert "grepogram auth" in unauthorized.stderr
 
 
-def test_cli_sync_rejects_negative_budget(tmp_home: Path) -> None:
-    result = runner.invoke(cli.app, ["sync", "--budget", "-1"])
+@pytest.mark.parametrize("budget", ["-1", "0"], ids=["negative", "zero"])
+def test_cli_sync_rejects_a_budget_that_fetches_nothing(tmp_home: Path, budget: str) -> None:
+    """``--budget 0`` used to be accepted and then fetch nothing; the MCP tool always refused it."""
+    result = runner.invoke(cli.app, ["sync", "--budget", budget])
     assert result.exit_code != 0
+    assert "--budget" in result.output
 
 
 def test_cli_sync_maps_network_errors(tmp_home: Path, monkeypatch: pytest.MonkeyPatch) -> None:

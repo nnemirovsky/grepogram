@@ -178,7 +178,7 @@ def sync_cmd(
         int | None,
         typer.Option(
             "--budget",
-            min=0,
+            min=1,
             help="Stop after this many seconds; unfinished chats resume on the next run.",
         ),
     ] = None,

@@ -616,9 +616,9 @@ async def sync(budget_s: int = 45) -> ToolResult:
     `chats_done`, `chats_remaining`, `unavailable` (chats Telegram refused), `warnings` and
     `index_age_min`. New units are embedded when the model is available.
     """
-    state = _app()
     if budget_s <= 0:
         raise ValueError(f"budget_s must be a positive number of seconds, got {budget_s}")
+    state = _app()
     cfg = state.config()
     if not cfg.sources:
         return {"error": "no sources are configured", "hint": NO_SOURCES_HINT}
