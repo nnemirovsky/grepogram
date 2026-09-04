@@ -295,15 +295,26 @@ async def add_source(
             )
         source = Source(chat=chat_value(dialog), since=normalized_since, comments=comments)
         members = [dialog]
-    _reject_duplicate(cfg, source, dialog)
+    updated = with_source(cfg, source, dialog)
     log.info("adding source %s (%s)", source.id, resolved.title)
     return Added(
-        config=dataclasses.replace(cfg, sources=[*cfg.sources, source]),
+        config=updated,
         source=source,
         title=resolved.title,
         dialogs=members,
         folder=resolved if isinstance(resolved, FolderInfo) else None,
     )
+
+
+def with_source(cfg: Config, source: Source, dialog: DialogInfo | None) -> Config:
+    """``cfg`` with ``source`` appended; :class:`DuplicateSource` when it is already there — by
+    id or, given the ``dialog`` a chat source resolved to, under another spelling of that chat.
+
+    Pure, so a caller that resolved the source over the network can re-read the config right
+    before saving and apply the source to that, not to the snapshot it started from.
+    """
+    _reject_duplicate(cfg, source, dialog)
+    return dataclasses.replace(cfg, sources=[*cfg.sources, source])
 
 
 def chat_value(dialog: DialogInfo) -> str | int:
@@ -345,8 +356,10 @@ def remove_source(cfg: Config, conn: sqlite3.Connection, target: Target) -> Remo
 
     The target may be a source id (``folder:Argentina``, ``chat:@arg_chat``), a folder name, a
     chat id / ``@username`` / link, or a fuzzy name matched against source entries and the
-    titles of their indexed chats. Naming a chat that came in through a folder is refused, since
-    that would silently remove the whole folder.
+    titles of their indexed chats. Naming a chat that came in through a folder, or a channel's
+    discussion group indexed through the channel's source, is refused: that would silently
+    remove the whole folder or the channel (:func:`_refuse_indirect`). The caller holds the sync
+    lock, so no sync writes to the chats being deleted.
     """
     source_id = find_source(cfg, conn, target)
     source = next((s for s in cfg.sources if s.id == source_id), None)
@@ -403,32 +416,55 @@ def _folder_source(name: str, known: list[str]) -> str:
 def _chat_source(chat: ChatRow | None, label: str) -> str:
     if chat is None or not chat.source_id:
         raise UnknownSource(f"{label} is not an indexed chat")
+    _refuse_indirect(chat, label)
+    return chat.source_id
+
+
+def _refuse_indirect(chat: ChatRow, label: str) -> None:
+    """Refuse a target that names a chat whose source covers more than that chat: a member of a
+    folder source, or a channel's discussion group indexed through the channel's source."""
+    if not chat.source_id:
+        return
     if chat.source_id.startswith(FOLDER_PREFIX):
         raise SourceError(
             f"{label} is indexed through {chat.source_id}; remove that folder source instead "
             "or take the chat out of the folder in Telegram"
         )
-    return chat.source_id
+    if chat.discussion_of is not None and not _own_source(chat):
+        raise SourceError(
+            f"{label} is the discussion group of channel {chat.discussion_of}, indexed through "
+            f"{chat.source_id}; remove that source instead"
+        )
+
+
+def _own_source(chat: ChatRow) -> bool:
+    """Whether ``chat.source_id`` is a ``chat:`` entry naming this very chat."""
+    own = {f"{CHAT_PREFIX}{chat.id}"}
+    if chat.username:
+        own.add(f"{CHAT_PREFIX}@{chat.username}".casefold())
+    return (chat.source_id or "").casefold() in own
 
 
 def _fuzzy_source(text: str, known: list[str], chats: list[ChatRow]) -> str:
     query = dialogs.normalize(text)
-    best: dict[str, tuple[float, bool]] = {}
+    best: dict[str, tuple[float, bool, ChatRow | None]] = {}
 
-    def consider(source_id: str, name: str | None, own: bool) -> None:
+    def consider(source_id: str, name: str | None, chat: ChatRow | None) -> None:
+        """Record the best match per source; a hit on the source's own name beats one on a
+        chat it indexes (``chat`` is ``None`` for the former)."""
         value = dialogs.score(query, name) if name else 0.0
         if value <= 0:
             return
         current = best.get(source_id)
-        if current is None or (value, own) > current:
-            best[source_id] = (value, own)
+        if current is None or (value, chat is None) > current[:2]:
+            best[source_id] = (value, chat is None, chat)
 
     for source_id in known:
-        consider(source_id, source_id.split(":", 1)[1], own=True)
+        consider(source_id, source_id.split(":", 1)[1], None)
     for chat in chats:
         if chat.source_id:
-            consider(chat.source_id, chat.title, own=False)
-            consider(chat.source_id, f"@{chat.username}" if chat.username else None, own=False)
+            consider(chat.source_id, chat.title, chat)
+            consider(chat.source_id, f"@{chat.username}" if chat.username else None, chat)
     if not best:
         raise UnknownSource(f"no source matches {text!r} (sources: {', '.join(known) or 'none'})")
     ranked = sorted(best, key=lambda s: (-best[s][0], s))
@@ -436,11 +472,9 @@ def _fuzzy_source(text: str, known: list[str], chats: list[ChatRow]) -> str:
     if len(ranked) > 1 and len(exact) != 1:
         raise AmbiguousTarget(text, ranked)
     winner = exact[0] if exact else ranked[0]
-    if winner.startswith(FOLDER_PREFIX) and not best[winner][1]:
-        raise SourceError(
-            f"{text!r} is a chat indexed through {winner}; remove that folder source instead "
-            "or take the chat out of the folder in Telegram"
-        )
+    matched = best[winner][2]
+    if matched is not None:
+        _refuse_indirect(matched, repr(text))
     return winner
 
 
@@ -452,9 +486,10 @@ async def resolve_sources(cfg: Config, client: Any, conn: sqlite3.Connection) ->
 
     Folder membership and entities are re-read from Telegram each time (``client`` must be
     connected). A chat covered by two sources keeps the first source's id; a source that no
-    longer resolves is logged at WARNING and skipped. Sync state on existing rows is preserved.
-    A chat already stored as the discussion group of a channel with comments on stays the
-    channel's (:func:`discussion_owner`): it is neither re-tagged nor returned for syncing.
+    longer resolves is logged at WARNING and skipped. Sync state on existing rows is preserved,
+    and so is a stored ``discussion_of`` (:func:`grepogram.db.upsert_chat`): a channel's
+    discussion group listed by a source is synced as a chat of its own and keeps holding the
+    channel's comments.
     """
     catalog = DialogCatalog(client)
     rows: list[ChatRow] = []
@@ -470,18 +505,6 @@ async def resolve_sources(cfg: Config, client: Any, conn: sqlite3.Connection) ->
                 log.debug("chat %s already covered by another source, keeping the first", info.id)
                 continue
             seen.add(info.id)
-            stored = db.get_chat(conn, info.id)
-            owner = None if stored is None else discussion_owner(conn, cfg, stored)
-            if owner is not None:
-                log.info(
-                    "chat %s (%s) is the discussion group of channel %s; source %s does not "
-                    "index it on its own",
-                    info.id,
-                    info.title,
-                    owner.id,
-                    source.id,
-                )
-                continue
             rows.append(
                 db.upsert_chat(
                     conn,
@@ -510,23 +533,6 @@ async def source_dialogs(source: Source, catalog: DialogCatalog) -> list[DialogI
             f"use folder = {resolved.title!r} instead"
         )
     return [resolved]
-
-
-def discussion_owner(conn: sqlite3.Connection, cfg: Config, chat: ChatRow) -> ChatRow | None:
-    """The configured channel whose comment threads ``chat`` holds, or ``None``.
-
-    A stored chat with ``discussion_of`` set belongs to that channel as long as the channel is
-    indexed through a source with ``comments`` on; syncing it as a chat of its own would store
-    the same messages a second time without their post ids.
-    """
-    if chat.discussion_of is None:
-        return None
-    channel = db.get_chat(conn, chat.discussion_of)
-    if channel is None:
-        return None
-    if any(s.id == channel.source_id and s.comments for s in cfg.sources):
-        return channel
-    return None
 
 
 # --- status ----------------------------------------------------------------------------------

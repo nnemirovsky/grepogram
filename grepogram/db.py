@@ -108,7 +108,7 @@ _MESSAGE_UPSERT = """
         from_id = excluded.from_id,
         from_name = excluded.from_name,
         reply_to_msg_id = excluded.reply_to_msg_id,
-        topic_id = excluded.topic_id,
+        topic_id = COALESCE(excluded.topic_id, messages.topic_id),
         fwd_from = excluded.fwd_from,
         text = excluded.text,
         media_kind = excluded.media_kind,
@@ -502,7 +502,10 @@ def upsert_messages(conn: sqlite3.Connection, batch: Iterable[MessageRow]) -> li
     """Insert or update messages keyed by ``(chat_id, msg_id)``; returns ``messages.id`` per row.
 
     Conflicts update in place, so an edited message keeps its ``id`` and therefore its FTS
-    rowid. The chat row must exist (foreign key).
+    rowid. A ``topic_id`` already stored survives a row without one: a channel's comment threads
+    store a discussion group's messages with the post id as topic, and the group's own history
+    sync stores the same messages with none — either may arrive first. The chat row must exist
+    (foreign key).
     """
     ids: list[int] = []
     with transaction(conn):
@@ -798,9 +801,10 @@ def containing_unit(
 ) -> UnitRow | None:
     """The window holding ``msg_id`` in ``(chat, topic)``, or a channel's ``post`` unit for it.
 
-    A window is found by its ``msg_id`` range within the topic — the ranges of different topics
-    interleave in a forum or a discussion chat, so the topic is part of the lookup. Channels have
-    no windows, so a post's own unit stands in. ``None`` while the message is in no unit yet.
+    A window is found by its ``msg_id`` range within the topic — the ranges of a forum's topics
+    interleave, so the topic is part of the lookup; outside forums windows carry no topic and
+    the caller passes ``None`` (:func:`grepogram.units.window_topic`). Channels have no windows,
+    so a post's own unit stands in. ``None`` while the message is in no unit yet.
     """
     row = conn.execute(
         "SELECT * FROM units WHERE kind = 'window' AND chat_id = ? "

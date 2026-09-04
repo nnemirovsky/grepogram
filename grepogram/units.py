@@ -162,11 +162,23 @@ def cut_windows(
     return windows
 
 
-def group_by_topic(messages: Iterable[MessageRow]) -> dict[int | None, list[MessageRow]]:
-    """Messages bucketed by ``topic_id`` (all under ``None`` outside forums), first seen first."""
+def window_topic(chat: ChatRow, msg: MessageRow) -> int | None:
+    """The topic whose windows hold ``msg``: its ``topic_id`` in a forum, ``None`` anywhere else.
+
+    Outside forums a chat is one linear conversation and its windows carry no topic. The
+    comments a channel stores in its discussion group keep the post id in ``topic_id`` — for the
+    post threads and the readers — but sit in the group's windows like any other message.
+    """
+    return msg.topic_id if chat.is_forum else None
+
+
+def group_by_topic(
+    chat: ChatRow, messages: Iterable[MessageRow]
+) -> dict[int | None, list[MessageRow]]:
+    """Messages bucketed by :func:`window_topic`, first seen first."""
     groups: dict[int | None, list[MessageRow]] = {}
     for msg in messages:
-        groups.setdefault(msg.topic_id, []).append(msg)
+        groups.setdefault(window_topic(chat, msg), []).append(msg)
     return groups
 
 
@@ -310,15 +322,15 @@ def units_for_chat(
     """Every unit of ``chat`` over ``messages``, chosen by the chat's kind.
 
     Channels get posts, plus post threads when their source has ``comments`` on. Everything
-    else — private chats, groups, forums and the discussion chats of channels alike — gets
-    windows per topic followed by reply threads.
+    else — private chats, groups, forums and the discussion groups of channels alike — gets
+    windows (per topic in a forum, one linear run otherwise) followed by reply threads.
     """
     if chat.type == "channel" and chat.discussion_of is None:
         return build_posts(conn, messages, chat, comments_enabled(cfg, chat), cfg.units)
     messages = list(messages)
     windows = [
         window
-        for topic_id, group in group_by_topic(messages).items()
+        for topic_id, group in group_by_topic(chat, messages).items()
         for window in cut_windows(group, cfg.units, chat.id, topic_id)
     ]
     return windows + build_threads(messages, cfg.units, chat.id)
@@ -365,7 +377,7 @@ def _rebuild_conversation(
 ) -> UnitDelta:
     stale: list[UnitRow] = []
     fresh: list[UnitRow] = []
-    for topic_id, group in group_by_topic(changed).items():
+    for topic_id, group in group_by_topic(chat, changed).items():
         old, new = _recut_open_window(conn, chat, cfg.units, topic_id, group)
         stale += old
         fresh += new
@@ -395,7 +407,10 @@ def _recut_open_window(
     start = None if window is None else window.msg_id_start
     if start is not None and all(msg.msg_id < start for msg in changed):
         return [], []
-    messages = db.get_messages_in_topic(conn, chat.id, topic_id, since_msg_id=start)
+    if chat.is_forum:
+        messages = db.get_messages_in_topic(conn, chat.id, topic_id, since_msg_id=start)
+    else:
+        messages = db.get_messages(conn, chat.id, since_msg_id=start)
     stale = [] if window is None else [window]
     return stale, cut_windows(messages, cfg, chat.id, topic_id)
 

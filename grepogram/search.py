@@ -61,7 +61,7 @@ from grepogram.models import (
 )
 from grepogram.rerank import Reranker
 from grepogram.stem import FtsOp, fts_query
-from grepogram.units import chronological, media_placeholder, render_line
+from grepogram.units import chronological, media_placeholder, render_line, window_topic
 
 log = logging.getLogger(__name__)
 
@@ -126,12 +126,17 @@ def lexical_messages(conn: sqlite3.Connection, q: str, filters: Filters, limit: 
     if not ranked:
         return []
     messages = {msg.id: msg for msg in db.get_messages_by_ids(conn, [rowid for rowid, _ in ranked])}
+    chats: dict[int, ChatRow | None] = {}
     found: dict[int, Match] = {}
     for rowid, score in ranked:
         msg = messages.get(rowid)
         if msg is None:
             continue
-        unit = db.containing_unit(conn, msg.chat_id, msg.msg_id, msg.topic_id)
+        if msg.chat_id not in chats:
+            chats[msg.chat_id] = db.get_chat(conn, msg.chat_id)
+        chat = chats[msg.chat_id]
+        topic_id = msg.topic_id if chat is None else window_topic(chat, msg)
+        unit = db.containing_unit(conn, msg.chat_id, msg.msg_id, topic_id)
         if unit is None or unit.id is None or unit.id in found:
             continue
         found[unit.id] = Match(unit.id, score, msg.msg_id)

@@ -480,8 +480,7 @@ def test_channel_with_comments_builds_post_threads_and_discussion_windows(
     assert _stored(conn, CHANNEL) == _expected(conn, channel)
     units.rebuild_for_chat(conn, discussion, CFG, comment_ids)
     assert [(u.kind, u.topic_id, u.msg_ids) for u in db.get_units(conn, DISC)] == [
-        ("window", 10, [1, 2]),
-        ("window", 12, [3]),
+        ("window", None, [1, 2, 3]),
         ("thread", 10, [1, 2]),
     ]
     assert _stored(conn, DISC) == _expected(conn, discussion)
@@ -656,7 +655,7 @@ async def test_sync_all_builds_channel_posts_threads_and_discussion_units(
         "[2025-01-01 00:02] Bob: reply",
     ]
     assert [(u.kind, u.topic_id, u.msg_ids) for u in db.get_units(conn, DISC_ID)] == [
-        ("window", 1, [1, 2]),
+        ("window", None, [1, 2]),
         ("thread", 1, [1, 2]),
     ]
     for chat_id in (NEWS_ID, DISC_ID):

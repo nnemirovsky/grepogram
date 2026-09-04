@@ -7,9 +7,10 @@ sources, syncs chats in ``last_sync_at`` order until the :class:`SyncBudget` run
 changed, and finally embeds the dirty units when an embedder is given. :func:`sync_chat` fetches
 one chat: new messages after ``last_msg_id`` in batches, then a re-fetch of the newest messages
 for edits and reactions. A channel whose source has ``comments`` also gets the comment threads of
-its new posts, stored under the linked discussion chat, and on every later run the threads of
-its newest posts that grew since; the discussion chat belongs to the channel from then on and is
-never synced as a chat of its own, whichever source lists it.
+its new posts, stored under the linked discussion group with the post id as ``topic_id``, and on
+every later run the threads of its newest posts that grew since. A source that lists the group
+itself syncs its whole history as well: both paths write the same rows, and a post id already
+stored survives the plain history's upsert (:func:`grepogram.db.upsert_messages`).
 
 :func:`map_message` reads raw TL attributes only — ``msg.message``, ``msg.media``,
 ``msg.reply_to``, ``msg.fwd_from``, ``msg.reactions``, ``msg.from_id``, ``msg.post``, ``msg.date``,
@@ -52,7 +53,7 @@ from grepogram.models import (
     UserRow,
 )
 from grepogram.paths import Paths
-from grepogram.sources import discussion_owner, resolve_sources
+from grepogram.sources import resolve_sources
 
 log = logging.getLogger(__name__)
 
@@ -717,11 +718,7 @@ async def _refetch_edits(run: _Run, sync_cfg: SyncCfg) -> list[int]:
         row.msg_id: row
         for row in db.get_messages(run.conn, chat.id, since_msg_id=min(r.msg_id for r in fresh))
     }
-    changed = [
-        row
-        for row in fresh
-        if row.msg_id in stored and dataclasses.replace(stored[row.msg_id], id=None) != row
-    ]
+    changed = [row for row in fresh if row.msg_id in stored and _differs(stored[row.msg_id], row)]
     if changed:
         log.debug(
             "chat %s: %d of %d re-fetched messages changed", chat.id, len(changed), len(fresh)
@@ -730,6 +727,16 @@ async def _refetch_edits(run: _Run, sync_cfg: SyncCfg) -> list[int]:
     if run.discussion is not None:
         ids += await _refresh_comments(run, stored, replies)
     return ids
+
+
+def _differs(stored: MessageRow, fresh: MessageRow) -> bool:
+    """Whether storing ``fresh`` would change ``stored``.
+
+    Compared with the ``topic_id`` the upsert would keep: a comment re-read as part of its
+    discussion group's own history arrives without its post id and must not count as an edit.
+    """
+    topic = stored.topic_id if fresh.topic_id is None else fresh.topic_id
+    return dataclasses.replace(stored, id=None) != dataclasses.replace(fresh, topic_id=topic)
 
 
 async def _refresh_comments(
@@ -804,13 +811,12 @@ async def link_discussion_chat(
 ) -> ChatRow | None:
     """Upsert the channel's linked discussion group as its own ``chats`` row.
 
-    The row carries ``discussion_of = channel.id`` and the channel's ``source_id`` so the
-    comments stored under it are removed together with the channel. ``None`` when the channel
-    has no discussion group; :class:`DiscussionUnavailable` when Telegram will not resolve the
-    group (private, or the account is not a member) — the channel's own errors propagate. A
-    group that was already indexed as an ordinary chat — a source listed it before the link was
-    known — is started over: its rows carry no post ids, and the comment threads stored from now
-    on would otherwise overlap them.
+    The row carries ``discussion_of = channel.id``. A group that is already stored — listed by a
+    source of its own, or linked in an earlier run — keeps its ``source_id`` and every message it
+    holds; a new row gets the channel's ``source_id`` so the comments stored under it are removed
+    together with the channel. ``None`` when the channel has no discussion group;
+    :class:`DiscussionUnavailable` when Telegram will not resolve the group (private, or the
+    account is not a member) — the channel's own errors propagate.
     """
     full = await client(functions.channels.GetFullChannelRequest(channel.id))
     linked = getattr(full.full_chat, "linked_chat_id", None)
@@ -829,17 +835,10 @@ async def link_discussion_chat(
                 f"cannot resolve discussion group {linked_id}: {exc}"
             ) from exc
     existing = db.get_chat(conn, linked_id)
-    if existing is not None and existing.discussion_of is None and existing.last_msg_id:
-        log.warning(
-            "chat %s (%s) was indexed on its own before it turned out to be the discussion "
-            "group of channel %s; its history is replaced by the channel's comment threads",
-            linked_id,
-            existing.title,
-            channel.id,
-        )
-        db.delete_chat(conn, linked_id)
-    row = _chat_row(entity, channel.source_id, discussion_of=channel.id)
-    return db.upsert_chat(conn, row)
+    source_id = (
+        channel.source_id if existing is None or not existing.source_id else existing.source_id
+    )
+    return db.upsert_chat(conn, _chat_row(entity, source_id, discussion_of=channel.id))
 
 
 def _chat_row(entity: Any, source_id: str | None, *, discussion_of: int | None = None) -> ChatRow:
@@ -938,10 +937,10 @@ async def _sync_chats(
 ) -> SyncReport:
     """The chat loop of :func:`sync_all`.
 
-    A queued chat that turns out to be the discussion group of a channel with comments — linked
-    earlier in this run, or in a previous one when it was listed by another source — is skipped:
-    the channel's comment threads are its content. The unit rebuild runs on a worker thread so
-    the loop keeps serving the client's keepalives while a big chat is cut into units.
+    The unit rebuild runs on a worker thread so the loop keeps serving the client's keepalives
+    while a big chat is cut into units. A chat whose row disappears while it is being fetched —
+    a removal that got past the lock, or a hand-edited database — fails its next write with a
+    foreign-key error; that ends the chat for this run with a warning, not the run.
     """
     me = _self_row(await client.get_me())
     queue = sorted(await resolve_sources(cfg, client, conn), key=_sync_order)
@@ -962,19 +961,12 @@ async def _sync_chats(
         if budget.expired:
             remaining.append(chat.id)
             continue
-        owner = discussion_owner(conn, cfg, _refresh(conn, chat))
-        if owner is not None:
-            log.info(
-                "chat %s (%s) is the discussion group of channel %s; its comment threads are "
-                "synced with the channel",
-                chat.id,
-                chat.title,
-                owner.id,
-            )
-            continue
         _cap_flood_sleep(client, cfg.sync, budget)
         try:
             synced = await sync_chat(client, conn, chat, source, budget, sync_cfg=cfg.sync, me=me)
+            for part in (synced, synced.discussion):
+                if part is not None and part.new_msg_ids:
+                    await asyncio.to_thread(on_chat_synced, conn, part.chat, cfg, part.new_msg_ids)
         except errors.FloodWaitError as exc:
             log.warning("flood wait of %ss on chat %s; stopping this run", exc.seconds, chat.id)
             warnings.append(
@@ -990,11 +982,12 @@ async def _sync_chats(
             warnings.append(f"chat {chat.id} ({chat.title}): {exc}")
             remaining.append(chat.id)
             continue
+        except sqlite3.IntegrityError as exc:
+            log.warning("chat %s (%s) was removed during the sync: %s", chat.id, chat.title, exc)
+            warnings.append(f"chat {chat.id} ({chat.title}) was removed while it was being synced")
+            continue
         new += synced.new
         warnings.extend(synced.warnings)
-        for part in (synced, synced.discussion):
-            if part is not None and part.new_msg_ids:
-                await asyncio.to_thread(on_chat_synced, conn, part.chat, cfg, part.new_msg_ids)
         if synced.discussion is not None:
             new += synced.discussion.new
         if synced.unavailable:

@@ -1,9 +1,11 @@
 import datetime as dt
 import sqlite3
 import stat
-from collections.abc import Callable, Iterator
+import time
+from collections.abc import AsyncIterator, Callable, Iterator
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 from telethon import errors
@@ -174,9 +176,11 @@ async def _run(
     paths: Paths,
     cfg: Config,
     seconds: float | None = None,
+    *,
+    clock: Callable[[], float] = time.monotonic,
 ) -> SyncReport:
     async with tg.connected(client):
-        return await sync.sync_all(client, conn, cfg, paths, SyncBudget(seconds))
+        return await sync.sync_all(client, conn, cfg, paths, SyncBudget(seconds, clock=clock))
 
 
 # --- budget ----------------------------------------------------------------------------------
@@ -768,49 +772,144 @@ def _discussion_state(conn: sqlite3.Connection, disc_id: int) -> dict[str, objec
         ),
     ],
 )
-async def test_discussion_group_belongs_to_its_channel_whichever_source_lists_it(
+async def test_discussion_group_listed_by_a_source_keeps_its_history_and_the_comments(
     conn: sqlite3.Connection, paths: Paths, disc: types.Channel, config: list[Source]
 ) -> None:
+    """Whichever of the two syncs first, the group ends up with its whole history, the
+    comments carry their post ids, its windows are linear, and its row belongs to the source
+    that lists it (the channel's only when none does)."""
     disc_id = -1000000000000 - disc.id
     client = _discussion_client(disc)
     cfg = _cfg(*config)
     expected = {
-        "source_id": config[0].id,
+        "source_id": config[-1].id,
         "discussion_of": NEWS_ID,
         "topics": {1: 1, 2: 1, 9: 3},
-        "window_topics": {1, 3},
+        "window_topics": {None},
     }
     first = await _run(client, conn, paths, cfg)
-    assert NEWS_ID in first.chats_done and first.unavailable == []
+    assert sorted(first.chats_done) == sorted([disc_id, NEWS_ID])
+    assert first.unavailable == [] and first.warnings == []
     assert _discussion_state(conn, disc_id) == expected
     assert [v.text for v in search.thread(conn, NEWS_ID, 1)] == ["post 1", "comment one", "reply"]
-    plain_fetches = len([c for c in _fetch_calls(client, disc_id) if c["reverse"]])
-    assert plain_fetches <= 1
+    assert len([c for c in _fetch_calls(client, disc_id) if c["reverse"]]) == 1
     second = await _run(client, conn, paths, cfg)
-    assert second.chats_done == [NEWS_ID] and second.new == 0
+    assert sorted(second.chats_done) == sorted([disc_id, NEWS_ID]) and second.new == 0
     assert _discussion_state(conn, disc_id) == expected
-    assert len([c for c in _fetch_calls(client, disc_id) if c["reverse"]]) == plain_fetches
+    assert len([c for c in _fetch_calls(client, disc_id) if c["reverse"]]) == 2
     assert [v.text for v in search.thread(conn, NEWS_ID, 1)] == ["post 1", "comment one", "reply"]
     by_source = {s.source_id: [c.id for c in s.chats] for s in sources.sources_status(cfg, conn)}
-    assert by_source[config[0].id] == sorted([disc_id, NEWS_ID])
     if len(config) > 1:
-        assert by_source[config[1].id] == []
+        assert by_source == {config[0].id: [NEWS_ID], config[1].id: [disc_id]}
+    else:
+        assert by_source == {config[0].id: sorted([disc_id, NEWS_ID])}
 
 
-def test_discussion_owner_requires_a_configured_channel_with_comments(
-    conn: sqlite3.Connection,
+async def test_plain_history_refetch_leaves_comments_and_their_post_ids_alone(
+    conn: sqlite3.Connection, paths: Paths
 ) -> None:
-    news = db.upsert_chat(conn, ChatRow(id=NEWS_ID, type="channel", source_id=NEWS_SOURCE.id))
-    disc = db.upsert_chat(
-        conn,
-        ChatRow(id=DISC_ID, type="supergroup", source_id=NEWS_SOURCE.id, discussion_of=NEWS_ID),
+    client = _discussion_client(DISC)
+    cfg = _cfg(Source(folder="News", comments=True), edit_refetch=10)
+    await _run(client, conn, paths, cfg)
+    group = db.get_chat(conn, DISC_ID)
+    assert group is not None and group.last_sync_at is not None
+    again = await sync.sync_chat(
+        client, conn, group, cfg.sources[0], SyncBudget(), sync_cfg=cfg.sync
     )
-    assert sources.discussion_owner(conn, _cfg(NEWS_SOURCE), disc) == news
-    assert sources.discussion_owner(conn, _cfg(Source(chat="@news")), disc) is None
-    assert sources.discussion_owner(conn, _cfg(), disc) is None
-    assert sources.discussion_owner(conn, _cfg(NEWS_SOURCE), news) is None
-    db.delete_chat(conn, NEWS_ID)
-    assert sources.discussion_owner(conn, _cfg(NEWS_SOURCE), disc) is None
+    assert again.complete and again.new == 0 and again.new_msg_ids == []
+    assert {m.msg_id: m.topic_id for m in db.get_messages(conn, DISC_ID)} == {1: 1, 2: 1, 9: 3}
+
+
+def _big_discussion_client(count: int) -> FakeClient:
+    """:func:`_discussion_client` with a group history of ``count`` messages, three of which
+    are the comments of the channel's posts."""
+    history = {i: tl.message(DISC_ID, i, f"g{i}", sender=1) for i in range(1, count + 1)}
+    return FakeClient(
+        dialogs=[make_dialog(ALICE), make_dialog(BOB), make_dialog(NEWS), make_dialog(DISC)],
+        me=ME,
+        folders=[make_folder(3, "News", include=[NEWS, DISC])],
+        messages={
+            NEWS_ID: [tl.channel_post(NEWS_ID, i, f"post {i}") for i in (1, 2, 3)],
+            DISC_ID: list(history.values()),
+        },
+        comments={(NEWS_ID, 1): [history[1], history[2]], (NEWS_ID, 3): [history[9]]},
+        responses={
+            functions.channels.GetFullChannelRequest: _full_channel(201, chats=[NEWS, DISC])
+        },
+    )
+
+
+async def test_large_discussion_group_keeps_its_history_across_budgeted_runs(
+    conn: sqlite3.Connection, paths: Paths
+) -> None:
+    """The group sorts before its channel and takes three budgeted runs; the channel's first
+    sync then adds the post ids to the comments without touching the rest."""
+    client = _big_discussion_client(1200)
+    cfg = _cfg(Source(folder="News", comments=True))
+    # the budget is read when it is created, by the loop's check and by the flood-sleep cap
+    # before the first chat, then after its first batch: expire right there
+    reports = [
+        await _run(client, conn, paths, cfg, 10, clock=_clock(0, 0, 0, 100)) for _ in range(3)
+    ]
+    assert [r.chats_remaining for r in reports] == [
+        [DISC_ID, NEWS_ID],
+        [DISC_ID, NEWS_ID],
+        [NEWS_ID],
+    ]
+    assert reports[2].chats_done == [DISC_ID]
+    assert db.message_counts(conn) == {DISC_ID: 1200}
+    units_before = sorted(u.id for u in db.get_units(conn, DISC_ID) if u.id is not None)
+    assert len(units_before) >= 40
+    fourth = await _run(client, conn, paths, cfg)
+    assert fourth.warnings == [] and fourth.chats_done == [NEWS_ID, DISC_ID]
+    assert fourth.new == 3
+    assert db.message_counts(conn) == {DISC_ID: 1200, NEWS_ID: 3}
+    topics = {m.msg_id: m.topic_id for m in db.get_messages(conn, DISC_ID) if m.topic_id}
+    assert topics == {1: 1, 2: 1, 9: 3}
+    assert sorted(u.id for u in db.get_units(conn, DISC_ID) if u.id is not None) == units_before
+    assert [v.text for v in search.thread(conn, NEWS_ID, 1)] == ["post 1", "g1", "g2"]
+
+
+class _VanishingClient(FakeClient):
+    """A client whose chat ``gone`` is deleted from the database as its first message arrives —
+    a removal that got past the sync lock, seen from the sync's side."""
+
+    def __init__(self, conn: sqlite3.Connection, gone: int, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self._conn = conn
+        self._gone = gone
+
+    async def iter_messages(
+        self, entity: Any, *args: Any, **kwargs: Any
+    ) -> AsyncIterator[types.Message | None]:
+        async for msg in super().iter_messages(entity, *args, **kwargs):
+            if self._peer_id(entity) == self._gone:
+                db.delete_chat(self._conn, self._gone)
+            yield msg
+
+
+async def test_chat_removed_during_the_sync_is_a_warning(
+    conn: sqlite3.Connection, paths: Paths
+) -> None:
+    client = _VanishingClient(
+        conn,
+        ARG_ID,
+        dialogs=[make_dialog(ARG), make_dialog(ALICE)],
+        me=ME,
+        folders=[make_folder(3, "Argentina", include=[ARG])],
+        messages={
+            ARG_ID: [tl.message(ARG_ID, 1, "m1", sender=1)],
+            ALICE_ID: [tl.message(ALICE_ID, 1, "hi", sender=1)],
+        },
+    )
+    report = await _run(client, conn, paths, _cfg(ARG_SOURCE, ALICE_SOURCE))
+    assert report.warnings == [
+        f"chat {ARG_ID} (Argentina chat) was removed while it was being synced"
+    ]
+    assert report.chats_done == [ALICE_ID] and report.chats_remaining == []
+    assert report.new == 1
+    assert db.get_chat(conn, ARG_ID) is None
+    assert db.last_sync_run(conn) is not None
 
 
 # --- migration -------------------------------------------------------------------------------

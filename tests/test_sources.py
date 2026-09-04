@@ -8,7 +8,7 @@ import pytest
 from telethon import errors
 from typer.testing import CliRunner
 
-from grepogram import cli, config, db, sources, tg
+from grepogram import cli, config, db, sources, sync, tg
 from grepogram.dialogs import DialogCatalog, DialogInfo
 from grepogram.log import shutdown_logging
 from grepogram.models import ChatRow, Config, MessageRow, Source
@@ -434,6 +434,73 @@ def test_remove_source_of_a_never_synced_entry(conn: sqlite3.Connection) -> None
     assert len(removed.config.sources) == 2
 
 
+DISC_ID = -1000000000201
+
+
+def _with_news_and_its_group(conn: sqlite3.Connection, group_source: str) -> None:
+    _store(conn, _chat(NEWS_ID, "chat:@news", type="channel", title="News", username="news"), 2)
+    _store(
+        conn,
+        _chat(
+            DISC_ID, group_source, title="News chat", username="news_chat", discussion_of=NEWS_ID
+        ),
+        3,
+    )
+
+
+def test_remove_source_refuses_a_discussion_group_indexed_through_its_channel(
+    conn: sqlite3.Connection,
+) -> None:
+    _with_news_and_its_group(conn, "chat:@news")
+    cfg = _cfg(Source(chat="@news", comments=True))
+    for raw in (str(DISC_ID), "@news_chat", "News chat", "https://t.me/news_chat", "news chat"):
+        with pytest.raises(SourceError, match=f"discussion group of channel {NEWS_ID}") as excinfo:
+            sources.remove_source(cfg, conn, sources.parse_target(raw))
+        assert "indexed through chat:@news; remove that source instead" in str(excinfo.value)
+    assert db.message_counts(conn) == {NEWS_ID: 2, DISC_ID: 3}
+    removed = sources.remove_source(cfg, conn, sources.parse_target("@news"))
+    assert removed.source_id == "chat:@news" and sorted(removed.chat_ids) == [DISC_ID, NEWS_ID]
+    assert removed.config.sources == [] and db.list_chats(conn) == []
+
+
+def test_remove_source_of_a_discussion_group_that_is_a_source_of_its_own(
+    conn: sqlite3.Connection,
+) -> None:
+    _with_news_and_its_group(conn, f"chat:{DISC_ID}")
+    cfg = _cfg(Source(chat="@news", comments=True), Source(chat=DISC_ID))
+    removed = sources.remove_source(cfg, conn, sources.parse_target("News chat"))
+    assert removed.source_id == f"chat:{DISC_ID}" and removed.chat_ids == [DISC_ID]
+    assert removed.config.sources == [Source(chat="@news", comments=True)]
+    assert db.message_counts(conn) == {NEWS_ID: 2}
+    _store(
+        conn,
+        _chat(
+            DISC_ID,
+            "chat:@News_Chat",
+            title="News chat",
+            username="news_chat",
+            discussion_of=NEWS_ID,
+        ),
+        1,
+    )
+    by_handle = sources.remove_source(
+        _cfg(Source(chat="@News_Chat")), conn, sources.parse_target(str(DISC_ID))
+    )
+    assert by_handle.source_id == "chat:@News_Chat" and by_handle.chat_ids == [DISC_ID]
+
+
+def test_with_source_appends_and_rejects_duplicates() -> None:
+    cfg = _cfg(Source(chat="@alice"))
+    added = sources.with_source(cfg, Source(chat="@news", comments=True), None)
+    assert added.sources == [Source(chat="@alice"), Source(chat="@news", comments=True)]
+    assert cfg.sources == [Source(chat="@alice")]
+    with pytest.raises(DuplicateSource, match="chat:@alice is already a source"):
+        sources.with_source(added, Source(chat="@alice"), None)
+    alice = DialogInfo(id=1, type="user", title="Alice Liddell", username="alice")
+    with pytest.raises(DuplicateSource, match="already a source as chat:@alice"):
+        sources.with_source(added, Source(chat=1), alice)
+
+
 # --- resolve_sources -------------------------------------------------------------------------
 
 
@@ -731,6 +798,17 @@ def test_cli_sources_rm_works_offline_without_api_keys(tmp_home: Path) -> None:
     result = runner.invoke(cli.app, ["sources", "rm", "@alice"])
     assert result.exit_code == 0, result.output
     assert result.stdout.strip() == "removed chat:@alice (0 chats deleted)"
+
+
+def test_cli_sources_rm_refuses_while_a_sync_runs(tmp_home: Path) -> None:
+    (tmp_home / "config.toml").write_text('[[sources]]\nchat = "@alice"\n', encoding="utf-8")
+    with sync.SyncLock(Paths.from_env()):
+        result = runner.invoke(cli.app, ["sources", "rm", "@alice"])
+    assert result.exit_code == 1
+    assert "another sync is running" in result.stderr and result.stdout == ""
+    assert config.load(Paths.from_env()).sources == [Source(chat="@alice")]
+    freed = runner.invoke(cli.app, ["sources", "rm", "@alice"])
+    assert freed.exit_code == 0, freed.output
 
 
 def test_cli_when_formats_timestamps() -> None:

@@ -939,3 +939,22 @@ def test_upsert_messages_rewrites_every_column_on_conflict(conn: sqlite3.Connect
     )
     assert db.upsert_messages(conn, [second]) == [row_id]
     assert db.get_message(conn, 1, 5) == dataclasses.replace(second, id=row_id)
+
+
+def test_upsert_messages_keeps_a_stored_topic_when_the_new_row_has_none(
+    conn: sqlite3.Connection,
+) -> None:
+    """A comment stored with its post id, re-read as part of the group's plain history."""
+    db.upsert_chat(conn, _chat(1))
+    comment = MessageRow(chat_id=1, msg_id=5, date=100, topic_id=9, text="a")
+    (row_id,) = db.upsert_messages(conn, [comment])
+    plain = MessageRow(chat_id=1, msg_id=5, date=100, text="a (edited)")
+    assert db.upsert_messages(conn, [plain]) == [row_id]
+    assert db.get_message(conn, 1, 5) == dataclasses.replace(plain, id=row_id, topic_id=9)
+    moved = dataclasses.replace(plain, topic_id=11)
+    db.upsert_messages(conn, [moved])
+    assert db.get_message(conn, 1, 5) == dataclasses.replace(moved, id=row_id)
+    fresh = MessageRow(chat_id=1, msg_id=6, date=101, text="b")
+    db.upsert_messages(conn, [fresh])
+    stored = db.get_message(conn, 1, 6)
+    assert stored is not None and stored.topic_id is None

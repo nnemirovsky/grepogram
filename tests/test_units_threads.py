@@ -412,22 +412,25 @@ def test_units_for_chat_channel_with_comments_off_in_source(conn: sqlite3.Connec
     assert [(u.kind, u.msg_ids) for u in result] == [("post", [10])]
 
 
-def test_units_for_chat_discussion_chat_gets_windows_per_post_and_threads(
+def test_units_for_chat_discussion_chat_gets_linear_windows_and_threads(
     conn: sqlite3.Connection,
 ) -> None:
-    comments = [
+    """The group is one conversation: comments of different posts (and the group's own talk,
+    ``topic_id`` None) share its windows; the post id stays on the rows for the post threads."""
+    messages = [
         _comment(1, 10, 0),
         _comment(2, 10, 1, reply_to=1),
-        _comment(3, 12, 2),
+        _msg(3, 2, chat_id=DISC, text="general chat"),
         _comment(4, 12, 3),
+        _comment(5, 12, 60),
     ]
-    _with_discussion(conn, comments)
+    _with_discussion(conn, messages)
     discussion = db.get_chat(conn, DISC)
     assert discussion is not None and discussion.discussion_of == CHANNEL
-    result = units.units_for_chat(conn, comments, discussion, _config(NEWS_SOURCE))
+    result = units.units_for_chat(conn, messages, discussion, _config(NEWS_SOURCE))
     assert [(u.kind, u.topic_id, u.msg_ids) for u in result] == [
-        ("window", 10, [1, 2]),
-        ("window", 12, [3, 4]),
+        ("window", None, [1, 2, 3, 4]),
+        ("window", None, [5]),
         ("thread", 10, [1, 2]),
     ]
     assert {u.chat_id for u in result} == {DISC}

@@ -4,11 +4,13 @@ from typing import Any
 import pytest
 
 from grepogram import units
-from grepogram.models import MessageRow, UnitRow, UnitsCfg
+from grepogram.models import ChatRow, MessageRow, UnitRow, UnitsCfg
 
 BASE = 1_705_314_600  # 2024-01-15 10:30:00 UTC
 CHAT = -1000000000100
 CFG = UnitsCfg(window_gap_min=30, window_max_msgs=3, window_max_chars=80, thread_max_msgs=40)
+GROUP = ChatRow(id=CHAT, type="supergroup")
+FORUM = ChatRow(id=CHAT, type="supergroup", is_forum=True)
 
 
 def _msg(msg_id: int, minutes: int = 0, text: str | None = None, **overrides: object) -> MessageRow:
@@ -214,9 +216,17 @@ def test_cut_windows_respects_every_limit() -> None:
 # --- group_by_topic and build_unit -----------------------------------------------------------
 
 
-def test_group_by_topic_non_forum() -> None:
-    messages = [_msg(1), _msg(2, 1)]
-    assert units.group_by_topic(messages) == {None: messages}
+def test_window_topic_follows_forum_topics_only() -> None:
+    comment = _msg(1, topic_id=5)
+    assert units.window_topic(FORUM, comment) == 5
+    assert units.window_topic(FORUM, _msg(2)) is None
+    assert units.window_topic(GROUP, comment) is None
+    assert units.window_topic(ChatRow(id=1, type="user"), comment) is None
+
+
+def test_group_by_topic_non_forum_is_one_linear_run() -> None:
+    messages = [_msg(1), _msg(2, 1), _msg(3, 2, topic_id=5)]
+    assert units.group_by_topic(GROUP, messages) == {None: messages}
 
 
 def test_group_by_topic_forum_keeps_first_seen_order() -> None:
@@ -226,7 +236,7 @@ def test_group_by_topic_forum_keeps_first_seen_order() -> None:
         _msg(3, 2, topic_id=5),
         _msg(4, 3),
     )
-    groups = units.group_by_topic([a1, b1, a2, g1])
+    groups = units.group_by_topic(FORUM, [a1, b1, a2, g1])
     assert list(groups) == [5, 7, None]
     assert groups == {5: [a1, a2], 7: [b1], None: [g1]}
 
@@ -240,10 +250,16 @@ def test_group_by_topic_then_cut_isolates_gaps_per_topic() -> None:
     ]
     windows = [
         window
-        for topic_id, group in units.group_by_topic(messages).items()
+        for topic_id, group in units.group_by_topic(FORUM, messages).items()
         for window in units.cut_windows(group, CFG, CHAT, topic_id)
     ]
     assert [(w.topic_id, w.msg_ids) for w in windows] == [(5, [1]), (5, [3]), (7, [2]), (7, [4])]
+    linear = [
+        window
+        for topic_id, group in units.group_by_topic(GROUP, messages).items()
+        for window in units.cut_windows(group, CFG, CHAT, topic_id)
+    ]
+    assert [(w.topic_id, w.msg_ids) for w in linear] == [(None, [1, 2, 3]), (None, [4])]
 
 
 def test_chronological_sorts_by_date_then_msg_id() -> None:
