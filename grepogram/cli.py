@@ -235,7 +235,7 @@ def embed_cmd(
         typer.Option(
             "--reembed",
             help="Discard every stored vector and embed all units again with the configured "
-            "model (required after changing [models] embed).",
+            "model (required after changing \\[models] embed).",
         ),
     ] = False,
 ) -> None:
@@ -293,7 +293,7 @@ def search_cmd(
     ] = Mode.hybrid,
     k: Annotated[
         int | None,
-        typer.Option("-k", "--limit", min=1, help="Number of hits (default: [search] k)."),
+        typer.Option("-k", "--limit", min=1, help="Number of hits (default: \\[search] k)."),
     ] = None,
     rerank: Annotated[
         bool,
