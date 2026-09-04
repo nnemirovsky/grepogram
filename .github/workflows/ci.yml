@@ -32,7 +32,7 @@ jobs:
       - run: uv run ruff check .
       - run: uv run ruff format --check .
       - run: uv run mypy grepogram tests
-      - run: uv run pytest --cov=grepogram --cov-report=term-missing
+      - run: uv run pytest --cov=grepogram --cov-branch --cov-report=term-missing
 
   lint:
     name: lint (ubuntu)
