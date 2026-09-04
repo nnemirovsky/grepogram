@@ -1,3 +1,4 @@
+import json
 import logging
 import sys
 from logging.handlers import RotatingFileHandler
@@ -13,6 +14,7 @@ from grepogram.config import TEMPLATE
 from grepogram.models import ChatRow, Config, MessageRow, SearchMode
 from grepogram.paths import Paths
 from tests.conftest import file_mode
+from tests.fixtures import chat_ru
 
 runner = CliRunner()
 
@@ -289,3 +291,176 @@ def test_search_text_output_prints_the_fallback_link_for_private_chats(tmp_home:
     assert result.exit_code == 0, result.output
     assert "   tg://openmessage?user_id=7&message_id=9" in result.stdout
     assert "   fallback: tg://user?id=7" in result.stdout
+
+
+# --- thread and context ----------------------------------------------------------------------
+
+NEWS = -1001000000300
+NEWS_CHAT = -1001000000301
+
+
+def _seed_chat_ru() -> None:
+    """The bilingual fixture corpus in the ``tmp_home`` index, as a sync would have left it."""
+    conn = db.connect(Paths.from_env())
+    try:
+        db.migrate(conn)
+        chat_ru.load(conn)
+    finally:
+        conn.close()
+
+
+def _seed_channel_with_a_comment() -> None:
+    """A channel post and one comment on it in the linked discussion group, both numbered 1:
+    the collision the per-message ``chat_id`` exists for."""
+    conn = db.connect(Paths.from_env())
+    try:
+        db.migrate(conn)
+        db.upsert_chat(
+            conn,
+            ChatRow(id=NEWS, type="channel", title="News", username="news", source_id="chat:@news"),
+        )
+        db.upsert_chat(
+            conn,
+            ChatRow(
+                id=NEWS_CHAT,
+                type="supergroup",
+                title="News chat",
+                source_id="chat:@news",
+                discussion_of=NEWS,
+            ),
+        )
+        db.upsert_messages(
+            conn,
+            [
+                MessageRow(
+                    chat_id=NEWS,
+                    msg_id=1,
+                    date=1_700_000_000,
+                    from_name="News",
+                    text="Announcing the new office hours",
+                ),
+                MessageRow(
+                    chat_id=NEWS_CHAT,
+                    msg_id=1,
+                    date=1_700_000_060,
+                    from_name="Bob",
+                    comment_of_chat_id=NEWS,
+                    comment_of_msg_id=1,
+                    text="Which branch keeps them?",
+                ),
+            ],
+        )
+    finally:
+        conn.close()
+
+
+def test_thread_prints_one_block_per_message_of_the_reply_chain(tmp_home: Path) -> None:
+    _seed_chat_ru()
+    result = runner.invoke(cli.app, ["thread", "@arg_chat", "5"])
+    assert result.exit_code == 0, result.output
+    blocks = result.stdout.strip().split("\n\n")
+    assert len(blocks) == 8
+    first = blocks[0].splitlines()
+    assert first[0] == f"1. {chat_ru.ARG_ID}/1  2024-01-15 10:00 UTC  Ольга"
+    assert first[1] == "   https://t.me/arg_chat/1"
+    assert first[2] == f"   {chat_ru.message(chat_ru.ARG_ID, 1).text}"
+    assert blocks[-1].splitlines()[0].startswith(f"8. {chat_ru.ARG_ID}/10  ")
+
+
+def test_context_prints_the_messages_around_one(tmp_home: Path) -> None:
+    _seed_chat_ru()
+    result = runner.invoke(cli.app, ["context", "@arg_chat", "5", "--before", "1", "--after", "1"])
+    assert result.exit_code == 0, result.output
+    urls = [line.strip() for line in result.stdout.splitlines() if line.startswith("   https")]
+    assert urls == [f"https://t.me/arg_chat/{n}" for n in (4, 5, 6)]
+    alone = runner.invoke(cli.app, ["context", "@arg_chat", "5", "--before", "0", "--after", "0"])
+    assert alone.exit_code == 0, alone.output
+    assert alone.stdout.splitlines()[0] == f"1. {chat_ru.ARG_ID}/5  2024-01-15 10:07 UTC  Alice"
+
+
+def test_context_refuses_a_negative_count_before_it_reaches_the_reader(tmp_home: Path) -> None:
+    _seed_chat_ru()
+    result = runner.invoke(cli.app, ["context", "@arg_chat", "5", "--before", "-1"])
+    assert result.exit_code == 2
+    assert "--before" in result.output
+
+
+def test_thread_json_prints_the_mcp_document_and_nothing_else(tmp_home: Path) -> None:
+    _seed_chat_ru()
+    result = runner.invoke(cli.app, ["thread", "@arg_chat", "5", "--json"])
+    assert result.exit_code == 0, result.output
+    assert result.stderr == ""
+    document = json.loads(result.stdout)
+    assert set(document) == {"chat_id", "msg_id", "messages"}
+    assert document["chat_id"] == chat_ru.ARG_ID and document["msg_id"] == 5
+    assert [m["msg_id"] for m in document["messages"]] == [1, 2, 3, 4, 5, 6, 7, 10]
+    assert set(document["messages"][0]) == {
+        "chat_id",
+        "msg_id",
+        "date",
+        "from_name",
+        "text",
+        "url",
+        "fallback_url",
+        "reply_to_msg_id",
+    }
+
+
+def test_thread_of_a_channel_post_names_the_chat_of_every_comment(tmp_home: Path) -> None:
+    """The comments come from the discussion group, whose message ids number from 1 exactly as
+    the channel's posts do: only the per-message ``chat_id`` leads back to them, and both output
+    forms carry it."""
+    _seed_channel_with_a_comment()
+    result = runner.invoke(cli.app, ["thread", "@news", "1", "--json"])
+    assert result.exit_code == 0, result.output
+    document = json.loads(result.stdout)
+    assert document["chat_id"] == NEWS and document["msg_id"] == 1
+    messages = document["messages"]
+    assert [(m["chat_id"], m["msg_id"]) for m in messages] == [(NEWS, 1), (NEWS_CHAT, 1)]
+    assert messages[1]["url"] == "https://t.me/c/1000000301/1"
+    text = runner.invoke(cli.app, ["thread", "@news", "1"])
+    assert text.exit_code == 0, text.output
+    headers = [line for line in text.stdout.splitlines() if not line.startswith(" ")]
+    assert headers == [
+        f"1. {NEWS}/1  2023-11-14 22:13 UTC  News",
+        "",
+        f"2. {NEWS_CHAT}/1  2023-11-14 22:14 UTC  Bob",
+    ]
+
+
+def test_thread_and_context_read_a_chat_by_id_and_by_title(tmp_home: Path) -> None:
+    _seed_chat_ru()
+    by_id = runner.invoke(cli.app, ["context", "--", str(chat_ru.GEO_ID), "3"])
+    assert by_id.exit_code == 0, by_id.output
+    assert f"   https://t.me/c/{abs(chat_ru.GEO_ID) - 1000000000000}/3" in by_id.stdout
+    by_title = runner.invoke(cli.app, ["thread", "Georgia", "3"])
+    assert by_title.exit_code == 0, by_title.output
+    assert by_title.stdout.splitlines()[0].startswith(f"1. {chat_ru.GEO_ID}/")
+
+
+@pytest.mark.parametrize("command", ["thread", "context"])
+def test_readers_exit_1_on_an_unknown_chat(tmp_home: Path, command: str) -> None:
+    _seed_chat_ru()
+    result = runner.invoke(cli.app, [command, "@nobody", "5"])
+    assert result.exit_code == 1
+    assert result.stdout == ""
+    assert result.stderr.startswith("error: no indexed chat matches '@nobody'")
+
+
+@pytest.mark.parametrize("command", ["thread", "context"])
+def test_readers_exit_1_on_a_chat_spec_naming_several(tmp_home: Path, command: str) -> None:
+    _seed_chat_ru()
+    result = runner.invoke(cli.app, [command, "chat", "5"])
+    assert result.exit_code == 1
+    assert result.stdout == ""
+    assert "error: 'chat' matches several indexed chats" in result.stderr
+    assert "name one of them" in result.stderr
+
+
+@pytest.mark.parametrize("command", ["thread", "context"])
+def test_readers_exit_1_on_an_unknown_message(tmp_home: Path, command: str) -> None:
+    _seed_chat_ru()
+    result = runner.invoke(cli.app, [command, "@arg_chat", "9999"])
+    assert result.exit_code == 1
+    assert result.stdout == ""
+    assert result.stderr.strip() == (f"error: message 9999 of chat {chat_ru.ARG_ID} is not indexed")

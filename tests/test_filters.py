@@ -6,7 +6,7 @@ from collections.abc import Iterator
 import pytest
 
 from grepogram import db, filters
-from grepogram.filters import FilterError, InvalidDate, UnknownChat
+from grepogram.filters import AmbiguousChat, FilterError, InvalidDate, UnknownChat
 from grepogram.models import ChatRow, Config, Filters, Source
 
 ARG_CHAT = -1000000000100
@@ -359,6 +359,64 @@ def test_resolve_chats_untitled_chat_is_listed_by_id(empty_conn: sqlite3.Connect
         filters.resolve_chats(empty_conn, Config(), ["anything"])
     assert info.value.candidates == ["None (id 5)"]
     assert filters.resolve_chats(empty_conn, Config(), ["5"]) == {5}
+
+
+# --- resolve_chat ----------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("spec", "expected"),
+    [
+        pytest.param(str(BANK), BANK, id="id"),
+        pytest.param("@arg_chat", ARG_CHAT, id="username"),
+        pytest.param("https://t.me/argnews", ARG_NEWS, id="link"),
+        pytest.param("Alicante expats", ALICANTE, id="title"),
+        pytest.param("Georgai", GEORGIA, id="title-fuzzy-typo"),
+    ],
+)
+def test_resolve_chat_takes_the_same_specs(
+    conn: sqlite3.Connection, spec: str, expected: int
+) -> None:
+    assert filters.resolve_chat(conn, CFG, spec) == expected
+
+
+@pytest.mark.parametrize(
+    ("spec", "chats"),
+    [
+        pytest.param("folder:Argentina", ARGENTINA, id="folder"),
+        pytest.param("alic", {ALICE, ALICANTE}, id="title-substring-in-two"),
+    ],
+)
+def test_resolve_chat_refuses_a_spec_naming_several(
+    conn: sqlite3.Connection, spec: str, chats: set[int]
+) -> None:
+    """A reader addresses one message, so what a search would have widened to is an error here,
+    and the message lists the chats to pick from."""
+    with pytest.raises(AmbiguousChat) as info:
+        filters.resolve_chat(conn, CFG, spec)
+    err = info.value
+    assert isinstance(err, FilterError)
+    assert err.spec == spec and len(err.candidates) == len(chats)
+    message = str(err)
+    assert all(f"(id {chat_id}" in message for chat_id in chats)
+    assert "name one of them" in message
+
+
+def test_resolve_chat_lists_its_candidates_by_title(conn: sqlite3.Connection) -> None:
+    with pytest.raises(AmbiguousChat) as info:
+        filters.resolve_chat(conn, CFG, "folder:Argentina")
+    assert info.value.candidates == [
+        f"'Argentina chat' (id {ARG_CHAT}, @arg_chat)",
+        f"'Argentina News' (id {ARG_NEWS}, @argnews)",
+        f"'Argentina News Chat' (id {ARG_DISCUSSION})",
+    ]
+
+
+def test_resolve_chat_unknown_spec_fails_like_resolve_chats(conn: sqlite3.Connection) -> None:
+    with pytest.raises(UnknownChat) as info:
+        filters.resolve_chat(conn, CFG, "@nobody")
+    assert info.value.spec == "@nobody"
+    assert "'Argentina chat' (id -1000000000100, @arg_chat)" in str(info.value)
 
 
 # --- resolve_filters -------------------------------------------------------------------------

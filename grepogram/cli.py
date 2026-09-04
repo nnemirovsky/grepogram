@@ -7,6 +7,11 @@ dense retrieval by default (``--mode``) and reranks unless ``--no-rerank``; when
 or a model is unavailable it falls back to lexical and prints a warning on stderr. ``sync`` embeds
 new units when the embedding model loads and only warns when it does not; ``embed`` insists on
 the model.
+
+``thread`` and ``context`` are the readers a hit leads to, the CLI half of the MCP tools of the
+same names: they take the chat specs ``search -c`` takes (through
+:func:`grepogram.filters.resolve_chat`, which insists on one chat) and print the messages around
+one, or with ``--json`` the same document those tools return.
 """
 
 import asyncio
@@ -42,10 +47,15 @@ from grepogram.dialogs import Match
 from grepogram.embed import Embedder, ModelUnavailable
 from grepogram.filters import FilterError
 from grepogram.log import setup_logging
-from grepogram.models import Config, SearchResult, SyncReport
+from grepogram.models import Config, MessageView, SearchResult, SyncReport
 from grepogram.paths import Paths
+from grepogram.search import UnknownMessage
 
 HELP = "Local hybrid search over opt-in Telegram chats, exposed to Claude Code through MCP."
+_CHAT_HELP = (
+    "The chat the message is in, naming exactly one indexed chat: id, @username, t.me link, "
+    "folder:<name> or a title (put -- before a negative id)."
+)
 
 app = typer.Typer(name="grepogram", help=HELP, no_args_is_help=True, add_completion=False)
 config_app = typer.Typer(help="Show or create the config file.", no_args_is_help=True)
@@ -375,6 +385,88 @@ def _span(start: int, end: int) -> str:
     if first.date() == last.date():
         return f"{first:%Y-%m-%d %H:%M}–{last:%H:%M} UTC"
     return f"{first:%Y-%m-%d %H:%M} – {last:%Y-%m-%d %H:%M} UTC"
+
+
+@app.command("thread")
+def thread_cmd(
+    chat: Annotated[str, typer.Argument(help=_CHAT_HELP)],
+    msg_id: Annotated[int, typer.Argument(help="Message id, as a hit's link and JSON carry it.")],
+    as_json: Annotated[
+        bool, typer.Option("--json", help="Print the result as JSON and nothing else.")
+    ] = False,
+) -> None:
+    """Print the whole reply thread a message belongs to, root first (offline); for a channel
+    post, the post followed by its comments from the linked discussion group."""
+    _, cfg, conn = _load()
+    try:
+        chat_id = filters.resolve_chat(conn, cfg, chat)
+        views = search.thread(conn, chat_id, msg_id)
+    except (FilterError, UnknownMessage) as exc:
+        fail(str(exc))
+    finally:
+        conn.close()
+    _print_messages(chat_id, msg_id, views, as_json=as_json)
+
+
+@app.command("context")
+def context_cmd(
+    chat: Annotated[str, typer.Argument(help=_CHAT_HELP)],
+    msg_id: Annotated[int, typer.Argument(help="Message id, as a hit's link and JSON carry it.")],
+    before: Annotated[
+        int, typer.Option("--before", min=0, help="How many earlier messages to print.")
+    ] = 15,
+    after: Annotated[
+        int, typer.Option("--after", min=0, help="How many later messages to print.")
+    ] = 15,
+    as_json: Annotated[
+        bool, typer.Option("--json", help="Print the result as JSON and nothing else.")
+    ] = False,
+) -> None:
+    """Print the messages around one in its chat or forum topic, the message itself included
+    (offline)."""
+    _, cfg, conn = _load()
+    try:
+        chat_id = filters.resolve_chat(conn, cfg, chat)
+        views = search.context(conn, chat_id, msg_id, before, after)
+    except (FilterError, UnknownMessage) as exc:
+        fail(str(exc))
+    finally:
+        conn.close()
+    _print_messages(chat_id, msg_id, views, as_json=as_json)
+
+
+def _print_messages(
+    chat_id: int, msg_id: int, views: Sequence[MessageView], *, as_json: bool
+) -> None:
+    """What ``thread`` and ``context`` print: one block per message, or the JSON document the
+    MCP tools of the same names answer with.
+
+    ``chat_id`` and ``msg_id`` are the message that was asked about; each block leads with the
+    chat and id of the message it shows, because a channel post's thread carries the comments of
+    its discussion group and those ids are only meaningful together with that group's own.
+    """
+    if as_json:
+        document = {
+            "chat_id": chat_id,
+            "msg_id": msg_id,
+            "messages": [asdict(view) for view in views],
+        }
+        typer.echo(json.dumps(document, ensure_ascii=False, indent=2))
+        return
+    for n, view in enumerate(views, start=1):
+        if n > 1:
+            typer.echo("")
+        who = view.from_name or "-"
+        typer.echo(f"{n}. {view.chat_id}/{view.msg_id}  {_moment(view.date)}  {who}")
+        typer.echo(f"   {view.url}")
+        if view.fallback_url:
+            typer.echo(f"   fallback: {view.fallback_url}")
+        for line in view.text.splitlines():
+            typer.echo(f"   {line}")
+
+
+def _moment(timestamp: int) -> str:
+    return f"{dt.datetime.fromtimestamp(timestamp, dt.UTC):%Y-%m-%d %H:%M} UTC"
 
 
 @sources_app.command("add")

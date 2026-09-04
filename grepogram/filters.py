@@ -7,6 +7,10 @@ A chat spec is anything :func:`grepogram.sources.parse_target` understands — a
 does: substring hits win, a ``SequenceMatcher`` ratio of at least 0.6 is the fallback when there
 is none. Every spec must select at least one indexed chat, and the union over all specs becomes
 ``chat_ids``. Dates are unix seconds in UTC; naive input is read as UTC.
+
+:func:`resolve_chat` reads the same specs for the readers (``thread``, ``context``) that address
+one message and therefore need exactly one chat: several is :class:`AmbiguousChat` there rather
+than a wider search.
 """
 
 import calendar
@@ -52,6 +56,16 @@ class UnknownChat(FilterError):
             message += f" ({hint})"
         listing = "; ".join(self.candidates) or "nothing is indexed yet"
         super().__init__(f"{message}; indexed: {listing}")
+
+
+class AmbiguousChat(FilterError):
+    """A chat spec selects several indexed chats where one is needed; ``candidates`` lists them."""
+
+    def __init__(self, spec: str, candidates: Sequence[str]) -> None:
+        self.spec = spec
+        self.candidates = list(candidates)
+        listing = "; ".join(self.candidates)
+        super().__init__(f"{spec!r} matches several indexed chats: {listing}; name one of them")
 
 
 # --- dates -----------------------------------------------------------------------------------
@@ -127,6 +141,20 @@ def resolve_chats(conn: sqlite3.Connection, cfg: Config, specs: Sequence[str]) -
     return selected
 
 
+def resolve_chat(conn: sqlite3.Connection, cfg: Config, spec: str) -> int:
+    """The marked id of the one indexed chat ``spec`` selects.
+
+    Same specs as :func:`resolve_chats`, for the readers that address a single message rather
+    than a set to search: a spec that selects nothing still raises :class:`UnknownChat`, and one
+    that selects several — a folder name, a title several chats share — raises
+    :class:`AmbiguousChat` listing them, where a search would simply have searched them all.
+    """
+    found = resolve_chats(conn, cfg, [spec])
+    if len(found) == 1:
+        return found.pop()
+    raise AmbiguousChat(spec, [_label(c) for c in _by_title(db.list_chats(conn)) if c.id in found])
+
+
 def _resolve_spec(spec: str, chats: list[ChatRow], cfg: Config) -> set[int]:
     try:
         target = parse_target(spec)
@@ -180,10 +208,17 @@ def _folders(chats: list[ChatRow]) -> dict[str, set[int]]:
 def _describe(chats: list[ChatRow]) -> list[str]:
     folders = _folders(chats)
     listing = [f"{FOLDER_PREFIX}{name} ({len(ids)} chats)" for name, ids in sorted(folders.items())]
-    for chat in sorted(chats, key=lambda c: dialogs.normalize(c.title or "")):
-        handle = f", @{chat.username}" if chat.username else ""
-        listing.append(f"{chat.title!r} (id {chat.id}{handle})")
+    listing += [_label(chat) for chat in _by_title(chats)]
     return listing
+
+
+def _by_title(chats: list[ChatRow]) -> list[ChatRow]:
+    return sorted(chats, key=lambda c: dialogs.normalize(c.title or ""))
+
+
+def _label(chat: ChatRow) -> str:
+    handle = f", @{chat.username}" if chat.username else ""
+    return f"{chat.title!r} (id {chat.id}{handle})"
 
 
 def _unsynced_hint(target: Target, cfg: Config, chats: list[ChatRow]) -> str | None:
