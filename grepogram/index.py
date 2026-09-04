@@ -21,7 +21,8 @@ immutable) nor inserted twice under one rowid, so a re-embed deletes and inserts
 :func:`ensure_embedding_space` guards the invariant every distance depends on: all stored vectors
 come from the model recorded in ``meta.embed_model`` at the width ``unit_vec`` declares, and a
 changed model is an :class:`EmbeddingSpaceMismatch` until ``grepogram embed --reembed`` rebuilds
-the table. :func:`knn` queries it under the config's fan-out rule: the partition key supports
+the table (:func:`check_embedding_space` is the read-only half search runs before a query).
+:func:`knn` queries it under the config's fan-out rule: the partition key supports
 ``=`` only, so a filter over a few chats runs one KNN per chat, while a filter over many runs a
 single KNN over-fetched :data:`KNN_OVERFETCH` times deeper and drops the other chats afterwards.
 """
@@ -135,6 +136,29 @@ def index_chat(
 # --- dense -----------------------------------------------------------------------------------
 
 
+def check_embedding_space(conn: sqlite3.Connection, embedder: Embedder) -> None:
+    """Raise :class:`EmbeddingSpaceMismatch` unless the stored space is ``embedder``'s.
+
+    Read-only: compares ``meta.embed_model`` / ``embed_dim`` and the width ``unit_vec`` declares
+    with the embedder's name and ``dim``; a database never embedded passes. This is what search
+    checks before a KNN, since a model change at the same width would otherwise go unnoticed.
+    """
+    stored_model = db.get_meta(conn, db.META_EMBED_MODEL)
+    stored_dim = db.get_meta(conn, db.META_EMBED_DIM)
+    table_dim = db.vec_dim(conn)
+    mismatch = (
+        stored_model not in (None, embedder.name)
+        or stored_dim not in (None, str(embedder.dim))
+        or table_dim not in (None, embedder.dim)
+    )
+    if mismatch:
+        raise EmbeddingSpaceMismatch(
+            f"the dense index was built with {stored_model or 'an unknown model'} "
+            f"({stored_dim or table_dim}-d) but the configured model is {embedder.name} "
+            f"({embedder.dim}-d); run `grepogram embed --reembed` to rebuild it"
+        )
+
+
 def ensure_embedding_space(
     conn: sqlite3.Connection, embedder: Embedder, reembed: bool = False
 ) -> None:
@@ -146,20 +170,11 @@ def ensure_embedding_space(
     vectors, flags every unit dirty and records the new space; ``reembed`` does the same for a
     matching space, which is how a deliberate full re-embed begins.
     """
-    stored_model = db.get_meta(conn, db.META_EMBED_MODEL)
-    stored_dim = db.get_meta(conn, db.META_EMBED_DIM)
-    table_dim = db.vec_dim(conn)
-    mismatch = (
-        stored_model not in (None, embedder.name)
-        or stored_dim not in (None, str(embedder.dim))
-        or table_dim not in (None, embedder.dim)
-    )
-    if mismatch and not reembed:
-        raise EmbeddingSpaceMismatch(
-            f"the dense index was built with {stored_model or 'an unknown model'} "
-            f"({stored_dim or table_dim}-d) but the configured model is {embedder.name} "
-            f"({embedder.dim}-d); run `grepogram embed --reembed` to rebuild it"
-        )
+    try:
+        check_embedding_space(conn, embedder)
+    except EmbeddingSpaceMismatch:
+        if not reembed:
+            raise
     with db.transaction(conn):
         if reembed:
             db.ensure_vec_table(conn, embedder.dim, drop=True)

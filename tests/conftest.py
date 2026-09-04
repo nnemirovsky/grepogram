@@ -3,6 +3,12 @@ from pathlib import Path
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def fake_models(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Every test resolves models to the fakes; tests of the real loaders unset this themselves."""
+    monkeypatch.setenv("GREPOGRAM_FAKE_MODELS", "1")
+
+
 @pytest.fixture
 def tmp_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     """Point grepogram at a throwaway home and force fake models for the test."""

@@ -1,4 +1,4 @@
-"""Search over the index: lexical retrieval over units and messages, rank fusion and hits.
+"""Search over the index: lexical and dense retrieval, rank fusion, reranking and dedup.
 
 The lexical side asks FTS5 twice. ``unit_fts`` ranks whole units — windows, threads, posts —
 with ``bm25(unit_fts, 2.0, 1.0)`` (the ``raw`` column weighted twice the ``stemmed`` one), and
@@ -10,13 +10,25 @@ match, the ``AND`` rows keeping their place at the top. ``bm25()`` is negative �
 negative — so rows are ordered ascending and the score is negated. Chat and date filters are
 plain ``AND`` predicates on the UNINDEXED columns, never part of the ``MATCH`` expression.
 
+The dense side (:func:`dense_units`) embeds the query with the configured
+:class:`~grepogram.embed.Embedder` and runs :func:`grepogram.index.knn` over ``unit_vec``; it
+catches paraphrase the stems cannot connect. It only works while vectors exist and come from the
+configured model: when they do not — nothing embedded yet, the ``dense`` extra missing, another
+model recorded in ``meta`` — :func:`search` falls back to the lexical lists and says so in
+``warnings`` instead of failing.
+
 The lists are fused with Reciprocal Rank Fusion (:func:`rrf`), which needs no score calibration
-between tables: a unit near the top of both lists outranks one found by a single list. The dense
-list joins the same fusion once the vector index exists, followed by reranking and dedup; until
-then ``hybrid`` and ``dense`` raise ``NotImplementedError``.
+between tables: a unit near the top of two lists outranks one found by a single list. The fused
+top ``rerank_top`` then go through the cross-encoder (:class:`~grepogram.rerank.Reranker`,
+skipped with ``rerank=False`` or when it cannot load) and are re-sorted by its scores, after
+which :func:`dedup` drops every hit that mostly repeats a better one — a thread inside a window
+already shown — and the top ``k`` survivors are returned. ``mode`` picks the retrieval lists
+(``hybrid`` fuses both sides, ``lexical`` and ``dense`` use one) while reranking and dedup apply
+to all of them, so a fallback from ``hybrid`` to ``lexical`` changes what is retrieved and
+nothing else.
 
 Every hit carries an *anchor*, the message its deep link opens: the matched message for a
-message-level hit, and for a unit-level hit the unit's best message under the query according to
+message-level hit, and for every other hit the unit's best message under the query according to
 ``msg_fts`` (:func:`best_anchor`), else the unit's first message. The snippet leads with the
 anchor's rendered line and adds its neighbours from within the unit while the total stays under
 :data:`SNIPPET_CHARS`; ``full`` adds the unit's whole text.
@@ -28,8 +40,12 @@ import time
 from collections.abc import Sequence
 from dataclasses import dataclass
 
-from grepogram import db, links
+from grepogram import db, embed, index, links
+from grepogram import rerank as reranking
+from grepogram.embed import Embedder, ModelUnavailable
+from grepogram.index import EmbeddingSpaceMismatch
 from grepogram.models import Config, Filters, Hit, MessageRow, SearchResult, UnitRow
+from grepogram.rerank import Reranker
 from grepogram.stem import FtsOp, fts_query
 from grepogram.units import render_line
 
@@ -42,13 +58,19 @@ NOTHING_INDEXED = (
     "nothing is indexed yet: add a source with `grepogram sources add <target>` "
     "and run `grepogram sync`"
 )
+NO_VECTORS = "no units are embedded yet; run `grepogram sync` or `grepogram embed`"
 _OPS: tuple[FtsOp, ...] = ("AND", "OR")
+
+
+class DenseUnavailable(Exception):
+    """The dense side cannot run: no vectors, no embedding model, or a mismatched space."""
 
 
 @dataclass(frozen=True, slots=True)
 class Match:
-    """One retrieved unit: ``score`` is ``-bm25`` on a lexical list; ``anchor_msg_id`` is the
-    matched message of a message-level hit and ``None`` when the unit matched as a whole."""
+    """One retrieved unit: ``score`` is ``-bm25`` on a lexical list and the cosine similarity
+    on the dense list; ``anchor_msg_id`` is the matched message of a message-level hit and
+    ``None`` when the unit matched as a whole."""
 
     unit_id: int
     score: float
@@ -144,6 +166,44 @@ def _fts_rows(
     return [(int(row["rowid"]), -float(row["s"])) for row in conn.execute(sql, params)]
 
 
+# --- dense list ------------------------------------------------------------------------------
+
+
+def dense_units(
+    conn: sqlite3.Connection,
+    cfg: Config,
+    query: str,
+    filters: Filters,
+    limit: int,
+    embedder: Embedder | None = None,
+) -> list[Match]:
+    """Up to ``limit`` units nearest to ``query`` in the dense index, best first, scored by
+    cosine similarity; a unit with no similarity at all (cosine ≤ 0) is not a match.
+
+    ``embedder`` defaults to :func:`grepogram.embed.load_embedder`, which is not called while
+    ``unit_vec`` is missing or empty — nothing to search, no point loading a model. Raises
+    :class:`DenseUnavailable` in that case, when the model cannot load, and when the stored
+    vectors come from another model or width than the embedder.
+    """
+    if not db.has_vectors(conn):
+        raise DenseUnavailable(NO_VECTORS)
+    if limit <= 0 or (filters.chat_ids is not None and not filters.chat_ids):
+        return []
+    if embedder is None:
+        try:
+            embedder = embed.load_embedder(cfg)
+        except ModelUnavailable as exc:
+            raise DenseUnavailable(str(exc)) from exc
+    try:
+        index.check_embedding_space(conn, embedder)
+        found = index.knn(
+            conn, embedder.embed_query(query), filters, limit, cfg.search.vec_fanout_max
+        )
+    except EmbeddingSpaceMismatch as exc:
+        raise DenseUnavailable(str(exc)) from exc
+    return [Match(unit_id, 1.0 - distance) for unit_id, distance in found if distance < 1.0]
+
+
 # --- fusion ----------------------------------------------------------------------------------
 
 
@@ -156,6 +216,32 @@ def rrf(rankings: Sequence[Sequence[int]], k: int) -> dict[int, float]:
         for rank, unit_id in enumerate(ranking, start=1):
             scores[unit_id] = scores.get(unit_id, 0.0) + 1.0 / (k + rank)
     return scores
+
+
+def dedup(hits: Sequence[Hit], overlap: float) -> list[Hit]:
+    """Best hits first, minus every hit that mostly repeats a better one.
+
+    Hits are taken in descending score (a stable sort, so ties keep their order) and a hit is
+    dropped when at least ``overlap`` of its own message ids already belong to a kept hit of the
+    same chat (:func:`overlap_ratio`): a thread inside a window that ranks higher is dropped,
+    while a window that extends a higher-ranked thread survives, since most of it is new. A
+    dropped hit shields nothing — later hits are compared with the kept ones only. A threshold
+    above 1.0 keeps everything.
+    """
+    kept: list[Hit] = []
+    for hit in sorted(hits, key=lambda h: -h.score):
+        if not any(overlap_ratio(hit, other) >= overlap for other in kept):
+            kept.append(hit)
+    return kept
+
+
+def overlap_ratio(hit: Hit, other: Hit) -> float:
+    """The share of ``hit``'s message ids that ``other`` also carries; 0 across chats, whose
+    message ids live in separate number spaces."""
+    ids = set(hit.msg_ids)
+    if hit.chat.id != other.chat.id or not ids:
+        return 0.0
+    return len(ids & set(other.msg_ids)) / len(ids)
 
 
 # --- hits ------------------------------------------------------------------------------------
@@ -264,30 +350,47 @@ def index_age_min(conn: sqlite3.Connection, now: int | None = None) -> int | Non
     return max(0, now - latest) // 60
 
 
+@dataclass(frozen=True, slots=True)
+class _Candidate:
+    unit_id: int
+    unit: UnitRow
+    score: float
+
+
 def search(
     conn: sqlite3.Connection,
     cfg: Config,
     query: str,
     filters: Filters | None = None,
     k: int | None = None,
-    mode: str = "lexical",
+    mode: str = "hybrid",
     full: bool = False,
     now: int | None = None,
+    *,
+    rerank: bool = True,
+    embedder: Embedder | None = None,
+    reranker: Reranker | None = None,
 ) -> SearchResult:
     """Run ``query`` over the index and return the top ``k`` hits (``[search] k`` by default).
 
-    ``mode`` is ``lexical`` for now; ``hybrid`` and ``dense`` raise ``NotImplementedError``
-    until the dense index exists, and anything else ``ValueError``. Both lexical lists are
-    fetched ``max(k, rerank_top)`` deep, fused with :func:`rrf` using ``rrf_k``, and the top
-    ``k`` become hits. A query without searchable words yields no hits and a warning, as does
-    an index with no chats; ``index_age_min`` is filled in either way.
+    ``mode`` picks the retrieval lists: ``hybrid`` fuses the two lexical lists with the dense
+    list, ``lexical`` and ``dense`` use one side only; anything else is a ``ValueError``. When
+    the dense side is unavailable — no vectors yet, the model cannot load, vectors from another
+    model — the search falls back to ``lexical`` and explains why in ``warnings``. A query
+    without searchable words is answered by the dense side alone in ``hybrid`` mode and yields
+    no hits (plus a warning) in ``lexical`` mode.
+
+    Every list is fetched ``max(k, rerank_top)`` deep and the lists are fused with :func:`rrf`
+    using ``rrf_k``; the fused top ``max(k, rerank_top)`` are re-scored by the cross-encoder
+    when ``rerank`` is set and it loads (a hit's ``score`` is then the reranker's, otherwise the
+    fused score), :func:`dedup` drops the near-duplicates at ``dedup_overlap``, and the top
+    ``k`` survivors become hits. ``embedder`` and ``reranker`` stand in for the models
+    :func:`grepogram.embed.load_embedder` and :func:`grepogram.rerank.load_reranker` would load.
+    An index with no chats yields no hits and a warning; ``index_age_min`` is filled in either
+    way.
     """
     if mode not in MODES:
         raise ValueError(f"unknown search mode {mode!r}; expected one of {', '.join(MODES)}")
-    if mode != "lexical":
-        raise NotImplementedError(
-            f"{mode} search needs the dense index, which is not built yet; use mode='lexical'"
-        )
     k = cfg.search.k if k is None else k
     if k <= 0:
         raise ValueError(f"k must be positive, got {k}")
@@ -296,33 +399,90 @@ def search(
     age = index_age_min(conn, now)
     if not db.list_chats(conn):
         warnings.append(NOTHING_INDEXED)
-    if fts_query(query) is None:
-        warnings.append(f"query {query!r} has no searchable words (letters or digits)")
         return SearchResult(hits=[], warnings=warnings, index_age_min=age)
     limit = max(k, cfg.search.rerank_top)
-    unit_matches = lexical_units(conn, query, filters, limit)
-    message_matches = lexical_messages(conn, query, filters, limit)
+    dense: list[Match] = []
+    if mode != "lexical":
+        try:
+            dense = dense_units(conn, cfg, query, filters, limit, embedder)
+        except DenseUnavailable as exc:
+            warnings.append(f"dense search unavailable: {exc}")
+            mode = "lexical"
+    if mode != "dense" and fts_query(query) is None:
+        note = f"query {query!r} has no searchable words (letters or digits)"
+        if mode == "lexical":
+            warnings.append(note)
+            return SearchResult(hits=[], warnings=warnings, index_age_min=age)
+        warnings.append(f"{note}; only the dense index was searched")
+        mode = "dense"
+    unit_matches: list[Match] = []
+    message_matches: list[Match] = []
+    if mode != "dense":
+        unit_matches = lexical_units(conn, query, filters, limit)
+        message_matches = lexical_messages(conn, query, filters, limit)
     fused = rrf(
-        [[m.unit_id for m in unit_matches], [m.unit_id for m in message_matches]],
+        [
+            [m.unit_id for m in unit_matches],
+            [m.unit_id for m in message_matches],
+            [m.unit_id for m in dense],
+        ],
         cfg.search.rrf_k,
     )
-    anchors = {m.unit_id: m.anchor_msg_id for m in message_matches}
-    top = sorted(fused, key=lambda unit_id: -fused[unit_id])[:k]
-    units = {unit.id: unit for unit in db.get_units_by_ids(conn, top)}
-    hits: list[Hit] = []
-    for unit_id in top:
+    order = sorted(fused, key=lambda unit_id: -fused[unit_id])[:limit]
+    units = {unit.id: unit for unit in db.get_units_by_ids(conn, order)}
+    candidates: list[_Candidate] = []
+    for unit_id in order:
         unit = units.get(unit_id)
         if unit is None:
             log.warning("unit %d is indexed but not stored; skipping", unit_id)
             continue
-        anchor = anchors.get(unit_id)
+        candidates.append(_Candidate(unit_id, unit, fused[unit_id]))
+    if rerank and candidates:
+        candidates = _rerank(cfg, query, candidates, reranker, warnings)
+    anchors = {m.unit_id: m.anchor_msg_id for m in message_matches}
+    hits: list[Hit] = []
+    for candidate in candidates:
+        anchor = anchors.get(candidate.unit_id)
         if anchor is None:
-            anchor = best_anchor(conn, unit, query)
-        hits.append(build_hit(conn, unit, anchor, fused[unit_id], full))
+            anchor = best_anchor(conn, candidate.unit, query)
+        hits.append(build_hit(conn, candidate.unit, anchor, candidate.score, full))
+    hits = dedup(hits, cfg.search.dedup_overlap)[:k]
     log.debug(
-        "lexical search: %d unit matches, %d message matches, %d hits",
+        "%s search: %d unit, %d message, %d dense matches; %d candidates, %d hits",
+        mode,
         len(unit_matches),
         len(message_matches),
+        len(dense),
+        len(candidates),
         len(hits),
     )
     return SearchResult(hits=hits, warnings=warnings, index_age_min=age)
+
+
+def _rerank(
+    cfg: Config,
+    query: str,
+    candidates: list[_Candidate],
+    reranker: Reranker | None,
+    warnings: list[str],
+) -> list[_Candidate]:
+    """The candidates re-scored by the cross-encoder and sorted by that score, ties keeping
+    their fused order; when the reranker cannot load or score, a warning is added and the
+    candidates come back untouched."""
+    try:
+        if reranker is None:
+            reranker = reranking.load_reranker(cfg)
+        scores = reranker.score(query, [candidate.unit.text for candidate in candidates])
+    except ModelUnavailable as exc:
+        warnings.append(f"reranking unavailable: {exc}")
+        return candidates
+    if len(scores) != len(candidates):
+        raise RuntimeError(
+            f"reranker {reranker.name} returned {len(scores)} scores for {len(candidates)} texts"
+        )
+    rescored = [
+        _Candidate(candidate.unit_id, candidate.unit, score)
+        for candidate, score in zip(candidates, scores, strict=True)
+    ]
+    rescored.sort(key=lambda candidate: -candidate.score)
+    return rescored

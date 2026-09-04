@@ -2,8 +2,11 @@
 
 Commands print plain text to stdout and diagnostics to stderr; logging goes to stderr and the log
 file. ``config`` and ``sources`` are sub-apps; ``search --json`` prints the
-:class:`~grepogram.models.SearchResult` and nothing else on stdout. ``sync`` embeds new units when
-the embedding model loads and only warns when it does not; ``embed`` insists on the model.
+:class:`~grepogram.models.SearchResult` and nothing else on stdout. ``search`` fuses lexical and
+dense retrieval by default (``--mode``) and reranks unless ``--no-rerank``; when the dense index
+or a model is unavailable it falls back to lexical and prints a warning on stderr. ``sync`` embeds
+new units when the embedding model loads and only warns when it does not; ``embed`` insists on
+the model.
 """
 
 import asyncio
@@ -282,13 +285,24 @@ def search_cmd(
     mode: Annotated[
         Mode,
         typer.Option(
-            "--mode", help="lexical = BM25 over stems; hybrid and dense need the dense index."
+            "--mode",
+            help="hybrid = lexical and dense retrieval fused; lexical = BM25 over stems only; "
+            "dense = embeddings only. Without vectors or the model, every mode falls back "
+            "to lexical.",
         ),
-    ] = Mode.lexical,
+    ] = Mode.hybrid,
     k: Annotated[
         int | None,
         typer.Option("-k", "--limit", min=1, help="Number of hits (default: [search] k)."),
     ] = None,
+    rerank: Annotated[
+        bool,
+        typer.Option(
+            "--rerank/--no-rerank",
+            help="Re-score the top candidates with the cross-encoder (skipped when it cannot "
+            "load).",
+        ),
+    ] = True,
     full: Annotated[
         bool, typer.Option("--full", help="Include each hit's full unit text.")
     ] = False,
@@ -300,8 +314,10 @@ def search_cmd(
     _, cfg, conn = _load()
     try:
         selected = filters.resolve_filters(conn, cfg, chat, since, until)
-        result = search.search(conn, cfg, query, selected, k, mode=mode.value, full=full)
-    except (FilterError, NotImplementedError) as exc:
+        result = search.search(
+            conn, cfg, query, selected, k, mode=mode.value, full=full, rerank=rerank
+        )
+    except FilterError as exc:
         fail(str(exc))
     finally:
         conn.close()

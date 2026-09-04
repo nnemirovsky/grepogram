@@ -230,6 +230,24 @@ def test_ensure_embedding_space_rejects_a_table_of_another_width(conn: sqlite3.C
     assert db.get_meta(conn, db.META_EMBED_MODEL) is None
 
 
+def test_check_embedding_space_is_read_only(
+    conn: sqlite3.Connection, loaded: chat_ru.Loaded, embedder: CountingEmbedder
+) -> None:
+    index.check_embedding_space(conn, embedder)
+    assert not db.has_vec_table(conn) and db.get_meta(conn, db.META_EMBED_MODEL) is None
+    index.embed_dirty_units(conn, embedder)
+    before = _vec_rowids(conn)
+    index.check_embedding_space(conn, FakeEmbedder())
+    with pytest.raises(EmbeddingSpaceMismatch, match=r"fake \(256-d\).*fake \(8-d\).*--reembed"):
+        index.check_embedding_space(conn, FakeEmbedder(dim=8))
+    with pytest.raises(EmbeddingSpaceMismatch, match="fake.*other-model"):
+        index.check_embedding_space(conn, OtherModel())
+    assert _vec_rowids(conn) == before
+    assert db.get_meta(conn, db.META_EMBED_MODEL) == "fake"
+    assert db.count_dirty_units(conn) == 0
+    assert not conn.in_transaction
+
+
 def test_ensure_embedding_space_reembed_rebuilds_for_a_new_width(
     conn: sqlite3.Connection, loaded: chat_ru.Loaded, embedded: CountingEmbedder
 ) -> None:

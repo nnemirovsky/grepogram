@@ -18,6 +18,8 @@ from tests.fixtures import chat_ru
 ARG = chat_ru.ARG_ID
 GEO = chat_ru.GEO_ID
 CFG = chat_ru.CFG
+RAW = Config(search=SearchCfg(dedup_overlap=1.5), units=CFG.units, sources=CFG.sources)
+"""The fixture config with dedup switched off, to look at the fused ranking itself."""
 ALL = Filters()
 JUNE = filters.parse_when("2024-06")
 
@@ -235,7 +237,7 @@ def test_lexical_messages_respect_filters_and_skip_unitless_messages(
 def test_search_hit_carries_url_anchor_and_snippet(
     conn: sqlite3.Connection, loaded: chat_ru.Loaded
 ) -> None:
-    result = search.search(conn, CFG, "Recoleta", ALL)
+    result = search.search(conn, CFG, "Recoleta", ALL, mode="lexical")
     assert result.warnings == [] and result.synced is False
     hit = result.hits[0]
     assert hit.kind == "window" and hit.chat == loaded.chats[ARG]
@@ -258,7 +260,7 @@ def test_search_hit_carries_url_anchor_and_snippet(
 def test_search_ranks_units_found_by_both_lists_first(
     conn: sqlite3.Connection, loaded: chat_ru.Loaded
 ) -> None:
-    hits = search.search(conn, CFG, "Recoleta", ALL).hits
+    hits = search.search(conn, RAW, "Recoleta", ALL, mode="lexical", rerank=False).hits
     assert [h.kind for h in hits] == ["window", "thread"]
     assert all(37 in h.msg_ids for h in hits)
     by_unit = _ids(search.lexical_units(conn, "Recoleta", ALL, 40))
@@ -271,14 +273,18 @@ def test_search_ranks_units_found_by_both_lists_first(
     rrf_k = CFG.search.rrf_k
     assert hits[0].score == pytest.approx(1 / (rrf_k + 2) + 1 / (rrf_k + 1))
     assert hits[1].score == pytest.approx(1 / (rrf_k + 1))
+    deduped = search.search(conn, CFG, "Recoleta", ALL, mode="lexical", rerank=False).hits
+    assert [h.kind for h in deduped] == ["window"]  # the thread lies inside the window
+    assert deduped[0].score == hits[0].score
 
 
 def test_search_anchors_unit_hits_at_their_best_message(
     conn: sqlite3.Connection, loaded: chat_ru.Loaded
 ) -> None:
-    thread = next(h for h in search.search(conn, CFG, "Recoleta", ALL).hits if h.kind == "thread")
+    found = search.search(conn, RAW, "Recoleta", ALL, mode="lexical").hits
+    thread = next(h for h in found if h.kind == "thread")
     assert thread.anchor_msg_id == 37 and thread.url == "https://t.me/arg_chat/37"
-    hits = search.search(conn, CFG, "открыть счёт", ALL).hits
+    hits = search.search(conn, RAW, "открыть счёт", ALL, mode="lexical").hits
     continuation = next(h for h in hits if h.kind == "thread" and h.msg_ids == [1, 7, 10])
     assert continuation.anchor_msg_id == 1
     assert continuation.snippet.startswith(render_line(chat_ru.message(ARG, 1)))
@@ -296,7 +302,7 @@ def test_search_applies_filters(conn: sqlite3.Connection, loaded: chat_ru.Loaded
 def test_search_warns_on_query_without_words(
     conn: sqlite3.Connection, loaded: chat_ru.Loaded
 ) -> None:
-    result = search.search(conn, CFG, "🙂🙂 …", ALL, now=chat_ru.SYNCED_AT + 120)
+    result = search.search(conn, CFG, "🙂🙂 …", ALL, mode="lexical", now=chat_ru.SYNCED_AT + 120)
     assert result.hits == []
     assert len(result.warnings) == 1 and "no searchable words" in result.warnings[0]
     assert result.index_age_min == 2
@@ -321,9 +327,6 @@ def test_search_on_an_empty_index_warns(conn: sqlite3.Connection) -> None:
 def test_search_rejects_bad_modes_and_k(conn: sqlite3.Connection, loaded: chat_ru.Loaded) -> None:
     with pytest.raises(ValueError, match="unknown search mode"):
         search.search(conn, CFG, "DNI", ALL, mode="bogus")
-    for mode in ("hybrid", "dense"):
-        with pytest.raises(NotImplementedError, match="dense index"):
-            search.search(conn, CFG, "DNI", ALL, mode=mode)
     with pytest.raises(ValueError, match="positive"):
         search.search(conn, CFG, "DNI", ALL, k=0)
 
@@ -416,7 +419,9 @@ def seeded_home(tmp_home: Path) -> Path:
 
 
 def test_cli_search_json_prints_the_result_and_nothing_else(seeded_home: Path) -> None:
-    result = runner.invoke(cli.app, ["search", "открыть счёт", "--json", "-k", "2"])
+    result = runner.invoke(
+        cli.app, ["search", "открыть счёт", "--json", "-k", "2", "--mode", "lexical"]
+    )
     assert result.exit_code == 0, result.output
     payload = json.loads(result.stdout)
     assert set(payload) == {"hits", "warnings", "index_age_min", "synced"}
@@ -446,16 +451,20 @@ def test_cli_search_json_prints_the_result_and_nothing_else(seeded_home: Path) -
 
 
 def test_cli_search_text_output_has_url_per_hit(seeded_home: Path) -> None:
-    result = runner.invoke(cli.app, ["search", "Recoleta"])
+    result = runner.invoke(cli.app, ["search", "Recoleta", "--mode", "lexical"])
     assert result.exit_code == 0, result.output
     lines = result.stdout.splitlines()
     assert lines[0].startswith("1. ") and "window" in lines[0] and "Argentina chat" in lines[0]
     assert lines[1] == "   https://t.me/arg_chat/37"
     assert lines[2].startswith("   [2024-06-20 18:04] Alice: Confirmed today at the Recoleta")
-    assert "" in lines and lines[lines.index("") + 1].startswith("2. ")
-    assert lines.count("   https://t.me/arg_chat/37") == 2
+    assert not any(line.startswith("2. ") for line in lines)  # the thread inside it is a duplicate
     assert "note: the index is" in result.stderr and "grepogram sync" in result.stderr
     assert "note:" not in result.stdout
+    two = runner.invoke(cli.app, ["search", "DNI", "--mode", "lexical", "-k", "2"])
+    lines = two.stdout.splitlines()
+    assert lines[0].startswith("1. ")
+    assert "" in lines and lines[lines.index("") + 1].startswith("2. ")
+    assert sum(line.startswith("   https://t.me/arg_chat/") for line in lines) == 2
 
 
 def test_cli_search_filters(seeded_home: Path) -> None:
@@ -478,8 +487,6 @@ def test_cli_search_filters(seeded_home: Path) -> None:
         (["search", "DNI", "--chat", "nowhere"], "no indexed chat matches"),
         (["search", "DNI", "--since", "yesterday"], "cannot read date"),
         (["search", "DNI", "--since", "2024-06", "--until", "2024-01"], "lies after"),
-        (["search", "DNI", "--mode", "hybrid"], "dense index"),
-        (["search", "DNI", "--mode", "dense"], "dense index"),
     ],
 )
 def test_cli_search_errors_go_to_stderr(seeded_home: Path, args: list[str], message: str) -> None:
