@@ -523,7 +523,11 @@ def set_chat_migrated(conn: sqlite3.Connection, chat_id: int, migrated_to: int) 
 
 
 def delete_chat(conn: sqlite3.Connection, chat_id: int) -> None:
-    """Remove a chat with its messages and units, including their FTS and vector rows.
+    """Remove a stored chat with its messages and units, including their FTS and vector rows.
+
+    A chat this index does not hold is a no-op: deleting an id that was never stored must not
+    reach the rows of the chats that are, and clearing ``discussion_of`` on a live group because
+    the id matches the channel it names would be exactly that.
 
     The virtual-table rows go first, addressed by rowid (a direct lookup, not a scan); deleting
     the ``chats`` row then cascades to ``messages`` and ``units``.
@@ -531,15 +535,16 @@ def delete_chat(conn: sqlite3.Connection, chat_id: int) -> None:
     Units of *other* chats can quote this one, and they go in the same transaction: a channel's
     post threads carry the comments its discussion group holds, so deleting a group drops the
     post threads its comments fed and flags those posts ``indexed = 0``
-    (:func:`_drop_post_threads`). The flag on its own would not do — the channel may never
+    (:func:`drop_comment_units`). The flag on its own would not do — the channel may never
     resolve again, and until it does the index would answer with rows that are gone. The mirror
     case is a channel deleted while its group lives on under a source of its own: the group's
     own windows and threads are its own messages and stay untouched, only the link goes.
     """
     with transaction(conn):
         chat = get_chat(conn, chat_id)
-        if chat is not None:
-            _drop_post_threads(conn, chat)
+        if chat is None:
+            return
+        drop_comment_units(conn, chat.discussion_of, chat.id)
         set_discussion_chat(conn, chat_id, None)
         conn.execute(
             "DELETE FROM msg_fts WHERE rowid IN (SELECT id FROM messages WHERE chat_id = ?)",
@@ -557,28 +562,39 @@ def delete_chat(conn: sqlite3.Connection, chat_id: int) -> None:
         conn.execute("DELETE FROM chats WHERE id = ?", (chat_id,))
 
 
-def _drop_post_threads(conn: sqlite3.Connection, group: ChatRow) -> None:
-    """Undo what a discussion group's comments left in the channel that stored them.
+def drop_comment_units(conn: sqlite3.Connection, channel_id: int | None, group_id: int) -> int:
+    """Undo what a discussion group's comments left in a channel's post threads.
 
-    A channel's post threads are the only units built from another chat's rows
-    (:func:`grepogram.units.build_posts`), and they hang under the post ids the group keeps its
-    comments in ``topic_id`` — so only a broadcast channel, the one shape that has them, is
-    touched. Those threads are deleted with their index rows and the posts are flagged for a
-    rebuild, which is the repair :func:`grepogram.sync._relink_discussion` makes when a channel
-    loses its group — except that here the rows the threads quote are about to be gone, so the
-    deletion cannot wait for a run that may never come. Nothing to do when ``group`` is not one:
-    a chat holds no units of another.
+    Returns how many of the channel's posts were flagged for a rebuild. This is the one answer
+    to "which units quote this group": a channel's post threads are the only units built from
+    another chat's rows (:func:`grepogram.units.build_posts`), and they hang under the post ids
+    the group keeps its comments in ``topic_id`` — so only a broadcast channel, the one shape
+    that has them, is touched. The threads themselves name no comment: each lists only the post
+    in ``msg_ids`` (comment ids live in the group's id space), so nothing in the rows ties a
+    thread back to the group whose text it carries. The link is that tie, and it is why every
+    place the link goes cleans up under it right there — :func:`delete_chat` when the group is
+    deleted, :func:`grepogram.sync._drop_comment_units` when a channel is unlinked from it or
+    another channel takes it over. Flagging the posts and leaving the threads for the next
+    rebuild would not do: delete the group in between and no link is left to find them by.
+
+    The stale threads go with their ``unit_fts`` and vector rows, and the posts are flagged
+    ``indexed = 0`` so the next rebuild cuts them again — without those comments, or with the
+    ones the new group holds. Nothing to do when the channel is not stored, when ``channel_id``
+    is ``None`` (a group no channel links) or when the chat is not a broadcast channel: no other
+    shape holds another chat's rows.
     """
-    channel = None if group.discussion_of is None else get_chat(conn, group.discussion_of)
+    channel = None if channel_id is None else get_chat(conn, channel_id)
     if channel is None or not channel.is_broadcast:
-        return
-    topics = stored_topic_ids(conn, group.id)
+        return 0
+    topics = stored_topic_ids(conn, group_id)
     if not topics:
-        return
-    stale = [unit.id for unit in threads_touching(conn, channel.id, topics) if unit.id is not None]
-    _drop_units_and_index(conn, stale)
-    posts = get_messages_by_msg_id(conn, channel.id, topics)
-    mark_unindexed(conn, [post.id for post in posts.values() if post.id is not None])
+        return 0
+    with transaction(conn):
+        stale = threads_touching(conn, channel.id, topics)
+        _drop_units_and_index(conn, [unit.id for unit in stale if unit.id is not None])
+        posts = get_messages_by_msg_id(conn, channel.id, topics)
+        mark_unindexed(conn, [post.id for post in posts.values() if post.id is not None])
+        return len(posts)
 
 
 def _drop_units_and_index(conn: sqlite3.Connection, ids: Sequence[int]) -> None:

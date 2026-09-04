@@ -594,6 +594,33 @@ def test_delete_chat_clears_the_link_of_a_group_that_outlives_its_channel(
     assert db.unindexed_message_ids(conn, 2) == []
 
 
+def _dump(conn: sqlite3.Connection) -> dict[str, list[tuple[object, ...]]]:
+    """Every row a delete could touch, for a before/after comparison."""
+    dumped = {
+        table: [tuple(row) for row in conn.execute(f"SELECT * FROM {table} ORDER BY id")]
+        for table in ("chats", "messages", "units")
+    }
+    for virtual in ("msg_fts", "unit_fts", "unit_vec"):
+        rows = conn.execute(f"SELECT rowid FROM {virtual} ORDER BY rowid")
+        dumped[virtual] = [tuple(row) for row in rows]
+    return dumped
+
+
+def test_delete_chat_leaves_every_row_alone_for_a_chat_it_never_held(
+    conn: sqlite3.Connection,
+) -> None:
+    """An id this index does not hold is a no-op, ``discussion_of`` included: a group whose
+    channel is not stored is a live chat of its own, and deleting the id it names must not
+    unlink it on the way past."""
+    _channel_with_comments(conn)
+    db.upsert_chat(conn, _chat(3, discussion_of=404, source_id="chat:3"))
+    before = _dump(conn)
+    db.delete_chat(conn, 404)
+    db.delete_chat(conn, 3_000_000)
+    assert _dump(conn) == before
+    assert not conn.in_transaction
+
+
 def test_delete_chat_fts_cleanup_is_rowid_lookup(conn: sqlite3.Connection) -> None:
     plan = conn.execute(
         "EXPLAIN QUERY PLAN DELETE FROM msg_fts WHERE rowid IN "
