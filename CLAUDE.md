@@ -187,20 +187,22 @@ never change the git identity.
   `finally` and `_fetch_comments` stores its rows as it reads them, because a flood wait on one
   comment thread leaves the whole run. A thread is only requested while Telegram reports more
   replies than are stored (`db.count_comment_messages`).
-- Never let a probe, smoke test or validation step call `links.open_link`, `links.run_command` or
-  the `open_message` tool with the real runner: inject a recording runner. `GREPOGRAM_NO_OPEN=1`
-  (set by the autouse fixture) makes `open_link` return the url without running anything and
-  `open_message` report `opened: false`, so nothing under the test environment launches Telegram
-  or a browser.
-- `links.message_url` returns the `https://t.me` form in `Link.url` (what hits and message views
-  show) and the `tg://` form in `Link.app_url` (`resolve` / `privatepost` / `openmessage`);
-  `open_link` tries `app_url`, then `url`, then `fallback_url`, because `open https://t.me/…` on
-  macOS lands in Safari, not in the Telegram app. The bare channel id a `t.me/c/` link needs comes
-  from `telethon.utils.resolve_id`, never from string surgery on the `-100` prefix: the mark is
-  arithmetic (`-(1000000000000 + id)`), so a channel id below ten digits leaves zeros right behind
-  that prefix and any lexical rule either swallows them or refuses the id — which took `search`,
-  `thread`, `context` and `open_message` down for the whole chat. `sources.parse_target` builds the
-  same mark arithmetically for `t.me/c/<id>`, so such ids reach the index by the front door.
+- grepogram launches nothing. It has no `open`, no `subprocess` outside the tests, and no
+  platform dependency on macOS beyond its default paths: a result carries links and a human or an
+  agent clicks one. The `open_message` tool, `links.open_link` and the `tg://resolve` /
+  `tg://privatepost` forms that only fed it were removed for that reason — a search answers with
+  ten hits, so "open this one" was never the workflow, and a review probe that reached the real
+  runner once launched Telegram and Safari with fixture links. Do not bring any of it back.
+- `links.message_url` returns the form to show and cite in `Link.url` — `https://t.me/…` where
+  Telegram has one, `tg://openmessage?…` for the private chats and legacy groups that have none —
+  and `Link.fallback_url` carries `tg://user?id=` for a DM, which is what a desktop client
+  actually opens. Both are display links; nothing consumes them but the reader. The bare channel
+  id a `t.me/c/` link needs comes from `telethon.utils.resolve_id`, never from string surgery on
+  the `-100` prefix: the mark is arithmetic (`-(1000000000000 + id)`), so a channel id below ten
+  digits leaves zeros right behind that prefix and any lexical rule either swallows them or
+  refuses the id — which took `search`, `thread` and `context` down for the whole chat.
+  `sources.parse_target` builds the same mark arithmetically for `t.me/c/<id>`, so such ids reach
+  the index by the front door.
 - A `MessageView` names the chat it is in (`chat_id`), because a list of them can span two:
   `search.thread` follows a channel post with its discussion group's comments, and post ids and
   comment ids both number from 1, so `msg_id` alone names two different messages. The top-level
@@ -235,11 +237,8 @@ never change the git identity.
   `~/.config/grepogram`.
 - `GREPOGRAM_FAKE_MODELS=1` — `embed.load_embedder` and `rerank.load_reranker` return
   `FakeEmbedder` (hashed bag of stems with a small RU/EN lexicon, 256-d) and `FakeReranker`. An
-  autouse fixture sets it for every test; tests of the real loaders unset it themselves.
-- `GREPOGRAM_NO_OPEN=1` — `links.open_link` returns the url without running `open` and the
-  `open_message` tool answers `opened: false` with an `error` saying so. The same autouse fixture
-  sets it for every test; the `open_link` / `open_message` tests unset it and inject a runner.
-  Both flags are read through `paths.env_flag` (`1`, `true`, `yes`, `on`).
+  autouse fixture sets it for every test; tests of the real loaders unset it themselves. It is
+  read through `paths.env_flag` (`1`, `true`, `yes`, `on`), the one helper for such switches.
 - `HF_HUB_OFFLINE=1` — huggingface_hub's own flag, honoured rather than owned:
   `embed.load_cached_first` never retries with the network while it is set, so a model missing
   from the cache degrades the search instead of downloading. CI sets it for the whole suite,
@@ -278,10 +277,10 @@ never change the git identity.
 fuzzy matching), `sources` (targets, resolution, status), `sync` (fetch, mapping, lock, budget),
 `units` (windows, threads, posts, incremental rebuild), `stem` (tokenizer, Snowball, FTS query),
 `index` (FTS and vec maintenance, KNN), `embed` and `rerank` (protocols, fakes, bge models),
-`links` (deep links, `open`), `filters` (chat specs, dates, `resolve_chat` for the one-chat
+`links` (deep links), `filters` (chat specs, dates, `resolve_chat` for the one-chat
 readers), `search` (retrieval, fusion, dedup, readers), `cli` (typer app: `search` and the
 `thread` / `context` readers beside `sources`, `sync`, `embed`, `config`), `mcp` (FastMCP server
-with nine tools). The CLI and the MCP server offer the same readers, and `--json` prints the
+with eight tools). The CLI and the MCP server offer the same readers, and `--json` prints the
 document the matching tool returns.
 
 Plans live in `docs/plans/`, finished ones in `docs/plans/completed/`.

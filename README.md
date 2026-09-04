@@ -63,9 +63,9 @@ Everything lives in one SQLite file.
 
 ## Requirements
 
-- macOS. On Apple Silicon the models run on Metal (`mps`), otherwise on the CPU; `open_message`
-  uses `open`, and the default paths follow macOS conventions. The code runs elsewhere with
-  `GREPOGRAM_HOME` set, but that is untested.
+- macOS. On Apple Silicon the models run on Metal (`mps`), otherwise on the CPU, and the default
+  paths follow macOS conventions. The code runs elsewhere with `GREPOGRAM_HOME` set, but that is
+  untested.
 - [uv](https://docs.astral.sh/uv/). The project pins CPython 3.12 (`torch` and `sqlite-vec`
   wheels); uv installs it. The interpreter's `sqlite3` module must be able to load extensions,
   because sqlite-vec is one: uv's own managed builds and Homebrew's `python@3.12` can, while
@@ -249,14 +249,13 @@ advisory; the data next to them is valid.
 | `dialogs` | `query` | `{query, matches}`: chats and folders of the account matching the name; each match carries `kind`, `id`, `title`, `type`, `username`, `folders`, `score` and `target`, the string to pass to `sources_add` |
 | `sources_add` | `target`, `since=null`, `comments=false` | `{source, kind, title, chats, hint}` after saving the config |
 | `sources_remove` | `target` | `{source_id, removed_chat_ids, config_updated}` after deleting the chats' data; `target` is a source id from `sources` (`folder:<name>`, `chat:<value>`), a folder name, a chat id, `@username` or a fuzzy title; `error` while a sync is running |
-| `open_message` | `chat_id`, `msg_id` | `{chat_id, msg_id, url, fallback_url, app_url, opened, opened_with}`; launches the `tg://` `app_url` through `open` (the `https://t.me` `url` and then `fallback_url` only when the app form is rejected) and says which one worked; when none can be launched — or `GREPOGRAM_NO_OPEN` is set — the result still carries the links plus `error` and `hint` |
 
 Messages in `thread` and `context` have `chat_id`, `msg_id`, `date`, `from_name`, `text` (a
 `[photo]`-style placeholder for media without a caption), `url`, `fallback_url` and
 `reply_to_msg_id`. A message's `chat_id` is the chat it is really in, which the top-level one
 need not be: a channel post's comments come back under the discussion group's id, and comment
 ids collide with the channel's post ids (both number from 1), so pass a message's own `chat_id`
-back to `context` or `open_message` alongside its `msg_id`.
+back to `context` alongside its `msg_id`.
 
 The server's `instructions` tell the agent how to use the tools: run two or three query variants
 (Russian and English, the specific term and the concept, synonyms), prefer `lexical` for exact
@@ -342,9 +341,7 @@ flood_sleep_threshold = 120
 
 `GREPOGRAM_HOME=<dir>` puts every file (`config.toml`, `config.lock`, `session.session`,
 `index.db`, `sync.lock`, `logs/`) under one directory; the tests use it. `GREPOGRAM_FAKE_MODELS=1`
-swaps both models for deterministic fakes (tests and CI only). `GREPOGRAM_NO_OPEN=1` makes
-`open_message` return the link without launching anything; the test environment sets it, so
-nothing run under it can open Telegram or a browser on the machine.
+swaps both models for deterministic fakes (tests and CI only).
 
 ## How Search Works
 
@@ -414,13 +411,9 @@ most word stems with the query, so a hit that owes its rank to a comment shows t
 Links follow Telegram's rules per chat type: `https://t.me/<username>/<msg>` for
 public channels and supergroups, `https://t.me/c/<id>/<msg>` for private ones (with the topic
 inserted for forums), `tg://openmessage?user_id=…&message_id=…` for private chats and bots with
-`tg://user?id=…` as fallback, `tg://openmessage?chat_id=…&message_id=…` for legacy groups. Those
-are the links results carry, for showing and citing. `open_message` launches the app form
-instead — `tg://resolve?domain=<username>&post=<msg>` for public chats,
-`tg://privatepost?channel=<id>&post=<msg>` for private ones, `&thread=<topic>` added in a forum
-topic, the `tg://openmessage` forms as they are — because macOS routes `tg://` straight to the
-Telegram app while `open https://t.me/…` lands on the t.me page in the browser; the `https` link
-and then the fallback are tried only when the app form is rejected (no Telegram installed).
+`tg://user?id=…` as fallback, `tg://openmessage?chat_id=…&message_id=…` for legacy groups. They
+are there to be shown and cited: terminals and MCP clients make a link clickable, and grepogram
+never launches anything itself.
 
 **Staying current.** `sync` re-resolves every source (folders change), then syncs chats in
 `last_sync_at` order, never-synced first: new messages after the stored `last_msg_id` in batches
@@ -484,8 +477,8 @@ results stay in the SQLite file and in the conversation with your agent, both on
 Embedding and reranking run locally, so a search costs a Telegram round trip at most; the language
 model is whichever agent you connect, and grepogram itself needs only your Telegram credentials.
 Logs keep message text below DEBUG level, where it is replaced by its length and a short digest.
-The one thing grepogram launches is macOS `open`, for `open_message`; `GREPOGRAM_NO_OPEN=1` makes
-that return the link instead.
+grepogram starts no other process and launches no application: results carry links, and opening
+one is the reader's own click.
 
 ## Local Model Throughput
 
@@ -512,8 +505,8 @@ connections are held open rather than refused — a firewall prompt nobody answe
 - Deep links into private chats and legacy groups use the `tg://openmessage` scheme, which
   Telegram's mobile apps honour; the desktop apps open the conversation through the
   `tg://user?id=` fallback but do not scroll to the message. Channel and supergroup links
-  (`https://t.me/…`) work everywhere; `open_message` opens them through their `tg://` form so the
-  desktop app, not a browser, receives them.
+  (`https://t.me/…`) work everywhere, though clicking one opens the t.me page in a browser unless
+  the client hands `https://t.me` links to the Telegram app.
 - The first sync of a large chat (hundreds of thousands of messages) takes a long time and may run
   into Telegram flood waits; a wait longer than `flood_sleep_threshold` stops the run and the next
   run continues, with everything the stopped run stored already searchable. Use `--since` on the

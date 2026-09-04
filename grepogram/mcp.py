@@ -1,29 +1,28 @@
 """The MCP server: the search engine as tools for Claude Code, spoken over stdio.
 
-:func:`build_server` registers the nine tools of the contract on a
+:func:`build_server` registers the eight tools of the contract on a
 :class:`~mcp.server.fastmcp.FastMCP` named ``grepogram`` whose ``instructions`` carry the agent
 playbook (:data:`INSTRUCTIONS`); :func:`main` is the ``grepogram-mcp`` entry point. Every tool is
 a thin wrapper over the library — :mod:`grepogram.search`, :mod:`grepogram.sync`,
-:mod:`grepogram.sources`, :mod:`grepogram.dialogs`, :mod:`grepogram.links` — that takes what it
-needs from the bound :class:`AppState` (:func:`bind`) and returns a JSON-serialisable dict.
-Expected failures — no session, another sync running, an unknown chat or message, a model that
-cannot load — come back as a result with ``error`` and ``hint`` (plus ``candidates`` when there
-is something to choose from), never as an exception, so Claude can act on them; anything else
-propagates and FastMCP reports it as a tool error.
+:mod:`grepogram.sources`, :mod:`grepogram.dialogs` — that takes what it needs from the bound
+:class:`AppState` (:func:`bind`) and returns a JSON-serialisable dict. Expected failures — no
+session, another sync running, an unknown chat or message, a model that cannot load — come back as
+a result with ``error`` and ``hint`` (plus ``candidates`` when there is something to choose from),
+never as an exception, so Claude can act on them; anything else propagates and FastMCP reports it
+as a tool error.
 
 stdout is the protocol. Logging goes to stderr and the log file only, :func:`main` redirects
 stdout to stderr while the server starts, and :data:`stdout_to_stderr` does the same around
 every tool body (:func:`guarded` / :func:`guarded_async`), so a stray ``print`` deep in a library
 cannot corrupt a JSON-RPC frame.
 
-The tools that talk to Telegram (``sync``, ``dialogs``, ``sources_add``), ``search``, which may
-refresh a stale index first, and ``open_message``, which waits for macOS ``open``, are
-coroutines; the offline readers are plain functions. Retrieval, embedding and ``open`` run in
-worker threads so the event loop keeps answering while they work — the SQLite connection
-serialises its statements across threads (:class:`grepogram.db.Connection`) and the models
-serialise their own calls. Tool calls arrive concurrently, so nothing that one call could close
-under another is shared: every Telegram-using block builds and disconnects its own client on a
-private in-memory copy of the session (:func:`grepogram.tg.make_client`), syncs queue on
+The tools that talk to Telegram (``sync``, ``dialogs``, ``sources_add``) and ``search``, which may
+refresh a stale index first, are coroutines; the offline readers are plain functions. Retrieval
+and embedding run in worker threads so the event loop keeps answering while they work — the SQLite
+connection serialises its statements across threads (:class:`grepogram.db.Connection`) and the
+models serialise their own calls. Tool calls arrive concurrently, so nothing that one call could
+close under another is shared: every Telegram-using block builds and disconnects its own client on
+a private in-memory copy of the session (:func:`grepogram.tg.make_client`), syncs queue on
 ``AppState.sync_lock`` instead of failing each other with ``SyncInProgress``, and config changes
 go through ``AppState.editing_config`` — the process-wide lock plus the cross-process
 :class:`grepogram.config.ConfigLock` — so neither two ``sources_add`` calls nor a CLI command in
@@ -51,7 +50,7 @@ from typing import Any, TextIO
 from mcp.server.fastmcp import FastMCP
 from telethon import errors as tg_errors
 
-from grepogram import config, db, embed, filters, links, tg
+from grepogram import config, db, embed, filters, tg
 from grepogram import rerank as reranking
 from grepogram import search as retrieval
 from grepogram import sources as sourcing
@@ -61,7 +60,6 @@ from grepogram.dialogs import DialogCatalog, Match
 from grepogram.dialogs import match as match_dialogs
 from grepogram.embed import Embedder, ModelUnavailable
 from grepogram.filters import FilterError, UnknownChat
-from grepogram.links import OpenFailed
 from grepogram.log import setup_logging
 from grepogram.models import Config, Filters, MessageView, SearchMode, SearchResult
 from grepogram.paths import Paths
@@ -87,8 +85,7 @@ price-related, filter with `since` when it matters, and state the date of the ev
 - Call `thread` or `context` on a hit before drawing a conclusion from its snippet; the answer \
 usually sits in the replies. Pass a message's own `chat_id` back with its `msg_id`: a channel \
 post's comments come from the discussion group, and both chats number their messages from 1.
-- Cite the hit's `url` for every claim so the user can open the message in Telegram \
-(`open_message` opens it directly).
+- Cite the hit's `url` for every claim: it is a clickable link to the message in Telegram.
 - If nothing relevant comes back, say so rather than guess — after trying other variants, \
 filters or chats.
 - When the user names a chat that is not indexed yet, call `sources` to see what is indexed and \
@@ -123,8 +120,6 @@ CHAT_HINT = (
 )
 PICK_HINT = "retry with one of the candidates: an id, @username or folder:<name>"
 MESSAGE_HINT = "chat_id and msg_id come from a hit (chat.id and anchor_msg_id) or a message view"
-OPEN_HINT = "open the url yourself: paste it into a browser or the Telegram app"
-NO_OPEN_ERROR = f"opening links is switched off ({links.NO_OPEN_ENV} is set)"
 NO_SOURCES_HINT = "find chats with dialogs, add them with sources_add, then sync"
 SYNC_NEXT_HINT = "call sync to fetch and index its history"
 
@@ -137,7 +132,6 @@ TOOL_ERRORS: tuple[type[Exception], ...] = (
     FilterError,
     SourceError,
     UnknownMessage,
-    OpenFailed,
     ValueError,
     tg_errors.RPCError,
     ConnectionError,
@@ -594,9 +588,9 @@ def thread(chat_id: int, msg_id: int) -> ToolResult:
     For a channel post: the post followed by its comments from the linked discussion chat. Each
     message has `chat_id`, `msg_id`, `date` (unix seconds, UTC), `from_name`, `text`, `url`,
     `fallback_url` and `reply_to_msg_id`. A message's own `chat_id` is the one to pass back to
-    `context` or `open_message` with its `msg_id` — comments carry the discussion group's id,
-    not the channel's, and the two number their messages from 1 alike. Read it before
-    concluding from a snippet; the arguments come from a hit's `chat.id` and `anchor_msg_id`.
+    `context` with its `msg_id` — comments carry the discussion group's id, not the channel's,
+    and the two number their messages from 1 alike. Read it before concluding from a snippet;
+    the arguments come from a hit's `chat.id` and `anchor_msg_id`.
     """
     return _messages_result(chat_id, msg_id, retrieval.thread(_app().conn, chat_id, msg_id))
 
@@ -759,42 +753,6 @@ def sources_remove(target: str) -> ToolResult:
     }
 
 
-@guarded_async
-async def open_message(chat_id: int, msg_id: int) -> ToolResult:
-    """Open a stored message in the Telegram app on this Mac. `url` is the message's link as
-    hits and message views show it (`https://t.me/…` where Telegram has one); `app_url` is the
-    `tg://` form the app takes directly, which is what gets launched — the `url` and then the
-    `fallback_url` (private chats) are tried only when the app form is rejected — and
-    `opened_with` says which one worked (`opened=true`). When nothing can be launched, or
-    opening is switched off with `GREPOGRAM_NO_OPEN`, the result still carries the links with
-    `error` and `hint`, so the link can be shown instead.
-    """
-    state = _app()
-    chat = db.get_chat(state.conn, chat_id)
-    message = db.get_message(state.conn, chat_id, msg_id)
-    if chat is None or message is None:
-        raise UnknownMessage(chat_id, msg_id)
-    link = links.message_url(chat, msg_id, message.topic_id)
-    result: ToolResult = {
-        "chat_id": chat_id,
-        "msg_id": msg_id,
-        "url": link.url,
-        "fallback_url": link.fallback_url,
-        "app_url": link.app_url,
-    }
-    if links.opening_disabled():
-        result.update(opened=False, error=NO_OPEN_ERROR, hint=OPEN_HINT)
-        return result
-    try:
-        opened_with = await asyncio.to_thread(links.open_link, link)
-    except (OpenFailed, NotImplementedError) as exc:
-        log.warning("cannot open %s: %s", link.url, exc)
-        result.update(opened=False, error=str(exc), hint=OPEN_HINT)
-        return result
-    result.update(opened=True, opened_with=opened_with)
-    return result
-
-
 TOOLS: tuple[Callable[..., Any], ...] = (
     search,
     thread,
@@ -804,7 +762,6 @@ TOOLS: tuple[Callable[..., Any], ...] = (
     dialogs,
     sources_add,
     sources_remove,
-    open_message,
 )
 
 
@@ -812,7 +769,7 @@ TOOLS: tuple[Callable[..., Any], ...] = (
 
 
 def build_server() -> FastMCP[Any]:
-    """A ``grepogram`` FastMCP server with the nine tools; docstrings are the descriptions."""
+    """A ``grepogram`` FastMCP server with the eight tools; docstrings are the descriptions."""
     server: FastMCP[Any] = FastMCP(SERVER_NAME, instructions=INSTRUCTIONS)
     for tool in TOOLS:
         server.add_tool(tool, description=inspect.cleandoc(tool.__doc__ or ""))

@@ -185,13 +185,12 @@ class Filters:
 
 @dataclass(frozen=True, slots=True)
 class Link:
-    """Where a message can be opened: ``url`` is the form to show and cite (``https://t.me/…``
-    where Telegram has one), ``app_url`` the ``tg://`` form the desktop app takes directly, and
-    ``fallback_url`` what to try when neither is accepted."""
+    """Where a message lives: ``url`` is the form to show and cite (``https://t.me/…`` where
+    Telegram has one, a ``tg://`` form where it has none) and ``fallback_url`` a second link for
+    the chats whose ``url`` only mobile honours."""
 
     url: str
     fallback_url: str | None = None
-    app_url: str | None = None
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)

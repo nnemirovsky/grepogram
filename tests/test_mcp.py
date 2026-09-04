@@ -10,7 +10,7 @@ import subprocess
 import sys
 import threading
 import time
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any
 
@@ -21,7 +21,7 @@ from telethon import errors
 from telethon.tl import functions, types
 from telethon.tl.types import messages as tl_messages
 
-from grepogram import config, db, embed, filters, index, links
+from grepogram import config, db, embed, filters, index
 from grepogram import mcp as tools
 from grepogram import rerank as reranking
 from grepogram import search as retrieval
@@ -29,11 +29,9 @@ from grepogram import sources as sourcing
 from grepogram import sync as syncing
 from grepogram.embed import FakeEmbedder, ModelUnavailable
 from grepogram.filters import InvalidDate, UnknownChat
-from grepogram.links import OpenFailed
 from grepogram.models import (
     ChatRow,
     Config,
-    Link,
     MessageRow,
     Source,
     SyncReport,
@@ -892,7 +890,7 @@ def test_thread_and_context_read_messages(state: tools.AppState) -> None:
     assert "negative" in tools.context(ARG, 5, before=-1)["error"]
 
 
-async def test_thread_of_a_channel_post_names_each_message_chat(
+def test_thread_of_a_channel_post_names_each_message_chat(
     state: tools.AppState, conn: sqlite3.Connection
 ) -> None:
     """The top-level ``chat_id`` is the argument; a comment's own is the discussion group, whose
@@ -925,145 +923,6 @@ async def test_thread_of_a_channel_post_names_each_message_chat(
     assert comment["url"] == "https://t.me/c/201/2"
     back = tools.context(comment["chat_id"], comment["msg_id"])
     assert [m["text"] for m in back["messages"]] == ["comment on post 1"]
-    opened = await tools.open_message(comment["chat_id"], comment["msg_id"])
-    assert opened["url"] == comment["url"] and opened["opened"] is False
-
-
-async def test_open_message_returns_the_url_used(
-    state: tools.AppState, conn: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.delenv(links.NO_OPEN_ENV)
-    opened: list[Link] = []
-
-    def open_link(link: Link) -> str:
-        opened.append(link)
-        return link.url
-
-    monkeypatch.setattr(links, "open_link", open_link)
-    assert await tools.open_message(ARG, 5) == {
-        "chat_id": ARG,
-        "msg_id": 5,
-        "url": "https://t.me/arg_chat/5",
-        "fallback_url": None,
-        "app_url": "tg://resolve?domain=arg_chat&post=5",
-        "opened": True,
-        "opened_with": "https://t.me/arg_chat/5",
-    }
-    assert opened == [
-        Link("https://t.me/arg_chat/5", app_url="tg://resolve?domain=arg_chat&post=5")
-    ]
-    geo = await tools.open_message(GEO, 3)
-    assert geo["url"] == "https://t.me/c/1000000200/3"
-    assert geo["app_url"] == "tg://privatepost?channel=1000000200&post=3"
-    db.upsert_chat(
-        conn,
-        ChatRow(id=FORUM, type="supergroup", title="Forum", username="forum_chat", is_forum=True),
-    )
-    db.upsert_chat(conn, ChatRow(id=7, type="user", title="Bob"))
-    db.upsert_messages(
-        conn,
-        [
-            MessageRow(chat_id=FORUM, msg_id=105, date=1_700_000_000, text="hi", topic_id=100),
-            MessageRow(chat_id=7, msg_id=9, date=1_700_000_000, text="hi"),
-        ],
-    )
-    forum = await tools.open_message(FORUM, 105)
-    assert forum["url"] == "https://t.me/forum_chat/100/105"
-    assert forum["app_url"] == "tg://resolve?domain=forum_chat&post=105&thread=100"
-    private = await tools.open_message(7, 9)
-    assert private["url"] == "tg://openmessage?user_id=7&message_id=9"
-    assert private["fallback_url"] == "tg://user?id=7"
-    assert private["app_url"] == private["url"]
-    assert (await tools.open_message(ARG, 999))["hint"] == tools.MESSAGE_HINT
-    assert len(opened) == 4
-
-
-async def test_open_message_keeps_the_url_when_open_fails(
-    state: tools.AppState, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.delenv(links.NO_OPEN_ENV)
-
-    def broken(link: Link) -> str:
-        raise OpenFailed(f"open failed for {link.url}: no application")
-
-    monkeypatch.setattr(links, "open_link", broken)
-    result = await tools.open_message(ARG, 5)
-    assert result["url"] == "https://t.me/arg_chat/5" and result["opened"] is False
-    assert result["error"].startswith("open failed") and result["hint"] == tools.OPEN_HINT
-
-    def elsewhere(link: Link) -> str:
-        raise NotImplementedError("opening links needs macOS 'open' (linux)")
-
-    monkeypatch.setattr(links, "open_link", elsewhere)
-    result = await tools.open_message(ARG, 5)
-    assert result["opened"] is False and "macOS" in result["error"]
-    assert result["url"] == "https://t.me/arg_chat/5"
-
-
-async def test_open_message_reports_a_hung_open_with_the_url(
-    state: tools.AppState, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.delenv(links.NO_OPEN_ENV)
-
-    def hung(args: Sequence[str]) -> subprocess.CompletedProcess[bytes]:
-        raise subprocess.TimeoutExpired(list(args), links.OPEN_TIMEOUT_S)
-
-    real_open = links.open_link
-    monkeypatch.setattr(
-        links, "open_link", lambda link: real_open(link, runner=hung, platform="darwin")
-    )
-    result = await tools.open_message(ARG, 5)
-    assert result["url"] == "https://t.me/arg_chat/5" and result["opened"] is False
-    assert "did not finish within" in result["error"] and result["hint"] == tools.OPEN_HINT
-    assert "tg://resolve?domain=arg_chat&post=5" in result["error"]
-
-
-async def test_open_message_reports_the_link_open_accepted(
-    state: tools.AppState, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """The app form is launched first and reported in ``opened_with``; when ``open`` rejects it
-    the web link follows, and ``url`` stays the web form for showing either way."""
-    monkeypatch.delenv(links.NO_OPEN_ENV)
-    launched: list[str] = []
-    codes = iter([1, 0])
-
-    def runner(args: Sequence[str]) -> subprocess.CompletedProcess[bytes]:
-        launched.append(args[1])
-        return subprocess.CompletedProcess(list(args), next(codes, 0), b"", b"rejected")
-
-    real_open = links.open_link
-    monkeypatch.setattr(
-        links, "open_link", lambda link: real_open(link, runner=runner, platform="darwin")
-    )
-    result = await tools.open_message(ARG, 5)
-    assert result["opened"] is True and result["opened_with"] == "https://t.me/arg_chat/5"
-    assert result["url"] == "https://t.me/arg_chat/5"
-    assert launched == ["tg://resolve?domain=arg_chat&post=5", "https://t.me/arg_chat/5"]
-    again = await tools.open_message(ARG, 5)
-    assert again["opened_with"] == "tg://resolve?domain=arg_chat&post=5"
-
-
-async def test_open_message_only_returns_the_url_while_opening_is_switched_off(
-    state: tools.AppState, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """``GREPOGRAM_NO_OPEN`` — set for every test — keeps the tool from launching anything,
-    and the result says so instead of claiming the message was opened."""
-
-    def never(*args: object, **kwargs: object) -> subprocess.CompletedProcess[bytes]:
-        raise AssertionError(f"open was run: {args}")
-
-    monkeypatch.setattr(subprocess, "run", never)
-    assert await tools.open_message(ARG, 5) == {
-        "chat_id": ARG,
-        "msg_id": 5,
-        "url": "https://t.me/arg_chat/5",
-        "fallback_url": None,
-        "app_url": "tg://resolve?domain=arg_chat&post=5",
-        "opened": False,
-        "error": tools.NO_OPEN_ERROR,
-        "hint": tools.OPEN_HINT,
-    }
-    assert (await tools.open_message(ARG, 999))["hint"] == tools.MESSAGE_HINT
 
 
 # --- failures --------------------------------------------------------------------------------
@@ -1247,13 +1106,13 @@ def test_instructions_carry_the_playbook() -> None:
     assert "`sources`" in text and "`dialogs`" in text and "`sources_add`" in text
 
 
-async def test_server_lists_the_nine_tools_over_a_session(state: tools.AppState) -> None:
+async def test_server_lists_the_eight_tools_over_a_session(state: tools.AppState) -> None:
     server = tools.build_server()
     assert server.name == "grepogram" and server.instructions == tools.INSTRUCTIONS
     async with create_connected_server_and_client_session(server) as session:
         listed = await session.list_tools()
         by_name = {tool.name: tool for tool in listed.tools}
-        assert len(by_name) == 9
+        assert len(by_name) == 8
         assert sorted(by_name) == sorted(tool.__name__ for tool in tools.TOOLS)
         search_tool = by_name["search"]
         assert search_tool.description is not None
