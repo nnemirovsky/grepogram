@@ -515,11 +515,11 @@ Every tool returns one JSON object (list-shaped results are wrapped as above) an
 - Create: `.github/workflows/ci.yml`
 - Modify: `pyproject.toml` (if config gaps surface)
 
-- [ ] `ruff check . && ruff format --check .` clean; `mypy grepogram` strict clean (typed shims or targeted `# type: ignore[...]` with reason for Telethon/sentence-transformers)
-- [ ] CI: macOS job — `uv sync --group dev` (no `dense` extra; `GREPOGRAM_FAKE_MODELS=1`, torch is never downloaded), ruff, mypy, `pytest --cov=grepogram --cov-report=term-missing`; ubuntu job — ruff + mypy only
-- [ ] `uv run pytest -m slow` run once locally on this Mac with real models; record embed throughput (units/s) in README
-- [ ] write tests: none new — this task verifies the suite; add regression tests for anything mypy/ruff/coverage surfaces (modules below 80% line coverage get tests before moving on)
-- [ ] run full suite — must pass before task 25
+- [x] `ruff check . && ruff format --check .` clean; `mypy grepogram tests` strict clean (gate widened to the test suite; `[tool.mypy] files` lists both) (typed shims or targeted `# type: ignore[...]` with reason for Telethon/sentence-transformers)
+- [x] CI: macOS job — `uv sync --group dev` (no `dense` extra; `GREPOGRAM_FAKE_MODELS=1`, torch is never downloaded), ruff, mypy, `pytest --cov=grepogram --cov-report=term-missing`; ubuntu job — ruff + mypy only
+- [x] `uv run pytest -m slow` run once locally on this Mac with real models; record embed throughput (units/s) in README
+- [x] write tests: none new — this task verifies the suite; add regression tests for anything mypy/ruff/coverage surfaces (modules below 80% line coverage get tests before moving on)
+- [x] run full suite — must pass before task 25
 
 ### Task 25: Verify acceptance criteria
 - [ ] verify all requirements from Overview are implemented: opt-in sources (folder + any chat type), incremental sync with budget, channel comments in their discussion chat, windows/threads/posts, stemmed FTS5 keyed by rowid, bge-m3 dense over units with vector cleanup, RRF + rerank + dedup, date/chat filters, deep links with fallback, MCP tools + instructions, auto-sync on stale with warnings, degradation without models, stdout hygiene, CLI parity
