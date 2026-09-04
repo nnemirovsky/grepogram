@@ -94,18 +94,12 @@ never change the git identity.
   are flagged `indexed = 0` so the next rebuild cuts them again, with the new group's comments or
   with none. Leaving the threads to that rebuild would not do: nothing inside a thread names the
   group it quotes, only the link does, so a group deleted in between would leave them
-  unreachable. The mapping goes in the same call: a comment's `messages.topic_id` is a post id in
-  the linking channel's id space and no column says whose, and post ids start at 1 in every
-  channel, so `db.drop_comment_units` clears `topic_id` on the group's rows under that channel's
-  posts (`db._clear_comment_topics`) and flags them `indexed = 0`. Left behind, the mapping would
-  hand the old channel's comments to the next channel's post of the same number —
-  `units.build_posts`, `search.thread`, `db.get_topic_messages` and `db.count_topic_messages` all
-  read comments by `(group, topic_id)` alone, and a group must therefore hold the mapping of the
-  channel that links it *now* and of no other. Only topics that are the losing channel's stored
-  posts are cleared, so a forum group's own topics survive; the windows filed under the cleared
-  topics go with them, since a recut of the group's linear stream would never reach a window
-  addressed by a post id (only a discussion group that is a forum has any). The whole transition
-  is one `db.transaction` in
+  unreachable. The mapping goes in the same call: `db.drop_comment_units` clears
+  `comment_of_chat_id` / `comment_of_msg_id` on every row of the group naming that channel
+  (`db._clear_comment_mapping`). Left behind, the mapping would hand the old channel's comments
+  to the next channel's post of the same number — post ids start at 1 in every channel. It is
+  cleared by channel, not by which of its posts are still stored, so a comment on a post the
+  channel has since dropped goes too. The whole transition is one `db.transaction` in
   `sync._relink_discussion` — the link that moves, the group's `source_id` and the flags of the
   posts it invalidates — so a killed process leaves all of it or none of it; never split those
   halves again. A group Telegram names but will not resolve still clears a link pointing at a
@@ -136,13 +130,26 @@ never change the git identity.
   thing tying them to the group (a thread lists the post in `msg_ids`, never a comment id — no
   `json_each` over `units.msg_ids` can find them). Deleting a channel clears the link of a group
   that outlives it (through `db.set_discussion_chat`, still the only way `discussion_of` is
-  cleared) and runs the same cleanup for every group it unlinks, while the channel's posts are
-  still stored to say which topics were its; the group keeps every message it holds, its own
-  windows and threads among them, and only stops holding *comments*.
+  cleared) and runs the same cleanup for every group it unlinks; the group keeps every message it
+  holds, its own windows, threads and forum topics among them, and only stops holding *comments*.
+- `messages.topic_id` is a forum topic and nothing else; the post a message comments on is
+  `comment_of_chat_id` / `comment_of_msg_id` (schema v4), NULL on every row that is not a comment.
+  They cannot share a column: a discussion group can be a forum, and a topic root and a channel
+  post are separate id spaces that both number from 1, so a group that is both would answer a
+  comment read with a topic message and lose real topics to an unlink. Every comment read and
+  every cleanup is keyed by the pair — `units.build_posts`, `search.thread`,
+  `db.get_comment_messages`, `db.count_comment_messages`, `db.stored_comment_post_ids`,
+  `db.drop_comment_units` — and `sync._fetch_comments` is the only writer of it. Nothing derived
+  from a group's rows reads the pair (windows are cut per forum topic in `units.window_topic`,
+  threads follow `reply_to_msg_id`), so clearing it needs no rebuild and drops no unit: a cleared
+  comment is searchable through the window it was already in, in the same commit. Keep it that
+  way — a cleanup that has to drop units to stay correct can strand a message until a later sync.
+  `db.upsert_messages` COALESCEs both columns like `topic_id`, because the group's own history
+  sync re-reads a comment with no comment relation on it.
 - A partial batch keeps what it earned: `sync._store_batch` writes `set_chat_progress` in a
   `finally` and `_fetch_comments` stores its rows as it reads them, because a flood wait on one
   comment thread leaves the whole run. A thread is only requested while Telegram reports more
-  replies than are stored (`db.count_topic_messages`).
+  replies than are stored (`db.count_comment_messages`).
 - Never let a probe, smoke test or validation step call `links.open_link`, `links.run_command` or
   the `open_message` tool with the real runner: inject a recording runner. `GREPOGRAM_NO_OPEN=1`
   (set by the autouse fixture) makes `open_link` return the url without running anything and
