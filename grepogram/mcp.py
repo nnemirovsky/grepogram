@@ -46,7 +46,7 @@ from contextlib import asynccontextmanager, contextmanager
 from dataclasses import asdict
 from pathlib import Path
 from types import TracebackType
-from typing import Any, Literal, TextIO
+from typing import Any, TextIO
 
 from mcp.server.fastmcp import FastMCP
 from telethon import errors as tg_errors
@@ -63,7 +63,7 @@ from grepogram.embed import Embedder, ModelUnavailable
 from grepogram.filters import FilterError, UnknownChat
 from grepogram.links import OpenFailed
 from grepogram.log import setup_logging
-from grepogram.models import Config, Filters, SearchResult
+from grepogram.models import Config, Filters, SearchMode, SearchResult
 from grepogram.paths import Paths
 from grepogram.rerank import Reranker
 from grepogram.search import UnknownMessage
@@ -96,7 +96,6 @@ filters or chats.
 advisory and the hits alongside them are valid.
 """
 
-Mode = Literal["hybrid", "lexical", "dense"]
 ToolResult = dict[str, Any]
 ClientFactory = Callable[[Config, Paths], Any]
 
@@ -457,7 +456,7 @@ async def search(
     since: str | None = None,
     until: str | None = None,
     k: int = 10,
-    mode: Mode = "hybrid",
+    mode: SearchMode = "hybrid",
     rerank: bool = True,
     full: bool = False,
 ) -> ToolResult:
@@ -559,7 +558,7 @@ def _retrieve(
     query: str,
     selected: Filters,
     k: int,
-    mode: str,
+    mode: SearchMode,
     rerank: bool,
     full: bool,
 ) -> SearchResult:

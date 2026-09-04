@@ -55,6 +55,11 @@ app.add_typer(sources_app, name="sources")
 
 
 class Mode(StrEnum):
+    """:data:`~grepogram.models.SearchMode` as the enum Typer needs to render ``--mode``.
+
+    The members mirror it one for one; ``tests/test_cli.py`` holds them to that.
+    """
+
     lexical = "lexical"
     hybrid = "hybrid"
     dense = "dense"

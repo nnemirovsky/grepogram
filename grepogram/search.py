@@ -48,6 +48,7 @@ import sqlite3
 import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
+from typing import get_args
 
 from grepogram import db, embed, index, links
 from grepogram import rerank as reranking
@@ -60,6 +61,7 @@ from grepogram.models import (
     Hit,
     MessageRow,
     MessageView,
+    SearchMode,
     SearchResult,
     UnitRow,
 )
@@ -71,7 +73,7 @@ log = logging.getLogger(__name__)
 
 SNIPPET_CHARS = 600
 ELLIPSIS = "…"
-MODES = ("lexical", "hybrid", "dense")
+MODES = get_args(SearchMode)
 NO_SOURCES = (
     "no sources are configured: add one with `grepogram sources add <target>` "
     "and run `grepogram sync`"
@@ -413,7 +415,7 @@ def build_hit(
 def _is_post_thread(chat: ChatRow, unit: UnitRow) -> bool:
     """A ``thread`` of a channel: the post with its comments (:func:`grepogram.units.build_posts`),
     the only unit whose ``msg_ids`` do not cover its text."""
-    return unit.kind == "thread" and chat.type == "channel" and chat.discussion_of is None
+    return unit.kind == "thread" and chat.is_broadcast
 
 
 # --- entry point -----------------------------------------------------------------------------
@@ -441,7 +443,7 @@ def search(
     query: str,
     filters: Filters | None = None,
     k: int | None = None,
-    mode: str = "hybrid",
+    mode: SearchMode = "hybrid",
     full: bool = False,
     now: int | None = None,
     *,
@@ -604,7 +606,7 @@ def thread(conn: sqlite3.Connection, chat_id: int, msg_id: int) -> list[MessageV
     """
     chat = _locate(conn, chat_id, msg_id)
     views = [message_view(chat, msg) for msg in db.get_thread_messages(conn, chat_id, msg_id)]
-    if chat.type == "channel" and chat.discussion_of is None:
+    if chat.is_broadcast:
         discussion = db.get_discussion_chat(conn, chat.id)
         if discussion is not None:
             comments = chronological(db.get_messages_in_topic(conn, discussion.id, msg_id))

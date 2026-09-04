@@ -10,6 +10,8 @@ from typing import Literal
 
 ChatType = Literal["user", "bot", "group", "supergroup", "channel"]
 UnitKind = Literal["window", "thread", "post"]
+SearchMode = Literal["hybrid", "lexical", "dense"]
+"""How a search retrieves: fused, BM25 only, embeddings only (:func:`grepogram.search.search`)."""
 MediaKind = Literal[
     "photo",
     "video",
@@ -110,6 +112,15 @@ class ChatRow:
     last_sync_at: int | None = None
     unavailable: bool = False
     migrated_to: int | None = None
+
+    @property
+    def is_broadcast(self) -> bool:
+        """A channel in its own right — not the discussion group of one.
+
+        Broadcast channels are cut into ``post`` units instead of windows, and their post
+        threads carry the comments of the linked group.
+        """
+        return self.type == "channel" and self.discussion_of is None
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)

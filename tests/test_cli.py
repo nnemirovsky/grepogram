@@ -2,14 +2,15 @@ import logging
 import sys
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
+from typing import get_args
 
 import pytest
 import typer
 from typer.testing import CliRunner
 
-from grepogram import __version__, cli, config, db, index, units
+from grepogram import __version__, cli, config, db, index, search, units
 from grepogram.config import TEMPLATE
-from grepogram.models import ChatRow, Config, MessageRow
+from grepogram.models import ChatRow, Config, MessageRow, SearchMode
 from grepogram.paths import Paths
 from tests.conftest import file_mode
 
@@ -17,6 +18,12 @@ runner = CliRunner()
 
 
 # --- app -------------------------------------------------------------------------------------
+
+
+def test_cli_search_modes_mirror_the_search_mode_literal() -> None:
+    """One vocabulary: the ``--mode`` enum and :data:`SearchMode` never drift apart."""
+    assert sorted(mode.value for mode in cli.Mode) == sorted(get_args(SearchMode))
+    assert sorted(search.MODES) == sorted(get_args(SearchMode))
 
 
 def test_version_prints_package_version() -> None:

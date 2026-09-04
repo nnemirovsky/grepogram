@@ -318,7 +318,8 @@ def test_search_on_an_empty_index_warns(conn: sqlite3.Connection) -> None:
 
 def test_search_rejects_bad_modes_and_k(conn: sqlite3.Connection, loaded: chat_ru.Loaded) -> None:
     with pytest.raises(ValueError, match="unknown search mode"):
-        search.search(conn, CFG, "DNI", ALL, mode="bogus")
+        # the type says otherwise; the check is for the callers that are not type-checked
+        search.search(conn, CFG, "DNI", ALL, mode="bogus")  # type: ignore[arg-type]
     with pytest.raises(ValueError, match="positive"):
         search.search(conn, CFG, "DNI", ALL, k=0)
 

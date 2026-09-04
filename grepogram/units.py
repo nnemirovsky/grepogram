@@ -325,7 +325,7 @@ def units_for_chat(
     else — private chats, groups, forums and the discussion groups of channels alike — gets
     windows (per topic in a forum, one linear run otherwise) followed by reply threads.
     """
-    if chat.type == "channel" and chat.discussion_of is None:
+    if chat.is_broadcast:
         return build_posts(conn, messages, chat, comments_enabled(cfg, chat), cfg.units)
     messages = list(messages)
     windows = [
@@ -370,7 +370,7 @@ def rebuild_for_chat(
     if not changed:
         return UnitDelta()
     with db.transaction(conn):
-        if chat.type == "channel" and chat.discussion_of is None:
+        if chat.is_broadcast:
             return _rebuild_posts(conn, chat, cfg, changed)
         return _rebuild_conversation(conn, chat, cfg, changed)
 
