@@ -14,20 +14,16 @@ function of what is stored, never of a snapshot taken earlier.
 
 import dataclasses
 import datetime as dt
-import fcntl
 import os
 import tomllib
 from collections.abc import Callable
 from pathlib import Path
-from types import TracebackType
-from typing import Any, Self, get_type_hints
+from typing import Any, get_type_hints
 
 import tomli_w
 
 from grepogram.models import Config, ModelsCfg, SearchCfg, Source, SyncCfg, TelegramCfg, UnitsCfg
-from grepogram.paths import Paths
-
-FILE_MODE = 0o600
+from grepogram.paths import PRIVATE_FILE_MODE, FileLock, Paths
 
 TEMPLATE = """\
 [telegram]
@@ -121,43 +117,16 @@ def save(cfg: Config, paths: Paths) -> None:
     write_private(paths.config_file, dumps(cfg))
 
 
-class ConfigLock:
+class ConfigLock(FileLock):
     """Exclusive ``flock`` on ``paths.config_lock_file`` around a read-modify-write of the config.
 
     Blocking, unlike the sync lock: a holder keeps it for the milliseconds a load and a save
-    take, and a process that dies releases it. The lock file is created with mode 0600 and never
-    deleted. Re-entering from the same descriptor is not supported; callers nest it inside the
-    sync lock when they need both.
+    take, and a process that dies releases it. Callers nest it inside the sync lock when they
+    need both.
     """
 
     def __init__(self, paths: Paths) -> None:
-        self.path = paths.config_lock_file
-        self._fd: int | None = None
-
-    def __enter__(self) -> Self:
-        self.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-        fd = os.open(self.path, os.O_RDWR | os.O_CREAT, FILE_MODE)
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX)
-        except BaseException:
-            os.close(fd)
-            raise
-        self._fd = fd
-        return self
-
-    def __exit__(
-        self,
-        exc_type: type[BaseException] | None,
-        exc: BaseException | None,
-        tb: TracebackType | None,
-    ) -> None:
-        if self._fd is None:
-            return
-        try:
-            fcntl.flock(self._fd, fcntl.LOCK_UN)
-        finally:
-            os.close(self._fd)
-            self._fd = None
+        super().__init__(paths.config_lock_file)
 
 
 def update(paths: Paths, change: Callable[[Config], Config]) -> Config:
@@ -189,11 +158,11 @@ def to_dict(cfg: Config) -> dict[str, Any]:
 def write_private(path: Path, text: str) -> None:
     """Atomically replace ``path`` with ``text``, owner-readable only."""
     tmp = path.with_name(f".{path.name}.tmp")
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, FILE_MODE)
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, PRIVATE_FILE_MODE)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
             handle.write(text)
-        os.chmod(tmp, FILE_MODE)
+        os.chmod(tmp, PRIVATE_FILE_MODE)
     except BaseException:
         tmp.unlink(missing_ok=True)
         raise

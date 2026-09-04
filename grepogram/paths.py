@@ -1,4 +1,4 @@
-"""Filesystem locations used by grepogram, and the environment flags that steer them.
+"""Filesystem locations used by grepogram, the flags that steer them and the lock over a file.
 
 ``GREPOGRAM_HOME=<dir>`` redirects everything under one directory (``config.toml``,
 ``config.lock``, ``session.session``, ``index.db``, ``sync.lock``, ``logs/``); tests rely on this.
@@ -6,12 +6,18 @@ Without it the macOS conventions apply: config, its lock and the session under
 ``~/.config/grepogram``, index and sync lock under ``~/Library/Application Support/grepogram``,
 logs under ``~/Library/Logs/grepogram``. :func:`env_flag` reads the boolean switches
 (``GREPOGRAM_FAKE_MODELS``, ``GREPOGRAM_NO_OPEN``) the same way everywhere.
+
+:class:`FileLock` is the ``flock`` both cross-process locks are built on —
+:class:`grepogram.sync.SyncLock` over ``sync.lock`` and :class:`grepogram.config.ConfigLock` over
+``config.lock`` — so the mode bits, the directory and the close-on-error handling are written once.
 """
 
+import fcntl
 import os
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
+from types import TracebackType
 from typing import Self
 
 ENV_HOME = "GREPOGRAM_HOME"
@@ -19,6 +25,8 @@ SESSION_SUFFIX = ".session"
 CONFIG_LOCK_NAME = "config.lock"
 LOG_FILE_NAME = "grepogram.log"
 DIR_MODE = 0o700
+PRIVATE_FILE_MODE = 0o600
+"""What every file grepogram writes with secrets in it gets: the config, the session, the locks."""
 _TRUE = frozenset({"1", "true", "yes", "on"})
 
 
@@ -110,3 +118,52 @@ class Paths:
             except FileExistsError:
                 continue
             directory.chmod(DIR_MODE)
+
+
+class FileLock:
+    """An exclusive ``flock`` on a lock file, held for the ``with`` block.
+
+    The file is created with :data:`PRIVATE_FILE_MODE` under a :data:`DIR_MODE` directory and is
+    never deleted: unlinking a file another process is about to lock would let both proceed.
+    ``blocking`` decides what contention costs — waiting for the holder, which is right for a
+    lock held for milliseconds, or :meth:`busy` at once, which is right for one held for the
+    length of a sync. Re-entering from the same descriptor is not supported.
+    """
+
+    blocking: bool = True
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self._fd: int | None = None
+
+    def busy(self) -> Exception:
+        """What a non-blocking lock raises when another process holds it."""
+        return BlockingIOError(f"another process holds the lock on {self.path}")
+
+    def __enter__(self) -> Self:
+        self.path.parent.mkdir(mode=DIR_MODE, parents=True, exist_ok=True)
+        fd = os.open(self.path, os.O_RDWR | os.O_CREAT, PRIVATE_FILE_MODE)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX if self.blocking else fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            os.close(fd)
+            raise self.busy() from None
+        except BaseException:
+            os.close(fd)
+            raise
+        self._fd = fd
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> None:
+        if self._fd is None:
+            return
+        try:
+            fcntl.flock(self._fd, fcntl.LOCK_UN)
+        finally:
+            os.close(self._fd)
+            self._fd = None

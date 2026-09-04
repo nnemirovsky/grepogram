@@ -24,10 +24,9 @@ from telethon import TelegramClient, errors, utils
 from telethon.sessions import MemorySession, SQLiteSession
 
 from grepogram.models import Config
-from grepogram.paths import Paths
+from grepogram.paths import PRIVATE_FILE_MODE, Paths
 
 DEVICE_MODEL = "grepogram"
-SESSION_MODE = 0o600
 AUTH_HINT = "run: grepogram auth"
 AUTH_ERRORS: tuple[type[Exception], ...] = (
     errors.AuthKeyUnregisteredError,
@@ -124,9 +123,9 @@ def _client(session: MemorySession | str, cfg: Config) -> TelegramClient:
 def prepare_session(paths: Paths) -> Path:
     """Create the session file with mode 0600 if needed, before Telethon creates it as 0644."""
     paths.ensure_dirs()
-    fd = os.open(paths.session_file, os.O_WRONLY | os.O_CREAT, SESSION_MODE)
+    fd = os.open(paths.session_file, os.O_WRONLY | os.O_CREAT, PRIVATE_FILE_MODE)
     os.close(fd)
-    os.chmod(paths.session_file, SESSION_MODE)
+    os.chmod(paths.session_file, PRIVATE_FILE_MODE)
     return paths.session_file
 
 
@@ -136,8 +135,8 @@ def ensure_session_mode(paths: Paths) -> Path:
         mode = stat.S_IMODE(paths.session_file.stat().st_mode)
     except FileNotFoundError:
         raise SessionMissing(paths.session_file) from None
-    if mode != SESSION_MODE:
-        paths.session_file.chmod(SESSION_MODE)
+    if mode != PRIVATE_FILE_MODE:
+        paths.session_file.chmod(PRIVATE_FILE_MODE)
     return paths.session_file
 
 

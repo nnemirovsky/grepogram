@@ -35,18 +35,15 @@ Telethon yields from ``iter_messages``. Display names come from a ``names`` map 
 import asyncio
 import dataclasses
 import datetime as dt
-import fcntl
 import functools
 import logging
 import math
-import os
 import sqlite3
 import threading
 import time
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
-from types import TracebackType
-from typing import Any, Self
+from typing import Any
 
 from telethon import errors, utils
 from telethon.tl import functions, types
@@ -65,14 +62,14 @@ from grepogram.models import (
     SyncReport,
     UserRow,
 )
-from grepogram.paths import Paths
+from grepogram.paths import FileLock, Paths
 from grepogram.sources import resolve_sources
 
 log = logging.getLogger(__name__)
 
 BATCH_SIZE = 500
 JOIN_TIMEOUT = 60.0
-LOCK_MODE = 0o600
+UNKNOWN_FORWARD = "unknown"
 SELF_NAME = "me"
 UNKNOWN_FORWARD = "unknown"
 _LOCATION_MEDIA = (types.MessageMediaGeo, types.MessageMediaGeoLive, types.MessageMediaVenue)
@@ -360,47 +357,22 @@ class SyncBudget:
         return max(0.0, self.deadline - self._clock())
 
 
-class SyncLock:
+class SyncLock(FileLock):
     """Exclusive ``flock`` on ``paths.lock_file`` so two processes never sync the same index.
 
     Non-blocking: entering while another process (or another open descriptor in this one) holds
-    the lock raises :class:`SyncInProgress`. The lock file is never deleted — unlinking a file
-    another process is about to lock would let both proceed.
+    the lock raises :class:`SyncInProgress`.
     """
 
+    blocking = False
+
     def __init__(self, paths: Paths) -> None:
-        self.path = paths.lock_file
-        self._fd: int | None = None
+        super().__init__(paths.lock_file)
 
-    def __enter__(self) -> Self:
-        self.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-        fd = os.open(self.path, os.O_RDWR | os.O_CREAT, LOCK_MODE)
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            os.close(fd)
-            raise SyncInProgress(
-                f"another sync is running (lock held on {self.path}); wait for it to finish"
-            ) from None
-        except BaseException:
-            os.close(fd)
-            raise
-        self._fd = fd
-        return self
-
-    def __exit__(
-        self,
-        exc_type: type[BaseException] | None,
-        exc: BaseException | None,
-        tb: TracebackType | None,
-    ) -> None:
-        if self._fd is None:
-            return
-        try:
-            fcntl.flock(self._fd, fcntl.LOCK_UN)
-        finally:
-            os.close(self._fd)
-            self._fd = None
+    def busy(self) -> Exception:
+        return SyncInProgress(
+            f"another sync is running (lock held on {self.path}); wait for it to finish"
+        )
 
 
 # --- one chat --------------------------------------------------------------------------------
