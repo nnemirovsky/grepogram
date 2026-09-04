@@ -535,6 +535,65 @@ def test_delete_chat_without_vec_table_and_unknown_chat(conn: sqlite3.Connection
     assert conn.execute("SELECT count(*) FROM msg_fts").fetchone()[0] == 0
 
 
+def _channel_with_comments(conn: sqlite3.Connection) -> tuple[int, int, int]:
+    """A channel with two posts, a discussion group holding a comment on the first, and the
+    channel's post thread over both — with its ``unit_fts`` and ``unit_vec`` rows. Returns the
+    ids of the post thread, the channel's own post unit and the group's window."""
+    db.ensure_vec_table(conn, 4)
+    db.upsert_chat(conn, _chat(1, type="channel"))
+    db.upsert_chat(conn, _chat(2, discussion_of=1, source_id="chat:2"))
+    db.upsert_messages(conn, [_message(1, 10), _message(1, 11)])
+    db.upsert_messages(conn, [_message(2, 5, topic_id=10)])
+    ids = db.insert_units(
+        conn,
+        [
+            _unit(1, [10], kind="thread", text="post 10\ncomment 5"),
+            _unit(1, [10], kind="post", text="post 10"),
+            _unit(2, [5], text="comment 5"),
+        ],
+    )
+    for unit_id in ids:
+        conn.execute(
+            "INSERT INTO unit_fts(rowid, raw, stemmed, chat_id, date_start) "
+            "VALUES (?, 'a', 'a', 1, 1)",
+            (unit_id,),
+        )
+        conn.execute(
+            "INSERT INTO unit_vec(rowid, chat_id, date_start, embedding) VALUES (?, 1, 1, ?)",
+            (unit_id, sqlite_vec.serialize_float32([1.0, 0.0, 0.0, 0.0])),
+        )
+    stored = db.get_messages(conn, 1) + db.get_messages(conn, 2)
+    db.mark_indexed(conn, [m.id for m in stored if m.id is not None])
+    conn.commit()
+    return ids[0], ids[1], ids[2]
+
+
+def test_delete_chat_drops_the_post_threads_of_a_deleted_discussion_group(
+    conn: sqlite3.Connection,
+) -> None:
+    thread_id, post_id, window_id = _channel_with_comments(conn)
+    db.delete_chat(conn, 2)
+    assert [u.id for u in db.get_units(conn, 1)] == [post_id]
+    assert [r[0] for r in conn.execute("SELECT rowid FROM unit_fts")] == [post_id]
+    assert [r[0] for r in conn.execute("SELECT rowid FROM unit_vec")] == [post_id]
+    assert thread_id not in {window_id, post_id}
+    post = db.get_message(conn, 1, 10)
+    assert post is not None
+    assert db.unindexed_message_ids(conn, 1) == [post.id]
+
+
+def test_delete_chat_clears_the_link_of_a_group_that_outlives_its_channel(
+    conn: sqlite3.Connection,
+) -> None:
+    _thread_id, _post_id, window_id = _channel_with_comments(conn)
+    db.delete_chat(conn, 1)
+    group = db.get_chat(conn, 2)
+    assert group is not None and group.discussion_of is None
+    assert db.get_discussion_chat(conn, 1) is None
+    assert [u.id for u in db.get_units(conn, 2)] == [window_id]
+    assert db.unindexed_message_ids(conn, 2) == []
+
+
 def test_delete_chat_fts_cleanup_is_rowid_lookup(conn: sqlite3.Connection) -> None:
     plan = conn.execute(
         "EXPLAIN QUERY PLAN DELETE FROM msg_fts WHERE rowid IN "

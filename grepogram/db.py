@@ -456,8 +456,9 @@ def set_discussion_chat(
     which is what the caller rebuilds the channel's post threads for.
 
     This is the only way ``discussion_of`` is cleared: :func:`upsert_chat` COALESCEs the column
-    so that re-resolving the group as a source chat of its own never drops the link. The old
-    rows are cleared before the new one is written, so the unique index never sees two.
+    so that re-resolving the group as a source chat of its own never drops the link, and
+    :func:`delete_chat` clears the link of a group outliving its channel through here too. The
+    old rows are cleared before the new one is written, so the unique index never sees two.
     """
     with transaction(conn):
         dropped = [
@@ -526,8 +527,20 @@ def delete_chat(conn: sqlite3.Connection, chat_id: int) -> None:
 
     The virtual-table rows go first, addressed by rowid (a direct lookup, not a scan); deleting
     the ``chats`` row then cascades to ``messages`` and ``units``.
+
+    Units of *other* chats can quote this one, and they go in the same transaction: a channel's
+    post threads carry the comments its discussion group holds, so deleting a group drops the
+    post threads its comments fed and flags those posts ``indexed = 0``
+    (:func:`_drop_post_threads`). The flag on its own would not do — the channel may never
+    resolve again, and until it does the index would answer with rows that are gone. The mirror
+    case is a channel deleted while its group lives on under a source of its own: the group's
+    own windows and threads are its own messages and stay untouched, only the link goes.
     """
     with transaction(conn):
+        chat = get_chat(conn, chat_id)
+        if chat is not None:
+            _drop_post_threads(conn, chat)
+        set_discussion_chat(conn, chat_id, None)
         conn.execute(
             "DELETE FROM msg_fts WHERE rowid IN (SELECT id FROM messages WHERE chat_id = ?)",
             (chat_id,),
@@ -542,6 +555,42 @@ def delete_chat(conn: sqlite3.Connection, chat_id: int) -> None:
                 (chat_id,),
             )
         conn.execute("DELETE FROM chats WHERE id = ?", (chat_id,))
+
+
+def _drop_post_threads(conn: sqlite3.Connection, group: ChatRow) -> None:
+    """Undo what a discussion group's comments left in the channel that stored them.
+
+    A channel's post threads are the only units built from another chat's rows
+    (:func:`grepogram.units.build_posts`), and they hang under the post ids the group keeps its
+    comments in ``topic_id`` — so only a broadcast channel, the one shape that has them, is
+    touched. Those threads are deleted with their index rows and the posts are flagged for a
+    rebuild, which is the repair :func:`grepogram.sync._relink_discussion` makes when a channel
+    loses its group — except that here the rows the threads quote are about to be gone, so the
+    deletion cannot wait for a run that may never come. Nothing to do when ``group`` is not one:
+    a chat holds no units of another.
+    """
+    channel = None if group.discussion_of is None else get_chat(conn, group.discussion_of)
+    if channel is None or not channel.is_broadcast:
+        return
+    topics = stored_topic_ids(conn, group.id)
+    if not topics:
+        return
+    stale = [unit.id for unit in threads_touching(conn, channel.id, topics) if unit.id is not None]
+    _drop_units_and_index(conn, stale)
+    posts = get_messages_by_msg_id(conn, channel.id, topics)
+    mark_unindexed(conn, [post.id for post in posts.values() if post.id is not None])
+
+
+def _drop_units_and_index(conn: sqlite3.Connection, ids: Sequence[int]) -> None:
+    """Delete these units with their ``unit_fts`` and vector rows, every one by rowid."""
+    if not ids:
+        return
+    rows = [(unit_id,) for unit_id in ids]
+    with transaction(conn):
+        conn.executemany("DELETE FROM unit_fts WHERE rowid = ?", rows)
+        if has_vec_table(conn):
+            conn.executemany(f"DELETE FROM {VEC_TABLE} WHERE rowid = ?", rows)
+        delete_units(conn, ids)
 
 
 # --- users -----------------------------------------------------------------------------------

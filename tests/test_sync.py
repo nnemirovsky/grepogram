@@ -819,6 +819,102 @@ async def test_a_handed_over_group_belongs_to_the_source_that_holds_it_now(
     assert db.get_messages(conn, DISC_ID) == []
 
 
+@pytest.mark.parametrize(
+    "spelling", [str(DISC_ID), "@news_chat", "https://t.me/news_chat", "t.me/c/201"]
+)
+async def test_a_directly_configured_group_keeps_its_source_whatever_the_spelling(
+    conn: sqlite3.Connection, spelling: str
+) -> None:
+    """``chat =`` takes an id, an ``@username`` and a ``t.me`` link alike, and a group covered by
+    such an entry owns its rows under every one of them: the link must not overwrite its
+    ``source_id`` with the channel's, which would empty the configured source and let
+    ``sources rm`` of the channel delete the group."""
+    client = _news_client(entities=[DISC])
+    own = Source(chat=spelling)
+    db.upsert_chat(
+        conn,
+        ChatRow(
+            id=DISC_ID,
+            type="supergroup",
+            title="News chat",
+            username="news_chat",
+            source_id=own.id,
+        ),
+    )
+    news = db.upsert_chat(
+        conn, ChatRow(id=NEWS_ID, type="channel", title="News", source_id=NEWS_SOURCE.id)
+    )
+    linked = await sync.link_discussion_chat(client, conn, news)
+    assert linked is not None and linked.source_id == own.id
+    cfg = _cfg(NEWS_SOURCE, own)
+    by_source = {s.source_id: [c.id for c in s.chats] for s in sources.sources_status(cfg, conn)}
+    assert by_source == {NEWS_SOURCE.id: [NEWS_ID], own.id: [DISC_ID]}
+    removed = sources.remove_source(cfg, conn, sources.parse_target("@news_chat"))
+    assert removed.source_id == own.id and removed.chat_ids == [DISC_ID]
+    assert db.get_chat(conn, NEWS_ID) is not None
+
+
+async def test_removing_a_group_that_is_its_own_source_takes_its_comments_off_the_channel(
+    conn: sqlite3.Connection, paths: Paths
+) -> None:
+    """The group's messages go with it, so the channel's post threads must not go on quoting
+    them — in the units, in ``unit_fts`` and in the vectors. Nothing is left for a later run to
+    repair: the channel may never be resolvable again."""
+    client = _discussion_client(DISC)
+    cfg = _cfg(NEWS_SOURCE, Source(chat="@news_chat"))
+    await _run(client, conn, paths, cfg)
+    assert _thread_texts(conn, NEWS_ID) == {
+        1: ["post 1", "comment one", "reply"],
+        3: ["post 3", "late comment"],
+    }
+    removed = sources.remove_source(cfg, conn, sources.parse_target("@news_chat"))
+    assert removed.source_id == "chat:@news_chat" and removed.chat_ids == [DISC_ID]
+    assert db.get_chat(conn, DISC_ID) is None
+    assert _thread_texts(conn, NEWS_ID) == {}
+    assert search.lexical_units(conn, "comment", Filters(), 5) == []
+    assert [v.text for v in search.thread(conn, NEWS_ID, 1)] == ["post 1"]
+    assert _unit_fts_count(conn, NEWS_ID) == len(db.get_units(conn, NEWS_ID))
+    posts = db.get_messages_by_msg_id(conn, NEWS_ID, [1, 3])
+    assert db.unindexed_message_ids(conn, NEWS_ID) == sorted(
+        post.id for post in posts.values() if post.id is not None
+    )
+
+
+async def test_removing_the_channel_leaves_its_discussion_group_whole(
+    conn: sqlite3.Connection, paths: Paths
+) -> None:
+    """The mirror case: the group is a source of its own and survives its channel. Its own
+    windows and threads stay, and the link that pointed at a chat which no longer exists goes."""
+    client = _discussion_client(DISC)
+    cfg = _cfg(NEWS_SOURCE, Source(chat="@news_chat"))
+    await _run(client, conn, paths, cfg)
+    before = [(u.kind, u.topic_id, u.msg_ids) for u in db.get_units(conn, DISC_ID)]
+    removed = sources.remove_source(cfg, conn, sources.parse_target("@news"))
+    assert removed.source_id == NEWS_SOURCE.id and removed.chat_ids == [NEWS_ID]
+    group = db.get_chat(conn, DISC_ID)
+    assert group is not None and group.discussion_of is None
+    assert _texts(conn, DISC_ID) == {1: "comment one", 2: "reply", 9: "late comment"}
+    assert [(u.kind, u.topic_id, u.msg_ids) for u in db.get_units(conn, DISC_ID)] == before
+    hits = search.lexical_units(conn, "comment", Filters(), 5)
+    assert {u.chat_id for u in db.get_units_by_ids(conn, [m.unit_id for m in hits])} == {DISC_ID}
+    assert db.unindexed_message_ids(conn, DISC_ID) == []
+
+
+async def test_removing_a_group_whose_channel_is_gone_leaves_nothing_to_repair(
+    conn: sqlite3.Connection, paths: Paths
+) -> None:
+    """The channel is unreachable — an account that left it, a deleted channel — so no later
+    sync will ever rebuild its posts. The removal itself has to leave the index coherent."""
+    client = _discussion_client(DISC)
+    cfg = _cfg(NEWS_SOURCE, Source(chat="@news_chat"))
+    await _run(client, conn, paths, cfg)
+    db.set_chat_unavailable(conn, NEWS_ID)
+    sources.remove_source(cfg, conn, sources.parse_target("@news_chat"))
+    assert _thread_texts(conn, NEWS_ID) == {}
+    assert search.lexical_units(conn, "comment", Filters(), 5) == []
+    assert _unit_fts_count(conn, NEWS_ID) == len(db.get_units(conn, NEWS_ID))
+
+
 async def test_the_unlink_and_the_flags_of_the_posts_it_invalidates_are_one_commit(
     conn: sqlite3.Connection, paths: Paths, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1795,6 +1891,11 @@ def test_cli_sync_maps_network_errors(tmp_home: Path, monkeypatch: pytest.Monkey
 
 def _fts_count(conn: sqlite3.Connection, chat_id: int) -> int:
     row = conn.execute("SELECT count(*) FROM msg_fts WHERE chat_id = ?", (chat_id,)).fetchone()
+    return int(row[0])
+
+
+def _unit_fts_count(conn: sqlite3.Connection, chat_id: int) -> int:
+    row = conn.execute("SELECT count(*) FROM unit_fts WHERE chat_id = ?", (chat_id,)).fetchone()
     return int(row[0])
 
 
