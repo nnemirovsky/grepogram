@@ -275,7 +275,9 @@ def build_posts(
     """One ``post`` unit per channel message, plus a ``thread`` for every post with comments.
 
     Comments are stored under the linked discussion chat (``chats.discussion_of = chat.id``)
-    with ``topic_id`` = the post id and are read from there when ``comments`` is set. The thread
+    with ``topic_id`` = the post id and are read from there when ``comments`` is set — by post id
+    alone, which only holds because a group carries the mapping of the channel that links it now
+    and of no other (:func:`grepogram.db._clear_comment_topics`). The thread
     belongs to the channel and lists only the post in ``msg_ids`` — comment ids live in the
     discussion chat's id space and would not open from a channel link — while its text carries
     the post followed by its comments in order and ``date_end`` reaches the last comment. Long

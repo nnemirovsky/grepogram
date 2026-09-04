@@ -737,6 +737,51 @@ async def test_a_group_two_channels_pointed_at_belongs_to_the_last_one(
     assert _texts(conn, DISC_ID) == {1: "comment one", 2: "reply", 9: "late comment"}
 
 
+async def test_a_handed_over_group_gives_the_new_channel_none_of_the_old_comments(
+    conn: sqlite3.Connection, paths: Paths
+) -> None:
+    """Post ids start at 1 in every channel and a comment's ``topic_id`` is one of them with no
+    channel attached, so the channel taking a group over must inherit nothing that hung under
+    the ids of the channel that lost it: its own post 1 is not the post 1 they commented on.
+    The comments themselves stay what they are — the group's messages, in its windows."""
+    client = _news_client(entities=[DISC, OTHER])
+    cfg = _cfg(NEWS_SOURCE)
+    await _run(client, conn, paths, cfg)
+    assert _thread_texts(conn, NEWS_ID) == {
+        1: ["post 1", "comment one", "reply"],
+        3: ["post 3", "late comment"],
+    }
+    other_source = Source(chat="@other_news", comments=True)
+    other = db.upsert_chat(
+        conn,
+        ChatRow(
+            id=OTHER_ID,
+            type="channel",
+            title="Other",
+            username="other_news",
+            source_id=other_source.id,
+        ),
+    )
+    db.upsert_messages(
+        conn, [MessageRow(chat_id=OTHER_ID, msg_id=1, date=1_700_000_000, text="other post 1")]
+    )
+    assert await sync.link_discussion_chat(client, conn, other) is not None
+    moved = _cfg(NEWS_SOURCE, other_source)
+    await sync.index_pending(conn, moved, other)
+    assert _thread_texts(conn, OTHER_ID) == {}
+    assert [v.text for v in search.thread(conn, OTHER_ID, 1)] == ["other post 1"]
+    assert _texts(conn, DISC_ID) == {1: "comment one", 2: "reply", 9: "late comment"}
+    assert {m.topic_id for m in db.get_messages(conn, DISC_ID)} == {None}
+    assert db.unindexed_message_ids(conn, DISC_ID) == []
+    hits = search.lexical_units(conn, "comment", Filters(), 5)
+    assert {u.chat_id for u in db.get_units_by_ids(conn, [m.unit_id for m in hits])} == {DISC_ID}
+    assert [v.text for v in search.context(conn, DISC_ID, 2, before=1, after=1)] == [
+        "comment one",
+        "reply",
+        "late comment",
+    ]  # no longer bounded by the post it commented on: the group's own neighbours
+
+
 def _fake_vectors(conn: sqlite3.Connection, chat_id: int) -> None:
     """A vector row for every unit of a chat, so a cleanup that misses them is visible."""
     db.ensure_vec_table(conn, 4)
@@ -953,19 +998,26 @@ async def test_removing_the_channel_leaves_its_discussion_group_whole(
     conn: sqlite3.Connection, paths: Paths
 ) -> None:
     """The mirror case: the group is a source of its own and survives its channel. Its own
-    windows and threads stay, and the link that pointed at a chat which no longer exists goes."""
+    windows and threads stay, the link that pointed at a chat which no longer exists goes, and
+    with it the post ids its messages hung under: they are posts of a channel this index no
+    longer holds. The rows are flagged, so the units that still carry the old topic are re-cut."""
     client = _discussion_client(DISC)
     cfg = _cfg(NEWS_SOURCE, Source(chat="@news_chat"))
     await _run(client, conn, paths, cfg)
-    before = [(u.kind, u.topic_id, u.msg_ids) for u in db.get_units(conn, DISC_ID)]
+    before = [(u.kind, u.msg_ids) for u in db.get_units(conn, DISC_ID)]
     removed = sources.remove_source(cfg, conn, sources.parse_target("@news"))
     assert removed.source_id == NEWS_SOURCE.id and removed.chat_ids == [NEWS_ID]
     group = db.get_chat(conn, DISC_ID)
     assert group is not None and group.discussion_of is None
     assert _texts(conn, DISC_ID) == {1: "comment one", 2: "reply", 9: "late comment"}
-    assert [(u.kind, u.topic_id, u.msg_ids) for u in db.get_units(conn, DISC_ID)] == before
+    assert [(u.kind, u.msg_ids) for u in db.get_units(conn, DISC_ID)] == before
     hits = search.lexical_units(conn, "comment", Filters(), 5)
     assert {u.chat_id for u in db.get_units_by_ids(conn, [m.unit_id for m in hits])} == {DISC_ID}
+    assert db.stored_topic_ids(conn, DISC_ID) == []
+    assert db.unindexed_message_ids(conn, DISC_ID) == [m.id for m in db.get_messages(conn, DISC_ID)]
+    await sync.index_pending(conn, removed.config, group)
+    assert [(u.kind, u.msg_ids) for u in db.get_units(conn, DISC_ID)] == before
+    assert {u.topic_id for u in db.get_units(conn, DISC_ID)} == {None}
     assert db.unindexed_message_ids(conn, DISC_ID) == []
 
 

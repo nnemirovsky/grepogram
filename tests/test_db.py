@@ -582,16 +582,46 @@ def test_delete_chat_drops_the_post_threads_of_a_deleted_discussion_group(
     assert db.unindexed_message_ids(conn, 1) == [post.id]
 
 
+def test_drop_comment_units_unmaps_the_comments_it_undoes(conn: sqlite3.Connection) -> None:
+    """The rows stop being comments, not only the threads built from them. A ``topic_id`` is a
+    post id in the linking channel's id space and nothing in the row says whose; post ids start
+    at 1 in every channel, so a mapping left behind would hand these comments to the next
+    channel's post of the same number. The messages stay — the group's own — flagged so what was
+    cut from them is cut again, and the windows that filed them under a post id go with the
+    mapping. A topic that is no post of this channel is none of its business and is left alone.
+    """
+    thread_id, _post_id, window_id = _channel_with_comments(conn)
+    db.upsert_messages(conn, [_message(2, 6, topic_id=999)])
+    own = db.get_message(conn, 2, 6)
+    assert own is not None and own.id is not None
+    db.mark_indexed(conn, [own.id])
+    filed, kept = db.insert_units(conn, [_unit(2, [5], topic_id=10), _unit(2, [6], topic_id=999)])
+    assert db.drop_comment_units(conn, 1, 2) == 1
+    comment = db.get_message(conn, 2, 5)
+    assert comment is not None and comment.topic_id is None
+    assert db.get_messages_in_topic(conn, 2, 10) == []
+    assert db.stored_topic_ids(conn, 2) == [999]
+    assert db.unindexed_message_ids(conn, 2) == [comment.id]
+    assert [u.id for u in db.get_units(conn, 2)] == [window_id, kept]
+    assert filed not in {window_id, kept, thread_id}
+
+
 def test_delete_chat_clears_the_link_of_a_group_that_outlives_its_channel(
     conn: sqlite3.Connection,
 ) -> None:
+    """The group keeps its messages and its window, and stops holding comments: the post id they
+    hung under names a post of a channel that is gone, and the next channel to link the group
+    numbers its own posts from 1 as well."""
     _thread_id, _post_id, window_id = _channel_with_comments(conn)
     db.delete_chat(conn, 1)
     group = db.get_chat(conn, 2)
     assert group is not None and group.discussion_of is None
     assert db.get_discussion_chat(conn, 1) is None
     assert [u.id for u in db.get_units(conn, 2)] == [window_id]
-    assert db.unindexed_message_ids(conn, 2) == []
+    comment = db.get_message(conn, 2, 5)
+    assert comment is not None and comment.topic_id is None
+    assert db.stored_topic_ids(conn, 2) == []
+    assert db.unindexed_message_ids(conn, 2) == [comment.id]
 
 
 def _dump(conn: sqlite3.Connection) -> dict[str, list[tuple[object, ...]]]:

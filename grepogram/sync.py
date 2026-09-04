@@ -925,9 +925,14 @@ def _relink_discussion(conn: sqlite3.Connection, channel: ChatRow, keep: int | N
     :func:`index_pending` cuts those posts again, with the new group's comments or with none
     (:func:`_drop_comment_units`). Waiting for that rebuild to drop the threads would leave them
     quoting a group that can be deleted in the meantime, and then nothing would say they exist.
+    The comments lose the post id they hung under in the same step
+    (:func:`grepogram.db._clear_comment_topics`) — it names a post in the old channel's id space,
+    and post ids start at 1 in every channel.
 
     A group can only be linked to one channel at a time, so ``keep`` may be the group another
-    channel held until now; that channel's post threads go the same way.
+    channel held until now; that channel's post threads, and the mapping that made the group's
+    rows its comments, go the same way — before the link moves, while the old channel's posts
+    are still there to say which topics were its.
 
     The whole transition is one transaction — the link that moves and the ``indexed = 0`` flags
     that say which posts it invalidated — so a process killed inside it leaves either both or
@@ -945,13 +950,15 @@ def _relink_discussion(conn: sqlite3.Connection, channel: ChatRow, keep: int | N
 
 
 def _drop_comment_units(conn: sqlite3.Connection, channel_id: int | None, group_id: int) -> None:
-    """Drop the post threads of ``channel_id`` that carry ``group_id``'s comments.
+    """Drop the post threads of ``channel_id`` that carry ``group_id``'s comments, and the
+    mapping that made them comments.
 
-    :func:`grepogram.db.drop_comment_units` deletes them with their index rows and flags the
-    posts for a rebuild — the same call :func:`grepogram.db.delete_chat` makes when the group
-    itself goes. The threads cannot be left to the rebuild the flag asks for: nothing in a
-    thread names the group it quotes, only the link does, so a group deleted between the unlink
-    and that rebuild would leave them with no link to find them by.
+    :func:`grepogram.db.drop_comment_units` deletes them with their index rows, flags the
+    posts for a rebuild and clears the post id off the group's rows — the same call
+    :func:`grepogram.db.delete_chat` makes when the group itself goes. The threads cannot be left
+    to the rebuild the flag asks for: nothing in a thread names the group it quotes, only the
+    link does, so a group deleted between the unlink and that rebuild would leave them with no
+    link to find them by.
     """
     if channel_id is None:
         return
