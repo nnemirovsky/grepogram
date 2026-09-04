@@ -463,7 +463,14 @@ four minutes.
 - A channel that loses its discussion group, or is given another one, drops the old link on its
   next sync: the comments already stored stay in the index as what they are — the messages of that
   group — but they stop being shown as the channel's comments, and the posts they hung under are
-  rebuilt without them. The old group keeps being synced only if a source of its own lists it.
+  rebuilt without them. The old group keeps being synced only if a source of its own lists it. A
+  group Telegram reports but this account cannot open (it went private, say) leaves the comments
+  out of that run, and drops the stored link when it is not that same group.
+- A discussion group belongs to the source that brought it in: the folder or `chat` entry listing
+  it when one does, and otherwise the source of the channel that links it now — so a group handed
+  from one channel to another moves to the new channel's source, and removing the channel it left
+  keeps it while removing the new one takes its comments along. A group no channel links any more
+  keeps the source it came in through until that source is removed.
 - A chat that came in through a folder cannot be removed on its own; remove the folder source or
   take the chat out of the folder in Telegram. Nor can a channel's discussion group be removed
   through the channel's source by naming the group; remove the channel's source.

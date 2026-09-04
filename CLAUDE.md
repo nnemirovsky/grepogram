@@ -61,7 +61,10 @@ never change the git identity.
   `upsert_messages` sets it, `db.mark_unindexed` raises it for a post whose thread grew, and
   `sync.on_chat_synced` clears it after the rebuild. `sync._sync_chats` runs `index_pending` for
   a chat after its fetch whether it returned or raised, and for the chats the run never reached,
-  so a batch committed before a flood wait or a crash is never left without units. Never make
+  so a batch committed before a flood wait or a crash is never left without units. It then ends
+  with `sync.index_stranded`, a sweep of at most `sync.STRANDED_CHATS` chats that still hold
+  flagged rows while no source and no link leads to them — a discussion group a channel was
+  unlinked from is reachable through `db.chats_with_unindexed` and through nothing else. Never make
   `on_chat_synced` depend on what a run remembers in memory; the flag is the source of truth.
   The rebuild, the indexing and `mark_indexed` are one transaction, so the flag is a two-phase
   marker rather than three commits with gaps in between; keep it that way. A rerun over the same
@@ -87,7 +90,19 @@ never change the git identity.
   `sync.link_discussion_chat` calls it on every sync with what `GetFullChannelRequest` reports,
   so an unlinked or replaced group loses the link. Its messages stay — they are a real group's —
   and the channel's posts that held them are flagged `indexed = 0` so the next rebuild drops the
-  post threads they fed.
+  post threads they fed. The whole transition is one `db.transaction` in
+  `sync._relink_discussion` — the link that moves, the group's `source_id` and the flags of the
+  posts it invalidates — so a killed process leaves all of it or none of it; never split those
+  halves again. A group Telegram names but will not resolve still clears a link pointing at a
+  *different* group (that one is demonstrably not the channel's any more), while a link to the
+  very group that failed to resolve is left alone and retried next run.
+- Who owns a discussion group's `source_id` is `sources.discussion_source_id`, and
+  `sources_status`, `sources rm` and `sources._refuse_indirect` read the same rule: a group a
+  source covers directly (a folder holding it, a `chat:` entry naming it) keeps that source; a
+  group known only through a channel's link belongs to the source of the channel that links it
+  *now*, so it moves along when another channel takes it over — removing the old channel then
+  leaves it and removing the new one takes its comments along; a group a channel was unlinked
+  from keeps the source it came in through until that source is removed.
 - A partial batch keeps what it earned: `sync._store_batch` writes `set_chat_progress` in a
   `finally` and `_fetch_comments` stores its rows as it reads them, because a flood wait on one
   comment thread leaves the whole run. A thread is only requested while Telegram reports more
