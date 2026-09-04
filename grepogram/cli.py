@@ -429,6 +429,12 @@ async def _add_source(
         return await sources.add_source(cfg, target, catalog, since=since, comments=comments)
 
 
+def _when(timestamp: int | None) -> str:
+    if timestamp is None:
+        return "never"
+    return dt.datetime.fromtimestamp(timestamp, dt.UTC).astimezone().strftime("%Y-%m-%d %H:%M")
+
+
 @sources_app.command("ls")
 def sources_ls() -> None:
     """List configured sources with their indexed chats and sync state (offline)."""
@@ -490,12 +496,6 @@ def sources_rm(
     finally:
         conn.close()
     typer.echo(f"removed {removed.source_id} ({len(removed.chat_ids)} chats deleted)")
-
-
-def _when(timestamp: int | None) -> str:
-    if timestamp is None:
-        return "never"
-    return dt.datetime.fromtimestamp(timestamp, dt.UTC).astimezone().strftime("%Y-%m-%d %H:%M")
 
 
 @config_app.command("path")
