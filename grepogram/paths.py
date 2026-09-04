@@ -4,8 +4,8 @@
 ``config.lock``, ``session.session``, ``index.db``, ``sync.lock``, ``logs/``); tests rely on this.
 Without it the macOS conventions apply: config, its lock and the session under
 ``~/.config/grepogram``, index and sync lock under ``~/Library/Application Support/grepogram``,
-logs under ``~/Library/Logs/grepogram``. :func:`env_flag` reads the boolean switches
-(``GREPOGRAM_FAKE_MODELS``, ``GREPOGRAM_NO_OPEN``) the same way everywhere.
+logs under ``~/Library/Logs/grepogram``. :func:`env_flag` reads a boolean switch such as
+``GREPOGRAM_FAKE_MODELS`` the same way everywhere.
 
 :class:`FileLock` is the ``flock`` both cross-process locks are built on —
 :class:`grepogram.sync.SyncLock` over ``sync.lock`` and :class:`grepogram.config.ConfigLock` over
