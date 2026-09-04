@@ -22,7 +22,10 @@ coroutines; the offline readers are plain functions. Retrieval, embedding and ``
 worker threads so the event loop keeps answering while they work — the SQLite connection
 serialises its statements across threads (:class:`grepogram.db.Connection`) and the models
 serialise their own calls. Tool calls arrive concurrently, so nothing that one call could close
-under another is shared: every Telegram-using block builds and disconnects its own client.
+under another is shared: every Telegram-using block builds and disconnects its own client on a
+private in-memory copy of the session (:func:`grepogram.tg.make_client`), syncs queue on
+``AppState.sync_lock`` instead of failing each other with ``SyncInProgress``, and config changes
+go through ``AppState.editing_config`` so two ``sources_add`` calls cannot overwrite each other.
 """
 
 import argparse
@@ -36,8 +39,8 @@ import sqlite3
 import sys
 import threading
 import time
-from collections.abc import AsyncIterator, Awaitable, Callable, Coroutine, Sequence
-from contextlib import asynccontextmanager
+from collections.abc import AsyncIterator, Awaitable, Callable, Coroutine, Iterator, Sequence
+from contextlib import asynccontextmanager, contextmanager
 from dataclasses import asdict
 from pathlib import Path
 from types import TracebackType
@@ -63,8 +66,8 @@ from grepogram.paths import Paths
 from grepogram.rerank import Reranker
 from grepogram.search import UnknownMessage
 from grepogram.sources import AmbiguousTarget, SourceError
-from grepogram.sync import SyncBudget, SyncInProgress
-from grepogram.tg import AuthRequired
+from grepogram.sync import SyncBudget, SyncInProgress, SyncLock
+from grepogram.tg import AuthRequired, SessionError
 
 log = logging.getLogger(__name__)
 
@@ -101,6 +104,10 @@ SETUP_HINT = (
     "in [telegram] api_id and api_hash, then `grepogram auth`"
 )
 LOCK_HINT = "another grepogram process (the CLI or a second server) is syncing; retry when it ends"
+SESSION_HINT = (
+    "another grepogram process is writing the session file (a `grepogram auth` in progress); "
+    "retry when it ends — if the file is damaged, delete it and sign in again with `grepogram auth`"
+)
 MODEL_HINT = (
     "install the dense extra (`uv sync --extra dense`) and restart the MCP server, or search "
     'with mode="lexical"'
@@ -116,6 +123,7 @@ SYNC_NEXT_HINT = "call sync to fetch and index its history"
 
 TOOL_ERRORS: tuple[type[Exception], ...] = (
     AuthRequired,
+    SessionError,
     SyncInProgress,
     ConfigError,
     ModelUnavailable,
@@ -136,6 +144,7 @@ when Telegram cannot be reached at all. Other ``OSError`` are environment failur
 
 AUTO_SYNC_ERRORS: tuple[type[Exception], ...] = (
     AuthRequired,
+    SessionError,
     SyncInProgress,
     ConfigError,
     tg_errors.RPCError,
@@ -209,7 +218,10 @@ class AppState:
     is not retried: the reason is kept in ``embed_error`` / ``rerank_error`` and repeated in
     every result's ``warnings`` until the server restarts. Telegram clients are not kept:
     :meth:`telegram` builds one per block through ``client_factory``
-    (:func:`grepogram.tg.make_client` unless a test injects a fake).
+    (:func:`grepogram.tg.make_client` unless a test injects a fake). ``sync_lock`` lets one sync
+    run at a time in this process — the explicit ``sync`` tool and the refresh inside ``search``
+    queue behind each other rather than tripping over the cross-process
+    :class:`~grepogram.sync.SyncLock` — and :meth:`editing_config` serialises config changes.
     """
 
     def __init__(
@@ -224,11 +236,13 @@ class AppState:
         self.cfg = cfg
         self.conn = conn
         self.client_factory = client_factory
+        self.sync_lock = asyncio.Lock()
         self._embedder: Embedder | None = None
         self._reranker: Reranker | None = None
         self.embed_error: str | None = None
         self.rerank_error: str | None = None
         self._models_lock = threading.Lock()
+        self._config_lock = threading.Lock()
 
     @classmethod
     def open(cls, paths: Paths) -> "AppState":
@@ -253,6 +267,18 @@ class AppState:
         config.save(cfg, self.paths)
         self.cfg = cfg
 
+    @contextmanager
+    def editing_config(self) -> Iterator[Config]:
+        """The config as it is now, for a read-modify-write that ends in :meth:`save_config`.
+
+        Tool calls run concurrently, and a call that resolved its target over the network must
+        not save the snapshot it started from — another call may have saved in between. The
+        block holds the one lock every config change goes through, so the config it reads is
+        the one its save replaces. Keep the block short and free of awaits.
+        """
+        with self._config_lock:
+            yield self.config()
+
     @asynccontextmanager
     async def telegram(self) -> AsyncIterator[Any]:
         """A connected, authorized client for the block, built for it and disconnected on exit.
@@ -260,10 +286,12 @@ class AppState:
         A fresh ``TelegramClient`` per block reads the session file as it is now — so a session
         created with ``grepogram auth`` after a failed call works without a restart, and a
         client that once found itself unauthorized (Telethon remembers that per instance) is
-        never asked again — and gives concurrent tool calls nothing to disconnect under each
-        other. Raises :class:`NotConfigured` without API keys,
-        :class:`~grepogram.tg.SessionMissing` before any client is built when there is no
-        session file, and :class:`~grepogram.tg.AuthRequired` for a session Telegram rejects.
+        never asked again — on a private in-memory copy, so concurrent blocks (and a CLI sync
+        in another process) share neither a connection nor a session database. Raises
+        :class:`NotConfigured` without API keys, :class:`~grepogram.tg.SessionMissing` before
+        any client is built when there is no session file, :class:`~grepogram.tg.SessionError`
+        when the file cannot be read, and :class:`~grepogram.tg.AuthRequired` for a session
+        Telegram rejects.
         """
         cfg = self.config()
         if cfg.telegram.api_id == 0 or not cfg.telegram.api_hash:
@@ -353,6 +381,8 @@ def hint_for(exc: BaseException) -> str | None:
         return AUTH_HINT
     if isinstance(exc, NotConfigured):
         return SETUP_HINT
+    if isinstance(exc, SessionError):
+        return SESSION_HINT
     if isinstance(exc, SyncInProgress):
         return LOCK_HINT
     if isinstance(exc, ModelUnavailable):
@@ -464,16 +494,22 @@ def _stale(state: AppState, cfg: Config) -> bool:
 async def _auto_sync(state: AppState, cfg: Config) -> tuple[bool, list[str]]:
     """Refresh a stale index within ``auto_sync_budget_s``; ``(synced, warnings)``.
 
-    Every expected failure — no session, a sync already running, a flood wait, a network
-    error — is a warning and the search goes on over the index as it is.
+    Every expected failure — no session, a sync already running in another process, a flood
+    wait, a network error — is a warning and the search goes on over the index as it is. A sync
+    already running in this process is waited for instead; the index is then fresh and nothing
+    is fetched again.
     """
     budget_s = cfg.search.auto_sync_budget_s
     try:
-        embedder = await asyncio.to_thread(state.embedder)
-        async with state.telegram() as client:
-            report = await syncing.sync_all(
-                client, state.conn, cfg, state.paths, SyncBudget(budget_s), embedder
-            )
+        async with state.sync_lock:
+            if not _stale(state, cfg):
+                log.debug("auto-sync: the index was refreshed while this call waited")
+                return False, []
+            embedder = await asyncio.to_thread(state.embedder)
+            async with state.telegram() as client:
+                report = await syncing.sync_all(
+                    client, state.conn, cfg, state.paths, SyncBudget(budget_s), embedder
+                )
     except AUTO_SYNC_ERRORS as exc:
         log.warning("auto-sync skipped: %s", exc)
         return False, [f"auto-sync skipped: {describe(exc)}"]
@@ -568,7 +604,7 @@ async def sync(budget_s: int = 45) -> ToolResult:
     if not cfg.sources:
         return {"error": "no sources are configured", "hint": NO_SOURCES_HINT}
     embedder = await asyncio.to_thread(state.embedder)
-    async with state.telegram() as client:
+    async with state.sync_lock, state.telegram() as client:
         report = await syncing.sync_all(
             client, state.conn, cfg, state.paths, SyncBudget(budget_s), embedder
         )
@@ -648,12 +684,15 @@ async def sources_add(target: str, since: str | None = None, comments: bool = Fa
     stored `source` and the `chats` it covers; call `sync` afterwards.
     """
     state = _app()
-    cfg = state.config()
     parsed = sourcing.parse_target(target)
     async with state.telegram() as client:
         catalog = DialogCatalog(client)
-        added = await sourcing.add_source(cfg, parsed, catalog, since=since, comments=comments)
-    state.save_config(added.config)
+        added = await sourcing.add_source(
+            state.config(), parsed, catalog, since=since, comments=comments
+        )
+    dialog = None if added.folder is not None else added.dialogs[0]
+    with state.editing_config() as current:
+        state.save_config(sourcing.with_source(current, added.source, dialog))
     log.info("source %s added (%s)", added.source.id, added.title)
     return {
         "source": {"id": added.source.id, **asdict(added.source)},
@@ -669,12 +708,16 @@ def sources_remove(target: str) -> ToolResult:
     """Remove a source and delete its chats' messages and index data (offline). `target` is a
     source id from `sources` (`folder:Argentina`, `chat:@name`), a folder name, a chat id /
     `@username`, or a fuzzy title. A chat that came in through a folder cannot be removed on
-    its own; remove the folder source or take the chat out of the folder in Telegram.
+    its own (remove the folder source or take the chat out of the folder in Telegram), nor can
+    a channel's discussion group indexed through the channel's source. Refused with `error`
+    while a sync is running.
     """
     state = _app()
-    removed = sourcing.remove_source(state.config(), state.conn, sourcing.parse_target(target))
-    if removed.source is not None:
-        state.save_config(removed.config)
+    parsed = sourcing.parse_target(target)
+    with SyncLock(state.paths), state.editing_config() as current:
+        removed = sourcing.remove_source(current, state.conn, parsed)
+        if removed.source is not None:
+            state.save_config(removed.config)
     log.info("source %s removed (%d chats)", removed.source_id, len(removed.chat_ids))
     return {
         "source_id": removed.source_id,

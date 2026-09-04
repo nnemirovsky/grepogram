@@ -43,7 +43,7 @@ from grepogram.rerank import FakeReranker
 from grepogram.search import UnknownMessage
 from grepogram.sources import AmbiguousTarget
 from grepogram.sync import SyncInProgress, SyncLock
-from grepogram.tg import AuthRequired, SessionMissing
+from grepogram.tg import AuthRequired, SessionError, SessionMissing
 from tests.fakes import FakeClient, make_channel, make_dialog, make_folder, make_user
 from tests.fixtures import chat_ru, tl
 
@@ -416,6 +416,58 @@ async def test_each_telegram_call_builds_a_fresh_client(
     assert [name for name, _ in clients[0].calls] == ["connect", "is_user_authorized", "disconnect"]
 
 
+async def test_concurrent_stale_searches_run_one_sync(
+    stale: tools.AppState, fake: FakeClient, conn: sqlite3.Connection
+) -> None:
+    """The second search waits for the first one's refresh and finds the index fresh, rather
+    than opening a second client and tripping over the sync lock."""
+    fake.messages[ARG] = [tl.message(ARG, 43, NEW_TEXT, sender=1)]
+    results = await asyncio.gather(
+        tools.search("Brubank", mode="lexical"),
+        tools.search("TBC", mode="lexical"),
+        tools.search("DNI", mode="lexical"),
+    )
+    assert all("error" not in result and result["hits"] for result in results)
+    assert sorted(result["synced"] for result in results) == [False, False, True]
+    assert all(result["warnings"] == [] for result in results)
+    assert _connects(fake) == 1
+    assert db.get_message(conn, ARG, 43) is not None
+
+
+async def test_sync_and_a_stale_search_queue_instead_of_colliding(
+    stale: tools.AppState, fake: FakeClient, conn: sqlite3.Connection
+) -> None:
+    fake.messages[ARG] = [tl.message(ARG, 43, NEW_TEXT, sender=1)]
+    report, result = await asyncio.gather(
+        tools.sync(budget_s=10), tools.search("Brubank", mode="lexical")
+    )
+    assert "error" not in report and "error" not in result
+    assert not any(
+        "another sync" in warning for warning in [*report["warnings"], *result["warnings"]]
+    )
+    assert db.get_message(conn, ARG, 43) is not None and _has(result, ARG, 43)
+
+
+async def test_an_unreadable_session_file_is_an_error_with_a_hint(
+    stale: tools.AppState, paths: Paths, conn: sqlite3.Connection
+) -> None:
+    def locked(cfg: Config, p: Paths) -> FakeClient:
+        raise SessionError(p.session_file, sqlite3.OperationalError("database is locked"))
+
+    tools.bind(tools.AppState(paths, CFG, conn, client_factory=locked))
+    denied = await tools.dialogs("arg")
+    assert denied["error"] == (
+        f"cannot read the Telegram session at {paths.session_file}: database is locked"
+    )
+    assert denied["hint"] == tools.SESSION_HINT
+    searched = await tools.search("DNI", mode="lexical")
+    assert searched["hits"] and searched["synced"] is False
+    assert searched["warnings"] == [
+        f"auto-sync skipped: cannot read the Telegram session at {paths.session_file}: "
+        "database is locked"
+    ]
+
+
 # --- sync ------------------------------------------------------------------------------------
 
 
@@ -458,6 +510,35 @@ async def test_sync_under_a_held_lock_carries_the_lock_hint(
         busy = await tools.sync()
     assert busy["error"].startswith("another sync is running")
     assert busy["hint"] == tools.LOCK_HINT
+
+
+async def test_sources_remove_under_a_held_lock_carries_the_lock_hint(
+    state: tools.AppState, paths: Paths, conn: sqlite3.Connection
+) -> None:
+    with SyncLock(paths):
+        busy = tools.sources_remove("folder:Argentina")
+    assert busy["error"].startswith("another sync is running")
+    assert busy["hint"] == tools.LOCK_HINT
+    assert db.get_chat(conn, ARG) is not None
+    assert state.config().sources == CFG.sources
+    freed = tools.sources_remove("folder:Argentina")
+    assert freed["removed_chat_ids"] == [ARG]
+
+
+async def test_concurrent_source_changes_all_reach_the_config(
+    bind: Callable[..., tools.AppState], paths: Paths, fake: FakeClient
+) -> None:
+    """Two ``sources_add`` calls resolve their targets at the same time; each saves onto the
+    config as it is by then, not onto the snapshot it started from."""
+    bind(Config(telegram=KEYS))
+    added = await asyncio.gather(tools.sources_add("georgia"), tools.sources_add("@news"))
+    assert all("error" not in result for result in added)
+    assert {s.id for s in config.load(paths).sources} == {f"chat:{GEO}", "chat:@news"}
+    again = await asyncio.gather(
+        tools.sources_add("folder:Argentina"), asyncio.to_thread(tools.sources_remove, "@news")
+    )
+    assert all("error" not in result for result in again)
+    assert {s.id for s in config.load(paths).sources} == {f"chat:{GEO}", "folder:Argentina"}
 
 
 def _offline() -> FakeClient:
@@ -819,6 +900,13 @@ FLOOD = errors.FloodWaitError(request=None, capture=30)
             tools.SETUP_HINT,
         ),
         (SyncInProgress("busy"), "busy", tools.LOCK_HINT),
+        (
+            SessionError(
+                Path("/x/session.session"), sqlite3.OperationalError("database is locked")
+            ),
+            "cannot read the Telegram session at /x/session.session: database is locked",
+            tools.SESSION_HINT,
+        ),
         (ModelUnavailable("no torch"), "no torch", tools.MODEL_HINT),
         (UnknownMessage(1, 2), "message 2 of chat 1 is not indexed", tools.MESSAGE_HINT),
         (InvalidDate("bad"), "bad", None),

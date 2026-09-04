@@ -5,6 +5,7 @@ grepogram makes from in-memory fixtures, and the ``make_*`` helpers build real T
 objects (``types.User``, ``types.Channel``, ``custom.Dialog``) without a client attached.
 """
 
+import asyncio
 import datetime as dt
 import inspect
 from collections.abc import AsyncIterator, Iterable, Mapping
@@ -278,8 +279,10 @@ class FakeClient:
         self, *_: Any, ignore_migrated: bool = False, **__: Any
     ) -> list[custom.Dialog]:
         """The dialogs; with ``ignore_migrated`` a legacy group upgraded to a supergroup is
-        left out, as Telethon does."""
+        left out, as Telethon does. Yields to the event loop once, as a request would, so
+        concurrent callers interleave the way they do against Telegram."""
         self.calls.append(("get_dialogs", {}))
+        await asyncio.sleep(0)
         return [
             dialog
             for dialog in self.dialogs
