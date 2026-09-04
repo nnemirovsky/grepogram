@@ -64,12 +64,12 @@ from grepogram.models import (
 )
 from grepogram.paths import FileLock, Paths
 from grepogram.sources import resolve_sources
+from grepogram.units import UNKNOWN_SENDER
 
 log = logging.getLogger(__name__)
 
 BATCH_SIZE = 500
 JOIN_TIMEOUT = 60.0
-UNKNOWN_FORWARD = "unknown"
 SELF_NAME = "me"
 UNKNOWN_FORWARD = "unknown"
 _LOCATION_MEDIA = (types.MessageMediaGeo, types.MessageMediaGeoLive, types.MessageMediaVenue)
@@ -305,7 +305,7 @@ def forward_of(fwd: Any, names: Mapping[int, str]) -> str | None:
     if fwd.from_id is not None:
         marked = int(utils.get_peer_id(fwd.from_id))
         return names.get(marked) or fwd.from_name or fwd.post_author or unknown_name(marked)
-    return fwd.from_name or fwd.post_author or UNKNOWN_FORWARD
+    return fwd.from_name or fwd.post_author or UNKNOWN_SENDER
 
 
 def reactions_total(reactions: Any) -> int:
