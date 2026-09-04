@@ -65,14 +65,34 @@ class FolderInfo:
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class Match:
-    """A dialog or folder matched by :func:`match`; ``score`` is in ``(0, 1]``."""
+    """A dialog or folder matched by :func:`match`; ``score`` is in ``(0, 1]``.
 
-    kind: MatchKind
-    id: int
-    title: str
+    Exactly one of ``dialog`` / ``folder`` is set; ``entry`` is whichever it is, and ``kind``,
+    ``id`` and ``title`` read through to it.
+    """
+
     score: float
     dialog: DialogInfo | None = None
     folder: FolderInfo | None = None
+
+    @property
+    def entry(self) -> DialogInfo | FolderInfo:
+        if self.folder is not None:
+            return self.folder
+        assert self.dialog is not None
+        return self.dialog
+
+    @property
+    def kind(self) -> MatchKind:
+        return "folder" if self.folder is not None else "dialog"
+
+    @property
+    def id(self) -> int:
+        return self.entry.id
+
+    @property
+    def title(self) -> str:
+        return self.entry.title
 
 
 # --- entities --------------------------------------------------------------------------------
@@ -358,14 +378,10 @@ def match(
         if dialog.username and handle:
             best = max(best, score(handle, dialog.username))
         if best > 0:
-            found.append(
-                Match(kind="dialog", id=dialog.id, title=dialog.title, score=best, dialog=dialog)
-            )
+            found.append(Match(score=best, dialog=dialog))
     for folder in folders:
         best = score(needle, folder.title)
         if best > 0:
-            found.append(
-                Match(kind="folder", id=folder.id, title=folder.title, score=best, folder=folder)
-            )
+            found.append(Match(score=best, folder=folder))
     found.sort(key=lambda m: (-m.score, normalize(m.title), m.kind))
     return found[:limit]

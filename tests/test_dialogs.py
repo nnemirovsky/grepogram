@@ -1,4 +1,5 @@
 import datetime as dt
+import difflib
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -571,3 +572,58 @@ def test_cli_dialogs_maps_auth_and_network_errors(
     offline = runner.invoke(cli.app, ["dialogs", "arg"])
     assert offline.exit_code == 1
     assert "telegram error: no route to Telegram" in offline.stderr
+
+
+# --- added by the review fixes --------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("exclude_archived", "expected"),
+    [(False, {-10, -1000000000100, -1000000000101}), (True, {-1000000000100, -1000000000101})],
+    ids=["archived-kept", "archived-excluded"],
+)
+def test_folder_members_exclude_archived_alone_drops_archived_groups(
+    exclude_archived: bool, expected: set[int]
+) -> None:
+    folder = FolderInfo(id=1, title="x", groups=True, exclude_archived=exclude_archived)
+    assert dialogs.folder_members(folder, _dialogs(), now=NOW) == expected
+
+
+async def test_catalog_hides_migrated_groups_but_still_resolves_them() -> None:
+    client = FakeClient(
+        dialogs=[make_dialog(make_group(10, "Old", migrated_to=101)), make_dialog(ARG)],
+        folders=[],
+    )
+    catalog = DialogCatalog(client)
+    assert [info.id for info in await catalog.list_dialogs()] == [-1000000000100]
+    assert (await catalog.entity(-10)).title == "Old"
+
+
+def test_match_exposes_kind_id_title_and_entry() -> None:
+    dialog_match = dialogs.match("alice", INFOS)[0]
+    assert (dialog_match.kind, dialog_match.id, dialog_match.title) == (
+        "dialog",
+        1,
+        "Alice Liddell",
+    )
+    assert dialog_match.entry is INFOS[4]
+    (folder_match,) = dialogs.match("people", [], FOLDERS)
+    assert (folder_match.kind, folder_match.id, folder_match.title) == ("folder", 4, "People")
+    assert folder_match.entry is FOLDERS[1]
+
+
+@pytest.mark.parametrize(
+    ("query", "hit"),
+    [("argn", True), ("agia", True), ("aagen", False), ("ahgen", False)],
+    ids=["argentina-0.615", "georgia-0.615", "argentina-0.571", "argentina-0.571-b"],
+)
+def test_fuzzy_threshold_sits_at_0_6(query: str, hit: bool) -> None:
+    """Queries whose best ``SequenceMatcher`` ratio lands within 0.05 of the threshold."""
+    ratio = 0.0
+    for title in [*(info.title for info in INFOS), *(folder.title for folder in FOLDERS)]:
+        target = dialogs.normalize(title)
+        for candidate in [target, *target.split()]:
+            ratio = max(ratio, difflib.SequenceMatcher(None, query, candidate).ratio())
+    assert abs(ratio - dialogs.FUZZY_MIN_RATIO) < 0.05
+    assert (ratio >= dialogs.FUZZY_MIN_RATIO) is hit
+    assert bool(dialogs.match(query, INFOS, FOLDERS)) is hit
