@@ -187,14 +187,16 @@ FTS and vec virtual tables cannot carry FK constraints, so `db.delete_chat(conn,
 | tool | signature | returns |
 |---|---|---|
 | `search` | `(query, chats: list[str] \| None, since: str \| None, until: str \| None, k=10, mode="hybrid", rerank=True, full=False)` | `SearchResult` as JSON |
-| `thread` | `(chat_id, msg_id)` | `MessageView` list for the reply thread containing `msg_id` |
-| `context` | `(chat_id, msg_id, before=15, after=15)` | surrounding `MessageView` list |
-| `sync` | `(budget_s=45)` | `SyncReport` |
-| `sources` | `()` | `SourceStatus` list (from `sources.sources_status`) |
-| `dialogs` | `(query)` | fuzzy matches over dialog titles and folder names: `{id, title, type, username, folders}` |
-| `sources_add` | `(target)` | target = id / `@username` / t.me link / `folder:<name>` / fuzzy title → writes config, returns resolved entry |
-| `sources_remove` | `(target)` | removes matching entry and deletes its chats' data (`db.delete_chat`) |
-| `open_message` | `(chat_id, msg_id)` | looks up the message (for `topic_id`), runs `open <url>`; returns the url used |
+| `thread` | `(chat_id, msg_id)` | `{chat_id, msg_id, messages}` — `MessageView` list for the reply thread containing `msg_id` |
+| `context` | `(chat_id, msg_id, before=15, after=15)` | `{chat_id, msg_id, messages}` — surrounding `MessageView` list |
+| `sync` | `(budget_s=45)` | `SyncReport` + `index_age_min` |
+| `sources` | `()` | `{sources, index_age_min}` — `SourceStatus` list (from `sources.sources_status`) |
+| `dialogs` | `(query)` | `{query, matches}` — fuzzy matches over dialog titles and folder names: `{kind, id, title, type, username, folders, score, target}` (`target` is what `sources_add` takes) |
+| `sources_add` | `(target, since=None, comments=False)` | target = id / `@username` / t.me link / `folder:<name>` / fuzzy title → writes config, returns the resolved entry `{source, kind, title, chats, hint}` (`since`/`comments` as in the CLI) |
+| `sources_remove` | `(target)` | removes matching entry and deletes its chats' data (`db.delete_chat`); `{source_id, removed_chat_ids, config_updated}` |
+| `open_message` | `(chat_id, msg_id)` | looks up the message (for `topic_id`), runs `open <url>`; returns `{url, fallback_url, opened}` with the url used (plus `error`/`hint` when `open` fails, the url still present) |
+
+Every tool returns one JSON object (list-shaped results are wrapped as above) and answers an expected failure — no session, another sync running, an unknown chat or message, a model that cannot load — with `{error, hint[, candidates]}` instead of raising.
 
 `instructions` (server-level): run 2–3 query variants (Russian and English, the specific term and the concept, synonyms); prefer recent hits for anything regulatory or price-related and state the date; call `thread`/`context` before drawing a conclusion from a snippet; cite `url` per claim; if nothing relevant comes back, say so rather than guess; call `sources`/`dialogs` when the user names a chat that is not indexed yet.
 
@@ -500,12 +502,12 @@ FTS and vec virtual tables cannot carry FK constraints, so `db.delete_chat(conn,
 - Create: `grepogram/mcp.py`
 - Create: `tests/test_mcp.py`
 
-- [ ] `mcp.py`: `FastMCP("grepogram", instructions=INSTRUCTIONS)`; `AppState` holding `paths/cfg/conn`, `DialogCatalog`, lazily-created Telethon client, embedder, reranker; `main()` sets up logging to stderr+file only, wraps startup and every tool body in `contextlib.redirect_stdout(sys.stderr)`, and runs stdio transport
-- [ ] tools `search`, `thread`, `context`, `sync`, `sources`, `dialogs`, `sources_add`, `sources_remove`, `open_message` as thin wrappers (`sources` → `sources_status`; `open_message` fetches the message first for `topic_id`) returning JSON-serializable dicts; docstrings become tool descriptions (include filter syntax and the `mode` values)
-- [ ] staleness in `search`: `index_age_min > auto_sync_after_min` → `sync_all(budget=auto_sync_budget_s, embedder)` first, `synced=true`; auto-sync failures (`AuthRequired`, `SyncInProgress`, `FloodWaitError`, budget overrun) become `warnings`, search proceeds
-- [ ] `AuthRequired` and `ModelUnavailable` from explicit tools surface as results with `error`/`hint` fields, never as crashes; `open_message` returns the url even when `open` is unavailable
-- [ ] write tests: tool functions called directly against in-memory state with the fixture chat: `search` returns hits with `url`; stale index triggers the sync callable exactly once and a failing auto-sync yields warnings not errors; `sources_add` with a fuzzy title writes config and invalidates the catalog; `dialogs` returns matches; `AuthRequired` surfaces as `error`; tool called from a worker thread works; `capfd` around `search` + `sync` + `sources_add` asserts `captured.out == ""`; one in-process MCP client session lists the nine tools
-- [ ] run tests — must pass before task 24
+- [x] `mcp.py`: `FastMCP("grepogram", instructions=INSTRUCTIONS)`; `AppState` holding `paths/cfg/conn`, `DialogCatalog`, lazily-created Telethon client, embedder, reranker; `main()` sets up logging to stderr+file only, wraps startup and every tool body in `contextlib.redirect_stdout(sys.stderr)`, and runs stdio transport
+- [x] tools `search`, `thread`, `context`, `sync`, `sources`, `dialogs`, `sources_add`, `sources_remove`, `open_message` as thin wrappers (`sources` → `sources_status`; `open_message` fetches the message first for `topic_id`) returning JSON-serializable dicts; docstrings become tool descriptions (include filter syntax and the `mode` values)
+- [x] staleness in `search`: `index_age_min > auto_sync_after_min` → `sync_all(budget=auto_sync_budget_s, embedder)` first, `synced=true`; auto-sync failures (`AuthRequired`, `SyncInProgress`, `FloodWaitError`, budget overrun) become `warnings`, search proceeds
+- [x] `AuthRequired` and `ModelUnavailable` from explicit tools surface as results with `error`/`hint` fields, never as crashes; `open_message` returns the url even when `open` is unavailable
+- [x] write tests: tool functions called directly against in-memory state with the fixture chat: `search` returns hits with `url`; stale index triggers the sync callable exactly once and a failing auto-sync yields warnings not errors; `sources_add` with a fuzzy title writes config and invalidates the catalog; `dialogs` returns matches; `AuthRequired` surfaces as `error`; tool called from a worker thread works; `capfd` around `search` + `sync` + `sources_add` asserts `captured.out == ""`; one in-process MCP client session lists the nine tools
+- [x] run tests — must pass before task 24
 
 ### Task 24: Static checks, CI and slow-test gate
 
