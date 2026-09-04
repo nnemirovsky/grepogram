@@ -41,6 +41,7 @@ import math
 import sqlite3
 import threading
 import time
+from collections import deque
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from typing import Any
@@ -1033,6 +1034,70 @@ async def _embed_after_sync(
     return dataclasses.replace(report, warnings=warnings)
 
 
+@dataclass(slots=True)
+class _Tally:
+    """What the chat loop accumulates on its way to a :class:`SyncReport`."""
+
+    new: int = 0
+    done: list[int] = field(default_factory=list)
+    remaining: list[int] = field(default_factory=list)
+    unavailable: list[int] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
+
+    def record(self, chat_id: int, synced: SyncedChat) -> None:
+        """Count one finished chat: its new messages, its warnings and where it ended up."""
+        self.new += synced.new + (0 if synced.discussion is None else synced.discussion.new)
+        self.warnings.extend(synced.warnings)
+        if synced.unavailable:
+            self.unavailable.append(chat_id)
+        elif synced.complete:
+            self.done.append(chat_id)
+        else:
+            self.remaining.append(chat_id)
+
+    def report(self) -> SyncReport:
+        log.info(
+            "sync: %d new messages, %d chats done, %d remaining, %d unavailable",
+            self.new,
+            len(self.done),
+            len(self.remaining),
+            len(self.unavailable),
+        )
+        return SyncReport(
+            new=self.new,
+            chats_done=self.done,
+            chats_remaining=self.remaining,
+            unavailable=self.unavailable,
+            warnings=self.warnings,
+        )
+
+
+def _record_failure(tally: _Tally, chat: ChatRow, exc: Exception) -> bool:
+    """Turn one chat's failure into warnings; returns whether the whole run must stop.
+
+    A flood wait is about the account rather than the chat, so the run ends and every chat left
+    is reported as remaining. An RPC error costs this chat its run, and a chat whose row
+    disappeared under the sync — a removal that got past the lock, or a hand-edited database —
+    costs it silently: it is gone, so there is nothing left to resume. An unauthorized session
+    never reaches here; :func:`_sync_chats` re-raises it.
+    """
+    if isinstance(exc, errors.FloodWaitError):
+        log.warning("flood wait of %ss on chat %s; stopping this run", exc.seconds, chat.id)
+        tally.warnings.append(
+            f"flood wait: Telegram asks to wait {exc.seconds}s before more history "
+            "requests; run sync again later"
+        )
+        return True
+    if isinstance(exc, errors.RPCError):
+        log.warning("chat %s (%s): %s; skipped this run", chat.id, chat.title, exc)
+        tally.warnings.append(f"chat {chat.id} ({chat.title}): {exc}")
+        tally.remaining.append(chat.id)
+        return False
+    log.warning("chat %s (%s) was removed during the sync: %s", chat.id, chat.title, exc)
+    tally.warnings.append(f"chat {chat.id} ({chat.title}) was removed while it was being synced")
+    return False
+
+
 async def _sync_chats(
     client: Any, conn: sqlite3.Connection, cfg: Config, budget: SyncBudget
 ) -> SyncReport:
@@ -1042,30 +1107,26 @@ async def _sync_chats(
     while a big chat is cut into units; it runs for every chat once its fetch is over — after
     the last batch, or after the batch a flood wait, an RPC error or a cancellation interrupted,
     which stays committed and searchable either way — and at the end for the chats the budget
-    or a flood wait kept the run from reaching, whose pending rows come from an earlier run. A
-    chat whose row disappears while it is being fetched — a removal that got past the lock, or
-    a hand-edited database — fails its next write with a foreign-key error; that ends the chat
-    for this run with a warning, not the run.
+    or a flood wait kept the run from reaching, whose pending rows come from an earlier run.
+    Failures are :func:`_record_failure`'s to describe; the tally becomes the report.
     """
     me = _self_row(await client.get_me())
-    queue = sorted(await resolve_sources(cfg, client, conn), key=_sync_order)
+    queue = deque(sorted(await resolve_sources(cfg, client, conn), key=_sync_order))
+    queued = {chat.id for chat in queue}
     sources = {source.id: source for source in cfg.sources}
-    done: list[int] = []
-    remaining: list[int] = []
-    unavailable: list[int] = []
-    warnings: list[str] = []
+    tally = _Tally()
     processed: set[int] = set()
     deferred: list[ChatRow] = []
-    new = 0
     while queue:
-        chat = queue.pop(0)
+        chat = queue.popleft()
+        queued.discard(chat.id)
         processed.add(chat.id)
         source = sources.get(chat.source_id or "")
         if source is None:
             log.debug("chat %s has no configured source; skipped", chat.id)
             continue
         if budget.expired:
-            remaining.append(chat.id)
+            tally.remaining.append(chat.id)
             deferred.append(chat)
             continue
         _cap_flood_sleep(client, cfg.sync, budget)
@@ -1076,54 +1137,21 @@ async def _sync_chats(
                 )
             finally:
                 await index_pending(conn, cfg, chat)
-        except errors.FloodWaitError as exc:
-            log.warning("flood wait of %ss on chat %s; stopping this run", exc.seconds, chat.id)
-            warnings.append(
-                f"flood wait: Telegram asks to wait {exc.seconds}s before more history "
-                "requests; run sync again later"
-            )
-            remaining.extend([chat.id, *(c.id for c in queue)])
-            break
         except errors.UnauthorizedError:
             raise
-        except errors.RPCError as exc:
-            log.warning("chat %s (%s): %s; skipped this run", chat.id, chat.title, exc)
-            warnings.append(f"chat {chat.id} ({chat.title}): {exc}")
-            remaining.append(chat.id)
+        except (errors.RPCError, sqlite3.IntegrityError) as exc:
+            if _record_failure(tally, chat, exc):
+                tally.remaining.extend([chat.id, *(c.id for c in queue)])
+                break
             continue
-        except sqlite3.IntegrityError as exc:
-            log.warning("chat %s (%s) was removed during the sync: %s", chat.id, chat.title, exc)
-            warnings.append(f"chat {chat.id} ({chat.title}) was removed while it was being synced")
-            continue
-        new += synced.new
-        warnings.extend(synced.warnings)
-        if synced.discussion is not None:
-            new += synced.discussion.new
-        if synced.unavailable:
-            unavailable.append(chat.id)
-        elif synced.complete:
-            done.append(chat.id)
-        else:
-            remaining.append(chat.id)
+        tally.record(chat.id, synced)
         migrated = synced.migrated_to
-        if migrated is not None and migrated.id not in processed and _not_queued(migrated, queue):
+        if migrated is not None and migrated.id not in processed and migrated.id not in queued:
             queue.append(migrated)
+            queued.add(migrated.id)
     for chat in [*deferred, *queue]:
         await index_pending(conn, cfg, chat)
-    log.info(
-        "sync: %d new messages, %d chats done, %d remaining, %d unavailable",
-        new,
-        len(done),
-        len(remaining),
-        len(unavailable),
-    )
-    return SyncReport(
-        new=new,
-        chats_done=done,
-        chats_remaining=remaining,
-        unavailable=unavailable,
-        warnings=warnings,
-    )
+    return tally.report()
 
 
 def _cap_flood_sleep(client: Any, sync_cfg: SyncCfg, budget: SyncBudget) -> None:
@@ -1146,10 +1174,6 @@ def _sync_order(chat: ChatRow) -> tuple[int, int, int]:
     if chat.last_sync_at is None:
         return (0, 0, chat.id)
     return (1, chat.last_sync_at, chat.id)
-
-
-def _not_queued(chat: ChatRow, queue: list[ChatRow]) -> bool:
-    return all(item.id != chat.id for item in queue)
 
 
 def _self_row(me: Any) -> UserRow | None:
