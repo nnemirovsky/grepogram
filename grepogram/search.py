@@ -47,7 +47,7 @@ import logging
 import sqlite3
 import time
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import get_args
 
 from grepogram import db, embed, index, links
@@ -484,32 +484,94 @@ def search(
         warnings.append(NOTHING_INDEXED if cfg.sources else NO_SOURCES)
         return SearchResult(hits=[], warnings=warnings, index_age_min=age)
     limit = max(k, cfg.search.rerank_top)
+    retrieved = _retrieve(conn, cfg, query, filters, limit, mode, warnings, embedder, load_embedder)
+    candidates = _fuse(conn, cfg, retrieved, limit)
+    if rerank and candidates:
+        candidates = _rerank(cfg, query, candidates, reranker, warnings, load_reranker)
+    hits = dedup(_hits(conn, query, retrieved, candidates, full), cfg.search.dedup_overlap)[:k]
+    log.debug(
+        "%s search: %d unit, %d message, %d dense matches; %d candidates, %d hits",
+        retrieved.mode,
+        len(retrieved.units),
+        len(retrieved.messages),
+        len(retrieved.dense),
+        len(candidates),
+        len(hits),
+    )
+    return SearchResult(hits=hits, warnings=warnings, index_age_min=age)
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class _Retrieved:
+    """The ranked lists one search fetched, under the mode it ended up running in.
+
+    ``mode`` is what ran, which is not always what the caller asked for: an unavailable dense
+    side degrades to ``lexical`` and a query without searchable words falls back to ``dense``.
+    """
+
+    mode: SearchMode
+    units: list[Match] = field(default_factory=list)
+    messages: list[Match] = field(default_factory=list)
+    dense: list[Match] = field(default_factory=list)
+
+
+def _retrieve(
+    conn: sqlite3.Connection,
+    cfg: Config,
+    query: str,
+    filters: Filters,
+    limit: int,
+    mode: SearchMode,
+    warnings: list[str],
+    embedder: Embedder | None,
+    load_embedder: EmbedderLoader | None,
+) -> _Retrieved:
+    """Fetch the lists ``mode`` calls for, degrading when a side cannot answer.
+
+    No vectors, no model or vectors from another model take the dense side out and leave a
+    warning; a query with no letters or digits takes the lexical side out. A ``lexical`` search
+    of such a query has nothing left to run and comes back empty.
+    """
+    effective = mode
     dense: list[Match] = []
-    if mode != "lexical":
+    if effective != "lexical":
         try:
             dense = dense_units(
                 conn, cfg, query, filters, limit, embedder, load_embedder=load_embedder
             )
         except DenseUnavailable as exc:
             warnings.append(f"dense search unavailable: {exc}")
-            mode = "lexical"
-    if mode != "dense" and fts_query(query) is None:
+            effective = "lexical"
+    if effective != "dense" and fts_query(query) is None:
         note = f"query {query!r} has no searchable words (letters or digits)"
-        if mode == "lexical":
+        if effective == "lexical":
             warnings.append(note)
-            return SearchResult(hits=[], warnings=warnings, index_age_min=age)
+            return _Retrieved(mode=effective)
         warnings.append(f"{note}; only the dense index was searched")
-        mode = "dense"
-    unit_matches: list[Match] = []
-    message_matches: list[Match] = []
-    if mode != "dense":
-        unit_matches = lexical_units(conn, query, filters, limit)
-        message_matches = lexical_messages(conn, query, filters, limit)
+        effective = "dense"
+    if effective == "dense":
+        return _Retrieved(mode=effective, dense=dense)
+    return _Retrieved(
+        mode=effective,
+        units=lexical_units(conn, query, filters, limit),
+        messages=lexical_messages(conn, query, filters, limit),
+        dense=dense,
+    )
+
+
+def _fuse(
+    conn: sqlite3.Connection, cfg: Config, retrieved: _Retrieved, limit: int
+) -> list[_Candidate]:
+    """The retrieved lists fused with :func:`rrf`, deepest ``limit`` first, units attached.
+
+    A unit an index still lists but the table no longer holds is logged and skipped; the repair
+    in :func:`grepogram.index.repair_unit_index` drops such a row on the next sync.
+    """
     fused = rrf(
         [
-            [m.unit_id for m in unit_matches],
-            [m.unit_id for m in message_matches],
-            [m.unit_id for m in dense],
+            [m.unit_id for m in retrieved.units],
+            [m.unit_id for m in retrieved.messages],
+            [m.unit_id for m in retrieved.dense],
         ],
         cfg.search.rrf_k,
     )
@@ -522,26 +584,26 @@ def search(
             log.warning("unit %d is indexed but not stored; skipping", unit_id)
             continue
         candidates.append(_Candidate(unit_id, unit, fused[unit_id]))
-    if rerank and candidates:
-        candidates = _rerank(cfg, query, candidates, reranker, warnings, load_reranker)
-    anchors = {m.unit_id: m.anchor_msg_id for m in message_matches}
+    return candidates
+
+
+def _hits(
+    conn: sqlite3.Connection,
+    query: str,
+    retrieved: _Retrieved,
+    candidates: list[_Candidate],
+    full: bool,
+) -> list[Hit]:
+    """The candidates as hits, anchored on the message the lexical pass matched when there is
+    one and on the unit's own best line otherwise."""
+    anchors = {m.unit_id: m.anchor_msg_id for m in retrieved.messages}
     hits: list[Hit] = []
     for candidate in candidates:
         anchor = anchors.get(candidate.unit_id)
         if anchor is None:
             anchor = best_anchor(conn, candidate.unit, query)
         hits.append(build_hit(conn, candidate.unit, anchor, candidate.score, full, query=query))
-    hits = dedup(hits, cfg.search.dedup_overlap)[:k]
-    log.debug(
-        "%s search: %d unit, %d message, %d dense matches; %d candidates, %d hits",
-        mode,
-        len(unit_matches),
-        len(message_matches),
-        len(dense),
-        len(candidates),
-        len(hits),
-    )
-    return SearchResult(hits=hits, warnings=warnings, index_age_min=age)
+    return hits
 
 
 def _rerank(
