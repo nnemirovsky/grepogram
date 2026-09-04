@@ -11,6 +11,7 @@ the model.
 
 import asyncio
 import datetime as dt
+import functools
 import json
 import logging
 import sqlite3
@@ -87,12 +88,20 @@ def auth() -> None:
     cfg = _load_config(paths)
     _require_api_keys(cfg, paths)
     tg.prepare_session(paths)
-    client = tg.make_login_client(cfg, paths)
     try:
+        client = tg.make_login_client(cfg, paths)
         name = asyncio.run(
             tg.login(client, phone=_ask_phone, code=_ask_code, password=_ask_password)
         )
-    except (tg.AuthRequired, tg_errors.RPCError, ConnectionError, RuntimeError) as exc:
+    except tg.SessionError as exc:
+        fail(f"{exc}; if the file is damaged, delete it and run grepogram auth again")
+    except (
+        tg.AuthRequired,
+        tg_errors.RPCError,
+        ConnectionError,
+        RuntimeError,
+        sqlite3.Error,
+    ) as exc:
         fail(f"sign-in failed: {exc}")
     tg.ensure_session_mode(paths)
     typer.echo(f"signed in as {name}")
@@ -184,7 +193,8 @@ def sync_cmd(
         tg.ensure_session_mode(paths)
         client = tg.make_client(cfg, paths)
         embedder = _optional_embedder(cfg)
-        report = asyncio.run(_run_sync(client, conn, cfg, paths, budget, embedder))
+        current = functools.partial(config.load, paths)
+        report = asyncio.run(_run_sync(client, conn, current, paths, budget, embedder))
     except (tg.AuthRequired, tg.SessionError, sync.SyncInProgress, ConfigError) as exc:
         fail(str(exc))
     except (tg_errors.RPCError, ConnectionError) as exc:
@@ -206,11 +216,14 @@ def _optional_embedder(cfg: Config) -> Embedder | None:
 async def _run_sync(
     client: TelegramClient,
     conn: sqlite3.Connection,
-    cfg: Config,
+    cfg: sync.ConfigSource,
     paths: Paths,
     budget: int | None,
     embedder: Embedder | None,
 ) -> SyncReport:
+    """Connect and run :func:`grepogram.sync.sync_all`; ``cfg`` is the config loader so the
+    sources come from the file as it is once the sync lock is held, not from the snapshot the
+    command started with (a ``sources rm`` may have run while the model loaded)."""
     async with tg.connected(client):
         return await sync.sync_all(client, conn, cfg, paths, sync.SyncBudget(budget), embedder)
 
@@ -454,14 +467,16 @@ def sources_rm(
     group)."""
     paths, cfg, conn = _load()
     try:
+        # the config is saved under the same lock as the delete, so a sync that starts as soon
+        # as the lock is free reads a config without this source and cannot re-create its chats
         with sync.SyncLock(paths):
             removed = sources.remove_source(cfg, conn, sources.parse_target(target))
+            if removed.source is not None:
+                config.save(removed.config, paths)
     except (sources.SourceError, sync.SyncInProgress) as exc:
         fail(str(exc))
     finally:
         conn.close()
-    if removed.source is not None:
-        config.save(removed.config, paths)
     typer.echo(f"removed {removed.source_id} ({len(removed.chat_ids)} chats deleted)")
 
 

@@ -877,10 +877,14 @@ def on_chat_synced(
     index.index_chat(conn, chat, new_msg_ids, delta)
 
 
+ConfigSource = Config | Callable[[], Config]
+"""A config, or a loader called once the :class:`SyncLock` is held (see :func:`sync_all`)."""
+
+
 async def sync_all(
     client: Any,
     conn: sqlite3.Connection,
-    cfg: Config,
+    cfg: ConfigSource,
     paths: Paths,
     budget: SyncBudget,
     embedder: Embedder | None = None,
@@ -890,9 +894,13 @@ async def sync_all(
     Takes the :class:`SyncLock` (:class:`SyncInProgress` when another process syncs), resolves
     the sources into chats, and processes them oldest-synced first (never-synced chats before
     all others) until the budget expires — the current batch is always committed, and the chats
-    not finished are reported in ``chats_remaining``. Each chat with changes goes through
-    :func:`on_chat_synced`. A flood wait Telegram will not let the client sleep through stops
-    the run with a warning; a chat Telegram refuses is reported in ``unavailable``; an
+    not finished are reported in ``chats_remaining``. ``cfg`` may be a loader instead of a
+    config: it is called after the lock is taken, so a source removed while the caller was still
+    loading its model or connecting — ``sources_remove`` holds the same lock for its delete and
+    its config save — is not resolved and fetched again from a stale snapshot. Callers that hold
+    a config they own (tests, a one-shot script) pass it as it is. Each chat with changes goes
+    through :func:`on_chat_synced`. A flood wait Telegram will not let the client sleep through
+    stops the run with a warning; a chat Telegram refuses is reported in ``unavailable``; an
     unauthorized session raises :class:`~telethon.errors.UnauthorizedError`, which the
     :func:`~grepogram.tg.connected` block every caller runs in turns into
     :class:`~grepogram.tg.AuthRequired`. The end of the run is stamped in ``meta.last_sync_run``
@@ -904,7 +912,8 @@ async def sync_all(
     changed embedding model become ``warnings`` — the messages are synced either way.
     """
     with SyncLock(paths):
-        report = await _sync_chats(client, conn, cfg, budget)
+        current = cfg if isinstance(cfg, Config) else cfg()
+        report = await _sync_chats(client, conn, current, budget)
         db.set_last_sync_run(conn, int(time.time()))
         if embedder is None:
             return report

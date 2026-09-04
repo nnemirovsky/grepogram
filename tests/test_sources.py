@@ -811,6 +811,27 @@ def test_cli_sources_rm_refuses_while_a_sync_runs(tmp_home: Path) -> None:
     assert freed.exit_code == 0, freed.output
 
 
+def test_cli_sources_rm_saves_the_config_under_the_sync_lock(
+    tmp_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A sync that takes the lock the moment ``rm`` releases it must already read a config
+    without the source, or it would re-create the chats ``rm`` just deleted."""
+    (tmp_home / "config.toml").write_text('[[sources]]\nchat = "@alice"\n', encoding="utf-8")
+    real_save = config.save
+    held: list[bool] = []
+
+    def save(cfg: Config, paths: Paths) -> None:
+        with pytest.raises(sync.SyncInProgress), sync.SyncLock(paths):
+            pass
+        held.append(True)
+        real_save(cfg, paths)
+
+    monkeypatch.setattr(config, "save", save)
+    result = runner.invoke(cli.app, ["sources", "rm", "@alice"])
+    assert result.exit_code == 0, result.output
+    assert held == [True] and config.load(Paths.from_env()).sources == []
+
+
 def test_cli_when_formats_timestamps() -> None:
     assert cli._when(None) == "never"
     rendered = cli._when(1_700_000_000)

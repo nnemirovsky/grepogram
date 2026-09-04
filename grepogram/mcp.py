@@ -104,6 +104,10 @@ SETUP_HINT = (
     "in [telegram] api_id and api_hash, then `grepogram auth`"
 )
 LOCK_HINT = "another grepogram process (the CLI or a second server) is syncing; retry when it ends"
+SYNC_RUNNING = (
+    "a sync started by another tool call is still running; the hits come from the index as it "
+    "is — search again when it ends"
+)
 SESSION_HINT = (
     "another grepogram process is writing the session file (a `grepogram auth` in progress); "
     "retry when it ends — if the file is damaged, delete it and sign in again with `grepogram auth`"
@@ -496,23 +500,33 @@ async def _auto_sync(state: AppState, cfg: Config) -> tuple[bool, list[str]]:
 
     Every expected failure — no session, a sync already running in another process, a flood
     wait, a network error — is a warning and the search goes on over the index as it is. A sync
-    already running in this process is waited for instead; the index is then fresh and nothing
-    is fetched again.
+    already running in this process is waited for instead, but no longer than the budget: a
+    short refresh leaves the index fresh and nothing is fetched again, while a long explicit
+    ``sync`` is reported as a warning and the search runs on the index as it is. The sources
+    are resolved from the config as it is once the sync lock is held (``state.config``), so a
+    source removed while this call was loading its model or connecting stays removed.
     """
     budget_s = cfg.search.auto_sync_budget_s
     try:
-        async with state.sync_lock:
-            if not _stale(state, cfg):
-                log.debug("auto-sync: the index was refreshed while this call waited")
-                return False, []
-            embedder = await asyncio.to_thread(state.embedder)
-            async with state.telegram() as client:
-                report = await syncing.sync_all(
-                    client, state.conn, cfg, state.paths, SyncBudget(budget_s), embedder
-                )
+        async with asyncio.timeout(budget_s):
+            await state.sync_lock.acquire()
+    except TimeoutError:
+        log.warning("auto-sync skipped: a sync in this process still runs after %ss", budget_s)
+        return False, [f"auto-sync skipped: {SYNC_RUNNING}"]
+    try:
+        if not _stale(state, cfg):
+            log.debug("auto-sync: the index was refreshed while this call waited")
+            return False, []
+        embedder = await asyncio.to_thread(state.embedder)
+        async with state.telegram() as client:
+            report = await syncing.sync_all(
+                client, state.conn, state.config, state.paths, SyncBudget(budget_s), embedder
+            )
     except AUTO_SYNC_ERRORS as exc:
         log.warning("auto-sync skipped: %s", exc)
         return False, [f"auto-sync skipped: {describe(exc)}"]
+    finally:
+        state.sync_lock.release()
     warnings = [f"auto-sync: {warning}" for warning in report.warnings]
     if report.chats_remaining:
         warnings.append(
@@ -606,7 +620,7 @@ async def sync(budget_s: int = 45) -> ToolResult:
     embedder = await asyncio.to_thread(state.embedder)
     async with state.sync_lock, state.telegram() as client:
         report = await syncing.sync_all(
-            client, state.conn, cfg, state.paths, SyncBudget(budget_s), embedder
+            client, state.conn, state.config, state.paths, SyncBudget(budget_s), embedder
         )
     warnings = list(report.warnings)
     if embedder is None:

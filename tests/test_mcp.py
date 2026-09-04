@@ -448,6 +448,29 @@ async def test_sync_and_a_stale_search_queue_instead_of_colliding(
     assert db.get_message(conn, ARG, 43) is not None and _has(result, ARG, 43)
 
 
+async def test_auto_sync_waits_no_longer_than_its_budget_for_a_running_sync(
+    bind: Callable[..., tools.AppState], conn: sqlite3.Connection, fake: FakeClient
+) -> None:
+    """A stale search spends at most ``auto_sync_budget_s`` on its refresh, waiting for a sync
+    another tool call started included; past that it searches the index as it is and says so."""
+    chat_ru.load(conn)
+    cfg = dataclasses.replace(CFG, search=dataclasses.replace(CFG.search, auto_sync_budget_s=1))
+    state = bind(cfg)
+    await state.sync_lock.acquire()
+    try:
+        started = time.monotonic()
+        result = await tools.search("DNI", mode="lexical")
+        waited = time.monotonic() - started
+    finally:
+        state.sync_lock.release()
+    assert 1 <= waited < 5
+    assert result["hits"] and result["synced"] is False
+    assert result["warnings"] == [f"auto-sync skipped: {tools.SYNC_RUNNING}"]
+    assert _connects(fake) == 0
+    again = await tools.search("DNI", mode="lexical")
+    assert again["synced"] is True and again["warnings"] == [] and _connects(fake) == 1
+
+
 async def test_an_unreadable_session_file_is_an_error_with_a_hint(
     stale: tools.AppState, paths: Paths, conn: sqlite3.Connection
 ) -> None:
@@ -523,6 +546,38 @@ async def test_sources_remove_under_a_held_lock_carries_the_lock_hint(
     assert state.config().sources == CFG.sources
     freed = tools.sources_remove("folder:Argentina")
     assert freed["removed_chat_ids"] == [ARG]
+
+
+async def test_source_removed_while_a_sync_starts_stays_removed(
+    state: tools.AppState, fake: FakeClient, conn: sqlite3.Connection, paths: Paths
+) -> None:
+    """``sync`` reads its config, then loads the model and connects before it takes the sync
+    lock; a ``sources_remove`` that runs in that window must win for good — the sync resolves
+    its sources from the config as it is once the lock is held, not from its snapshot."""
+    fake.messages[ARG] = [tl.message(ARG, 43, NEW_TEXT, sender=1)]
+    task = asyncio.create_task(tools.sync(budget_s=10))
+    await asyncio.sleep(0)  # the sync has read its config and is loading the embedder
+    removed = tools.sources_remove("folder:Argentina")
+    assert removed["removed_chat_ids"] == [ARG] and removed["config_updated"] is True
+    report = await task
+    assert "error" not in report and report["chats_done"] == [GEO]
+    assert db.get_chat(conn, ARG) is None and db.get_message(conn, ARG, 43) is None
+    assert [s.id for s in config.load(paths).sources] == [f"chat:{GEO}"]
+    assert [s["source_id"] for s in tools.sources()["sources"]] == [f"chat:{GEO}"]
+
+
+async def test_source_removed_while_a_stale_search_starts_its_refresh_stays_removed(
+    stale: tools.AppState, fake: FakeClient, conn: sqlite3.Connection, paths: Paths
+) -> None:
+    fake.messages[ARG] = [tl.message(ARG, 43, NEW_TEXT, sender=1)]
+    task = asyncio.create_task(tools.search("TBC", mode="lexical"))
+    await asyncio.sleep(0)  # the search holds sync_lock and is loading the embedder
+    removed = tools.sources_remove("folder:Argentina")
+    assert removed["removed_chat_ids"] == [ARG]
+    result = await task
+    assert "error" not in result and result["synced"] is True and result["warnings"] == []
+    assert db.get_chat(conn, ARG) is None and db.get_message(conn, ARG, 43) is None
+    assert [s.id for s in config.load(paths).sources] == [f"chat:{GEO}"]
 
 
 async def test_concurrent_source_changes_all_reach_the_config(
