@@ -198,6 +198,24 @@ def test_load_exits_on_newer_schema(tmp_home: Path, capsys: pytest.CaptureFixtur
     assert "newer" in capsys.readouterr().err
 
 
+def test_load_exits_on_a_schema_version_it_cannot_read(
+    tmp_home: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A corrupt recorded version reaches the user as the rebuild instruction, like every other
+    schema refusal, and not as a traceback out of ``int()``."""
+    conn = db.connect(Paths.from_env())
+    db.migrate(conn)
+    db.set_meta(conn, db.META_SCHEMA_VERSION, "five")
+    conn.close()
+    with pytest.raises(typer.Exit) as excinfo:
+        cli._load()
+    assert excinfo.value.exit_code == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "error:" in captured.err
+    assert "delete index.db and run `grepogram sync`" in captured.err
+
+
 def test_fail_writes_to_stderr_and_exits(capsys: pytest.CaptureFixture[str]) -> None:
     with pytest.raises(typer.Exit) as excinfo:
         cli.fail("nope", code=3)

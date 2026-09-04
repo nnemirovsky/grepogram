@@ -311,17 +311,58 @@ def has_table(conn: sqlite3.Connection, name: str) -> bool:
     return row is not None
 
 
+def _meta_is_grepogram(conn: sqlite3.Connection) -> bool:
+    """Whether ``meta`` carries the ``key`` and ``value`` columns :func:`get_meta` reads.
+
+    Asking the table for its columns is what tells a file some other program wrote apart from a
+    database that cannot be read at all: a locked or corrupt file raises out of the read itself
+    and means something else entirely, so it is never classified here.
+    """
+    columns = {row[0] for row in conn.execute("SELECT name FROM pragma_table_info('meta')")}
+    return {"key", "value"} <= columns
+
+
 def schema_version(conn: sqlite3.Connection) -> int:
-    """Version recorded in ``meta``; ``0`` for an empty database."""
+    """Version recorded in ``meta``; ``0`` for an empty database.
+
+    A ``meta`` table this build cannot read a version out of — one of another program's making,
+    or a value that is not a number — raises :class:`SchemaError` carrying the same rebuild
+    instruction as every refusal in :func:`migrate`, instead of the bare ``sqlite3`` or ``int()``
+    error that would reach the user as a traceback past the handlers in the CLI and the MCP
+    server. A database that cannot be read at all fails as it always did.
+    """
     if not has_table(conn, "meta"):
         return 0
+    if not _meta_is_grepogram(conn):
+        raise SchemaError(
+            f"the meta table of this database is not the one grepogram writes; {_REBUILD_HINT}"
+        )
     value = get_meta(conn, META_SCHEMA_VERSION)
-    return int(value) if value else 0
+    if not value:
+        return 0
+    try:
+        return int(value)
+    except ValueError as exc:
+        raise SchemaError(
+            f"database records {value!r} as its schema version, which is not a number; "
+            f"{_REBUILD_HINT}"
+        ) from exc
 
 
 def _is_empty(conn: sqlite3.Connection) -> bool:
     """Whether the database holds no schema objects at all — what :func:`migrate` builds in."""
     return conn.execute("SELECT 1 FROM sqlite_master LIMIT 1").fetchone() is None
+
+
+def _missing_steps(first: int) -> list[int]:
+    """Versions from ``first`` up to :data:`SCHEMA_VERSION` that :data:`MIGRATIONS` holds no step
+    for; empty when the chain reaches the head without a hole.
+
+    Whether it does is a property of this module and not of any database, so both paths into
+    :func:`_apply` ask before they apply: a step keyed with a gap must not stamp an empty database
+    at a version an existing one is refused at.
+    """
+    return [version for version in range(first, SCHEMA_VERSION + 1) if version not in MIGRATIONS]
 
 
 def _apply(conn: sqlite3.Connection, steps: Sequence[tuple[str, ...]]) -> int:
@@ -346,10 +387,13 @@ def migrate(conn: sqlite3.Connection) -> int:
     * anything else raises :class:`SchemaError` telling the user to rebuild the index: tables
       carrying no recorded version, a version newer than this build knows, a version below
       :data:`BASE_VERSION` (every number the pre-release development chain wrote — a different
-      schema behind numbers this build no longer uses), and a version no chain of steps reaches.
+      schema behind numbers this build no longer uses), a version no chain of steps reaches, and
+      a version :func:`schema_version` cannot read at all.
 
     Rows are never transformed on a guess: the index is derived from Telegram and a rebuild costs
-    one sync.
+    one sync. A gap in :data:`MIGRATIONS` itself is refused on both paths, the empty file's
+    included: a mis-keyed step is a bug here, and an empty database stamped at the head while
+    every existing one is turned away would hide it.
     """
     current = schema_version(conn)
     if current == SCHEMA_VERSION:
@@ -357,7 +401,17 @@ def migrate(conn: sqlite3.Connection) -> int:
     if current == 0:
         if not _is_empty(conn):
             raise SchemaError(f"database records no schema version; {_REBUILD_HINT}")
-        return _apply(conn, [MIGRATIONS[version] for version in sorted(MIGRATIONS)])
+        gap = _missing_steps(BASE_VERSION)
+        if gap:
+            raise SchemaError(
+                "this grepogram holds no schema step for "
+                + ", ".join(f"v{version}" for version in gap)
+                + f": MIGRATIONS has to run from v{BASE_VERSION} to v{SCHEMA_VERSION} without a "
+                "gap, and a mis-keyed step is a bug in grepogram, not in the database"
+            )
+        return _apply(
+            conn, [MIGRATIONS[version] for version in range(BASE_VERSION, SCHEMA_VERSION + 1)]
+        )
     if current > SCHEMA_VERSION:
         raise SchemaError(
             f"database schema v{current} is newer than this grepogram supports "
@@ -369,7 +423,7 @@ def migrate(conn: sqlite3.Connection) -> int:
             f"first release and is not the schema behind that number any more; {_REBUILD_HINT}"
         )
     pending = range(current + 1, SCHEMA_VERSION + 1)
-    if any(version not in MIGRATIONS for version in pending):
+    if _missing_steps(current + 1):
         raise SchemaError(
             f"database schema v{current} is not one this grepogram can upgrade to "
             f"v{SCHEMA_VERSION}; {_REBUILD_HINT}"

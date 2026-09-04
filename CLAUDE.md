@@ -67,10 +67,17 @@ never change the git identity.
   used as it is, one between `BASE_VERSION` and `SCHEMA_VERSION` that `MIGRATIONS` holds every
   step for is walked up, and everything else — tables with no recorded version, a newer version,
   anything below `BASE_VERSION` (the dev chain's 1 through 4), a version no chain of steps
-  reaches — raises `SchemaError` telling the user to delete `index.db` and sync again. Nothing
-  has shipped, so no step transforms rows: an index is derived from Telegram and a rebuild costs
-  one sync. Change the schema by editing `_V5` until the first release; after it, append a step
-  above `BASE_VERSION` and leave `_V5` alone.
+  reaches, a version `db.schema_version` cannot read at all — raises `SchemaError` telling the
+  user to delete `index.db` and sync again. That last one is why `schema_version` classifies what
+  it reads: a `meta` table of another program's shape and a recorded version that is not a number
+  are `SchemaError`, so the handlers in `cli._load` and `mcp.main` give the rebuild hint instead
+  of a traceback, while a locked or unreadable file keeps raising its own `sqlite3` error — it is
+  not a schema this code can classify. `MIGRATIONS` has to run from `BASE_VERSION` to
+  `SCHEMA_VERSION` without a gap and `db._missing_steps` is where both paths check it: a
+  mis-keyed step is a bug in grepogram, and stamping an empty database at a version every
+  existing one is refused at would hide it. Nothing has shipped, so no step transforms rows: an
+  index is derived from Telegram and a rebuild costs one sync. Change the schema by editing `_V5`
+  until the first release; after it, append a step above `BASE_VERSION` and leave `_V5` alone.
 - `messages.indexed` is 0 for a row whose units and `msg_fts` entry are behind: every
   `upsert_messages` sets it, `db.mark_unindexed` raises it for a post whose thread grew, and
   `sync.on_chat_synced` clears it after the rebuild. `sync._sync_chats` runs `index_pending` for

@@ -293,6 +293,52 @@ def test_migrate_rolls_back_on_failure(monkeypatch: pytest.MonkeyPatch) -> None:
     connection.close()
 
 
+def test_fresh_migrate_refuses_a_gap_in_the_migration_chain(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A step keyed with a hole below it is a bug in grepogram, and an empty file must not hide
+    it: the fresh path refuses the same chain the upgrade path refuses, instead of stamping a
+    new database at a version every existing one is turned away at."""
+    gap = db.SCHEMA_VERSION + 1
+    monkeypatch.setitem(
+        db.MIGRATIONS, db.SCHEMA_VERSION + 2, ("ALTER TABLE chats ADD COLUMN note TEXT",)
+    )
+    monkeypatch.setattr(db, "SCHEMA_VERSION", db.SCHEMA_VERSION + 2)
+    connection = db.connect(":memory:")
+    with pytest.raises(db.SchemaError, match=f"no schema step for v{gap}") as excinfo:
+        db.migrate(connection)
+    assert "without a gap" in str(excinfo.value)
+    assert _names(connection, "table") == set()
+    assert db.schema_version(connection) == 0
+    connection.close()
+
+
+def test_schema_version_refuses_a_recorded_version_that_is_not_a_number(
+    conn: sqlite3.Connection,
+) -> None:
+    """A corrupt value is classified where it is read, so the CLI and the MCP server answer it
+    with the rebuild instruction instead of a bare ``ValueError`` traceback."""
+    db.set_meta(conn, db.META_SCHEMA_VERSION, "five")
+    for call in (db.schema_version, db.migrate):
+        with pytest.raises(db.SchemaError, match="not a number") as excinfo:
+            call(conn)
+        assert "grepogram sync" in str(excinfo.value)
+
+
+def test_schema_version_refuses_a_meta_table_of_another_shape() -> None:
+    """A file some other program wrote can hold a ``meta`` table of its own; asking its columns
+    tells that apart from a database that cannot be read at all, whose error means something
+    else and is left alone."""
+    connection = db.connect(":memory:")
+    connection.execute("CREATE TABLE meta(name TEXT PRIMARY KEY, data TEXT)")
+    for call in (db.schema_version, db.migrate):
+        with pytest.raises(db.SchemaError, match="not the one grepogram writes") as excinfo:
+            call(connection)
+        assert "grepogram sync" in str(excinfo.value)
+    assert _names(connection, "table") == {"meta"}
+    connection.close()
+
+
 def test_fts_tables_accept_rowid_keyed_rows_and_unindexed_filters(conn: sqlite3.Connection) -> None:
     conn.execute(
         "INSERT INTO msg_fts(rowid, raw, stemmed, chat_id, date) VALUES (7, 'café', 'cafe', 5, 10)"
