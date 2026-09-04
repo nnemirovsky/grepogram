@@ -288,8 +288,11 @@ run across comments and general talk alike, the way the group reads in Telegram,
 channel's post threads give the per-post view. A unit's text is one line per message,
 `[YYYY-MM-DD HH:MM] name: text`, with
 `[photo]` / `[voice]` / `[document: name.pdf]` placeholders for media without a caption. A sync
-re-cuts only the open window of each touched chat and rebuilds only the threads reachable from
-new or edited messages; unchanged units keep their rows and their vectors.
+re-cuts only the open window of each touched chat — or, when a message arrived below it that no
+window holds yet (a channel storing a comment in its group ahead of the group's own history, a
+late comment on an old post), the windows from the one before that message on — and rebuilds only
+the threads reachable from new or edited messages; unchanged units keep their rows and their
+vectors.
 
 **Lexical.** Two FTS5 tables (`unicode61`, diacritics removed) hold a `raw` and a `stemmed` column
 each — one for whole units, one for single messages so that a message packing every query term
@@ -347,7 +350,11 @@ the report lists `chats_remaining`. A non-blocking file lock keeps two syncs off
 a CLI `sync`, `embed`, `sources rm` or MCP `sync` / `sources_remove` started while another sync
 runs fails at once with `SyncInProgress`, and the MCP `search` auto-sync turns that into a
 warning. Inside the MCP server, syncs queue instead: a `search` that finds the index stale while
-another tool call is already syncing waits for it and then searches the fresh index. Chats
+another tool call is already syncing waits for it — for at most `auto_sync_budget_s` seconds —
+and then searches the fresh index; a sync still running after that is reported as a warning and
+the search runs on the index as it is. A sync resolves its sources from the config as it is once
+it holds the lock, so a source removed while the sync was still loading its model or connecting
+is not fetched again. Chats
 Telegram refuses (left, kicked, private) are marked `unavailable`, retried on every sync, and
 cleared when they succeed again; a legacy group that was upgraded to a supergroup is followed to
 its new id. When the MCP `search` tool finds the last sync run older than `auto_sync_after_min`,
@@ -431,6 +438,10 @@ four minutes.
   uncommitted write open on the session file (a sync in another Telethon-based tool, say) can
   fail with `database is locked`; grepogram's own clients only read it.
 - `sources add` / `rm` and the MCP tools rewrite `config.toml` without its comments.
+- An index built with a development version before 2026-09-04 may hold discussion-group messages
+  outside any window: the group's own history stored after the channel's comments was never
+  re-cut, so those messages were invisible to search. Rebuild such an index — delete `index.db`
+  and run `grepogram sync`.
 - The MCP contract targets the `mcp` 1.x SDK (`FastMCP`); 2.x renamed the API and is excluded by
   the dependency pin.
 

@@ -47,7 +47,15 @@ never change the git identity.
   call (`AppState.telegram()`): Telethon caches the authorization check per instance and
   concurrent calls must never share a connection one of them will close. Syncs in the server go
   through `AppState.sync_lock`, config writes through `AppState.editing_config()`, and
-  `sources_remove` / `sources rm` take the `SyncLock` like a sync does.
+  `sources_remove` / `sources rm` take the `SyncLock` like a sync does and save the config under
+  it. `sync_all` resolves its sources from the config as it is once it holds the `SyncLock`:
+  callers pass a loader (`state.config`, `functools.partial(config.load, paths)`), not the
+  snapshot they started with, so a source removed while the model loaded is not fetched again.
+- Windows are cut in `msg_id` order but rows do not always arrive that way (a channel stores
+  comments in its discussion group before the group's own history gets there). `units._recut_windows`
+  starts at the open window unless a changed message no window holds lies below it; then it
+  re-cuts from the window before that message. Membership in `msg_ids`, not the id range, decides
+  whether a window holds a message.
 - `mcp` stays `<2`: `grepogram/mcp.py` targets the 1.x `FastMCP` API (2.x renamed it).
 - Never instantiate `FastMCP` at module level; `mcp.build_server()` runs after `setup_logging()`
   because `FastMCP.__init__` calls `logging.basicConfig`, and `main()` lowers the `mcp` logger to
