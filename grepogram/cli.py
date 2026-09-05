@@ -37,6 +37,7 @@ from grepogram import (
     embed,
     filters,
     index,
+    media,
     search,
     sources,
     sync,
@@ -47,7 +48,7 @@ from grepogram.dialogs import Match
 from grepogram.embed import Embedder, ModelUnavailable
 from grepogram.filters import FilterError
 from grepogram.log import setup_logging
-from grepogram.models import Config, MessageView, SearchResult, SyncReport
+from grepogram.models import Config, MediaReport, MessageView, SearchResult, SyncReport
 from grepogram.paths import Paths
 from grepogram.search import UnknownMessage
 
@@ -252,6 +253,80 @@ def _print_report(report: SyncReport) -> None:
     if report.unavailable:
         ids = ", ".join(str(chat_id) for chat_id in report.unavailable)
         typer.echo(f"chats unavailable: {len(report.unavailable)} ({ids})")
+    for warning in report.warnings:
+        typer.echo(f"warning: {warning}", err=True)
+
+
+@app.command("extract")
+def extract_cmd(
+    budget: Annotated[
+        int | None,
+        typer.Option(
+            "--budget",
+            min=1,
+            help="Stop after this many seconds; what is left resumes on the next run.",
+        ),
+    ] = None,
+    retry_failed: Annotated[
+        bool,
+        typer.Option(
+            "--retry-failed",
+            help="Queue the media an earlier run could not read again, and the media this "
+            "build had no extractor for (installing the 'media' extra is what fixes those).",
+        ),
+    ] = False,
+) -> None:
+    """Read text out of stored media — photos through OCR, PDFs and DOCX; needs a session.
+
+    A network pass, not an offline one: Telethon downloads from a message Telegram just
+    returned, so every pending message is re-fetched by id first. Run it after `grepogram sync`;
+    it never runs inside one, because a 400-page PDF must not eat a sync's budget.
+    """
+    paths, cfg, conn = _load()
+    _require_api_keys(cfg, paths)
+    try:
+        tg.ensure_session_mode(paths)
+        client = tg.make_client(cfg, paths)
+        with sync.SyncLock(paths):
+            report = asyncio.run(_run_extract(client, conn, cfg, budget, retry_failed))
+    except (tg.AuthRequired, tg.SessionError, sync.SyncInProgress, ConfigError) as exc:
+        fail(str(exc), hint=getattr(exc, "hint", None))
+    except (tg_errors.RPCError, ConnectionError) as exc:
+        fail(f"telegram error: {exc}")
+    finally:
+        conn.close()
+    _print_media_report(report)
+
+
+async def _run_extract(
+    client: TelegramClient,
+    conn: sqlite3.Connection,
+    cfg: Config,
+    budget: int | None,
+    retry_failed: bool,
+) -> MediaReport:
+    """Connect and run :func:`grepogram.media.run` under the sync lock the caller holds."""
+    async with tg.connected(client):
+        return await media.run(
+            conn, client, cfg, sync.SyncBudget(budget), retry_failed=retry_failed
+        )
+
+
+def _print_media_report(report: MediaReport) -> None:
+    typer.echo(f"media read: {report.extracted}")
+    for label, count in (
+        ("too large to download", report.skipped),
+        ("could not be read", report.failed),
+        ("no extractor here", report.unsupported),
+        ("switched off in [media]", report.disabled),
+        ("queued again", report.requeued),
+    ):
+        if count:
+            typer.echo(f"{label}: {count}")
+    if report.remaining:
+        typer.echo(f"media pending: {report.remaining}; run extract again")
+    if report.extracted:
+        typer.echo("next: grepogram sync (to re-cut and embed the units that changed)")
     for warning in report.warnings:
         typer.echo(f"warning: {warning}", err=True)
 

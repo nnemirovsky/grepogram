@@ -3,20 +3,25 @@ import logging
 import sys
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
-from typing import get_args
+from typing import Any, get_args
 
 import pytest
 import typer
+from telethon import errors as tg_errors
 from typer.testing import CliRunner
 
-from grepogram import __version__, cli, config, db, index, search, units
+from grepogram import __version__, cli, config, db, index, media, search, sync, tg, units
 from grepogram.config import TEMPLATE
-from grepogram.models import ChatRow, Config, MessageRow, SearchMode
+from grepogram.models import ChatRow, Config, MediaReport, MessageRow, SearchMode
 from grepogram.paths import Paths
 from tests.conftest import file_mode
-from tests.fixtures import chat_ru
+from tests.fakes import FakeClient
+from tests.fixtures import chat_ru, tl
 
 runner = CliRunner()
+
+SAMPLE_PDF = Path(__file__).resolve().parent / "fixtures" / "sample.pdf"
+EXTRACT_ID = -1000000000900
 
 
 # --- app -------------------------------------------------------------------------------------
@@ -485,3 +490,125 @@ def test_readers_exit_1_on_an_unknown_message(tmp_home: Path, command: str) -> N
     assert result.exit_code == 1
     assert result.stdout == ""
     assert result.stderr.strip() == (f"error: message 9999 of chat {chat_ru.ARG_ID} is not indexed")
+
+
+# --- extract ---------------------------------------------------------------------------------
+
+
+EXTRACT_KEYS = '[telegram]\napi_id = 12345\napi_hash = "fakehash"\n'
+
+
+def _signed_in(tmp_home: Path, extra: str = "") -> Paths:
+    (tmp_home / "config.toml").write_text(EXTRACT_KEYS + extra, encoding="utf-8")
+    paths = Paths.from_env()
+    paths.session_file.touch()
+    return paths
+
+
+def _extract_chat(paths: Paths) -> FakeClient:
+    """One indexed chat holding one pending PDF, and the client that answers for it."""
+    conn = db.connect(paths)
+    db.migrate(conn)
+    db.upsert_chat(conn, ChatRow(id=EXTRACT_ID, type="supergroup", title="Chat", source_id="x"))
+    db.upsert_messages(
+        conn,
+        [
+            MessageRow(
+                chat_id=EXTRACT_ID,
+                msg_id=1,
+                date=1_700_000_000,
+                media_kind="document",
+                media_filename="note.pdf",
+            )
+        ],
+    )
+    conn.close()
+    return FakeClient(
+        messages={EXTRACT_ID: [tl.document_message(EXTRACT_ID, 1, "note.pdf")]},
+        downloads={(EXTRACT_ID, 1): SAMPLE_PDF.read_bytes()},
+    )
+
+
+def test_extract_reads_the_media_and_reports_what_it_did(
+    tmp_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    paths = _signed_in(tmp_home)
+    client = _extract_chat(paths)
+    monkeypatch.setattr(tg, "make_client", lambda cfg, paths: client)
+    result = runner.invoke(cli.app, ["extract", "--budget", "30"])
+    assert result.exit_code == 0, result.output
+    lines = result.stdout.splitlines()
+    assert lines[0] == "media read: 1"
+    assert any("grepogram sync" in line for line in lines)
+    assert client.calls[-1] == ("disconnect", {})
+    conn = db.connect(paths)
+    row = conn.execute("SELECT extracted_text, media_state, indexed FROM messages").fetchone()
+    conn.close()
+    assert row["media_state"] == db.MEDIA_EXTRACTED
+    assert row["indexed"] == 0
+    assert "sample pdf" in str(row["extracted_text"]).lower()
+
+
+def test_extract_passes_retry_failed_through(
+    tmp_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _signed_in(tmp_home)
+    seen: dict[str, object] = {}
+
+    async def record(
+        conn: object, client: object, cfg: object, budget: object, **kw: object
+    ) -> Any:
+        seen.update(kw)
+        seen["seconds"] = budget.seconds  # type: ignore[attr-defined]
+        return MediaReport(unsupported=3, remaining=2, warnings=["careful"])
+
+    monkeypatch.setattr(tg, "make_client", lambda cfg, paths: FakeClient())
+    monkeypatch.setattr(media, "run", record)
+    result = runner.invoke(cli.app, ["extract", "--retry-failed", "--budget", "7"])
+    assert result.exit_code == 0, result.output
+    assert seen == {"retry_failed": True, "seconds": 7}
+    assert "no extractor here: 3" in result.stdout
+    assert "media pending: 2; run extract again" in result.stdout
+    assert "warning: careful" in result.stderr
+
+
+def test_extract_without_api_keys_is_a_clean_error(tmp_home: Path) -> None:
+    result = runner.invoke(cli.app, ["extract"])
+    assert result.exit_code == 1
+    assert result.stdout == ""
+    assert "api_id and api_hash are not set" in result.stderr
+
+
+def test_extract_without_a_session_is_a_clean_error(tmp_home: Path) -> None:
+    (tmp_home / "config.toml").write_text(EXTRACT_KEYS, encoding="utf-8")
+    result = runner.invoke(cli.app, ["extract"])
+    assert result.exit_code == 1
+    assert result.stdout == ""
+    assert "grepogram auth" in result.stderr
+
+
+def test_extract_reports_a_held_sync_lock_as_a_clean_error(
+    tmp_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    paths = _signed_in(tmp_home)
+    monkeypatch.setattr(tg, "make_client", lambda cfg, paths: FakeClient())
+    with sync.SyncLock(paths):
+        result = runner.invoke(cli.app, ["extract"])
+    assert result.exit_code == 1
+    assert result.stdout == ""
+    assert "another sync is running" in result.stderr
+
+
+def test_extract_reports_a_telegram_error_as_a_clean_error(
+    tmp_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _signed_in(tmp_home)
+
+    def broken(cfg: object, paths: object) -> FakeClient:
+        raise tg_errors.RPCError(request=None, message="nope")
+
+    monkeypatch.setattr(tg, "make_client", broken)
+    result = runner.invoke(cli.app, ["extract"])
+    assert result.exit_code == 1
+    assert result.stdout == ""
+    assert "telegram error:" in result.stderr

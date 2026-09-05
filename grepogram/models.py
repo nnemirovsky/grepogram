@@ -273,6 +273,31 @@ class SyncReport:
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
+class MediaReport:
+    """What one run of the extraction pass did — :func:`grepogram.media.run`'s answer.
+
+    The offline counters (``unsupported``, ``disabled``, ``requeued``) come from the bulk
+    updates that park media on what the stored ``media_kind`` alone says, before a single
+    Telegram request; the rest are messages the pass actually re-fetched. ``remaining`` is what
+    a budget or a flood wait left in the queue for the next run.
+    """
+
+    extracted: int = 0
+    """Media that was read; ``extracted_text`` may still be empty — a photo holding no text."""
+    failed: int = 0
+    skipped: int = 0
+    """Larger than ``[media] max_download_mb``, so never downloaded."""
+    unsupported: int = 0
+    """Parked because this build has no extractor for the kind, offline or in the loop."""
+    disabled: int = 0
+    """Parked offline: the kind is switched off in ``[media]``."""
+    requeued: int = 0
+    """Put back in the queue: a kind switched back on, or ``--retry-failed``."""
+    remaining: int = 0
+    warnings: list[str] = field(default_factory=list)
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
 class ChatStatus:
     id: int
     title: str | None

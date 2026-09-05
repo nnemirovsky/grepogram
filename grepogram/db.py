@@ -29,7 +29,7 @@ import sqlite3
 import sys
 import threading
 from collections import deque
-from collections.abc import Iterable, Iterator, Sequence
+from collections.abc import Collection, Iterable, Iterator, Sequence
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from typing import Any
 
@@ -1014,6 +1014,102 @@ def mark_unindexed(conn: sqlite3.Connection, ids: Iterable[int]) -> None:
     with transaction(conn):
         for chunk in _chunks(ids):
             conn.execute(f"UPDATE messages SET indexed = 0 WHERE id IN ({_marks(chunk)})", chunk)
+
+
+# --- media extraction ------------------------------------------------------------------------
+
+
+def messages_pending_media(
+    conn: sqlite3.Connection, limit: int, chat_id: int | None = None
+) -> list[MessageRow]:
+    """The extraction pass's queue: rows whose media nothing has looked at yet, oldest first.
+
+    ``chat_id`` narrows it to one chat, which is how the pass reads it: a batch is re-fetched
+    through a single ``client.get_messages(chat_id, ids=[…])`` and cannot mix chats. The
+    predicate is spelled the way ``messages_media_pending`` is, :data:`MEDIA_PENDING` inlined
+    rather than bound, because SQLite only uses a partial index when the query's ``WHERE``
+    provably implies the index's own — a parameter proves nothing at prepare time.
+    """
+    scope = "" if chat_id is None else " AND chat_id = ?"
+    order = "id" if chat_id is not None else "chat_id, id"
+    sql = (
+        f"SELECT * FROM messages WHERE media_state = {MEDIA_PENDING} "
+        f"AND media_kind IS NOT NULL{scope} ORDER BY {order} LIMIT ?"
+    )
+    params = [limit] if chat_id is None else [chat_id, limit]
+    return [_message_row(row) for row in conn.execute(sql, params)]
+
+
+def chats_with_pending_media(conn: sqlite3.Connection) -> list[int]:
+    """``chat_id`` of every chat still holding media the extraction pass has not looked at."""
+    rows = conn.execute(
+        f"SELECT DISTINCT chat_id FROM messages WHERE media_state = {MEDIA_PENDING} "
+        "AND media_kind IS NOT NULL ORDER BY chat_id"
+    ).fetchall()
+    return [int(row["chat_id"]) for row in rows]
+
+
+def count_pending_media(conn: sqlite3.Connection) -> int:
+    """How many rows are left in the extraction queue — what a stopped pass reports as remaining."""
+    row = conn.execute(
+        f"SELECT COUNT(*) AS n FROM messages WHERE media_state = {MEDIA_PENDING} "
+        "AND media_kind IS NOT NULL"
+    ).fetchone()
+    return int(row["n"])
+
+
+def set_media_text(conn: sqlite3.Connection, row_id: int, text: str) -> None:
+    """Store what an extractor read out of one message's media and flag the row for a rebuild.
+
+    The one writer here that touches ``indexed``: this text is rendered into the message's line
+    (``units.render_line``), so the units holding it are behind until they are cut again. Its
+    twin :func:`set_media_state` writes the state byte alone, because every other transition
+    changes no rendered text at all.
+    """
+    with transaction(conn):
+        conn.execute(
+            "UPDATE messages SET extracted_text = ?, media_state = ?, indexed = 0 WHERE id = ?",
+            (text, MEDIA_EXTRACTED, row_id),
+        )
+
+
+def set_media_state(conn: sqlite3.Connection, ids: Iterable[int], state: int) -> None:
+    """Record how far the extraction pass got with these ``messages.id`` — and nothing else.
+
+    ``indexed`` is deliberately left alone. None of the states this writes (unsupported, failed,
+    skipped, disabled) changes a rendered line, and flagging would hand the deferred, unbudgeted
+    ``index_pending`` loop :func:`grepogram.sync._sync_chats` ends with a whole-index backlog to
+    rebuild and re-embed — the next 20-second auto-sync inside a ``search`` would drain it in
+    full. :func:`set_media_text` is the writer for the one transition that does change a line.
+    """
+    with transaction(conn):
+        for chunk in _chunks(ids):
+            conn.execute(
+                f"UPDATE messages SET media_state = ? WHERE id IN ({_marks(chunk)})",
+                [state, *chunk],
+            )
+
+
+def move_media_state(conn: sqlite3.Connection, kinds: Collection[str], *, frm: int, to: int) -> int:
+    """Move every message of these media kinds from one ``media_state`` to another; how many moved.
+
+    The offline half of the extraction pass, and the reason it is offline: which kinds have an
+    extractor and which are switched off in the config depends on the stored ``media_kind``
+    alone, so tens of thousands of rows are parked without a single Telegram request. Like
+    :func:`set_media_state` it never touches ``indexed``, for the same reason and more so — most
+    kinds (``video``, ``sticker``, ``audio``, ``webpage``, ``poll``, ``contact``, ``location``,
+    ``other`` and, until v0.3.0, ``voice`` and ``video_note``) have no extractor at all.
+    """
+    listed = list(dict.fromkeys(kinds))
+    if not listed:
+        return 0
+    with transaction(conn):
+        cursor = conn.execute(
+            f"UPDATE messages SET media_state = ? WHERE media_state = ? "
+            f"AND media_kind IN ({_marks(listed)})",
+            [to, frm, *listed],
+        )
+        return int(cursor.rowcount)
 
 
 def get_messages(

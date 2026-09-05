@@ -559,15 +559,15 @@ Task 15's `sources add` guard, or the import protection silently evaporates.
 - Create: `tests/test_media.py`
 - Modify: `tests/test_cli.py`
 
-- [ ] add `db.messages_pending_media(conn, limit)` and two distinct writers: `db.set_media_text`,
+- [x] add `db.messages_pending_media(conn, limit)` and two distinct writers: `db.set_media_text`,
       which stores the text **and** flags `indexed = 0`, and `db.set_media_state`, which writes only
       the state byte and **leaves `indexed` alone**
-- [ ] implement `media.run(conn, client, cfg, budget)` following the flow in Technical Details —
+- [x] implement `media.run(conn, client, cfg, budget)` following the flow in Technical Details —
       it **re-fetches each pending message by id** (`client.get_messages`) because Telethon cannot
       download from a stored row, and reads the size from the re-fetched media, since no size
       column exists
-- [ ] `--budget` is **seconds**, like `SyncBudget`; respect the flood-wait threshold as `sync` does
-- [ ] resolve the offline states **before** touching the network, as three bulk `UPDATE`s (no
+- [x] `--budget` is **seconds**, like `SyncBudget`; respect the flood-wait threshold as `sync` does
+- [x] resolve the offline states **before** touching the network, as three bulk `UPDATE`s (no
       extractor → `2`, disabled → `5`, re-enabled → back to `0`): both depend only on the stored
       `media_kind`, and leaving them in the loop would re-fetch tens of thousands of messages over
       the network purely to write a state byte — most kinds (`video`, `sticker`, `audio`,
@@ -575,19 +575,19 @@ Task 15's `sources add` guard, or the import protection silently evaporates.
       have no extractor at all. These updates change no rendered text, so they must **not** flag
       `indexed = 0`: doing so would flag tens of thousands of rows across every chat and hand
       `sync.py:1326`'s unbudgeted loop the exact backlog this plan forbids
-- [ ] take the `SyncLock` for the whole pass and report `SyncInProgress` as a clean error — this
+- [x] take the `SyncLock` for the whole pass and report `SyncInProgress` as a clean error — this
       writes `media_state`, `extracted_text` and `indexed`, and `db.Connection`'s lock only
       serialises within one process (CLAUDE.md invariant; `embed_cmd` takes it at cli.py:280)
-- [ ] add `grepogram extract [--budget N] [--retry-failed]` modelled on **`sync_cmd`**, not
+- [x] add `grepogram extract [--budget N] [--retry-failed]` modelled on **`sync_cmd`**, not
       `embed_cmd`: this pass needs a Telegram client, so it needs `_require_api_keys`,
       `tg.make_client`, `tg.connected` and the `AuthRequired` / `RPCError` handling
-- [ ] delete the temp file in a `finally`; commit per batch so a flood wait keeps what it earned
-- [ ] write tests: each state transition; the size cap skips before downloading; a disabled kind
+- [x] delete the temp file in a `finally`; commit per batch so a flood wait keeps what it earned
+- [x] write tests: each state transition; the size cap skips before downloading; a disabled kind
       lands on `5` and is re-queued when re-enabled; **the offline states are resolved with no
       client call at all and change no `indexed` value**; a failed extraction is retried only with `--retry-failed`; the temp file
       is always removed; the budget stops the pass mid-chat and the next run resumes; a held
       `SyncLock` is a clean error; no API keys is a clean error, not a traceback
-- [ ] run tests — must pass before task 8
+- [x] run tests — must pass before task 8
 
 ### Task 8: Feed extracted text into the rendered unit, including closed windows
 
