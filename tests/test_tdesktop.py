@@ -182,6 +182,15 @@ def test_a_poll_contributes_its_question_and_answers(export: Export) -> None:
     assert row.text == "Идём в четверг?\nда\nнет"
 
 
+def test_a_poll_with_no_answer_list_still_contributes_its_question(tmp_path: Path) -> None:
+    """Nothing in an export's shape is guaranteed — this parser reads a file the user hands it,
+    and one field being another type must cost that field, never the message."""
+    row = _one(tmp_path, poll={"question": "Идём в четверг?", "answers": "да, нет"}, text="")
+    assert row.text == "Идём в четверг?"
+    listed = _one(tmp_path, poll={"answers": [{"text": "да"}, "нет"]}, text="")
+    assert listed.text == "да", "and an entry that is not an object costs only that entry"
+
+
 def test_nothing_extracted_is_claimed_for_an_import(export: Export) -> None:
     """The extraction pass owns both columns; an import must leave its queue untouched."""
     for entry in export.chats:

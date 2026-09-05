@@ -545,6 +545,42 @@ def test_ocr_is_available_on_a_mac_carrying_the_extra(monkeypatch: pytest.Monkey
     assert extract._ocr_unavailable() is None
 
 
+class _StubPage:
+    """One PDF page that records the moment it was asked for its text."""
+
+    def __init__(self, number: int, read: list[int]) -> None:
+        self.number = number
+        self._read = read
+
+    def extract_text(self) -> str:
+        self._read.append(self.number)
+        return "z" * 3000
+
+
+def test_a_long_pdf_stops_being_parsed_past_the_cap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Extraction of a 400-page contract must cost the pages it needs, not the whole document.
+
+    Driven through a stub ``pypdf`` rather than a fixture: the point is *which pages were read*,
+    which no committed file can show, and the stub also lets this run where pypdf is absent.
+    """
+    read: list[int] = []
+
+    class _StubReader:
+        def __init__(self, path: str) -> None:
+            self.pages = [_StubPage(number, read) for number in range(20)]
+
+    class _StubPypdf:
+        PdfReader = _StubReader
+
+    monkeypatch.setitem(sys.modules, "pypdf", _StubPypdf)
+    path = tmp_path / "contract.pdf"
+    path.write_bytes(b"%PDF-1.4\n")
+    assert len(extract.extract_document(path)) == EXTRACT_MAX_CHARS
+    assert read == [0, 1], "the cap was passed on the second page and the rest was never parsed"
+
+
 def test_the_cap_does_not_leave_a_dangling_space(tmp_path: Path) -> None:
     """The cut lands wherever the character count runs out, and a truncation ending in a space
     (or in a newline, half a line into the next one) is text with a ragged edge — one that shows
