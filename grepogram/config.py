@@ -50,6 +50,7 @@ k = 10
 rrf_k = 60
 rerank_top = 40
 dedup_overlap = 0.5
+reaction_weight = 0.05                 # most a unit's reactions add to its reranked score
 vec_fanout_max = 8                     # above this many chats → one KNN with k*4, post-filtered
 auto_sync_after_min = 60
 auto_sync_budget_s = 20

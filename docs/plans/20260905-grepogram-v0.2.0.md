@@ -730,35 +730,35 @@ Task 15's `sources add` guard, or the import protection silently evaporates.
 - Modify: `README.md`
 - Modify: `tests/test_search_hybrid.py`
 
-- [ ] add `SearchCfg.reaction_weight: float = 0.05` plus its `TEMPLATE` and README entries
-- [ ] **min-max normalise the rerank scores across the candidate set for ordering only**, then add
+- [x] add `SearchCfg.reaction_weight: float = 0.05` plus its `TEMPLATE` and README entries
+- [x] **min-max normalise the rerank scores across the candidate set for ordering only**, then add
       `reaction_weight * log1p(reactions) / (1 + log1p(reactions))`. `as_scores` (rerank.py:156-161)
       returns raw logits spanning several units in production while `FakeReranker` returns `[0,1]`,
       so an un-normalised bonus is a no-op in production and a tuned-on-the-fake test proves nothing
-- [ ] the bonus must land **in `Hit.score` itself**. "Ordering only" is a provable no-op:
+- [x] the bonus must land **in `Hit.score` itself**. "Ordering only" is a provable no-op:
       `search.py:491` is `dedup(_hits(...), ...)[:k]`, and `dedup` (search.py:265-279) opens with
       `sorted(hits, key=lambda h: -h.score)` — whatever order `_rerank` returns is discarded and
       rebuilt from `Hit.score`, which also decides which of two overlapping hits `dedup` keeps and
       where `[:k]` cuts
-- [ ] say in README that `score` is therefore a within-result-set number, not comparable across
+- [x] say in README that `score` is therefore a within-result-set number, not comparable across
       queries — it is shown in the CLI output and the MCP result (README:215, 244)
-- [ ] when the range is degenerate — a single candidate, or `hi - lo` below a small epsilon —
+- [x] when the range is degenerate — a single candidate, or `hi - lo` below a small epsilon —
       **skip the bonus**: `(s - lo) / (hi - lo)` would divide by zero, and an exact-equality test
       would make a `1e-9` spread reorder the whole set by reactions alone
-- [ ] apply it only when reranking **actually ran**: `_rerank` (search.py:609-635) returns the fused
+- [x] apply it only when reranking **actually ran**: `_rerank` (search.py:609-635) returns the fused
       RRF scores untouched when the reranker cannot load, and those top out near `0.016` where this
       bonus would dominate outright. `_rerank` returns the same shape either way, so **give it a way
       to report that it scored** and key on that — **not** on `mode`, since `search()` reranks in
       every mode unless `rerank=False` (search.py:489)
-- [ ] `reaction_weight = 0` must reproduce the previous ordering exactly
-- [ ] document the bonus in README's How Search Works section
-- [ ] write tests **through `search()`, not `_rerank`**, so `dedup` and `[:k]` are exercised: two
+- [x] `reaction_weight = 0` must reproduce the previous ordering exactly
+- [x] document the bonus in README's How Search Works section
+- [x] write tests **through `search()`, not `_rerank`**, so `dedup` and `[:k]` are exercised: two
       near-tied units reorder by reactions in the returned hits; a far-behind unit does not overtake
       a relevant one at the default weight; **the same assertions hold on a raw-logit scale as on
       `[0,1]`**; a single-candidate set does not raise; a near-degenerate spread does not reorder by
       reactions alone; no bonus when the reranker did not run; zero weight reproduces the previous
       hits exactly
-- [ ] run tests — must pass before task 12
+- [x] run tests — must pass before task 12
 
 ### Task 12: Notice deletions during the edit-refetch pass
 

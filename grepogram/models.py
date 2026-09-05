@@ -46,10 +46,20 @@ class ModelsCfg:
 
 @dataclass(frozen=True, slots=True)
 class SearchCfg:
+    """How a search retrieves, fuses, reranks and orders its hits.
+
+    ``reaction_weight`` is the most a unit can gain for the reactions it collected, on the
+    normalised scale :func:`grepogram.search.search` puts the cross-encoder's scores on: the
+    bonus is ``reaction_weight * log1p(reactions) / (1 + log1p(reactions))``, so it rises fast
+    over the first few reactions and never reaches the weight itself. ``0`` switches it off and
+    leaves the reranker's own scores exactly as they were.
+    """
+
     k: int = 10
     rrf_k: int = 60
     rerank_top: int = 40
     dedup_overlap: float = 0.5
+    reaction_weight: float = 0.05
     vec_fanout_max: int = 8
     auto_sync_after_min: int = 60
     auto_sync_budget_s: int = 20

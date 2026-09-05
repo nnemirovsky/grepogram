@@ -213,7 +213,9 @@ argument, put `--` before it: `grepogram sources add --since 2024-01-01 -- -1001
 | `--json` | print the result document as JSON and nothing else on stdout |
 
 Text output prints one block per hit — rank, score, unit kind, chat, UTC date range, the deep link
-(and a fallback link for private chats), then the snippet.
+(and a fallback link for private chats), then the snippet. The `score` ranks the hits of *this*
+answer against each other and means nothing across two searches: it is normalised across the
+candidate set before the reaction bonus goes on (see [How Search Works](#how-search-works)).
 
 `thread` and `context` are what a hit leads to, the CLI half of the MCP tools of the same names:
 read the conversation around a hit instead of guessing from its snippet. `<chat>` takes the same
@@ -241,7 +243,7 @@ advisory; the data next to them is valid.
 
 | tool | arguments | returns |
 |---|---|---|
-| `search` | `query`, `chats: list[str] \| null`, `since`, `until`, `k=10`, `mode="hybrid"`, `rerank=true`, `full=false` | `{hits, warnings, index_age_min, synced}`; each hit has `score`, `chat` (id, type, title, username, …), `kind` (`window` / `thread` / `post`), `date_start`, `date_end` (unix seconds, UTC), `anchor_msg_id`, `url`, `fallback_url`, `snippet`, `msg_ids`, `text` (with `full`) |
+| `search` | `query`, `chats: list[str] \| null`, `since`, `until`, `k=10`, `mode="hybrid"`, `rerank=true`, `full=false` | `{hits, warnings, index_age_min, synced}`; each hit has `score` (a within-result-set number — it orders this answer and compares across nothing else), `chat` (id, type, title, username, …), `kind` (`window` / `thread` / `post`), `date_start`, `date_end` (unix seconds, UTC), `anchor_msg_id`, `url`, `fallback_url`, `snippet`, `msg_ids`, `text` (with `full`) |
 | `thread` | `chat_id`, `msg_id` | `{chat_id, msg_id, messages}`: the whole reply thread the message belongs to, root first; for a channel post, the post followed by its comments — those live in the discussion group, so the list spans two chats and each message names its own |
 | `context` | `chat_id`, `msg_id`, `before=15`, `after=15` | `{chat_id, msg_id, messages}`: the surrounding messages in the same chat, bounded to the message's own thread or forum topic where Telegram gave it one |
 | `sync` | `budget_s=45` | the sync report: `new`, `chats_done`, `chats_remaining`, `unavailable`, `warnings`, `index_age_min` |
@@ -292,6 +294,7 @@ k = 10
 rrf_k = 60
 rerank_top = 40
 dedup_overlap = 0.5
+reaction_weight = 0.05                 # most a unit's reactions add to its reranked score
 vec_fanout_max = 8                     # above this many chats → one KNN with k*4, post-filtered
 auto_sync_after_min = 60
 auto_sync_budget_s = 20
@@ -334,6 +337,7 @@ max_download_mb = 20                   # anything larger is skipped, never downl
 | `search.rrf_k` | the constant in `1 / (rrf_k + rank)` |
 | `search.rerank_top` | how many fused candidates the cross-encoder re-scores; each retrieval list is fetched `max(k, rerank_top)` deep |
 | `search.dedup_overlap` | drop a hit when at least this share of its message ids already belongs to a better hit of the same chat; a value above 1.0 disables dedup |
+| `search.reaction_weight` | how much a unit's reactions can raise it after reranking. The cross-encoder's scores are min-max normalised across the candidate set and this much times `log1p(reactions) / (1 + log1p(reactions))` is added, so a well-received message wins a near-tie without a popular unit overtaking a relevant one; `0` switches it off and leaves the reranker's own scores untouched |
 | `search.vec_fanout_max` | a chat filter with up to this many chats runs one KNN per chat (sqlite-vec partition key); above it one KNN over-fetches four times deeper and filters afterwards |
 | `search.auto_sync_after_min` | the MCP `search` tool runs a sync first when the index is older than this many minutes; the CLI only prints a note |
 | `search.auto_sync_budget_s` | the time cap of that automatic sync |
@@ -448,6 +452,25 @@ by a single list. The fused top `rerank_top` are re-scored by the cross-encoder 
 thread inside a window that ranks higher disappears while a window extending a better-ranked
 thread survives. The top `k` survivors are returned. `mode` picks the retrieval lists; reranking
 and dedup apply in every mode, including the lexical fallback.
+
+**Reactions.** A chat usually agrees on the answer, and it says so by reacting to it. Every unit
+carries the reactions its messages collected, and after the cross-encoder has scored the
+candidates each one is raised by `reaction_weight * log1p(reactions) / (1 + log1p(reactions))` —
+0.02 at one reaction, 0.035 at ten, never the full `reaction_weight` however many arrive. The
+bonus is deliberately small: it settles a near-tie in favour of the message the chat agreed with
+and cannot buy a popular unit past a relevant one. Setting `search.reaction_weight = 0`
+reproduces the pre-v0.2.0 ordering exactly.
+
+It is added on a *normalised* scale, and that is what makes one weight mean the same thing
+everywhere: a cross-encoder returns raw logits spanning several units, so a fixed number added to
+them would be a rounding error on one query and decisive on the next. The candidate scores are
+therefore min-max normalised to `[0, 1]` across the result set before the bonus goes on. Two
+consequences worth knowing: a hit's `score` — shown in the CLI and returned by the MCP tools — is
+a **within-result-set number**, so it ranks the hits of one answer and says nothing across
+queries; and when the reranker did not run at all (`--no-rerank`, or a model that cannot load)
+neither the normalisation nor the bonus applies, because the fused RRF scores it would fall back
+to top out near `1 / (rrf_k + 1)` ≈ 0.016, where this bonus would decide the whole ordering. A
+result set of one, or one whose scores are all but identical, is left alone for the same reason.
 
 **Degradation.** The dense side is used only when vectors exist and come from the configured
 model. No vectors yet, the `dense` extra missing, a model that cannot load, a model change without

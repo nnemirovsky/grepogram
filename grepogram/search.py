@@ -20,12 +20,13 @@ model recorded in ``meta`` — :func:`search` falls back to the lexical lists an
 The lists are fused with Reciprocal Rank Fusion (:func:`rrf`), which needs no score calibration
 between tables: a unit near the top of two lists outranks one found by a single list. The fused
 top ``rerank_top`` then go through the cross-encoder (:class:`~grepogram.rerank.Reranker`,
-skipped with ``rerank=False`` or when it cannot load) and are re-sorted by its scores, after
-which :func:`dedup` drops every hit that mostly repeats a better one — a thread inside a window
-already shown — and the top ``k`` survivors are returned. ``mode`` picks the retrieval lists
-(``hybrid`` fuses both sides, ``lexical`` and ``dense`` use one) while reranking and dedup apply
-to all of them, so a fallback from ``hybrid`` to ``lexical`` changes what is retrieved and
-nothing else.
+skipped with ``rerank=False`` or when it cannot load) and are re-sorted by its scores, which
+:func:`_with_reaction_bonus` then normalises across the candidate set and raises by what each
+unit was reacted to. After that :func:`dedup` drops every hit that mostly repeats a better one —
+a thread inside a window already shown — and the top ``k`` survivors are returned. ``mode`` picks
+the retrieval lists (``hybrid`` fuses both sides, ``lexical`` and ``dense`` use one) while
+reranking, the bonus and dedup apply to all of them, so a fallback from ``hybrid`` to ``lexical``
+changes what is retrieved and nothing else.
 
 Every hit carries an *anchor*, the message its deep link opens: the matched message for a
 message-level hit, and for every other hit the unit's best message under the query according to
@@ -44,6 +45,7 @@ chat) and :func:`context` the messages around one in its topic, both as
 """
 
 import logging
+import math
 import sqlite3
 import time
 from collections.abc import Callable, Sequence
@@ -89,6 +91,11 @@ RECUT_PENDING = (
 The condition is re-derived here rather than flagged anywhere: a run whose budget is below
 :data:`grepogram.sync.RECUT_MIN_BUDGET_S` writes nothing, and an MCP-only user — whose syncs
 are the 20-second ones inside a ``search`` call — is exactly who never sees the log line."""
+SCORE_SPAN_EPSILON = 1e-6
+"""The narrowest spread of rerank scores :func:`_with_reaction_bonus` will normalise across.
+
+Below it the candidates are all but tied and the division would turn rounding noise into a full
+ordering; an exact ``hi == lo`` test would let a ``1e-9`` spread do exactly that."""
 _OPS: tuple[FtsOp, ...] = ("AND", "OR")
 
 EmbedderLoader = Callable[[Config], Embedder]
@@ -473,13 +480,16 @@ def search(
 
     Every list is fetched ``max(k, rerank_top)`` deep and the lists are fused with :func:`rrf`
     using ``rrf_k``; the fused top ``max(k, rerank_top)`` are re-scored by the cross-encoder
-    when ``rerank`` is set and it loads (a hit's ``score`` is then the reranker's, otherwise the
-    fused score), :func:`dedup` drops the near-duplicates at ``dedup_overlap``, and the top
-    ``k`` survivors become hits. ``embedder`` and ``reranker`` stand in for the models
-    ``load_embedder`` and ``load_reranker`` (:data:`EmbedderLoader`, :data:`RerankerLoader`;
-    the package loaders by default) would load. An index with no chats yields no hits and a
-    warning — that no source is configured, or that the configured ones are not synced yet;
-    ``index_age_min`` is filled in either way.
+    when ``rerank`` is set and it loads, and only then — the fused scale being far too small for
+    it — :func:`_with_reaction_bonus` normalises those scores and adds ``reaction_weight`` times
+    each unit's reaction share. A hit's ``score`` is that normalised sum, or the reranker's raw
+    score at ``reaction_weight = 0``, or the fused score when reranking did not run; it orders
+    one answer and compares across nothing else. :func:`dedup` drops the near-duplicates at
+    ``dedup_overlap``, and the top ``k`` survivors become hits. ``embedder`` and ``reranker``
+    stand in for the models ``load_embedder`` and ``load_reranker`` (:data:`EmbedderLoader`,
+    :data:`RerankerLoader`; the package loaders by default) would load. An index with no chats
+    yields no hits and a warning — that no source is configured, or that the configured ones are
+    not synced yet; ``index_age_min`` is filled in either way.
     """
     if mode not in MODES:
         raise ValueError(f"unknown search mode {mode!r}; expected one of {', '.join(MODES)}")
@@ -498,7 +508,9 @@ def search(
     retrieved = _retrieve(conn, cfg, query, filters, limit, mode, warnings, embedder, load_embedder)
     candidates = _fuse(conn, cfg, retrieved, limit)
     if rerank and candidates:
-        candidates = _rerank(cfg, query, candidates, reranker, warnings, load_reranker)
+        candidates, scored = _rerank(cfg, query, candidates, reranker, warnings, load_reranker)
+        if scored:
+            candidates = _with_reaction_bonus(cfg, candidates)
     hits = dedup(_hits(conn, query, retrieved, candidates, full), cfg.search.dedup_overlap)[:k]
     log.debug(
         "%s search: %d unit, %d message, %d dense matches; %d candidates, %d hits",
@@ -624,17 +636,24 @@ def _rerank(
     reranker: Reranker | None,
     warnings: list[str],
     load_reranker: RerankerLoader | None = None,
-) -> list[_Candidate]:
+) -> tuple[list[_Candidate], bool]:
     """The candidates re-scored by the cross-encoder and sorted by that score, ties keeping
     their fused order; when the reranker cannot load or score, a warning is added and the
-    candidates come back untouched."""
+    candidates come back untouched.
+
+    The flag says which of the two happened. It has to, because the two answers are the same
+    shape carrying scores on incomparable scales — the cross-encoder's, and the fused RRF
+    scores that top out near ``1 / (rrf_k + 1)`` — and :func:`_with_reaction_bonus` is only
+    meaningful on the first. ``mode`` cannot stand in for it: :func:`search` reranks in every
+    mode unless ``rerank=False``.
+    """
     try:
         if reranker is None:
             reranker = (reranking.load_reranker if load_reranker is None else load_reranker)(cfg)
         scores = reranker.score(query, [candidate.unit.text for candidate in candidates])
     except ModelUnavailable as exc:
         warnings.append(f"reranking unavailable: {exc}")
-        return candidates
+        return candidates, False
     if len(scores) != len(candidates):
         # not redundant with the model's own check: any Reranker may answer the wrong number of
         # scores, and only a RuntimeError says "bug" — a ValueError out of zip(strict=True) is a
@@ -647,7 +666,55 @@ def _rerank(
         for candidate, score in zip(candidates, scores, strict=True)
     ]
     rescored.sort(key=lambda candidate: -candidate.score)
-    return rescored
+    return rescored, True
+
+
+def _with_reaction_bonus(cfg: Config, candidates: list[_Candidate]) -> list[_Candidate]:
+    """The reranked candidates on a normalised scale, each raised by what its unit was reacted to.
+
+    The cross-encoder's own scores are raw logits spanning several units
+    (:func:`grepogram.rerank.as_scores` passes ``predict`` through unchanged), so no fixed
+    weight means the same thing twice. They are therefore min-max normalised across this
+    candidate set to ``[0, 1]`` first, and the bonus — ``reaction_weight`` times
+    :func:`_reaction_share` — is added on that scale, where ``reaction_weight = 0.05`` buys at
+    most a twentieth of the whole spread and cannot pull a far-behind unit past a relevant one.
+
+    That normalised sum is the score itself, not a sort key: :func:`dedup` re-sorts by
+    ``Hit.score`` and decides from it which of two overlapping hits survives, so a bonus that
+    only reordered the list here would be discarded a line later. The price is that ``score``
+    is a within-result-set number, comparable inside one answer and across nothing else.
+
+    A set that cannot be normalised is left exactly as it is: one candidate, or a spread below
+    :data:`SCORE_SPAN_EPSILON`, where dividing by the range would either raise or magnify noise
+    into a full re-ordering by reactions alone. A zero (or negative) weight is off, and returns
+    the reranker's own scores untouched.
+    """
+    weight = cfg.search.reaction_weight
+    if weight <= 0.0 or len(candidates) < 2:
+        return candidates
+    scores = [candidate.score for candidate in candidates]
+    low, span = min(scores), max(scores) - min(scores)
+    if span < SCORE_SPAN_EPSILON:
+        return candidates
+    boosted = [
+        _Candidate(
+            candidate.unit_id,
+            candidate.unit,
+            (candidate.score - low) / span + weight * _reaction_share(candidate.unit.reactions),
+        )
+        for candidate in candidates
+    ]
+    boosted.sort(key=lambda candidate: -candidate.score)
+    return boosted
+
+
+def _reaction_share(reactions: int) -> float:
+    """``log1p(n) / (1 + log1p(n))``: 0 at none, 0.41 at one, 0.71 at ten, and approaching 1
+    without ever reaching it, so the loudest unit in a chat cannot buy more than the weight."""
+    if reactions <= 0:
+        return 0.0
+    growth = math.log1p(reactions)
+    return growth / (1.0 + growth)
 
 
 # --- readers ---------------------------------------------------------------------------------
