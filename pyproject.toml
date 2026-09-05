@@ -1,0 +1,78 @@
+[project]
+name = "grepogram"
+dynamic = ["version"]
+description = "Local hybrid search over opt-in Telegram chats, exposed to Claude Code through MCP"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.12,<3.13"
+authors = [{ name = "Nikita Nemirovsky", email = "vaze.legend@gmail.com" }]
+keywords = ["telegram", "search", "mcp", "sqlite", "fts5", "embeddings", "claude"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: End Users/Desktop",
+    "Operating System :: MacOS",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Communications :: Chat",
+    "Topic :: Text Processing :: Indexing",
+]
+dependencies = [
+    "telethon",
+    "mcp>=1.2,<2",
+    "sqlite-vec",
+    "snowballstemmer",
+    "typer",
+    "tomli-w",
+]
+
+[project.optional-dependencies]
+dense = ["sentence-transformers", "torch"]
+
+[project.scripts]
+grepogram = "grepogram.cli:app"
+grepogram-mcp = "grepogram.mcp:main"
+
+[dependency-groups]
+dev = ["pytest", "pytest-asyncio", "pytest-cov", "ruff", "mypy"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.version]
+path = "grepogram/__init__.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["grepogram"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.mypy]
+files = ["grepogram", "tests"]
+python_version = "3.12"
+strict = true
+
+[[tool.mypy.overrides]]
+module = [
+    "sqlite_vec",
+    "snowballstemmer",
+    "telethon",
+    "telethon.*",
+    "sentence_transformers",
+    "sentence_transformers.*",
+    "torch",
+    "torch.*",
+]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = ["slow: loads real bge-m3 / reranker models; excluded by default"]
+addopts = "-m 'not slow'"
+asyncio_mode = "auto"
