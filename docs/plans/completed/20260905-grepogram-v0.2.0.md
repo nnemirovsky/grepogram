@@ -1023,19 +1023,19 @@ means the CLI is the only default-configuration door to it. Task 19's README wor
 - Modify: `CLAUDE.md`
 - Modify: `grepogram/__init__.py`
 
-- [ ] document the extraction pass, `[media]`, `sources prune`, `prune-deleted`, `import` and the
+- [x] document the extraction pass, `[media]`, `sources prune`, `prune-deleted`, `import` and the
       reaction bonus in README, including the one-time re-index on upgrade
-- [ ] rewrite the Known Limitations bullet on deleted messages and edits (README.md:571-575), which
+- [x] rewrite the Known Limitations bullet on deleted messages and edits (README.md:571-575), which
       Tasks 12 and 13 falsify
-- [ ] update README's Files and Privacy section — extraction writes temporary files and OCR reads
+- [x] update README's Files and Privacy section — extraction writes temporary files and OCR reads
       image content, all locally
-- [ ] add the new invariants to CLAUDE.md: the recipe-version contract **including that units are
+- [x] add the new invariants to CLAUDE.md: the recipe-version contract **including that units are
       never dropped globally and a short-budget run never starts a re-cut**; that extraction is a
       network pass that never blocks a sync; that an extractor degrades rather than fails; and that
       unit reactions are refreshed directly because `_content_key` cannot see them
-- [ ] bump `__version__` to `0.2.0`
-- [ ] run the full gate — this task modifies source
-- [ ] move this plan to `docs/plans/completed/`
+- [x] bump `__version__` to `0.2.0`
+- [x] run the full gate — this task modifies source
+- [x] move this plan to `docs/plans/completed/`
 
 ## Post-Completion
 
