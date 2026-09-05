@@ -200,6 +200,24 @@ never change the git identity.
   returns `None` for a message in a closed window, where all but the newest handful of a chat's
   history lives, and `on_chat_synced` clears `indexed` whether or not anything was rebuilt — so
   without that step the text this pass reads would be written to a column nothing ever renders.
+  That re-cut is a chat's own units and no more, so `media._recut` owes the same two follow-ups
+  every such pass owes: `sync._invalidate_comment_posts` for an extracted **comment**, whose
+  channel post thread quotes it and is reachable only through `comment_of_*`, and keeping
+  `indexed = 0` raised for the rows `units.uncut_rows` names — a `(chat, topic)` with no window
+  at all, where `_invalidation_start` answers `None` and clearing the flag would hide the rows
+  from `index_stranded`, the one pass that would ever cut their first windows. An *empty delta*
+  is not that case and must still clear: an OCR that read nothing leaves every unit identical,
+  and keeping those flagged is the whole-index backlog again.
+- **A message re-stored with a different attachment loses its extraction.**
+  `db._MESSAGE_UPSERT` leaves `extracted_text` and `media_state` alone so a routine re-store
+  cannot clobber the pass's work, *except* when `media_kind` or `media_filename` moved
+  (`db._ATTACHMENT_REPLACED`) — then the text is dropped and the state goes back to
+  `MEDIA_PENDING`, because `MEDIA_EXTRACTED` is terminal and the row would otherwise carry the
+  previous file's text for good, unreachable even to `extract --retry-failed`. Those two columns
+  and nothing else: a caption edit moves neither, and keying this on `edit_date` or `text` would
+  re-download every extracted photo in the index for a typo fix, `edit_refetch` messages per
+  chat per sync. `sync._differs` compares both columns in full, so a replaced attachment always
+  reaches the upsert as an edit.
 - An extractor **degrades rather than fails**. `extract.registry()` is re-derived on every call,
   never frozen at import, because what a kind maps to is a property of the environment: `pypdf`
   and `python-docx` come with the `media` extra, and OCR needs macOS and
@@ -276,6 +294,13 @@ never change the git identity.
   own `source_id` onto the supergroup it migrated to, and only when that supergroup is not
   already stored. Lose the tag and `sources rm` of the live source deletes the import,
   `prunable` offers it, and the `import:` handle every refusal tells the user to remove is gone.
+  `sources.prune_chats` asks the same question a fourth time, on the *delete* side: the scan and
+  the confirmation both predate the `SyncLock` — a Telegram round trip must never be held across
+  it — so every candidate is put to `_still_prunable` again inside the deletion transaction, and
+  one that gained an `import:` tag, changed `source_id`, or became a channel's discussion group
+  in between is dropped. It takes `PruneCandidate`s and not ids for exactly that: the offer's
+  `source_id` is what "unchanged" is measured against. Re-ordering the resolve and the lock is
+  not the fix and never will be.
 - Never decide what a `chat:` source covers by comparing `source_id` strings. `chat =` takes an
   id, an `@username`, `https://t.me/<name>` and `t.me/c/<id>`, and all four are one chat:
   `sources.parse_target` folds them into a `Target`, and `sources._names_chat` / `_same_target`
