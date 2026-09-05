@@ -4,11 +4,12 @@ import logging
 import os
 import sqlite3
 import stat
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
 import pytest
-from telethon import errors
+from telethon import TelegramClient, errors
 from typer.testing import CliRunner
 
 from grepogram import cli, config, db, sources, sync, tg
@@ -707,7 +708,7 @@ def _signed_in(tmp_home: Path, extra: str = "") -> Path:
 def test_cli_sources_help_lists_commands() -> None:
     result = runner.invoke(cli.app, ["sources", "--help"])
     assert result.exit_code == 0, result.output
-    for name in ("add", "ls", "rm"):
+    for name in ("add", "ls", "rm", "prune"):
         assert name in result.output
 
 
@@ -1084,3 +1085,327 @@ def test_remove_source_by_id_or_username_finds_the_other_spelling(
     by_username = sources.remove_source(by_id.config, conn, sources.parse_target("@xchat"))
     assert (by_username.source_id, by_username.chat_ids) == ("chat:555", [555])
     assert Source(chat=555) not in by_username.config.sources
+
+
+# --- prune -----------------------------------------------------------------------------------
+
+
+LEFT_ID = -1000000000555
+
+
+def _left(source_id: str = "folder:Argentina", **overrides: object) -> ChatRow:
+    """A chat indexed through a folder that no longer lists it."""
+    return _chat(LEFT_ID, source_id, title="Left chat", **overrides)
+
+
+def _membership(
+    listed: dict[str, set[int]] | None = None, failed: dict[str, str] | None = None
+) -> sources.FolderMembership:
+    return sources.FolderMembership(listed=listed or {}, failed=failed or {})
+
+
+async def test_folder_membership_lists_every_peer_a_folder_names() -> None:
+    cfg = _cfg(Source(folder="Argentina"), Source(chat="@alice"))
+    membership = await sources.folder_membership(cfg, _catalog())
+    # GHOST_ID has no entity to resolve, and is still listed by the folder: `folder_dialogs`
+    # drops such a peer, and reading that as "it left" is what would delete a live chat
+    assert membership.listed == {"folder:Argentina": {ARG_ID, NEWS_ID, OUTSIDE_ID, GHOST_ID}}
+    assert membership.failed == {}
+
+
+async def test_folder_membership_records_an_unresolvable_source_instead_of_skipping_it() -> None:
+    cfg = _cfg(Source(folder="Xyz"), Source(folder="Argentina"))
+    membership = await sources.folder_membership(cfg, _catalog())
+    assert set(membership.listed) == {"folder:Argentina"}
+    assert "no folder named" in membership.failed["folder:Xyz"]
+
+
+async def test_folder_membership_records_a_transient_rpc_error() -> None:
+    flooded = _catalog(entity_errors={GHOST_ID: errors.FloodWaitError(request=None, capture=30)})
+    membership = await sources.folder_membership(_cfg(Source(folder="Argentina")), flooded)
+    assert membership.listed == {}
+    assert "wait" in membership.failed["folder:Argentina"].casefold()
+
+
+def test_prunable_offers_a_chat_the_folder_no_longer_lists(conn: sqlite3.Connection) -> None:
+    _populate(conn)
+    _store(conn, _left(), 4)
+    scan = sources.prunable(CFG, conn, _membership({"folder:Argentina": {ARG_ID, NEWS_ID}}))
+    assert [(c.chat.id, c.messages) for c in scan.prunable] == [(LEFT_ID, 4)]
+    assert scan.prunable[0].reason == "folder:Argentina no longer lists it"
+    assert scan.kept == [] and scan.unresolved == []
+
+
+def test_prunable_keeps_the_chats_the_folder_still_lists(conn: sqlite3.Connection) -> None:
+    _populate(conn)
+    scan = sources.prunable(CFG, conn, _membership({"folder:Argentina": {ARG_ID, NEWS_ID}}))
+    assert scan.prunable == [] and scan.kept == []
+
+
+def test_prunable_prunes_nothing_when_the_source_fails_to_resolve(
+    conn: sqlite3.Connection,
+) -> None:
+    """The hazard this command exists around: `resolve_sources` logs and skips a source it
+    cannot resolve, so deriving "the folder no longer lists them" from a failed resolution
+    would offer a whole indexed history for deletion after one transient RPCError."""
+    _populate(conn)
+    _store(conn, _left(), 4)
+    scan = sources.prunable(
+        CFG, conn, _membership(failed={"folder:Argentina": "A wait of 30 seconds is required"})
+    )
+    assert scan.prunable == []
+    assert scan.unresolved == ["folder:Argentina: A wait of 30 seconds is required"]
+    # every chat of the source is held back, not only the one that looked gone
+    assert {c.chat.id for c in scan.kept} == {LEFT_ID, ARG_ID, NEWS_ID}
+    assert {c.reason for c in scan.kept} == {"folder:Argentina could not be checked"}
+
+
+def test_prunable_prunes_nothing_while_another_source_is_unchecked(
+    conn: sqlite3.Connection,
+) -> None:
+    """Coverage is a union over every source, so one folder that did not answer means no chat
+    can be proved uncovered — not even a chat of a folder that did answer."""
+    _populate(conn)
+    _store(conn, _left(), 4)
+    cfg = _cfg(*CFG.sources, Source(folder="Other"))
+    scan = sources.prunable(
+        cfg,
+        conn,
+        _membership({"folder:Argentina": {ARG_ID, NEWS_ID}}, {"folder:Other": "no folder named"}),
+    )
+    assert scan.prunable == [] and scan.unresolved == ["folder:Other: no folder named"]
+
+
+def test_prunable_keeps_a_chat_covered_by_another_source(conn: sqlite3.Connection) -> None:
+    """A chat two sources cover keeps the first source's id, so the stored tag says nothing
+    about who covers it now."""
+    _populate(conn)
+    _store(conn, _left(), 4)
+    by_folder = _cfg(*CFG.sources, Source(folder="Other"))
+    scan = sources.prunable(
+        by_folder,
+        conn,
+        _membership({"folder:Argentina": {ARG_ID, NEWS_ID}, "folder:Other": {LEFT_ID}}),
+    )
+    assert scan.prunable == [] and scan.kept == []
+
+
+def test_prunable_keeps_a_chat_a_chat_entry_names(conn: sqlite3.Connection) -> None:
+    _populate(conn)
+    _store(conn, _left(username="left_chat"), 4)
+    by_username = _cfg(*CFG.sources, Source(chat="https://t.me/left_chat"))
+    listed = _membership({"folder:Argentina": {ARG_ID, NEWS_ID}})
+    assert sources.prunable(by_username, conn, listed).prunable == []
+    by_id = _cfg(*CFG.sources, Source(chat=LEFT_ID))
+    assert sources.prunable(by_id, conn, listed).prunable == []
+
+
+def test_prunable_keeps_a_discussion_group_a_channel_still_links(
+    conn: sqlite3.Connection,
+) -> None:
+    _populate(conn)
+    _store(conn, _left(type="supergroup"), 4)
+    db.set_discussion_chat(conn, NEWS_ID, LEFT_ID)
+    scan = sources.prunable(CFG, conn, _membership({"folder:Argentina": {ARG_ID, NEWS_ID}}))
+    assert scan.prunable == []
+    assert [(c.chat.id, c.reason) for c in scan.kept] == [
+        (LEFT_ID, f"still the discussion group of channel {NEWS_ID}")
+    ]
+
+
+def test_prunable_offers_a_discussion_group_whose_channel_is_gone(
+    conn: sqlite3.Connection,
+) -> None:
+    _populate(conn)
+    _store(conn, _left(discussion_of=-1000000000777), 4)
+    scan = sources.prunable(CFG, conn, _membership({"folder:Argentina": {ARG_ID, NEWS_ID}}))
+    assert [c.chat.id for c in scan.prunable] == [LEFT_ID]
+
+
+def test_prunable_never_offers_an_imported_chat(conn: sqlite3.Connection) -> None:
+    _populate(conn)
+    _store(conn, _chat(LEFT_ID, "import:left-chat", title="Left chat"), 4)
+    scan = sources.prunable(CFG, conn, _membership({"folder:Argentina": {ARG_ID, NEWS_ID}}))
+    assert scan.prunable == [] and scan.kept == []
+
+
+def test_prunable_keeps_a_chat_whose_source_is_no_longer_configured(
+    conn: sqlite3.Connection,
+) -> None:
+    _populate(conn)
+    _store(conn, _left("folder:Gone"), 4)
+    scan = sources.prunable(CFG, conn, _membership({"folder:Argentina": {ARG_ID, NEWS_ID}}))
+    assert scan.prunable == []
+    assert [(c.chat.id, c.reason) for c in scan.kept] == [
+        (LEFT_ID, "folder:Gone is not a configured source; use sources rm")
+    ]
+
+
+def test_prune_chats_deletes_the_rows_and_skips_ids_that_are_gone(
+    conn: sqlite3.Connection,
+) -> None:
+    _populate(conn)
+    removed = sources.prune_chats(conn, [NEWS_ID, GHOST_ID, NEWS_ID])
+    assert removed == [NEWS_ID]
+    assert [c.id for c in db.list_chats(conn)] == sorted([ARG_ID, GEORGIA_ID, 1])
+    assert db.message_counts(conn) == {ARG_ID: 3, GEORGIA_ID: 4, 1: 1}
+
+
+# --- prune, through the CLI ------------------------------------------------------------------
+
+
+def _prune_home(tmp_home: Path, monkeypatch: pytest.MonkeyPatch, extra: str = "") -> Paths:
+    """A signed-in home with the Argentina folder as its only source, holding one chat the
+    folder still lists and one it does not."""
+    _signed_in(tmp_home, '[[sources]]\nfolder = "Argentina"\n' + extra)
+    paths = Paths.from_env()
+    conn = db.connect(paths)
+    db.migrate(conn)
+    _store(conn, _chat(ARG_ID, "folder:Argentina", title="Argentina chat", username="arg_chat"), 3)
+    _store(conn, _left(), 4)
+    conn.close()
+    monkeypatch.setattr(tg, "make_client", lambda cfg, paths: _client())
+    return paths
+
+
+def _indexed(paths: Paths) -> list[int]:
+    conn = db.connect(paths)
+    try:
+        return [chat.id for chat in db.list_chats(conn)]
+    finally:
+        conn.close()
+
+
+def test_cli_sources_prune_deletes_after_a_confirmation(
+    tmp_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    paths = _prune_home(tmp_home, monkeypatch)
+    result = runner.invoke(cli.app, ["sources", "prune"], input="y\n")
+    assert result.exit_code == 0, result.output
+    assert f"{LEFT_ID}" in result.stdout and "folder:Argentina no longer lists it" in result.stdout
+    assert "removed 1 chats" in result.stdout
+    assert _indexed(paths) == [ARG_ID]
+    again = runner.invoke(cli.app, ["sources", "prune"])
+    assert again.exit_code == 0, again.output
+    assert again.stdout.strip() == "nothing to prune"
+
+
+def test_cli_sources_prune_dry_run_changes_nothing(
+    tmp_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    paths = _prune_home(tmp_home, monkeypatch)
+    result = runner.invoke(cli.app, ["sources", "prune", "--dry-run"])
+    assert result.exit_code == 0, result.output
+    assert "1 chats would go" in result.stdout
+    assert _indexed(paths) == sorted([ARG_ID, LEFT_ID])
+    assert config.load(paths).sources == [Source(folder="Argentina")]
+
+
+def test_cli_sources_prune_declined_removes_nothing(
+    tmp_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    paths = _prune_home(tmp_home, monkeypatch)
+    result = runner.invoke(cli.app, ["sources", "prune"], input="n\n")
+    assert result.exit_code == 0, result.output
+    assert "nothing removed" in result.stdout
+    assert _indexed(paths) == sorted([ARG_ID, LEFT_ID])
+
+
+def test_cli_sources_prune_refuses_when_a_source_cannot_be_resolved(
+    tmp_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    paths = _prune_home(tmp_home, monkeypatch, extra='\n[[sources]]\nfolder = "Xyz"\n')
+    result = runner.invoke(cli.app, ["sources", "prune"], input="y\n")
+    assert result.exit_code == 1
+    assert "nothing was pruned" in result.stderr and "folder:Xyz" in result.stderr
+    assert "does not resolve is not a source that lists nothing" in result.stderr
+    assert _indexed(paths) == sorted([ARG_ID, LEFT_ID])
+
+
+def test_cli_sources_prune_keeps_a_linked_discussion_group_and_says_why(
+    tmp_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    paths = _prune_home(tmp_home, monkeypatch)
+    conn = db.connect(paths)
+    _store(conn, _chat(NEWS_ID, "folder:Argentina", type="channel", title="News"))
+    db.set_discussion_chat(conn, NEWS_ID, LEFT_ID)
+    conn.close()
+    result = runner.invoke(cli.app, ["sources", "prune"], input="y\n")
+    assert result.exit_code == 0, result.output
+    assert f"kept Left chat (id {LEFT_ID}): still the discussion group" in result.stdout
+    assert "nothing to prune" in result.stdout
+    assert _indexed(paths) == sorted([ARG_ID, NEWS_ID, LEFT_ID])
+
+
+def test_cli_sources_prune_refuses_while_a_sync_runs(
+    tmp_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    paths = _prune_home(tmp_home, monkeypatch)
+    with sync.SyncLock(paths):
+        result = runner.invoke(cli.app, ["sources", "prune"], input="y\n")
+    assert result.exit_code == 1
+    assert "another sync is running" in result.stderr
+    assert _indexed(paths) == sorted([ARG_ID, LEFT_ID])
+    freed = runner.invoke(cli.app, ["sources", "prune"], input="y\n")
+    assert freed.exit_code == 0, freed.output
+    assert _indexed(paths) == [ARG_ID]
+
+
+def test_cli_sources_prune_resolves_before_it_takes_the_sync_lock(
+    tmp_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Telegram is read first and the lock is taken for the deletion alone: a round trip held
+    across the sync lock would block every sync for as long as Telegram takes to answer."""
+    paths = _prune_home(tmp_home, monkeypatch)
+    real_membership = cli._folder_membership
+    real_prune = sources.prune_chats
+    order: list[str] = []
+
+    async def membership_without_the_lock(
+        client: TelegramClient, cfg: Config
+    ) -> sources.FolderMembership:
+        with sync.SyncLock(paths):  # free while the network is being read
+            order.append("resolved")
+        return await real_membership(client, cfg)
+
+    def prune_under_the_lock(conn: sqlite3.Connection, chat_ids: Sequence[int]) -> list[int]:
+        with pytest.raises(sync.SyncInProgress), sync.SyncLock(paths):
+            pass
+        order.append("deleted")
+        return real_prune(conn, chat_ids)
+
+    monkeypatch.setattr(cli, "_folder_membership", membership_without_the_lock)
+    monkeypatch.setattr(sources, "prune_chats", prune_under_the_lock)
+    result = runner.invoke(cli.app, ["sources", "prune"], input="y\n")
+    assert result.exit_code == 0, result.output
+    assert order == ["resolved", "deleted"]
+    assert _indexed(paths) == [ARG_ID]
+
+
+def test_cli_sources_prune_needs_keys_a_session_and_sources(tmp_home: Path) -> None:
+    no_keys = runner.invoke(cli.app, ["sources", "prune"])
+    assert no_keys.exit_code == 1 and "my.telegram.org" in no_keys.stderr
+    (tmp_home / "config.toml").write_text(CONFIG_WITH_KEYS, encoding="utf-8")
+    no_sources = runner.invoke(cli.app, ["sources", "prune"])
+    assert no_sources.exit_code == 1 and "no sources configured" in no_sources.stderr
+    (tmp_home / "config.toml").write_text(
+        CONFIG_WITH_KEYS + '[[sources]]\nfolder = "Argentina"\n', encoding="utf-8"
+    )
+    no_session = runner.invoke(cli.app, ["sources", "prune"])
+    assert no_session.exit_code == 1 and "run: grepogram auth" in no_session.stderr
+
+
+def test_cli_sources_prune_maps_network_errors(
+    tmp_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _prune_home(tmp_home, monkeypatch)
+    broken = _client()
+
+    async def failing_connect() -> None:
+        raise ConnectionError("offline")
+
+    monkeypatch.setattr(broken, "connect", failing_connect)
+    monkeypatch.setattr(tg, "make_client", lambda cfg, paths: broken)
+    result = runner.invoke(cli.app, ["sources", "prune"])
+    assert result.exit_code == 1
+    assert "telegram error: offline" in result.stderr

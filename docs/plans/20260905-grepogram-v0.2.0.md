@@ -656,29 +656,29 @@ Task 15's `sources add` guard, or the import protection silently evaporates.
 - Modify: `tests/test_sources.py`
 - Modify: `tests/test_cli.py`
 
-- [ ] add `sources.prunable(cfg, conn, folders)` returning indexed chats whose folder source no
+- [x] add `sources.prunable(cfg, conn, folders)` returning indexed chats whose folder source no
       longer lists them, with a reason for each. `folders` is the resolved folder membership from
       `sources.source_dialogs` (sources.py:616-627) — state its type in the signature
-- [ ] this pass **needs Telegram**: knowing what a folder holds *now* requires a connected client,
+- [x] this pass **needs Telegram**: knowing what a folder holds *now* requires a connected client,
       so the command needs `_require_api_keys`, `tg.make_client` and `tg.connected` like
       `sync_cmd`, not the offline shape of `sources rm`
-- [ ] resolve over the network **first, then** take the `SyncLock` for the deletion — the ordering
+- [x] resolve over the network **first, then** take the `SyncLock` for the deletion — the ordering
       `sources_rm` uses (`with sync.SyncLock(paths), config.ConfigLock(paths):`, cli.py:575-589).
       Note `sources_add` takes no `SyncLock` at all, so it is not the precedent to copy. There is no
       config to save: a chat that left a folder changes no `[[sources]]` entry
-- [ ] a source that **fails to resolve** must abort the prune for that source with a clear message.
+- [x] a source that **fails to resolve** must abort the prune for that source with a clear message.
       `resolve_sources` logs and skips an unresolvable source (sources.py:588-591), so deriving
       "the folder no longer lists them" from a failed resolution would offer to delete a user's
       whole indexed history after one transient `RPCError`
-- [ ] add `grepogram sources prune [--dry-run]`, defaulting to showing what would go and requiring
+- [x] add `grepogram sources prune [--dry-run]`, defaulting to showing what would go and requiring
       confirmation — deleting indexed history is not a silent operation
-- [ ] leave a discussion group a channel still links, and say why it was kept
-- [ ] never prune a chat whose source id starts `import:`, which by definition has no dialog
-- [ ] **no MCP tool** — pruning deletes indexed history and stays a deliberate CLI action
-- [ ] write tests: a chat removed from a folder is prunable; one still in it is not; a linked
+- [x] leave a discussion group a channel still links, and say why it was kept
+- [x] never prune a chat whose source id starts `import:`, which by definition has no dialog
+- [x] **no MCP tool** — pruning deletes indexed history and stays a deliberate CLI action
+- [x] write tests: a chat removed from a folder is prunable; one still in it is not; a linked
       discussion group is kept; `--dry-run` changes nothing; an imported chat is never listed; **a
       source that fails to resolve prunes nothing**; a held lock is a clean error
-- [ ] run tests — must pass before task 10
+- [x] run tests — must pass before task 10
 
 ### Task 10: Put reactions on units and keep them fresh
 

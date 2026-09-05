@@ -48,7 +48,14 @@ from grepogram.dialogs import Match
 from grepogram.embed import Embedder, ModelUnavailable
 from grepogram.filters import FilterError
 from grepogram.log import setup_logging
-from grepogram.models import Config, MediaReport, MessageView, SearchResult, SyncReport
+from grepogram.models import (
+    ChatRow,
+    Config,
+    MediaReport,
+    MessageView,
+    SearchResult,
+    SyncReport,
+)
 from grepogram.paths import Paths
 from grepogram.search import UnknownMessage
 
@@ -663,6 +670,81 @@ def sources_rm(
     finally:
         conn.close()
     typer.echo(f"removed {removed.source_id} ({len(removed.chat_ids)} chats deleted)")
+
+
+@sources_app.command("prune")
+def sources_prune(
+    dry_run: Annotated[
+        bool, typer.Option("--dry-run", help="Show what would go and change nothing.")
+    ] = False,
+) -> None:
+    """Delete indexed chats their folder source no longer lists; needs a session.
+
+    What a folder holds right now is only knowable from Telegram, so the folders are read over
+    the network first and the sync lock is taken afterwards, for the deletion alone; there is no
+    config to save, because a chat that left a folder changes no source entry. Nothing goes
+    without a confirmation, and a source Telegram will not answer for stops the prune — a folder
+    that failed to resolve is not a folder that lists nothing.
+    """
+    paths, cfg, conn = _load()
+    _require_api_keys(cfg, paths)
+    if not cfg.sources:
+        conn.close()
+        fail("no sources configured; add one with: grepogram sources add <target>")
+    try:
+        tg.ensure_session_mode(paths)
+        client = tg.make_client(cfg, paths)
+        scan = sources.prunable(cfg, conn, asyncio.run(_folder_membership(client, cfg)))
+        for candidate in scan.kept:
+            typer.echo(f"kept {_chat_label(candidate.chat)}: {candidate.reason}")
+        if scan.unresolved:
+            fail(
+                "nothing was pruned, these sources could not be checked: "
+                + "; ".join(scan.unresolved),
+                hint="a source that does not resolve is not a source that lists nothing; "
+                "run `grepogram sources prune` again once Telegram answers for it",
+            )
+        if not scan.prunable:
+            typer.echo("nothing to prune")
+            return
+        _print_prune(scan.prunable)
+        if dry_run:
+            typer.echo(f"--dry-run: nothing removed ({len(scan.prunable)} chats would go)")
+            return
+        if not typer.confirm(
+            f"delete these {len(scan.prunable)} chats and everything indexed from them?"
+        ):
+            typer.echo("nothing removed")
+            return
+        with sync.SyncLock(paths):
+            removed = sources.prune_chats(conn, [c.chat.id for c in scan.prunable])
+        typer.echo(f"removed {len(removed)} chats")
+    except (tg.AuthRequired, tg.SessionError, sync.SyncInProgress, ConfigError) as exc:
+        fail(str(exc), hint=getattr(exc, "hint", None))
+    except (tg_errors.RPCError, ConnectionError) as exc:
+        fail(f"telegram error: {exc}")
+    finally:
+        conn.close()
+
+
+async def _folder_membership(client: TelegramClient, cfg: Config) -> sources.FolderMembership:
+    """Connect and read what every folder source lists right now."""
+    async with tg.connected(client):
+        return await sources.folder_membership(cfg, dialogs.DialogCatalog(client))
+
+
+def _chat_label(chat: ChatRow) -> str:
+    return f"{chat.title or chat.type} (id {chat.id})"
+
+
+def _print_prune(candidates: Sequence[sources.PruneCandidate]) -> None:
+    _print_table(
+        ("id", "type", "title", "messages", "reason"),
+        [
+            (str(c.chat.id), c.chat.type, c.chat.title or "-", str(c.messages), c.reason)
+            for c in candidates
+        ],
+    )
 
 
 @config_app.command("path")

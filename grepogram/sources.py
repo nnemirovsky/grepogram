@@ -30,6 +30,7 @@ log = logging.getLogger(__name__)
 TargetKind = Literal["id", "username", "folder", "fuzzy"]
 FOLDER_PREFIX = "folder:"
 CHAT_PREFIX = "chat:"
+IMPORT_PREFIX = "import:"
 ENTITY_ERRORS: tuple[type[Exception], ...] = (
     ValueError,
     TypeError,
@@ -112,6 +113,41 @@ class Removed:
     source_id: str
     source: Source | None
     chat_ids: list[int]
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class FolderMembership:
+    """What every folder source lists right now, read from Telegram by :func:`folder_membership`.
+
+    ``listed`` maps a folder source's id to the chat ids it covers *at this moment*; ``failed``
+    maps the id of a source that could not be resolved to the reason. A source is in exactly one
+    of the two, and one in neither was never looked at. The failures are data rather than a log
+    line on purpose: :func:`prunable` derives "the folder no longer lists this chat" from this
+    object, and a folder that answered with an error must never read as an empty one.
+    """
+
+    listed: dict[str, set[int]] = dataclasses.field(default_factory=dict)
+    failed: dict[str, str] = dataclasses.field(default_factory=dict)
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class PruneCandidate:
+    """One indexed chat the prune scan reached, with ``reason`` saying why it is offered or kept
+    and ``messages`` how many stored messages would go with it."""
+
+    chat: ChatRow
+    reason: str
+    messages: int
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class PruneScan:
+    """What ``sources prune`` would delete (:attr:`prunable`), what it deliberately keeps
+    (:attr:`kept`) and which configured sources it could not check (:attr:`unresolved`)."""
+
+    prunable: list[PruneCandidate]
+    kept: list[PruneCandidate]
+    unresolved: list[str]
 
 
 # --- targets ---------------------------------------------------------------------------------
@@ -654,6 +690,116 @@ def discussion_source_id(group: ChatRow | None, channel: ChatRow) -> str | None:
     if group.source_id.startswith(FOLDER_PREFIX) or _own_source(group):
         return group.source_id
     return channel.source_id or group.source_id
+
+
+# --- prune -----------------------------------------------------------------------------------
+
+
+async def folder_membership(cfg: Config, catalog: DialogCatalog) -> FolderMembership:
+    """Read what every folder source lists right now; ``catalog``'s client must be connected.
+
+    The network half of ``sources prune``, and it differs from :func:`resolve_sources` in the
+    one way that matters here: a source that does not resolve is *recorded* as failed instead of
+    being logged and skipped. :func:`prunable` reads a chat's absence from its folder as "it
+    left", so a transient ``RPCError`` swallowed in silence would offer that source's whole
+    indexed history for deletion.
+
+    A folder's membership is the chats it shows plus the explicit peers it names, resolvable or
+    not: :func:`folder_dialogs` drops a peer whose entity Telegram will not hand over (a channel
+    gone private, say), and such a peer is still very much listed by the folder.
+    """
+    listed: dict[str, set[int]] = {}
+    failed: dict[str, str] = {}
+    for source in cfg.sources:
+        if source.folder is None:
+            continue
+        try:
+            folder = await find_folder(source.folder, catalog)
+            members = await folder_dialogs(folder, catalog)
+        except (SourceError, errors.RPCError) as exc:
+            log.warning("cannot check source %s: %s", source.id, exc)
+            failed[source.id] = str(exc)
+            continue
+        named = (folder.include_ids | folder.pinned_ids) - folder.exclude_ids
+        listed[source.id] = {info.id for info in members} | set(named)
+    return FolderMembership(listed=listed, failed=failed)
+
+
+def prunable(cfg: Config, conn: sqlite3.Connection, folders: FolderMembership) -> PruneScan:
+    """The indexed chats whose folder source no longer lists them, with a reason for each.
+
+    ``folders`` is what :func:`folder_membership` just read from Telegram, and it is the only
+    evidence: a chat is offered when a folder source that *resolved* brought it in and no
+    resolved source covers it any more.
+
+    Four kinds of chat are kept instead, each with its reason:
+
+    * one an ``import:`` source holds — an import has no dialog by definition, so no folder
+      could ever list it;
+    * one a ``chat:`` entry names, whatever its stored ``source_id`` says: a chat two sources
+      cover keeps the first one's id (:func:`resolve_sources`), so the stored tag is no proof of
+      who covers it now;
+    * a channel's discussion group the channel still links — it is indexed through that link,
+      not through a folder listing (:func:`discussion_source_id`);
+    * one whose source is gone from the config; that is ``sources rm``'s business, and nothing
+      here can resolve a source the config does not hold.
+
+    A configured source that failed to resolve makes the whole scan inconclusive, and
+    :attr:`PruneScan.prunable` comes back empty while :attr:`PruneScan.unresolved` is not:
+    coverage is a union over every source, so one unchecked source means no chat can be *proved*
+    uncovered. The caller reports that instead of deleting anything.
+    """
+    covered: set[int] = set()
+    for ids in folders.listed.values():
+        covered |= ids
+    named = [
+        target
+        for target in (_target_of(str(s.chat)) for s in cfg.sources if s.chat is not None)
+        if target is not None
+    ]
+    counts = db.message_counts(conn)
+    unresolved = [f"{source_id}: {why}" for source_id, why in sorted(folders.failed.items())]
+    offered: list[PruneCandidate] = []
+    kept: list[PruneCandidate] = []
+
+    def record(into: list[PruneCandidate], chat: ChatRow, reason: str) -> None:
+        into.append(PruneCandidate(chat=chat, reason=reason, messages=counts.get(chat.id, 0)))
+
+    for chat in db.list_chats(conn):
+        source_id = chat.source_id or ""
+        if source_id.startswith(IMPORT_PREFIX) or not source_id.startswith(FOLDER_PREFIX):
+            continue  # an import and a chat entry name themselves; neither can leave a folder
+        if chat.id in covered or any(_names_chat(t, chat.id, chat.username) for t in named):
+            continue
+        if source_id in folders.failed:
+            record(kept, chat, f"{source_id} could not be checked")
+        elif source_id not in folders.listed:
+            record(kept, chat, f"{source_id} is not a configured source; use sources rm")
+        elif chat.discussion_of is not None and db.get_chat(conn, chat.discussion_of) is not None:
+            record(kept, chat, f"still the discussion group of channel {chat.discussion_of}")
+        else:
+            record(offered, chat, f"{source_id} no longer lists it")
+    if unresolved:
+        log.warning("prune scan is inconclusive: %s", "; ".join(unresolved))
+    return PruneScan(prunable=[] if unresolved else offered, kept=kept, unresolved=unresolved)
+
+
+def prune_chats(conn: sqlite3.Connection, chat_ids: Sequence[int]) -> list[int]:
+    """Delete the chats :func:`prunable` offered, with their messages, units and index rows.
+
+    One transaction for the lot, and a chat that is no longer stored is skipped rather than
+    raised: the scan runs before the sync lock is taken — a network round trip must never be
+    held across it — so a sync may have removed a chat in between. Returns the ids removed.
+    """
+    removed: list[int] = []
+    with db.transaction(conn):
+        for chat_id in chat_ids:
+            if db.get_chat(conn, chat_id) is None:
+                continue
+            db.delete_chat(conn, chat_id)
+            removed.append(chat_id)
+    log.info("pruned %d chats", len(removed))
+    return removed
 
 
 # --- status ----------------------------------------------------------------------------------
