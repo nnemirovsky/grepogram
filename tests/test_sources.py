@@ -24,6 +24,7 @@ from grepogram.sources import (
     UnknownSource,
     UnknownTarget,
 )
+from grepogram.tdesktop import ImportedChat
 from tests.fakes import (
     FakeClient,
     make_channel,
@@ -1409,3 +1410,228 @@ def test_cli_sources_prune_maps_network_errors(
     result = runner.invoke(cli.app, ["sources", "prune"])
     assert result.exit_code == 1
     assert "telegram error: offline" in result.stderr
+
+
+# --- import ----------------------------------------------------------------------------------
+
+
+def _export(*chats: ChatRow, messages: int = 1) -> list[ImportedChat]:
+    """A parsed export: what :func:`grepogram.tdesktop.read_export` hands the importer."""
+    return [
+        ImportedChat(
+            chat=chat,
+            messages=[
+                MessageRow(chat_id=chat.id, msg_id=i, date=1_700_000_000 + i, text=f"import {i}")
+                for i in range(1, messages + 1)
+            ],
+        )
+        for chat in chats
+    ]
+
+
+def _imported(chat_id: int, title: str | None) -> ChatRow:
+    """A chat as :func:`grepogram.tdesktop.read_export` builds it: no source, never fetched."""
+    return ChatRow(id=chat_id, type="supergroup", title=title, unavailable=True)
+
+
+@pytest.mark.parametrize(
+    ("title", "slug"),
+    [
+        ("Valencia Expats", "valencia-expats"),
+        ("Грузия | Georgia chat", "грузия-georgia-chat"),
+        ("  ...Trip 2019!  ", "trip-2019"),
+        ("a" * 60, "a" * 40),
+        ("🙂", ""),
+        (None, ""),
+    ],
+    ids=["ascii", "cyrillic", "punctuation", "truncated", "emoji-only", "unnamed"],
+)
+def test_import_slug_reads_a_title_as_the_readable_half_of_a_source_id(
+    title: str | None, slug: str
+) -> None:
+    assert sources.import_slug(title) == slug
+
+
+def test_import_source_ids_are_the_slugged_titles(conn: sqlite3.Connection) -> None:
+    chats = [_imported(LEFT_ID, "Left chat"), _imported(ARG_ID, "Argentina chat")]
+    assert sources.import_source_ids(conn, chats) == {
+        LEFT_ID: "import:left-chat",
+        ARG_ID: "import:argentina-chat",
+    }
+
+
+def test_import_source_ids_disambiguate_a_shared_title(conn: sqlite3.Connection) -> None:
+    """Two contacts of one name in a single export must not share a source id: ``sources rm``
+    on either would then delete both."""
+    chats = [_imported(LEFT_ID, "Anna"), _imported(ARG_ID, "Anna")]
+    assert sources.import_source_ids(conn, chats) == {
+        LEFT_ID: f"import:anna-{abs(LEFT_ID)}",
+        ARG_ID: f"import:anna-{abs(ARG_ID)}",
+    }
+
+
+def test_import_source_ids_avoid_a_slug_an_earlier_import_claimed(
+    conn: sqlite3.Connection,
+) -> None:
+    _store(conn, _chat(ARG_ID, "import:anna", title="Anna"))
+    assert sources.import_source_ids(conn, [_imported(LEFT_ID, "Anna")]) == {
+        LEFT_ID: f"import:anna-{abs(LEFT_ID)}"
+    }
+    # the chat that holds the plain slug keeps it, so re-importing it stays idempotent
+    assert sources.import_source_ids(conn, [_imported(ARG_ID, "Anna")]) == {ARG_ID: "import:anna"}
+
+
+def test_import_source_ids_fall_back_to_the_chat_id_for_a_nameless_chat(
+    conn: sqlite3.Connection,
+) -> None:
+    assert sources.import_source_ids(conn, [_imported(LEFT_ID, None)]) == {
+        LEFT_ID: f"import:chat-{abs(LEFT_ID)}"
+    }
+
+
+def test_import_chats_stores_the_rows_under_an_import_tag(conn: sqlite3.Connection) -> None:
+    stored = sources.import_chats(conn, _export(_imported(LEFT_ID, "Left chat"), messages=3))
+    assert [(item.source_id, item.messages) for item in stored] == [("import:left-chat", 3)]
+    chat = db.get_chat(conn, LEFT_ID)
+    assert chat is not None
+    assert chat.source_id == "import:left-chat"
+    # nothing was fetched from Telegram, so no sync resumes from this chat
+    assert chat.unavailable and chat.last_msg_id == 0
+    assert db.message_counts(conn) == {LEFT_ID: 3}
+
+
+def test_import_chats_is_idempotent(conn: sqlite3.Connection) -> None:
+    entries = _export(_imported(LEFT_ID, "Left chat"), messages=3)
+    sources.import_chats(conn, entries)
+    again = sources.import_chats(conn, entries)
+    assert [item.source_id for item in again] == ["import:left-chat"]
+    assert db.message_counts(conn) == {LEFT_ID: 3}
+
+
+def test_import_chats_refuses_a_chat_already_synced_from_telegram(
+    conn: sqlite3.Connection,
+) -> None:
+    """`db.upsert_chat` overwrites `source_id`, so an import over a live chat would retag it and
+    hide it from the source that fetches it."""
+    _populate(conn)
+    with pytest.raises(sources.ImportConflict) as excinfo:
+        sources.import_chats(conn, _export(_imported(ARG_ID, "Argentina chat")))
+    assert "already indexed from Telegram through folder:Argentina" in str(excinfo.value)
+    assert "grepogram sources rm" in str(excinfo.value)
+
+
+def test_import_chats_refuses_a_stored_chat_that_carries_no_source(
+    conn: sqlite3.Connection,
+) -> None:
+    """An untagged row is still a row this index got from Telegram; refusing is the safe way to
+    be wrong about it."""
+    _store(conn, ChatRow(id=LEFT_ID, type="supergroup", title="Left chat"), 2)
+    with pytest.raises(sources.ImportConflict, match="with no source"):
+        sources.import_chats(conn, _export(_imported(LEFT_ID, "Left chat")))
+
+
+def test_import_chats_writes_nothing_when_one_chat_of_the_export_is_refused(
+    conn: sqlite3.Connection,
+) -> None:
+    """The refusal is checked for the whole export before the first row goes in, so a partial
+    import never leaves half a history under a tag the other half does not carry."""
+    _populate(conn)
+    entries = _export(_imported(LEFT_ID, "Left chat"), _imported(ARG_ID, "Argentina chat"))
+    with pytest.raises(sources.ImportConflict):
+        sources.import_chats(conn, entries)
+    assert db.get_chat(conn, LEFT_ID) is None
+    assert db.message_counts(conn) == {ARG_ID: 3, NEWS_ID: 2, GEORGIA_ID: 4, 1: 1}
+
+
+def test_refuse_imported_refuses_a_live_source_over_an_imported_chat(
+    conn: sqlite3.Connection,
+) -> None:
+    sources.import_chats(conn, _export(_imported(ARG_ID, "Argentina chat")))
+    covered = [DialogInfo(id=ARG_ID, type="supergroup", title="Argentina chat")]
+    with pytest.raises(sources.ImportConflict) as excinfo:
+        sources.refuse_imported(conn, covered)
+    assert "already in the index as import:argentina-chat" in str(excinfo.value)
+    assert "grepogram sources rm import:argentina-chat" in str(excinfo.value)
+
+
+def test_refuse_imported_passes_a_chat_that_is_not_an_import(conn: sqlite3.Connection) -> None:
+    _populate(conn)
+    sources.refuse_imported(
+        conn,
+        [
+            DialogInfo(id=ARG_ID, type="supergroup", title="Argentina chat"),
+            DialogInfo(id=GHOST_ID, type="channel", title="Never indexed"),
+        ],
+    )
+
+
+def test_refuse_imported_refuses_a_folder_holding_one_imported_chat(
+    conn: sqlite3.Connection,
+) -> None:
+    """Adding the folder would cover that chat on every sync from now on, so the whole folder is
+    refused rather than the one member silently taken over."""
+    sources.import_chats(conn, _export(_imported(NEWS_ID, "News")))
+    covered = [
+        DialogInfo(id=ARG_ID, type="supergroup", title="Argentina chat"),
+        DialogInfo(id=NEWS_ID, type="channel", title="News"),
+    ]
+    with pytest.raises(sources.ImportConflict, match="import:news"):
+        sources.refuse_imported(conn, covered)
+
+
+def _import_home(tmp_home: Path, monkeypatch: pytest.MonkeyPatch, chat_id: int) -> Paths:
+    """A signed-in home whose index already holds ``chat_id`` as a Telegram Desktop import."""
+    _signed_in(tmp_home)
+    paths = Paths.from_env()
+    conn = db.connect(paths)
+    db.migrate(conn)
+    sources.import_chats(conn, _export(_imported(chat_id, "Argentina chat"), messages=2))
+    conn.close()
+    monkeypatch.setattr(tg, "make_client", lambda cfg, paths: _client())
+    return paths
+
+
+def test_cli_sources_add_refuses_an_imported_chat_and_leaves_its_tag(
+    tmp_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Without this guard `db.upsert_chat` would replace `import:argentina-chat` with
+    `chat:@arg_chat` on the next sync, and `sources prune` — which keys on the prefix — would
+    then offer the imported history for deletion."""
+    paths = _import_home(tmp_home, monkeypatch, ARG_ID)
+    result = runner.invoke(cli.app, ["sources", "add", "@arg_chat"])
+    assert result.exit_code == 1
+    assert result.stdout == ""
+    assert "already in the index as import:argentina-chat" in result.stderr
+    assert config.load(paths).sources == []
+    conn = db.connect(paths)
+    try:
+        chat = db.get_chat(conn, ARG_ID)
+        assert chat is not None and chat.source_id == "import:argentina-chat"
+        assert db.message_counts(conn) == {ARG_ID: 2}
+    finally:
+        conn.close()
+
+
+def test_cli_sources_add_refuses_a_folder_that_holds_an_imported_chat(
+    tmp_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    paths = _import_home(tmp_home, monkeypatch, ARG_ID)
+    result = runner.invoke(cli.app, ["sources", "add", "folder:Argentina"])
+    assert result.exit_code == 1
+    assert "already in the index as import:argentina-chat" in result.stderr
+    assert config.load(paths).sources == []
+
+
+def test_cli_sources_rm_removes_an_imported_chat_by_its_source_id(
+    tmp_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The refusal above tells the user to do exactly this, so it has to work."""
+    paths = _import_home(tmp_home, monkeypatch, ARG_ID)
+    result = runner.invoke(cli.app, ["sources", "rm", "import:argentina-chat"])
+    assert result.exit_code == 0, result.output
+    assert "removed import:argentina-chat (1 chats deleted)" in result.stdout
+    conn = db.connect(paths)
+    try:
+        assert db.list_chats(conn) == []
+    finally:
+        conn.close()

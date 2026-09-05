@@ -812,6 +812,23 @@ async def test_sources_add_fuzzy_writes_config_and_reads_dialogs_afresh(
     assert config.load(paths).sources == expected
 
 
+async def test_sources_add_refuses_a_chat_already_held_as_an_import(
+    bind: Callable[..., tools.AppState], paths: Paths, conn: sqlite3.Connection
+) -> None:
+    """The tool is the second door to the same operation, so it carries the same guard: without
+    it ``db.upsert_chat`` would replace ``import:`` with ``chat:@arg_chat`` on the next sync and
+    the imported history would become prunable."""
+    bind(Config(telegram=KEYS))
+    db.upsert_chat(
+        conn, ChatRow(id=ARG, type="supergroup", title="Argentina chat", source_id="import:arg")
+    )
+    refused = await tools.sources_add("@arg_chat")
+    assert "already in the index as import:arg" in refused["error"]
+    assert config.load(paths).sources == []
+    stored = db.get_chat(conn, ARG)
+    assert stored is not None and stored.source_id == "import:arg"
+
+
 async def test_sources_remove_deletes_data_and_saves_the_config(
     state: tools.AppState, paths: Paths, conn: sqlite3.Connection
 ) -> None:

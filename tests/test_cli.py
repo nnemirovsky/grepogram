@@ -10,8 +10,21 @@ import typer
 from telethon import errors as tg_errors
 from typer.testing import CliRunner
 
-from grepogram import __version__, cli, config, db, index, media, search, sync, tg, units
+from grepogram import (
+    __version__,
+    cli,
+    config,
+    db,
+    embed,
+    index,
+    media,
+    search,
+    sync,
+    tg,
+    units,
+)
 from grepogram.config import TEMPLATE
+from grepogram.embed import ModelUnavailable
 from grepogram.models import ChatRow, Config, MediaReport, MessageRow, PruneReport, SearchMode
 from grepogram.paths import Paths
 from tests.conftest import file_mode
@@ -723,3 +736,184 @@ def test_prune_deleted_reports_a_telegram_error_as_a_clean_error(
     assert result.exit_code == 1
     assert result.stdout == ""
     assert "telegram error:" in result.stderr
+
+
+# --- import ----------------------------------------------------------------------------------
+
+
+EXPORT = Path(__file__).resolve().parent / "fixtures" / "tdesktop_export.json"
+EXPATS_ID = -1001234567890
+BOAT_ID = -987654
+
+
+def _single_chat_export(tmp_path: Path, **over: Any) -> Path:
+    """A one-chat ``messages.json``, the shape Telegram Desktop writes for a single export."""
+    entry: dict[str, Any] = {
+        "name": "Old group",
+        "type": "private_group",
+        "id": 555,
+        "messages": [
+            {
+                "id": 1,
+                "type": "message",
+                "date": "2024-03-01T09:00:00",
+                "date_unixtime": "1709283600",
+                "from": "Nina",
+                "from_id": "user777000",
+                "text": "cita previa extranjeria",
+            }
+        ],
+    }
+    entry.update(over)
+    directory = tmp_path / "export"
+    directory.mkdir(exist_ok=True)
+    (directory / "messages.json").write_text(json.dumps(entry, ensure_ascii=False), "utf-8")
+    return directory
+
+
+def _chats(paths: Paths) -> dict[int, ChatRow]:
+    conn = db.connect(paths)
+    try:
+        return {chat.id: chat for chat in db.list_chats(conn)}
+    finally:
+        conn.close()
+
+
+def test_import_stores_a_searchable_chat_tagged_as_an_import(tmp_home: Path) -> None:
+    """The whole point: an export the account can no longer open answers `search` at once, and
+    the chat carries the `import:` tag every protection of that history keys on."""
+    result = runner.invoke(cli.app, ["import", str(EXPORT)])
+    assert result.exit_code == 0, result.output
+    assert "imported 6 messages into 2 chats" in result.stdout
+    assert "service messages skipped: 1" in result.stdout
+    assert "entries that could not be read: 1" in result.stdout
+    assert "embedded 3 units" in result.stdout
+    chats = _chats(Paths.from_env())
+    assert chats[EXPATS_ID].source_id == "import:valencia-expats"
+    assert chats[BOAT_ID].source_id == "import:двое-в-лодке"
+    # nothing was fetched from Telegram, so no sync may ever resume from these rows
+    assert all(chat.unavailable and chat.last_msg_id == 0 for chat in chats.values())
+    found = runner.invoke(cli.app, ["search", "ВНЖ", "--mode", "lexical", "--no-rerank"])
+    assert found.exit_code == 0, found.output
+    assert "Valencia Expats" in found.stdout
+    assert f"https://t.me/c/{abs(EXPATS_ID) - 1000000000000}/2" in found.stdout
+
+
+def test_import_is_idempotent(tmp_home: Path) -> None:
+    """Re-running an import is how a partial one is finished: the ids come from the export, so
+    the second run updates the same rows instead of storing a second copy."""
+    first = runner.invoke(cli.app, ["import", str(EXPORT)])
+    assert first.exit_code == 0, first.output
+    second = runner.invoke(cli.app, ["import", str(EXPORT)])
+    assert second.exit_code == 0, second.output
+    assert "imported 6 messages into 2 chats" in second.stdout
+    # the units were already embedded, so the second run has nothing left to embed
+    assert "embedded 0 units" in second.stdout
+    conn = db.connect(Paths.from_env())
+    try:
+        assert db.message_counts(conn) == {EXPATS_ID: 3, BOAT_ID: 3}
+        assert [chat.source_id for chat in db.list_chats(conn)] == [
+            "import:valencia-expats",
+            "import:двое-в-лодке",
+        ]
+    finally:
+        conn.close()
+
+
+def test_import_over_a_chat_synced_from_telegram_is_refused_by_name(tmp_home: Path) -> None:
+    """`db.upsert_chat` overwrites `source_id`, so an import over a live chat would retag it and
+    hide it from the source that fetches it."""
+    paths = Paths.from_env()
+    conn = db.connect(paths)
+    db.migrate(conn)
+    db.upsert_chat(
+        conn, ChatRow(id=EXPATS_ID, type="supergroup", title="Live", source_id="folder:Spain")
+    )
+    conn.close()
+    result = runner.invoke(cli.app, ["import", str(EXPORT)])
+    assert result.exit_code == 1
+    assert "already indexed from Telegram through folder:Spain" in result.stderr
+    # refused as a whole, before a row of any chat of the export was written
+    assert _chats(paths)[EXPATS_ID].source_id == "folder:Spain"
+    conn = db.connect(paths)
+    try:
+        assert db.message_counts(conn) == {}
+    finally:
+        conn.close()
+
+
+def test_import_applies_chat_title_to_a_single_chat_export(tmp_home: Path) -> None:
+    directory = _single_chat_export(tmp_path=tmp_home, name=None)
+    result = runner.invoke(cli.app, ["import", str(directory), "--chat-title", "Пикник 2019"])
+    assert result.exit_code == 0, result.output
+    stored = _chats(Paths.from_env())[-555]
+    assert stored.title == "Пикник 2019"
+    assert stored.source_id == "import:пикник-2019"
+
+
+def test_import_refuses_chat_title_for_a_multi_chat_export(tmp_home: Path) -> None:
+    result = runner.invoke(cli.app, ["import", str(EXPORT), "--chat-title", "One"])
+    assert result.exit_code == 1
+    assert result.stdout == ""
+    assert "--chat-title names one chat and this export holds 2" in result.stderr
+    assert _chats(Paths.from_env()) == {}
+
+
+def test_import_of_a_directory_without_an_export_is_a_clean_error(tmp_home: Path) -> None:
+    empty = tmp_home / "elsewhere"
+    empty.mkdir()
+    result = runner.invoke(cli.app, ["import", str(empty)])
+    assert result.exit_code == 1
+    assert result.stdout == ""
+    assert "holds no result.json or messages.json" in result.stderr
+
+
+def test_import_of_an_export_with_no_readable_chat_is_a_clean_error(tmp_home: Path) -> None:
+    directory = _single_chat_export(tmp_path=tmp_home, type="channel_of_the_future")
+    result = runner.invoke(cli.app, ["import", str(directory)])
+    assert result.exit_code == 1
+    assert "unknown export type" in result.stderr
+    assert "the export holds no chat this version can read" in result.stderr
+
+
+def test_import_reports_a_held_sync_lock_as_a_clean_error(tmp_home: Path) -> None:
+    paths = Paths.from_env()
+    with sync.SyncLock(paths):
+        result = runner.invoke(cli.app, ["import", str(EXPORT)])
+    assert result.exit_code == 1
+    assert "another sync is running" in result.stderr
+    assert _chats(paths) == {}
+
+
+def test_import_keeps_the_messages_when_the_dense_index_was_built_elsewhere(
+    tmp_home: Path,
+) -> None:
+    """A model change is the embedding step's problem, never the import's: the export is stored
+    and searchable lexically, and the mismatch is a warning naming the way out."""
+    conn = db.connect(Paths.from_env())
+    db.migrate(conn)
+    db.set_meta(conn, db.META_EMBED_MODEL, "some-other-model")
+    conn.close()
+    result = runner.invoke(cli.app, ["import", str(EXPORT)])
+    assert result.exit_code == 0, result.output
+    assert "warning: dense index not updated:" in result.stderr
+    assert "embed --reembed" in result.stderr
+    assert "next: grepogram embed" in result.stdout
+    assert _chats(Paths.from_env())[EXPATS_ID].source_id == "import:valencia-expats"
+
+
+def test_import_without_an_embedding_model_says_what_finishes_the_job(
+    tmp_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An import is offline and its messages are searchable lexically the moment they land, so a
+    missing model is a warning and the chat is still imported."""
+
+    def unavailable(cfg: object) -> Any:
+        raise ModelUnavailable("no torch here")
+
+    monkeypatch.setattr(embed, "load_embedder", unavailable)
+    result = runner.invoke(cli.app, ["import", str(EXPORT)])
+    assert result.exit_code == 0, result.output
+    assert "warning: dense index not updated: no torch here" in result.stderr
+    assert "next: grepogram embed" in result.stdout
+    assert _chats(Paths.from_env())[EXPATS_ID].source_id == "import:valencia-expats"

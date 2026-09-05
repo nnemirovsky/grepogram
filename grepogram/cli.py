@@ -15,6 +15,7 @@ one, or with ``--json`` the same document those tools return.
 """
 
 import asyncio
+import dataclasses
 import datetime as dt
 import functools
 import json
@@ -23,6 +24,7 @@ import sqlite3
 from collections.abc import Sequence
 from dataclasses import asdict
 from enum import StrEnum
+from pathlib import Path
 from typing import Annotated, NoReturn
 
 import typer
@@ -41,6 +43,7 @@ from grepogram import (
     search,
     sources,
     sync,
+    tdesktop,
     tg,
 )
 from grepogram.config import TEMPLATE, ConfigError
@@ -413,6 +416,122 @@ def _print_prune_report(report: PruneReport) -> None:
         typer.echo(f"warning: {warning}", err=True)
 
 
+@app.command("import")
+def import_cmd(
+    path: Annotated[
+        Path,
+        typer.Argument(
+            help="The export directory Telegram Desktop wrote, or the JSON file inside it.",
+            exists=True,
+            readable=True,
+        ),
+    ],
+    chat_title: Annotated[
+        str | None,
+        typer.Option(
+            "--chat-title",
+            help="Title for the chat this export holds; single-chat exports often carry none.",
+        ),
+    ] = None,
+) -> None:
+    """Index a Telegram Desktop export of a chat this account can no longer open (offline).
+
+    Export the chat from Telegram Desktop as JSON (Settings → Advanced → Export Telegram data,
+    machine-readable format), then point this at the directory it wrote. The messages are stored,
+    cut into units and indexed exactly as a sync's are, so `search` answers from them at once;
+    the chat is tagged `import:<slug>` and marked unavailable, so no sync ever fetches it and no
+    prune ever offers it. Running the same import again is safe: it updates what it already
+    stored rather than adding a second copy.
+    """
+    paths, cfg, conn = _load()
+    try:
+        export = tdesktop.read_export(path)
+        for warning in export.warnings:
+            typer.echo(f"warning: {warning}", err=True)
+        entries = _retitled(export.chats, chat_title)
+        embedder = _optional_embedder(cfg)
+        with sync.SyncLock(paths):
+            stored = sources.import_chats(conn, entries)
+            for item in stored:
+                pending = db.unindexed_message_ids(conn, item.chat.id)
+                sync.on_chat_synced(conn, item.chat, cfg, pending)
+            embedded = _embed_imported(conn, embedder)
+    except tdesktop.ExportError as exc:
+        fail(str(exc))
+    except (sources.SourceError, sync.SyncInProgress) as exc:
+        fail(str(exc), hint=getattr(exc, "hint", None))
+    finally:
+        conn.close()
+    _print_import(export, stored, embedded)
+
+
+def _retitled(
+    entries: Sequence[tdesktop.ImportedChat], title: str | None
+) -> list[tdesktop.ImportedChat]:
+    """``entries`` with ``--chat-title`` applied, which only a single-chat export can take.
+
+    The title decides the ``import:<slug>`` tag as well as what ``sources ls`` shows, so an
+    account export holding many chats has no one place to put it and says so instead of
+    renaming an arbitrary one.
+    """
+    if not entries:
+        fail("the export holds no chat this version can read")
+    if title is None:
+        return list(entries)
+    if len(entries) > 1:
+        fail(
+            f"--chat-title names one chat and this export holds {len(entries)}; "
+            "import it without the option and the export's own names are used"
+        )
+    entry = entries[0]
+    return [dataclasses.replace(entry, chat=dataclasses.replace(entry.chat, title=title))]
+
+
+def _embed_imported(conn: sqlite3.Connection, embedder: Embedder | None) -> int | None:
+    """Embed the units the import just cut; ``None`` when no model was there to do it.
+
+    The import is offline and the messages are searchable lexically the moment they are indexed,
+    so a missing model is a warning and never a failure — `grepogram embed` finishes the job.
+    """
+    if embedder is None:
+        return None
+    try:
+        index.ensure_embedding_space(conn, embedder)
+        return index.embed_dirty_units(conn, embedder)
+    except index.EmbeddingSpaceMismatch as exc:
+        typer.echo(f"warning: dense index not updated: {exc}", err=True)
+        return None
+
+
+def _print_import(
+    export: tdesktop.Export, stored: Sequence[sources.Imported], embedded: int | None
+) -> None:
+    typer.echo(f"read {export.path}")
+    _print_table(
+        ("id", "type", "title", "messages", "source"),
+        [
+            (
+                str(item.chat.id),
+                item.chat.type,
+                item.chat.title or "-",
+                str(item.messages),
+                item.source_id,
+            )
+            for item in stored
+        ],
+    )
+    total = sum(item.messages for item in stored)
+    typer.echo(f"imported {total} messages into {len(stored)} chats")
+    if export.service:
+        typer.echo(f"service messages skipped: {export.service}")
+    if export.skipped:
+        typer.echo(f"entries that could not be read: {export.skipped}")
+    if embedded is None:
+        typer.echo("next: grepogram embed (to make the imported chats searchable by meaning)")
+    else:
+        typer.echo(f"embedded {embedded} units")
+
+
 @app.command("embed")
 def embed_cmd(
     reembed: Annotated[
@@ -644,14 +763,17 @@ def sources_add(
     ] = False,
 ) -> None:
     """Add a folder or chat to the indexed sources and save the config; needs a session."""
-    paths = Paths.from_env()
-    cfg = _load_config(paths)
+    paths, cfg, conn = _load()
     _require_api_keys(cfg, paths)
     try:
         parsed = sources.parse_target(target)
         tg.ensure_session_mode(paths)
         client = tg.make_client(cfg, paths)
         added = asyncio.run(_add_source(client, cfg, parsed, since, comments))
+        # the index is opened for this one check: a chat held as a Telegram Desktop import must
+        # not gain a live source, because `db.upsert_chat` overwrites `source_id` and the next
+        # sync would drop the `import:` tag every protection of that history keys on
+        sources.refuse_imported(conn, added.dialogs)
         # the target was resolved over the network; the source is applied to the file as it is
         # by now, under the config lock, not to the snapshot read before the round trip — the
         # MCP server may have saved a change (a removed source) in the meantime
@@ -661,6 +783,8 @@ def sources_add(
         fail(str(exc), hint=getattr(exc, "hint", None))
     except (tg_errors.RPCError, ConnectionError) as exc:
         fail(f"telegram error: {exc}")
+    finally:
+        conn.close()
     if added.folder is not None:
         what = f"folder {added.title!r} with {len(added.dialogs)} chats"
     else:

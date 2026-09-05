@@ -860,23 +860,31 @@ Task 15's `sources add` guard, or the import protection silently evaporates.
 **Files:**
 - Modify: `grepogram/cli.py`
 - Modify: `grepogram/sources.py`
+- Modify: `grepogram/mcp.py` (➕ the MCP `sources_add` tool is the second door to the same
+  operation and carries the same guard)
 - Modify: `tests/test_cli.py`
 - Modify: `tests/test_sources.py`
+- Modify: `tests/test_mcp.py` (➕ the tool's guard is pinned where the other `sources_add` tests are)
 
-- [ ] add `grepogram import <dir> [--chat-title X]`, storing through `db.upsert_messages` so units,
+- [x] add `grepogram import <dir> [--chat-title X]`, storing through `db.upsert_messages` so units,
       FTS and vectors follow the normal path
-- [ ] mark the chat `unavailable = 1`, `last_msg_id = 0` and source id `import:<slug>`
-- [ ] refuse to import over a chat already synced from Telegram, naming it
-- [ ] refuse `sources add` for a chat that is already imported — `db.upsert_chat` (db.py:553-574)
+- [x] mark the chat `unavailable = 1`, `last_msg_id = 0` and source id `import:<slug>`
+- [x] refuse to import over a chat already synced from Telegram, naming it
+- [x] refuse `sources add` for a chat that is already imported — `db.upsert_chat` (db.py:553-574)
       overwrites `source_id` unconditionally, so without this guard `import:<slug>` silently
       becomes `chat:@x` and Task 9's prune protection evaporates. **`sources_add` (cli.py:470-511)
       opens no database connection at all** — it uses `Paths.from_env()` and `_load_config`, never
       `_load()` — so this task must add one, and check the MCP `sources_add` tool the same way
-- [ ] index what was imported at the end of the command, so it is searchable immediately
-- [ ] write tests: an import creates a searchable chat; a second import of the same export is
+- [x] index what was imported at the end of the command, so it is searchable immediately
+- [x] write tests: an import creates a searchable chat; a second import of the same export is
       idempotent; importing over a live chat is refused; `sources add` over an imported chat is
       refused and the source id survives
-- [ ] run tests — must pass before task 16
+- [x] run tests — must pass before task 16
+
+➕ `sources.import_source_ids` disambiguates a slug two chats would share (two contacts of one
+name in an export, or a slug an earlier import claimed) with the chat's own id — a shared
+`import:` id would make `sources rm` on either delete both. ➕ The refusal points at
+`grepogram sources rm import:<slug>`, which `find_source` already answers for; a test pins that.
 
 ### Task 16: Prepare the repository to be public
 

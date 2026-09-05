@@ -714,7 +714,9 @@ async def sources_add(target: str, since: str | None = None, comments: bool = Fa
     t.me link, `folder:<name>`, or a chat / folder title (fuzzy; an ambiguous one comes back as
     `error` with `candidates`). `since` (YYYY-MM-DD) skips older history on the first sync;
     `comments=true` (channels only) also indexes the linked discussion threads. Returns the
-    stored `source` and the `chats` it covers; call `sync` afterwards.
+    stored `source` and the `chats` it covers; call `sync` afterwards. A chat already in the
+    index as a Telegram Desktop import comes back as `error`: a live source would take it over
+    on the next sync and the imported history would be lost.
     """
     state = _app()
     parsed = sourcing.parse_target(target)
@@ -723,6 +725,9 @@ async def sources_add(target: str, since: str | None = None, comments: bool = Fa
         added = await sourcing.add_source(
             state.config(), parsed, catalog, since=since, comments=comments
         )
+    # `db.upsert_chat` overwrites `source_id`, so a live source over an imported chat would drop
+    # the `import:` tag every protection of that history keys on; the CLI refuses the same way
+    sourcing.refuse_imported(state.conn, added.dialogs)
     dialog = None if added.folder is not None else added.dialogs[0]
     with state.editing_config() as current:
         state.save_config(sourcing.with_source(current, added.source, dialog))
