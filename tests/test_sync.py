@@ -1104,6 +1104,63 @@ async def test_a_chat_the_account_cannot_resolve_costs_that_chat_its_turn(
     assert db.get_message(conn, gone, 7) is not None, "and the one it could not kept its rows"
 
 
+async def test_a_session_revoked_mid_sweep_stops_it_with_the_auth_hint(
+    conn: sqlite3.Connection, paths: Paths
+) -> None:
+    """Every ``UnauthorizedError`` is an ``RPCError``, so the per-chat handler read a revoked
+    session as one chat that could not be swept and carried on asking with a dead key, chat
+    after chat, ending in a wall of warnings and an exit code of zero.
+
+    ``_sync_chats`` re-raises it ahead of its own ``RPCError`` handler for exactly this reason:
+    only a raised one reaches ``tg.connected``'s ``wrap_auth_errors``, which is what turns it
+    into an ``AuthRequired`` carrying the ``grepogram auth`` hint.
+    """
+    client = _client(messages={ARG_ID: _talk(101, 102)})
+    cfg = _cfg(ARG_SOURCE)
+    await _run(client, conn, paths, cfg)
+    client.failures[ARG_ID] = errors.AuthKeyUnregisteredError(request=None)
+
+    with pytest.raises(tg.AuthRequired):
+        await _prune(client, conn, paths, cfg)
+
+
+@pytest.mark.parametrize("at", ["dialogs", "channel"])
+async def test_the_warm_up_reraises_a_revoked_session_and_swallows_the_rest(
+    at: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The warm-up is worth failing a pass for in one case only.
+
+    A chat it cannot resolve is left to the caller's per-chat handler — that is the whole of its
+    contract — but a session Telegram has revoked resolves nothing at all, ever, and both of its
+    handlers caught ``RPCError``, of which every ``UnauthorizedError`` is one. The pass behind it
+    then reported every chat as unresolvable and exited 0.
+    """
+    client = _client()
+    chats = [ChatRow(id=DISC_ID, type="supergroup", title="News chat", discussion_of=NEWS_ID)]
+    revoked = errors.AuthKeyUnregisteredError(request=None)
+    other: Exception = errors.ChannelPrivateError(request=None)
+
+    def arm(error: Exception) -> None:
+        if at == "channel":
+            client.responses[functions.channels.GetFullChannelRequest] = error
+            return
+
+        async def raising(*_: Any, **__: Any) -> list[Any]:
+            raise error
+
+        monkeypatch.setattr(client, "get_dialogs", raising)
+
+    arm(revoked)
+    with pytest.raises(tg.AuthRequired):
+        async with tg.connected(client):
+            await sync.warm_peer_cache(client, chats)
+
+    arm(other)
+    async with tg.connected(client):
+        # anything else is still swallowed: the chat is left to the caller's per-chat handler
+        await sync.warm_peer_cache(client, chats)
+
+
 async def test_an_imported_or_unavailable_chat_is_never_asked_about(
     conn: sqlite3.Connection, paths: Paths
 ) -> None:

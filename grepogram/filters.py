@@ -2,11 +2,12 @@
 indexed ``chats`` table into the :class:`~grepogram.models.Filters` the search layer applies.
 
 A chat spec is anything :func:`grepogram.sources.parse_target` understands — a marked id,
-``@username``, a ``t.me`` link, ``folder:<name>`` — or free text. Free text names a folder
-(through ``chats.source_id``) or matches chat titles and usernames the way ``grepogram dialogs``
-does: substring hits win, a ``SequenceMatcher`` ratio of at least 0.6 is the fallback when there
-is none. Every spec must select at least one indexed chat, and the union over all specs becomes
-``chat_ids``. Dates are unix seconds in UTC; naive input is read as UTC.
+``@username``, a ``t.me`` link, ``folder:<name>`` — plus ``import:<slug>``, the source id an
+export carries, or free text. The two prefixed forms read ``chats.source_id`` and are matched
+alike (exact on the name, then scored); free text matches chat titles and usernames the way
+``grepogram dialogs`` does: substring hits win, a ``SequenceMatcher`` ratio of at least 0.6 is
+the fallback when there is none. Every spec must select at least one indexed chat, and the union
+over all specs becomes ``chat_ids``. Dates are unix seconds in UTC; naive input is read as UTC.
 
 :func:`resolve_chat` reads the same specs for the readers (``thread``, ``context``) that address
 one message and therefore need exactly one chat: several is :class:`AmbiguousChat` there rather
@@ -22,7 +23,14 @@ from collections.abc import Sequence
 
 from grepogram import db, dialogs
 from grepogram.models import ChatRow, Config, Filters, Source
-from grepogram.sources import FOLDER_PREFIX, InvalidTarget, Target, parse_target, same_target
+from grepogram.sources import (
+    FOLDER_PREFIX,
+    IMPORT_PREFIX,
+    InvalidTarget,
+    Target,
+    parse_target,
+    same_target,
+)
 
 WHEN_GRAMMAR = (
     "an ISO date (2025-06-01), month (2025-06) or datetime (2025-06-01T14:30[:00][Z|+03:00]), "
@@ -128,11 +136,12 @@ def resolve_chats(conn: sqlite3.Connection, cfg: Config, specs: Sequence[str]) -
     """Marked ids of the indexed chats the specs select, as one union.
 
     A marked id, ``@username`` or ``t.me`` link selects that chat; ``folder:<name>`` selects
-    the chats indexed through that folder source (exact name first, then the same matching as
-    free text); free text selects every folder and chat whose name contains it, or — when
-    nothing does — every one within ``SequenceMatcher`` reach. A spec that selects nothing
-    raises :class:`UnknownChat` listing the indexed folders and chats; ``cfg`` only serves that
-    message, so a configured source that has never been synced is called out as such.
+    the chats indexed through that folder source and ``import:<slug>`` the chat an export was
+    stored as (both exact on the name first, then the same matching as free text); free text
+    selects every folder and chat whose name contains it, or — when nothing does — every one
+    within ``SequenceMatcher`` reach. A spec that selects nothing raises :class:`UnknownChat`
+    listing the indexed folders and chats; ``cfg`` only serves that message, so a configured
+    source that has never been synced is called out as such.
     """
     chats = db.list_chats(conn)
     selected: set[int] = set()
@@ -167,18 +176,29 @@ def _resolve_spec(spec: str, chats: list[ChatRow], cfg: Config) -> set[int]:
 
 
 def _select(target: Target, chats: list[ChatRow]) -> set[int]:
+    """The chats ``target`` selects; empty when it names none.
+
+    ``import:<slug>`` is read here and not by :func:`~grepogram.sources.parse_target`, which
+    leaves it a fuzzy target: the score would be taken over the *whole typed string*, seven
+    characters of ``import:`` in front of a slug that is often shorter than that, and no such
+    spec could reach :data:`grepogram.dialogs.FUZZY_MIN_RATIO`. It is the same reason
+    :func:`grepogram.sources.find_source` matches the id exactly on the other side of this
+    feature, and the two resolvers of a user-typed spec against ``chats.source_id`` have to
+    agree: an ``import:`` id is what ``sources ls``, the MCP ``sources`` tool and every refusal
+    message print, so it must scope a search and a reader exactly as ``folder:`` does.
+    """
     if target.kind == "id":
         return {chat.id for chat in chats if chat.id == target.value}
     if target.kind == "username":
         wanted = target.text.casefold()
         return {chat.id for chat in chats if (chat.username or "").casefold() == wanted}
-    folders = _folders(chats)
+    folders = _tagged(chats, FOLDER_PREFIX)
     query = dialogs.normalize(target.text)
     if target.kind == "folder":
-        exact = [ids for name, ids in folders.items() if dialogs.normalize(name) == query]
-        if exact:
-            return set().union(*exact)
-        return _best_tier([(dialogs.score(query, name), ids) for name, ids in folders.items()])
+        return _by_name(query, folders)
+    if target.text.casefold().startswith(IMPORT_PREFIX):
+        slug = dialogs.normalize(target.text[len(IMPORT_PREFIX) :])
+        return _by_name(slug, _tagged(chats, IMPORT_PREFIX))
     scored = [(dialogs.score(query, name), ids) for name, ids in folders.items()]
     for chat in chats:
         value = dialogs.score(query, chat.title or "")
@@ -186,6 +206,15 @@ def _select(target: Target, chats: list[ChatRow]) -> set[int]:
             value = max(value, dialogs.score(query, chat.username))
         scored.append((value, {chat.id}))
     return _best_tier(scored)
+
+
+def _by_name(query: str, tagged: dict[str, set[int]]) -> set[int]:
+    """The chats a ``folder:`` or ``import:`` spec selects: the source whose name is exactly
+    ``query`` when there is one, else the best tier of the scored names."""
+    exact = [ids for name, ids in tagged.items() if dialogs.normalize(name) == query]
+    if exact:
+        return set().union(*exact)
+    return _best_tier([(dialogs.score(query, name), ids) for name, ids in tagged.items()])
 
 
 def _best_tier(scored: list[tuple[float, set[int]]]) -> set[int]:
@@ -196,17 +225,17 @@ def _best_tier(scored: list[tuple[float, set[int]]]) -> set[int]:
     return set().union(*tier)
 
 
-def _folders(chats: list[ChatRow]) -> dict[str, set[int]]:
-    """Folder name → ids of the chats indexed through that folder source."""
-    folders: dict[str, set[int]] = {}
+def _tagged(chats: list[ChatRow], prefix: str) -> dict[str, set[int]]:
+    """Source name (the id past ``prefix``) → ids of the chats indexed through that source."""
+    tagged: dict[str, set[int]] = {}
     for chat in chats:
-        if chat.source_id and chat.source_id.startswith(FOLDER_PREFIX):
-            folders.setdefault(chat.source_id[len(FOLDER_PREFIX) :], set()).add(chat.id)
-    return folders
+        if chat.source_id and chat.source_id.startswith(prefix):
+            tagged.setdefault(chat.source_id[len(prefix) :], set()).add(chat.id)
+    return tagged
 
 
 def _describe(chats: list[ChatRow]) -> list[str]:
-    folders = _folders(chats)
+    folders = _tagged(chats, FOLDER_PREFIX)
     listing = [f"{FOLDER_PREFIX}{name} ({len(ids)} chats)" for name, ids in sorted(folders.items())]
     listing += [_label(chat) for chat in _by_title(chats)]
     return listing

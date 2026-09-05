@@ -470,13 +470,14 @@ async def search(
     Hits are conversation units — time windows, reply threads, channel posts — with `chat`,
     `kind`, `date_start`/`date_end` (unix seconds, UTC), `anchor_msg_id` (the message the link
     opens), `url`, `snippet` and `msg_ids`; `full=true` adds the whole unit `text`. `chats`
-    restricts the search: each entry is a chat id, `@username`, t.me link, `folder:<name>` or
-    a chat / folder title (fuzzy). `since` / `until` take an ISO date (2025-06-01), month
-    (2025-06), datetime (2025-06-01T14:30) or an age such as 7d, 3w, 6m, 1y; `until` is
-    inclusive. `mode`: `hybrid` fuses stemmed BM25 with dense embeddings (default), `lexical` is
-    BM25 only (exact tokens, names, numbers), `dense` is embeddings only (paraphrase); without
-    vectors or the model every mode falls back to lexical and says so in `warnings`. `rerank`
-    re-scores the top candidates with a cross-encoder. A stale index is refreshed briefly first
+    restricts the search: each entry is a chat id, `@username`, t.me link, `folder:<name>`,
+    `import:<slug>` (a source id `sources` reports) or a chat / folder title (fuzzy). `since` /
+    `until` take an ISO date (2025-06-01), month (2025-06), datetime (2025-06-01T14:30) or an
+    age such as 7d, 3w, 6m, 1y; `until` is inclusive. `mode`: `hybrid` fuses stemmed BM25 with
+    dense embeddings (default), `lexical` is BM25 only (exact tokens, names, numbers), `dense`
+    is embeddings only (paraphrase); without vectors or the model every mode falls back to
+    lexical and says so in `warnings`. `rerank` re-scores the top candidates with a
+    cross-encoder. A stale index is refreshed briefly first
     (`synced=true`); problems with that refresh are `warnings`, the hits are still valid.
     `index_age_min` is the age of the index. A bad filter comes back as `error` with `hint` and
     `candidates`.

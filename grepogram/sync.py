@@ -1754,6 +1754,8 @@ async def prune_deleted(
                 )
                 tally.remaining.extend(rest.id for rest in targets[position:])
                 break
+            except errors.UnauthorizedError:
+                raise
             except (errors.RPCError, ValueError) as exc:
                 log.warning(
                     "chat %s (%s): %s; nothing was removed from it", chat.id, chat.title, exc
@@ -1839,12 +1841,19 @@ async def warm_peer_cache(client: Any, chats: Sequence[ChatRow]) -> None:
     Nothing here is worth failing a pass for: a chat neither route resolves is left to the
     caller's per-chat handler, which costs that chat its turn and reports it, and a Telegram
     error during the warm-up (a flood wait included) resurfaces on the very next request the
-    pass makes, where it is handled properly.
+    pass makes, where it is handled properly. An ``UnauthorizedError`` is the exception both
+    handlers make, for the reason :func:`_sync_chats` makes it: a session revoked mid-run is not
+    a chat that would not resolve, and only re-raising lets
+    :func:`grepogram.tg.wrap_auth_errors` turn it into an :class:`~grepogram.tg.AuthRequired`
+    with the ``grepogram auth`` hint instead of a wall of per-chat warnings and an exit code of
+    zero.
     """
     if not chats:
         return
     try:
         listed = {int(dialog.id) for dialog in await client.get_dialogs(ignore_migrated=True)}
+    except errors.UnauthorizedError:
+        raise
     except (errors.RPCError, ValueError) as exc:
         log.warning("could not read the dialog list to resolve %d chats: %s", len(chats), exc)
         return
@@ -1854,6 +1863,8 @@ async def warm_peer_cache(client: Any, chats: Sequence[ChatRow]) -> None:
             continue
         try:
             await client(functions.channels.GetFullChannelRequest(chat.discussion_of))
+        except errors.UnauthorizedError:
+            raise
         except (errors.RPCError, ValueError) as exc:
             log.warning(
                 "chat %s (%s): channel %s, which it holds the comments of, could not be read, "

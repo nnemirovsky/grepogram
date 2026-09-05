@@ -828,6 +828,13 @@ async def folder_membership(cfg: Config, catalog: DialogCatalog) -> FolderMember
     A folder's membership is the chats it shows plus the explicit peers it names, resolvable or
     not: :func:`folder_dialogs` drops a peer whose entity Telegram will not hand over (a channel
     gone private, say), and such a peer is still very much listed by the folder.
+
+    An ``UnauthorizedError`` is re-raised rather than recorded, the way
+    :func:`grepogram.sync._sync_chats` re-raises it: every ``UnauthorizedError`` is an
+    ``RPCError``, and a session revoked mid-scan is not a source Telegram would not answer for
+    but a session that answers for none. Raised, it reaches
+    :func:`grepogram.tg.wrap_auth_errors` and the user is told to run ``grepogram auth``
+    instead of to try again once Telegram comes back.
     """
     listed: dict[str, set[int]] = {}
     failed: dict[str, str] = {}
@@ -837,6 +844,8 @@ async def folder_membership(cfg: Config, catalog: DialogCatalog) -> FolderMember
         try:
             folder = await find_folder(source.folder, catalog)
             members = await folder_dialogs(folder, catalog)
+        except errors.UnauthorizedError:
+            raise
         except (SourceError, errors.RPCError) as exc:
             log.warning("cannot check source %s: %s", source.id, exc)
             failed[source.id] = str(exc)

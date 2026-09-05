@@ -1208,6 +1208,19 @@ async def test_folder_membership_records_a_transient_rpc_error() -> None:
     assert "wait" in membership.failed["folder:Argentina"].casefold()
 
 
+async def test_folder_membership_reraises_a_revoked_session() -> None:
+    """Every ``UnauthorizedError`` is an ``RPCError``, so a session revoked mid-scan was
+    recorded as "these sources could not be checked" and the user was told to try again once
+    Telegram answers — which it never will until ``grepogram auth`` is run. Raised, it reaches
+    ``tg.connected``'s ``wrap_auth_errors`` and says so, the way ``sync._sync_chats`` does.
+    """
+    client = _client(entity_errors={GHOST_ID: errors.AuthKeyUnregisteredError(request=None)})
+    cfg = _cfg(Source(folder="Argentina"))
+    with pytest.raises(tg.AuthRequired):
+        async with tg.connected(client):
+            await sources.folder_membership(cfg, DialogCatalog(client))
+
+
 def test_prunable_offers_a_chat_the_folder_no_longer_lists(conn: sqlite3.Connection) -> None:
     _populate(conn)
     _store(conn, _left(), 4)

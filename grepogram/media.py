@@ -190,6 +190,8 @@ async def run(
                     "requests; run `grepogram extract` again later"
                 )
                 break
+            except errors.UnauthorizedError:
+                raise
             except (errors.RPCError, ValueError) as exc:
                 log.warning("chat %s: %s; its media was skipped this run", chat_id, exc)
                 warnings.append(f"chat {chat_id}: {exc}")

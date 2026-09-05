@@ -66,7 +66,7 @@ from grepogram.search import UnknownMessage
 HELP = "Local hybrid search over opt-in Telegram chats, exposed to Claude Code through MCP."
 _CHAT_HELP = (
     "The chat the message is in, naming exactly one indexed chat: id, @username, t.me link, "
-    "folder:<name> or a title (put -- before a negative id)."
+    "folder:<name>, import:<slug> or a title (put -- before a negative id)."
 )
 
 app = typer.Typer(name="grepogram", help=HELP, no_args_is_help=True, add_completion=False)
@@ -597,7 +597,8 @@ def search_cmd(
         typer.Option(
             "--chat",
             "-c",
-            help="Search only these chats: id, @username, folder:<name> or a title (repeatable).",
+            help="Search only these chats: id, @username, folder:<name>, import:<slug> or a "
+            "title (repeatable).",
         ),
     ] = None,
     since: Annotated[

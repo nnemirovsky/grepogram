@@ -259,7 +259,7 @@ argument, put `--` before it: `grepogram sources add --since 2024-01-01 -- -1001
 
 | option | meaning |
 |---|---|
-| `-c`, `--chat <spec>` | restrict to these chats (repeatable): id, `@username`, `t.me` link, `folder:<name>` or a title / folder name (substring, then fuzzy) |
+| `-c`, `--chat <spec>` | restrict to these chats (repeatable): id, `@username`, `t.me` link, `folder:<name>`, `import:<slug>` or a title / folder name (substring, then fuzzy) |
 | `--since <when>`, `--until <when>` | date bounds on the unit's start: an ISO date (`2025-06-01`), month (`2025-06`), datetime (`2025-06-01T14:30`, optional seconds and `Z` / `+03:00`) or an age (`7d`, `3w`, `6m`, `1y`); `--until` is inclusive; naive input is UTC |
 | `--mode hybrid\|lexical\|dense` | `hybrid` (default) fuses BM25 and embeddings, `lexical` is BM25 over stems only, `dense` is embeddings only; without vectors or a model every mode falls back to lexical with a warning |
 | `-k`, `--limit N` | number of hits (default `[search] k`) |
@@ -651,9 +651,10 @@ reranker that cannot load adds `reranking unavailable: …` and the fused order 
 means CPU with a one-time warning in the log.
 
 **Filters.** Chat specs are resolved against the indexed chats — an id, `@username`, a `t.me`
-link, `folder:<name>` (through the source that pulled the chats in), or free text matched against
-titles, usernames and folder names (substring first, then a `SequenceMatcher` ratio of at least
-0.6; all hits of the best tier are searched). A spec that matches nothing is an error listing what
+link, `folder:<name>` or `import:<slug>` (through the source that pulled the chats in, matched
+exactly and then fuzzily on the name past the prefix), or free text matched against titles,
+usernames and folder names (substring first, then a `SequenceMatcher` ratio of at least 0.6; all
+hits of the best tier are searched). A spec that matches nothing is an error listing what
 is indexed. Date bounds apply to the unit's start time; `until` covers the whole day or month
 named; relative ages (`6m`) step the calendar rather than counting 30-day months.
 

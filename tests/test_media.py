@@ -706,6 +706,28 @@ async def test_an_rpc_error_costs_one_chat_its_turn_and_the_rest_runs(
     assert _states(conn) == {1: db.MEDIA_PENDING, 2: db.MEDIA_EXTRACTED}
 
 
+async def test_a_session_revoked_mid_pass_stops_it_with_the_auth_hint(
+    conn: sqlite3.Connection, scratch: Path
+) -> None:
+    """Every ``UnauthorizedError`` is an ``RPCError``, so the handler above read a revoked
+    session as one chat that could not be reached and went on downloading with a dead key, chat
+    after chat, ending in a wall of warnings and an exit code of zero.
+
+    ``sync._sync_chats`` re-raises it ahead of its own ``RPCError`` handler for exactly this
+    reason: only a raised one reaches ``tg.connected``'s ``wrap_auth_errors``, which turns it
+    into an ``AuthRequired`` carrying the ``grepogram auth`` hint.
+    """
+    db.upsert_chat(conn, _chat())
+    db.upsert_chat(conn, _chat(OTHER_ID))
+    db.upsert_messages(conn, [_pdf_row(CHAT_ID, 1), _pdf_row(OTHER_ID, 2)])
+    client = _pdf_client(1)
+    client.failures[OTHER_ID] = errors.AuthKeyUnregisteredError(request=None)
+
+    with pytest.raises(tg.AuthRequired):
+        async with tg.connected(client):
+            await media.run(conn, client, _cfg(), SyncBudget())
+
+
 async def test_an_unresolvable_peer_is_a_warning_not_a_traceback(
     conn: sqlite3.Connection, scratch: Path
 ) -> None:
