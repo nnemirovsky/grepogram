@@ -95,10 +95,15 @@ RECUT_MIN_BUDGET_S = 60.0
 
 A re-cut is started deliberately, never incidentally. The floor sits above
 ``search.auto_sync_budget_s`` (20 s by default) so the auto-sync inside an MCP ``search`` call
-never begins one, and an unlimited budget — ``SyncBudget.remaining is None``, what
-``grepogram sync`` without ``--budget`` gives — always qualifies. A run below the floor logs
-that a re-cut is pending and writes nothing; :func:`grepogram.search.search` re-derives the same
-condition and warns, which is how an MCP-only user learns to run ``grepogram sync``."""
+never begins one, and below the MCP ``sync`` tool's own ``budget_s`` default
+(:mod:`grepogram.mcp`, 120 s) so an explicit tool call does — that call is as deliberate as
+``grepogram sync``, and the pass is bounded by :data:`RECUT_CHATS_PER_RUN` and resumable through
+the per-chat markers, so a short deliberate window costs a few chats' work and no more. An
+unlimited budget — ``SyncBudget.remaining is None``, what ``grepogram sync`` without ``--budget``
+gives — always qualifies. A run below the floor logs that a re-cut is pending and writes nothing;
+:func:`grepogram.search.search` re-derives the same condition and warns, which is how a user who
+has only ever searched learns to sync. Move either number and ``tests/test_mcp.py`` fails: the
+two live in different modules and the order between them is the whole contract."""
 SELF_NAME = "me"
 UNKNOWN_FORWARD = "unknown"
 _LOCATION_MEDIA = (types.MessageMediaGeo, types.MessageMediaGeoLive, types.MessageMediaVenue)

@@ -131,8 +131,11 @@ never change the git identity.
   `_sync_chats`'s unbudgeted deferred `index_pending` loop to drain. **A short-budget run never
   starts one**: below `RECUT_MIN_BUDGET_S` the pass logs and returns (an unlimited budget,
   `remaining is None`, always qualifies), writes no flag, and `search` re-derives the condition
-  into `search.RECUT_PENDING` so an MCP-only user is told to run `grepogram sync` — the MCP
-  `sync` tool's own `budget_s = 45` default is below the floor on purpose. **The re-cut touches no
+  into `search.RECUT_PENDING` so a user who has only ever searched is told to sync. The floor
+  sits between two numbers in other modules and `tests/test_mcp.py` pins both: below it
+  `search.auto_sync_budget_s = 20`, so no `search` ever starts a re-cut, and above it the MCP
+  `sync` tool's own `budget_s = 120` default, so an explicit `sync()` — as deliberate as
+  `grepogram sync`, and bounded and resumable either way — does. **The re-cut touches no
   `messages` row**: unit boundaries change, message text does not, so no `indexed = 0` flagging
   and no `msg_fts` rewrite — flagging inside the transaction recovers nothing and flagging outside
   one is the backlog this design exists to prevent. The marker holds the version a chat was last

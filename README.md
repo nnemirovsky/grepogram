@@ -197,7 +197,7 @@ embedded. On a 47,000-unit index that is roughly an hour of local model time.
 
 It happens on its own, and it never takes the index down:
 
-- The re-cut runs at the end of `grepogram sync`, **four whole chats per run at most**. One
+- The re-cut runs at the end of a sync, **four whole chats per run at most**. One
   chat's delete, re-cut, index and progress marker are a single transaction, so search keeps
   answering throughout — from the chats that are through and the chats that are not alike.
 - An interrupted run loses nothing. Each finished chat is marked with the recipe it was cut at,
@@ -206,18 +206,20 @@ It happens on its own, and it never takes the index down:
   valid; they are just cut the old way in the chats that have not moved yet.
 
 **A run whose budget is under 60 seconds does not start one.** A one-time re-cut has no business
-being attempted inside a short automatic sync — but that floor has a consequence worth knowing:
-the MCP `sync` tool's default `budget_s = 45` is *below* it, and so is the automatic refresh the
-MCP `search` tool runs (`auto_sync_budget_s = 20`). **Drive grepogram only through an agent and
-the re-cut never starts by itself** — which is exactly what the warning on every search is there
-to tell you. Run it from a terminal:
+being attempted inside a short automatic sync, and the refresh the MCP `search` tool runs by
+itself is exactly that (`auto_sync_budget_s = 20`): searching never starts the re-cut, which is
+what the warning on every search is there to tell you. **A sync you ask for is a different
+matter** — the MCP `sync` tool's default `budget_s = 120` is *above* the floor, so an agent
+calling `sync()` with nothing passed moves the re-cut along, four chats at a time. Or run it from
+a terminal:
 
 ```sh
 grepogram sync                 # no --budget means unlimited, which always qualifies
 ```
 
-as many times as it takes for the warning to go, or call the MCP `sync` tool with a `budget_s` of
-at least 60. Either door works; the CLI is the one that works with nothing passed.
+as many times as it takes for the warning to go. Either door works; the terminal is the one with
+no budget at all, so it is the quickest way through a big index — and a `sync()` given a
+`budget_s` under 60 closes the door again, doing a plain fetch and nothing more.
 
 Nothing else about the upgrade needs doing. The schema migrates itself when the index is first
 opened, the config and the session carry over untouched, and the new `[media]` settings take their
@@ -380,7 +382,7 @@ advisory; the data next to them is valid.
 | `search` | `query`, `chats: list[str] \| null`, `since`, `until`, `k=10`, `mode="hybrid"`, `rerank=true`, `full=false` | `{hits, warnings, index_age_min, synced}`; each hit has `score` (a within-result-set number — it orders this answer and compares across nothing else), `chat` (id, type, title, username, …), `kind` (`window` / `thread` / `post`), `date_start`, `date_end` (unix seconds, UTC), `anchor_msg_id`, `url`, `fallback_url`, `snippet`, `msg_ids`, `text` (with `full`) |
 | `thread` | `chat_id`, `msg_id` | `{chat_id, msg_id, messages}`: the whole reply thread the message belongs to, root first; for a channel post, the post followed by its comments — those live in the discussion group, so the list spans two chats and each message names its own |
 | `context` | `chat_id`, `msg_id`, `before=15`, `after=15` | `{chat_id, msg_id, messages}`: the surrounding messages in the same chat, bounded to the message's own thread or forum topic where Telegram gave it one |
-| `sync` | `budget_s=45` | the sync report: `new`, `chats_done`, `chats_remaining`, `unavailable`, `warnings`, `index_age_min` |
+| `sync` | `budget_s=120` | the sync report: `new`, `chats_done`, `chats_remaining`, `unavailable`, `warnings`, `index_age_min` |
 | `sources` | — | `{sources, index_age_min}`: every configured source with its chats (`id`, `title`, `type`, `username`, `message_count`, `last_sync_at`, `unavailable`) |
 | `dialogs` | `query` | `{query, matches}`: chats and folders of the account matching the name; each match carries `kind`, `id`, `title`, `type`, `username`, `folders`, `score` and `target`, the string to pass to `sources_add` |
 | `sources_add` | `target`, `since=null`, `comments=false` | `{source, kind, title, chats, hint}` after saving the config |
@@ -396,9 +398,11 @@ back to `context` alongside its `msg_id`.
 Four CLI commands have **no tool here, deliberately**: `sources prune` and `prune-deleted` delete
 indexed history, `extract` is a long flood-exposed network pass, and `import` reads a directory
 the server has no reason to be looking at. They stay in the terminal, and an agent that needs one
-should say so rather than find it. The `sync` tool's default `budget_s = 45` is also below the
-60-second floor the one-time unit re-cut needs, so an upgraded index is not re-cut by an agent
-calling `sync()` with nothing passed — see [Upgrading from v0.1.x](#upgrading-from-v01x).
+should say so rather than find it. The `sync` tool's default `budget_s = 120` clears the
+60-second floor the one-time unit re-cut needs, so an agent calling `sync()` with nothing passed
+does move an upgraded index along; the automatic refresh inside `search`
+(`auto_sync_budget_s = 20`) stays below that floor and never starts one — see
+[Upgrading from v0.1.x](#upgrading-from-v01x).
 
 The server's `instructions` tell the agent how to use the tools: run two or three query variants
 (Russian and English, the specific term and the concept, synonyms), prefer `lexical` for exact

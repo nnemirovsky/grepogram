@@ -623,12 +623,20 @@ def _messages_result(chat_id: int, msg_id: int, views: Sequence[MessageView]) ->
 
 
 @guarded_async
-async def sync(budget_s: int = 45) -> ToolResult:
+async def sync(budget_s: int = 120) -> ToolResult:
     """Fetch new messages from every configured source into the index (needs a signed-in
     session). Runs for at most `budget_s` seconds and stops cleanly: `chats_remaining` lists
     what is still behind — call again to continue. Returns `new` (messages stored),
     `chats_done`, `chats_remaining`, `unavailable` (chats Telegram refused), `warnings` and
     `index_age_min`. New units are embedded when the model is available.
+
+    The 120-second default is chosen, not arbitrary: it clears the 60-second floor
+    (`sync.RECUT_MIN_BUDGET_S`) a pending one-time unit re-cut needs before it starts, so calling
+    this tool — a deliberate act, like `grepogram sync` in a terminal — lets that re-cut begin,
+    while the 20-second automatic sync inside `search` stays below the floor and never starts one
+    incidentally. The re-cut is bounded (four chats a run) and resumable, so a short-but-explicit
+    window is safe. Pass a `budget_s` under 60 and this call does a plain fetch, leaving the
+    re-cut — and the warning `search` returns about it — for a later one.
     """
     if budget_s <= 0:
         raise ValueError(f"budget_s must be a positive number of seconds, got {budget_s}")

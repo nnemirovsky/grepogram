@@ -89,8 +89,10 @@ RECUT_PENDING = (
 """Warning for the unit recipe a sync has not caught up with yet.
 
 The condition is re-derived here rather than flagged anywhere: a run whose budget is below
-:data:`grepogram.sync.RECUT_MIN_BUDGET_S` writes nothing, and an MCP-only user — whose syncs
-are the 20-second ones inside a ``search`` call — is exactly who never sees the log line."""
+:data:`grepogram.sync.RECUT_MIN_BUDGET_S` writes nothing, and an MCP-only user — whose automatic
+syncs are the 20-second ones inside a ``search`` call — is exactly who never sees the log line.
+This warning is what sends them to ``grepogram sync`` or to a ``sync`` tool call, whose 120-second
+default clears the floor."""
 SCORE_SPAN_EPSILON = 1e-6
 """The narrowest spread of rerank scores :func:`_with_reaction_bonus` will normalise across.
 

@@ -1,6 +1,7 @@
 import asyncio
 import dataclasses
 import fcntl
+import inspect
 import json
 import logging
 import os
@@ -509,6 +510,21 @@ async def test_sync_without_the_model_warns(
 
 async def test_sync_rejects_a_non_positive_budget(state: tools.AppState) -> None:
     assert (await tools.sync(budget_s=0))["error"].startswith("budget_s must be")
+
+
+def test_the_sync_tool_default_budget_clears_the_recut_floor() -> None:
+    """A ``sync()`` call with nothing passed must be able to start the one-time unit re-cut.
+
+    The floor (`sync.RECUT_MIN_BUDGET_S`) exists so a re-cut is never started incidentally, and
+    the automatic sync inside ``search`` sits below it for that reason. An explicit tool call is
+    the deliberate act the floor was drawn for — as much as ``grepogram sync`` is — so its default
+    belongs above the floor, or an MCP-only user never opens the door at all. The two numbers live
+    in different modules, and this is the whole of what keeps them in that order: the default is
+    read off the signature so it tracks whatever ``mcp.sync`` declares.
+    """
+    default = inspect.signature(tools.sync).parameters["budget_s"].default
+    assert default >= syncing.RECUT_MIN_BUDGET_S
+    assert Config().search.auto_sync_budget_s < syncing.RECUT_MIN_BUDGET_S
 
 
 async def test_sync_under_a_held_lock_carries_the_lock_hint(
@@ -1146,7 +1162,7 @@ async def test_server_lists_the_eight_tools_over_a_session(state: tools.AppState
         assert properties["mode"]["enum"] == ["hybrid", "lexical", "dense"]
         assert properties["k"]["default"] == 10 and properties["rerank"]["default"] is True
         assert search_tool.inputSchema["required"] == ["query"]
-        assert by_name["sync"].inputSchema["properties"]["budget_s"]["default"] == 45
+        assert by_name["sync"].inputSchema["properties"]["budget_s"]["default"] == 120
         assert by_name["context"].inputSchema["properties"]["before"]["default"] == 15
         assert by_name["sources"].inputSchema["properties"] == {}
         for tool in listed.tools:
