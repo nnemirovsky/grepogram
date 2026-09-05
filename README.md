@@ -205,21 +205,18 @@ It happens on its own, and it never takes the index down:
 - Until every chat is through, `search` returns a warning saying so. The hits next to it are
   valid; they are just cut the old way in the chats that have not moved yet.
 
-**A run whose budget is under 60 seconds does not start one.** A one-time re-cut has no business
-being attempted inside a short automatic sync, and the refresh the MCP `search` tool runs by
-itself is exactly that (`auto_sync_budget_s = 20`): searching never starts the re-cut, which is
-what the warning on every search is there to tell you. **A sync you ask for is a different
-matter** — the MCP `sync` tool's default `budget_s = 120` is *above* the floor, so an agent
-calling `sync()` with nothing passed moves the re-cut along, four chats at a time. Or run it from
-a terminal:
+**The automatic sync inside a `search` never starts one.** A one-time re-cut has no business
+being attempted inside a refresh nobody asked for, so that one refreshes messages and stops
+there — which is what the warning on every search is there to tell you. **A sync you ask for is a
+different matter**: `grepogram sync`, and the MCP `sync` tool, both move the re-cut along, four
+chats at a time, making whatever progress their budget allows. From a terminal:
 
 ```sh
-grepogram sync                 # no --budget means unlimited, which always qualifies
+grepogram sync                 # no --budget means unlimited
 ```
 
 as many times as it takes for the warning to go. Either door works; the terminal is the one with
-no budget at all, so it is the quickest way through a big index — and a `sync()` given a
-`budget_s` under 60 closes the door again, doing a plain fetch and nothing more.
+no budget at all, so it is the quickest way through a big index.
 
 Nothing else about the upgrade needs doing. The schema migrates itself when the index is first
 opened, the config and the session carry over untouched, and the new `[media]` settings take their
@@ -240,13 +237,13 @@ diagnostics and logs to stderr and the log file.
 | `grepogram auth` | sign in (phone, code, optional 2FA password) and store the session |
 | `grepogram dialogs <query> [-n N]` | find chats and folders of the account whose title, `@username` or folder name matches; prints kind, id, type, title, username, folders, score |
 | `grepogram sources add <target> [--since YYYY-MM-DD] [--comments]` | add a source and save the config; `target` is a chat id, `@username`, `t.me` link, `folder:<name>` or a fuzzy chat / folder title |
-| `grepogram sources ls` | configured sources with their chats, message counts and last sync |
+| `grepogram sources ls` | every source the index holds chats under — the configured ones first, then any others still in the database: an `import:<slug>` from `grepogram import`, and a source removed from the config whose chats are still stored — each with its chats, message counts and last sync |
 | `grepogram sources rm <target>` | remove a source and delete its chats' messages and index rows; `target` is a source id as `sources ls` prints it (`folder:<name>`, `chat:@name`, `chat:-100…`), a folder name, a chat id, `@username` or a fuzzy title; refuses while a sync is running |
 | `grepogram sources prune [--dry-run]` | delete the indexed chats a folder source no longer lists — what a folder holds *now* is only knowable from Telegram, so this one needs a session; it prints what would go and asks before deleting, keeps a channel's discussion group and says so, never offers an imported chat, and prunes nothing at all if a source failed to resolve |
 | `grepogram sync [--budget S]` | fetch new messages from every source, rebuild units, index and embed; stops cleanly after `S` seconds (at least 1) |
 | `grepogram extract [--budget S] [--retry-failed]` | read text out of the media already stored — photos through OCR, PDF and DOCX attachments — and re-cut the units holding it; a network pass, run after `sync`, resumable; `--retry-failed` queues what an earlier run could not read, and what this build had no extractor for, again. See [Reading Text Out of Media](#reading-text-out-of-media) |
 | `grepogram prune-deleted [--chat X] [--budget S]` | ask Telegram about every indexed message and drop the ones it no longer has, the discussion group of a channel included; about one request per hundred stored messages, so it is run by hand, resumes where it stopped and is never started by a sync |
-| `grepogram import <dir> [--chat-title T]` | index a Telegram Desktop JSON export of a chat this account can no longer open; offline, idempotent, and the chat it creates is marked unavailable so no sync fetches it and no prune offers it |
+| `grepogram import <dir> [--chat-title T]` | index a Telegram Desktop JSON export — one chat's `messages.json` or a whole account's `result.json`, every chat in it — of history this account can no longer open; offline, idempotent, and the chats it creates are marked unavailable so no sync fetches them and no prune offers them. `--chat-title` names the one chat of a single-chat export and is refused for an export holding several, which carry their own titles |
 | `grepogram embed [--reembed]` | embed units the dense index does not hold yet; `--reembed` drops every vector and starts over (needed after changing `[models] embed`); refuses while a sync is running |
 | `grepogram search <query> …` | search the index, see below |
 | `grepogram thread <chat> <msg_id> [--json]` | print the whole reply thread a message belongs to, root first; for a channel post, the post followed by its comments from the linked discussion group |
@@ -306,11 +303,17 @@ per hundred stored messages, which is why it is yours to run and never a sync's;
 cursor. Anything Telegram declines for some other reason is left where it is.
 
 `import` reads a Telegram Desktop export — Settings → Advanced → Export Telegram data, in the
-machine-readable JSON format — of a chat this account can no longer open. Its messages are stored,
-cut into units and indexed exactly as a sync's are, so `search` answers from them immediately, and
-the chat is tagged `import:<slug>` and marked unavailable so no sync fetches it and no prune
-offers it. Running the same import again updates what it stored rather than adding a second copy,
-and `sources add` over an imported chat is refused by name instead of quietly taking it over.
+machine-readable JSON format — of history this account can no longer open. Point it at the
+directory: a single chat's export (`messages.json`) is one chat, and a whole-account export
+(`result.json`) brings in **every chat it holds**, each under its own tag. `--chat-title` names
+the chat of a single-chat export, which carries no title of its own, and is refused for an export
+that holds several. Messages are stored, cut into units and indexed exactly as a sync's are, so
+`search` answers from them immediately; each chat is tagged `import:<slug>` and marked unavailable
+so no sync fetches it and no prune offers it. The units are embedded inline when the model is
+available, and when it is not the command says `next: grepogram embed`. Running the same import
+again updates what it stored rather than adding a second copy, `sources add` over an imported chat
+is refused by name instead of quietly taking it over, and a live source that later comes to cover
+one keeps its hands off it as well.
 
 ## Reading Text Out of Media
 
@@ -335,8 +338,10 @@ inside one, because a 400-page PDF or a slow OCR must not eat a sync's budget. `
 seconds like `sync`'s, a flood wait is respected the same way, each batch of 50 commits on its
 own so an interrupted run keeps what it earned, and the downloaded file is deleted whatever
 happens to it. Nothing is downloaded at all for media whose kind this build cannot read, or that
-`[media]` switches off: those are settled from the stored `media_kind` in three bulk updates
-before the first request.
+`[media]` switches off, or that is an attachment in a format nothing here reads: those are settled
+before the first request, from the stored `media_kind` and — for documents, where `.xlsx`, `.zip`
+and every other attachment share one kind — from the stored file name, which is enough to know
+that only `.pdf` and `.docx` can be read.
 
 **What the text does.** It is rendered into the unit's line for that message — next to a caption
 when there is one, in place of the bare placeholder when there is not — with the `[photo]` /
@@ -347,20 +352,33 @@ window, and all but the newest handful of any chat's history sits in windows clo
 re-cut units are indexed immediately and **embedded by the next `grepogram sync`** (or
 `grepogram embed`), which is what the command's closing line reminds you to run.
 
+**How much of a file is read.** At most 4000 characters per message, and the extractors stop
+reading once they are past it rather than parsing the rest. A 400-page PDF therefore contributes
+its opening and nothing else: the text is rendered into the unit holding that message, and a
+message longer than `units.window_max_chars` becomes a window of its own, so an uncapped contract
+would be one enormous unit no embedder sees the end of.
+
+**What OCR reads.** Russian and English only. Those are the languages grepogram asks Vision for,
+narrowed to what the running macOS actually supports, so a Spanish, Georgian or Greek screenshot
+comes back as whatever those two make of it — usually little, and the row is still recorded as
+read rather than failed.
+
 **What it needs.** The `media` extra, which brings `pypdf`, `python-docx` and — on macOS —
-`pyobjc-framework-Vision`. PDF and DOCX are pure Python and work anywhere. OCR is macOS Vision, so
-it needs a Mac, and **Russian recognition needs macOS 15**: Vision learned Russian there, and
-grepogram asks it what it supports and requests only that rather than failing the whole request
-over a language the system does not know. Where any of it is missing nothing breaks — the media is
-parked as "no extractor here" and `--retry-failed` picks it up once the extra is installed.
+`pyobjc-framework-Vision`. PDF and DOCX are pure Python and work anywhere, and only `.pdf` and
+`.docx` attachments are read at all — anything else is settled from the file name before it is
+fetched. OCR is macOS Vision, so it needs a Mac, and **Russian recognition needs macOS 15**:
+Vision learned Russian there, and grepogram asks it what it supports and requests only that rather
+than failing the whole request over a language the system does not know. Where any of it is
+missing nothing breaks — the media is parked as "no extractor here" and `--retry-failed` picks it
+up once the extra is installed.
 
 Every message with media carries a state, and `grepogram extract` reports them:
 
 | state | what it means | what to do about it |
 |---|---|---|
-| pending | not looked at yet | `grepogram extract` |
+| pending | not looked at yet | `grepogram extract` — except in an imported or unavailable chat, where nothing can be fetched and the media stays pending for good |
 | read | the file was read; the text may still be empty, which is what a photo holding no text looks like | nothing |
-| no extractor here | this build cannot read that kind: a video, sticker or poll (which nothing reads), a document without the `media` extra, a photo off macOS or without the extra, or a voice message or video note — those wait for whisper in v0.3.0 | install the `media` extra if it applies, then `grepogram extract --retry-failed` |
+| no extractor here | this build cannot read that kind: a video, sticker or poll (which nothing reads), an attachment that is neither PDF nor DOCX (a `.xlsx`, a `.zip`, an `.apk` — decided from the file name, never downloaded), a document without the `media` extra, a photo off macOS or without the extra, or a voice message or video note — those wait for whisper in v0.3.0 | install the `media` extra if it applies, then `grepogram extract --retry-failed` |
 | could not be read | a corrupt file, a mislabelled one (a `.docx` holding a PDF), a download that failed | `grepogram extract --retry-failed` |
 | too large to download | Telegram reported it larger than `media.max_download_mb`, so it was never fetched | raising the cap does not queue it again; nothing re-reads a skipped file |
 | switched off in `[media]` | `enabled`, `ocr` or `documents` is `false` for that kind | switch it back on — the next `extract` queues it again by itself |
@@ -382,14 +400,15 @@ advisory; the data next to them is valid.
 | `search` | `query`, `chats: list[str] \| null`, `since`, `until`, `k=10`, `mode="hybrid"`, `rerank=true`, `full=false` | `{hits, warnings, index_age_min, synced}`; each hit has `score` (a within-result-set number — it orders this answer and compares across nothing else), `chat` (id, type, title, username, …), `kind` (`window` / `thread` / `post`), `date_start`, `date_end` (unix seconds, UTC), `anchor_msg_id`, `url`, `fallback_url`, `snippet`, `msg_ids`, `text` (with `full`) |
 | `thread` | `chat_id`, `msg_id` | `{chat_id, msg_id, messages}`: the whole reply thread the message belongs to, root first; for a channel post, the post followed by its comments — those live in the discussion group, so the list spans two chats and each message names its own |
 | `context` | `chat_id`, `msg_id`, `before=15`, `after=15` | `{chat_id, msg_id, messages}`: the surrounding messages in the same chat, bounded to the message's own thread or forum topic where Telegram gave it one |
-| `sync` | `budget_s=120` | the sync report: `new`, `chats_done`, `chats_remaining`, `unavailable`, `warnings`, `index_age_min` |
-| `sources` | — | `{sources, index_age_min}`: every configured source with its chats (`id`, `title`, `type`, `username`, `message_count`, `last_sync_at`, `unavailable`) |
+| `sync` | `budget_s=45` | the sync report: `new`, `chats_done`, `chats_remaining`, `unavailable`, `warnings`, `index_age_min` |
+| `sources` | — | `{sources, index_age_min}`: every source the index holds chats under, with its chats (`id`, `title`, `type`, `username`, `message_count`, `last_sync_at`, `unavailable`) — the configured sources first, then any other `source_id` still in the database, including an `import:<slug>` from `grepogram import` |
 | `dialogs` | `query` | `{query, matches}`: chats and folders of the account matching the name; each match carries `kind`, `id`, `title`, `type`, `username`, `folders`, `score` and `target`, the string to pass to `sources_add` |
 | `sources_add` | `target`, `since=null`, `comments=false` | `{source, kind, title, chats, hint}` after saving the config |
 | `sources_remove` | `target` | `{source_id, removed_chat_ids, config_updated}` after deleting the chats' data; `target` is a source id from `sources` (`folder:<name>`, `chat:<value>`), a folder name, a chat id, `@username` or a fuzzy title; `error` while a sync is running |
 
 Messages in `thread` and `context` have `chat_id`, `msg_id`, `date`, `from_name`, `text` (a
-`[photo]`-style placeholder for media without a caption), `url`, `fallback_url` and
+`[photo]`-style placeholder for media without a caption, followed by whatever `grepogram extract`
+read off it), `url`, `fallback_url` and
 `reply_to_msg_id`. A message's `chat_id` is the chat it is really in, which the top-level one
 need not be: a channel post's comments come back under the discussion group's id, and comment
 ids collide with the channel's post ids (both number from 1), so pass a message's own `chat_id`
@@ -398,10 +417,9 @@ back to `context` alongside its `msg_id`.
 Four CLI commands have **no tool here, deliberately**: `sources prune` and `prune-deleted` delete
 indexed history, `extract` is a long flood-exposed network pass, and `import` reads a directory
 the server has no reason to be looking at. They stay in the terminal, and an agent that needs one
-should say so rather than find it. The `sync` tool's default `budget_s = 120` clears the
-60-second floor the one-time unit re-cut needs, so an agent calling `sync()` with nothing passed
-does move an upgraded index along; the automatic refresh inside `search`
-(`auto_sync_budget_s = 20`) stays below that floor and never starts one — see
+should say so rather than find it. The `sync` tool is also the door to the one-time unit re-cut:
+an explicit `sync()` moves an upgraded index along, four chats a run, while the automatic refresh
+inside `search` never starts one however long its budget — see
 [Upgrading from v0.1.x](#upgrading-from-v01x).
 
 The server's `instructions` tell the agent how to use the tools: run two or three query variants
@@ -791,6 +809,12 @@ connections are held open rather than refused — a firewall prompt nobody answe
   macOS 15. Everything a build cannot read is parked rather than retried, and `--retry-failed`
   queues it again once that changes. A file over `media.max_download_mb` is skipped for good:
   raising the cap later does not queue it again.
+- `grepogram import` reads the whole export file into memory at once — the decoded text, the
+  parsed object graph, and, when the file was cut short, one more pass over that same text to
+  recover it — so expect a few times the file's size in RAM. That is fine for the exports people
+  actually have; a whole-account export of several hundred megabytes is one to split, exporting
+  chat by chat from Telegram Desktop instead. An export that was cut short mid-write is still
+  read, up to its last complete message, and the command says so.
 - `since` on a source is that day's UTC midnight, and the bound is inclusive: a message stamped
   exactly at `00:00:00Z` is indexed. Telethon 1.44 hands `offset_date` to `messages.getHistory`
   untouched and filters nothing by date itself, so a `reverse=True` chunk is the complement of the

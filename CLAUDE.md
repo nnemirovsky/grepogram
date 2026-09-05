@@ -5,8 +5,9 @@ Python 3.12 pinned, `uv` only (no pip, no global installs), developed on macOS.
 
 ## Commands
 
-- `uv sync --managed-python --all-extras --all-groups` — full environment (the `dense` extra
-  brings torch and sentence-transformers). `--managed-python` is not decoration: sqlite-vec is a
+- `uv sync --managed-python --all-extras --all-groups` — full environment. The `dense` extra
+  brings torch and sentence-transformers; the `media` extra brings pypdf, python-docx and
+  pyobjc-framework-Vision. `--managed-python` is not decoration: sqlite-vec is a
   loadable extension, and uv would otherwise build the venv on whichever `python3.12` it finds
   first — python.org's macOS build and Apple's system Python are compiled without
   `--enable-loadable-sqlite-extensions`, so `db.connect` refuses them (`ExtensionsUnsupported`).
@@ -21,10 +22,37 @@ Python 3.12 pinned, `uv` only (no pip, no global installs), developed on macOS.
 - `uv run grepogram --help`, `uv run grepogram-mcp` — the CLI and the MCP server
 - all checks pass before every commit; CI (`.github/workflows/ci.yml`) runs them with
   `--group dev` only, `GREPOGRAM_FAKE_MODELS=1` and `HF_HUB_OFFLINE=1`
+- **CI installs no extras**, so the pure-Python half of an extra that the tests import must be
+  mirrored into the `dev` group — pypdf and python-docx are there for that reason (CONTRIBUTING.md
+  states the rule). What cannot be mirrored (torch, pyobjc) is what the tests must monkeypatch
+  around: a module-level `import docx` in a test file makes the whole module uncollectable on CI
 - `uv.lock` is committed and CI installs with `--locked`: after touching dependencies run
   `uv lock` and commit the lockfile
 - the version lives in `grepogram/__init__.py` only (`__version__`, read by hatch and
   `grepogram --version`)
+
+## Releasing
+
+`.github/workflows/release.yml` runs on a `v*` tag. In order:
+
+1. bump `__version__` in `grepogram/__init__.py`, commit, and push to `main`;
+2. tag it `vX.Y.Z` and push the tag — the workflow refuses a tag whose name does not match
+   `__version__`, so the two can never drift;
+3. it runs `uv build`, uploads `dist/` as an artifact (before the release step, so a failed
+   release still leaves the build to look at), and publishes with
+   `gh release create "$GITHUB_REF_NAME" dist/* --generate-notes --verify-tag` — `--verify-tag`
+   means the tag must already be on the remote;
+4. the `pypi` job is gated on the repository variable `PYPI_PUBLISH == 'true'` and `needs:
+   release`, downloads that artifact and uploads through trusted publishing (the `pypi`
+   environment, `id-token: write`, no API token). Until the variable is set the job skips, so a
+   tag pushed before the PyPI publisher exists still cuts a GitHub release instead of failing the
+   workflow.
+
+`ci.yml` is the per-push suite and is separate from this.
+
+`CONTRIBUTING.md` covers the same gates for an outside contributor, plus the PR flow; when the
+two disagree, this file is what the repository's own work follows and the other should be
+corrected to match.
 
 ## Commit convention
 
@@ -340,11 +368,18 @@ never change the git identity.
   (both autouse), `tmp_home`, `conn` (an in-memory index, migrated) and the `file_mode` helper.
   A module that needs more overrides `conn` by requesting it (`tests/test_filters.py`).
 - `tests/fakes.py` — `FakeClient` (async `get_dialogs`, `iter_messages` with Telethon's offset
-  semantics, `get_entity`, raw requests such as `GetDialogFiltersRequest`) driven by in-memory
-  fixtures, plus `make_*` builders for TL entities and dialogs.
+  semantics, `get_messages(entity, ids=…)`, `get_entity`, `download_media(message, file)`, raw
+  requests such as `GetDialogFiltersRequest`) driven by in-memory fixtures, plus `make_*` builders
+  for TL entities and dialogs. Two of those answers are signals the product reads, not
+  conveniences: a list `ids` answers one slot per id and `None` where a message is gone, which is
+  what `sync.prune_deleted` and `media.run` both key on, and the `downloads=` mapping keyed by
+  `(chat_id, msg_id)` is what a download writes (bytes, or an exception to raise).
 - `tests/fixtures/tl.py` — real Telethon `types.Message` objects built without a client (text,
   caption with photo, voice, document with filename, reply, forum topic, forward, service message,
   reactions, channel post).
+- `tests/fixtures/sample.pdf`, `tests/fixtures/sample.docx` — tiny hand-built documents the
+  extraction tests round-trip; `tests/fixtures/tdesktop_export.json` — a Telegram Desktop export
+  the import tests parse.
 - `tests/fixtures/chat_ru.py` — a 62-message bilingual corpus over two chats, loaded through the
   real pipeline (`upsert_messages` → `rebuild_for_chat` → `index_chat`); `PARAPHRASE` names the
   pair only the dense side can connect.

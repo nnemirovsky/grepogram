@@ -208,7 +208,17 @@ def find_export(path: Path) -> Path:
 
 
 def _load(path: Path, notes: _Notes) -> Any:
-    """The export's JSON, recovered up to its last complete object when the file was cut short."""
+    """The export's JSON, recovered up to its last complete object when the file was cut short.
+
+    **The whole file is held in memory, twice over.** ``read_text`` decodes it into a ``str``,
+    ``json.loads`` builds the object graph beside it, and the recovery scan below walks that same
+    string character by character — so a whole-account export runs at roughly three times the
+    file's size in RAM plus the parsed graph. That is deliberate: ``import`` is a one-off,
+    offline, interactive command, and a streaming parser would buy nothing for the exports people
+    actually have while making the truncation recovery impossible. An export large enough to be a
+    problem is one to split per chat (Telegram Desktop exports one chat at a time as well);
+    README's Known Limitations says so.
+    """
     try:
         text = path.read_text(encoding="utf-8")
     except (OSError, UnicodeDecodeError) as exc:

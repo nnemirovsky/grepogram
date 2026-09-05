@@ -985,6 +985,19 @@ upload. `actionlint` 1.7.12 reports no findings.
       the tree is id-scoped and transactional — `units.recut_chat` (delete + insert in one
       `db.transaction`), `units._apply`, `db._drop_units_and_index` — and `_recut_one` wraps the
       re-cut, the indexing and the marker in one more; nothing deletes units index-wide
+      — ➕ **superseded in review.** `RECUT_MIN_BUDGET_S` is gone. The floor did not achieve what
+      this item checked: `search.auto_sync_budget_s` is user-editable, so raising it to 90 silently
+      turned every `search` into a whole-index re-cutter — exactly what the guard forbade — while
+      an explicit sync whose fetch had already spent the budget never started one, precisely on the
+      backlogged indexes it existed for. Who may start a re-cut is now the caller's own
+      `sync_all(recut=...)` flag, `mcp._auto_sync` being the one caller that passes `False`; an
+      explicit sync makes whatever progress its budget allows, still bounded at
+      `RECUT_CHATS_PER_RUN` and resumable through the markers. The MCP `sync` default went back to
+      `budget_s = 45` (the 120 of `c5c456b` existed only to clear the floor) and
+      `test_the_sync_tool_default_budget_clears_the_recut_floor` was replaced by two behavioural
+      tests: a `search`'s auto-sync leaves the units and the recipe alone, and an explicit
+      `sync(budget_s=5)` re-cuts and stamps. Everything this item verified about transaction scope
+      still holds unchanged
 - [x] verify graceful degradation with the `media` extra absent and on a non-darwin platform — the
       CI environment exactly (`uv sync --locked --group dev`, no extras: no `Vision`, no `torch`,
       no `sentence_transformers`) runs the whole suite green, 1673 passed. With `pypdf` and
@@ -1015,6 +1028,13 @@ floor, so an MCP-only user who calls it with the default never starts the one-ti
 That is consistent with the design — `search.RECUT_PENDING` tells such a user to run `grepogram
 sync`, and the plan's own "The unit recipe" section says a re-cut is started deliberately — but it
 means the CLI is the only default-configuration door to it. Task 19's README work should say so.
+
+➕ **The second finding was fixed rather than documented.** Raising the default to 120
+(`c5c456b`) cleared the floor but did not survive review: the floor itself was the wrong
+mechanism, and both are gone. The MCP `sync` tool is back at `budget_s = 45` and is now a real
+door to the re-cut, because the flag — not the budget — decides. README and CLAUDE.md state that
+rule: the `search` auto-sync never starts a re-cut; any explicit sync may, and makes what progress
+its budget allows.
 
 ### Task 19: [Final] Update documentation and release
 

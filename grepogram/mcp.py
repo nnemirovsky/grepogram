@@ -667,10 +667,14 @@ async def sync(budget_s: int = 45) -> ToolResult:
 
 @guarded
 def sources() -> ToolResult:
-    """List the configured sources with the chats indexed through each: `id`, `title`, `type`,
-    `username`, `message_count`, `last_sync_at` (unix seconds, null before the first sync) and
-    `unavailable`. A source with no chats has not been synced yet. `index_age_min` is minutes
-    since the last completed sync (null before the first).
+    """List every source the index holds chats under, with the chats indexed through each: `id`,
+    `title`, `type`, `username`, `message_count`, `last_sync_at` (unix seconds, null before the
+    first sync) and `unavailable`. A source with no chats has not been synced yet.
+    `index_age_min` is minutes since the last completed sync (null before the first).
+
+    The configured sources come first, then any other `source_id` still in the database. An
+    `import:<slug>` is a Telegram Desktop export the user indexed from a file: those chats are
+    `unavailable` and no sync ever fetches them, but they are searched like any other.
     """
     state = _app()
     statuses = sourcing.sources_status(state.config(), state.conn)
