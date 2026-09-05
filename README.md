@@ -332,7 +332,7 @@ flood_sleep_threshold = 120
 | `search.auto_sync_after_min` | the MCP `search` tool runs a sync first when the index is older than this many minutes; the CLI only prints a note |
 | `search.auto_sync_budget_s` | the time cap of that automatic sync |
 | `units.window_gap_min` | a pause longer than this closes the current window |
-| `units.window_max_msgs`, `units.window_max_chars` | a window also closes at this many messages or this many characters of rendered text |
+| `units.window_max_msgs`, `units.window_max_chars` | a window also closes at this many messages, or before the message that would take its rendered text past this many characters — a ceiling, so only a single message longer than the whole budget exceeds it |
 | `units.thread_max_msgs` | a reply thread longer than this continues in further units, each repeating the root |
 | `sync.edit_refetch` | how many of the newest messages of each chat are re-read to pick up edits and reaction counts — after every sync that finishes the chat's incremental pass (skipped on the chat's first sync and when the budget stops the chat); for a channel with `comments` the re-read posts whose reply count grew get their threads fetched again |
 | `sync.flood_sleep_threshold` | Telethon sleeps through a `FloodWait` up to this many seconds; a longer one stops the run with a warning and the chats resume next time |
@@ -350,7 +350,8 @@ swaps both models for deterministic fakes (tests and CI only).
 **Units.** Single messages are too short to embed, and the answer to a question usually spans
 several of them. The index therefore holds *units*: per chat (and per forum topic) the history is
 cut into *windows* — chronological runs that end at a pause of more than `window_gap_min`
-minutes, at `window_max_msgs` messages or at `window_max_chars` characters; every message that
+minutes, at `window_max_msgs` messages, or before the message that would take the window past
+`window_max_chars` characters; every message that
 got replies and has no parent in the chat becomes the root of a *thread* (root plus all
 descendants, chronological, capped at `thread_max_msgs` with continuation units that repeat the
 root); every channel message is a *post*, and with `comments = true` a thread of the post with its
@@ -389,33 +390,36 @@ unit text, and a cap that let one of them see more of a unit than the other woul
 stages rank different documents. (The reranker spends part of that budget on the query, so it sees
 a little less of a long unit than the embedder does.)
 
-512 tokens was chosen on the assumption that a `window_max_chars = 1500` unit fits inside it. It
-does not, for two reasons. First, `window_max_chars` is not a ceiling on the finished text: it is
-the size at which a window *closes*, tested before the next message is added, so a closed window
-holds at least 1500 characters and however much more the message that carried it over the line
-brought with it — measured on a real 159,539-message index, window text runs to 3,453 characters
-at the top end against a median of 1,274. Second, 1500 characters is already about 470 tokens of
-this corpus, so even a window that stops exactly on the threshold has almost no headroom left.
+`window_max_chars` is a **ceiling** on a unit's finished text: a window closes *before* the
+message that would take it past 1500 characters, so a finished window never exceeds the cap. The
+one exception is a single message longer than the whole budget, which forms a window of its own
+rather than none. 1500 characters is about 470 tokens of this corpus, which is what 512 leaves
+headroom for.
 
-Measured over 400 random windows of that index with `BAAI/bge-m3`'s own tokenizer: median 384
-tokens, p90 547, max 869, and **15.8% of windows are longer than 512 tokens**. Those units are
-embedded and reranked from their first 512 tokens only. Script is not what drives this, contrary
-to what you might expect of a byte-hungry alphabet: bge-m3's SentencePiece vocabulary encodes
-Russian about as compactly as English — 1500 characters of pure Cyrillic message text comes to a
-median 399 tokens against 418 for pure Latin — so what reaches the cap is unit *length*, in any
-language.
+It was a floor until v0.2.0, tested *after* the window had already grown past the cap, so a closed
+window held 1500 characters plus however much the message that carried it over brought with it.
+Measured on a real 159,539-message index it ran to 3,453 characters at the top end against a
+median of 1,274, and over 400 random windows tokenized with `BAAI/bge-m3`'s own tokenizer: median
+384 tokens, p90 547, max 869, and **15.8% of windows longer than 512 tokens** — embedded and
+reranked from their first 512 tokens only. Script is not what drove it, contrary to what you might
+expect of a byte-hungry alphabet: bge-m3's SentencePiece vocabulary encodes Russian about as
+compactly as English — 1500 characters of pure Cyrillic message text comes to a median 399 tokens
+against 418 for pure Latin — so what reached the cap was unit *length*, in any language.
+
+Making the cap real changes where windows are cut, so an index built before v0.2.0 re-cuts and
+re-embeds every unit once, chat by chat, over the syncs that follow the upgrade.
 
 A truncated unit is not a lost unit. Its whole text is in the FTS tables, so lexical retrieval
 matches on every word of it and the hit comes back complete — a query whose terms sit in the tail
 still finds it through BM25, just not through the vector. What truncation costs is the dense
-side's half of hybrid retrieval on those units, which is the half that catches a paraphrase.
+side's half of hybrid retrieval on those units, which is the half that catches a paraphrase. So if
+you raise `window_max_chars` past what 512 tokens hold, raise `max_seq_length` with it.
 
-Raising the cap is the fix, and it is paid for in time. On an Apple M1 Pro, fp16 on MPS, over 128
-random real windows: embedding runs at **12.6 units/s at 512** and **9.9 units/s at 1024** (about
-21% slower), and reranking 40 `(query, unit)` pairs at **10.6 pairs/s at 512** against **6.1 at
-1024** (about 42% slower — a full `rerank_top = 40` goes from ~3.8 s to ~6.6 s, which a reader
-waits through on every search). 1024 tokens covered every one of the 400 sampled windows; the
-shipped default stays 512 so a fresh install behaves as documented.
+That is paid for in time. On an Apple M1 Pro, fp16 on MPS, over 128 random real windows: embedding
+runs at **12.6 units/s at 512** and **9.9 units/s at 1024** (about 21% slower), and reranking 40
+`(query, unit)` pairs at **10.6 pairs/s at 512** against **6.1 at 1024** (about 42% slower — a
+full `rerank_top = 40` goes from ~3.8 s to ~6.6 s, which a reader waits through on every search).
+The shipped default stays 512, which the shipped `window_max_chars = 1500` now fits inside.
 
 Nothing detects the change for you. The embedding-space guard (`index.ensure_embedding_space`)
 compares two things: `meta.embed_model` against the configured model name, and the width the

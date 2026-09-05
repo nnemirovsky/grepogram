@@ -8,7 +8,9 @@ from grepogram.models import ChatRow, MessageRow, UnitRow, UnitsCfg
 
 BASE = 1_705_314_600  # 2024-01-15 10:30:00 UTC
 CHAT = -1000000000100
-CFG = UnitsCfg(window_gap_min=30, window_max_msgs=3, window_max_chars=80, thread_max_msgs=40)
+CFG = UnitsCfg(window_gap_min=30, window_max_msgs=3, window_max_chars=120, thread_max_msgs=40)
+"""Three ``message N`` lines come to 108 characters, so the message count is what binds here;
+the character ceiling has its own tests below."""
 GROUP = ChatRow(id=CHAT, type="supergroup")
 FORUM = ChatRow(id=CHAT, type="supergroup", is_forum=True)
 
@@ -137,16 +139,33 @@ def test_cut_windows_count_cut() -> None:
 
 def test_cut_windows_char_cut() -> None:
     long_text = "x" * 50
-    cfg = UnitsCfg(window_gap_min=30, window_max_msgs=100, window_max_chars=120)
+    cfg = UnitsCfg(window_gap_min=30, window_max_msgs=100, window_max_chars=160)
     windows = _run([_msg(i, i, text=long_text) for i in range(1, 6)], cfg)
     assert _ids(windows) == [[1, 2], [3, 4], [5]]
-    for window in windows[:-1]:
-        assert len(window.text) >= 120
-        assert len(window.text.split("\n")[0]) < 120
+    for window in windows:
+        assert len(window.text) <= 160
+
+
+def test_cut_windows_never_exceeds_the_char_cap() -> None:
+    """The cap is a ceiling on the finished text, not the size at which a window closes: the
+    third line of each pair below would take it to 229, so the window closes before it."""
+    cfg = UnitsCfg(window_gap_min=30, window_max_msgs=100, window_max_chars=160)
+    windows = _run([_msg(i, i, text="x" * 50) for i in range(1, 20)], cfg)
+    assert all(len(window.text) <= cfg.window_max_chars for window in windows)
+
+
+def test_cut_windows_a_line_that_exactly_hits_the_cap_is_kept() -> None:
+    line = units.render_line(_msg(1, 0, text="ab"))
+    cfg = UnitsCfg(window_gap_min=30, window_max_msgs=100, window_max_chars=2 * len(line) + 1)
+    windows = _run([_msg(i, i, text="ab") for i in range(1, 3)], cfg)
+    assert _ids(windows) == [[1, 2]]
+    assert len(windows[0].text) == cfg.window_max_chars
 
 
 def test_cut_windows_oversized_message_is_its_own_window() -> None:
-    cfg = UnitsCfg(window_gap_min=30, window_max_msgs=100, window_max_chars=40)
+    """The empty-window guard: a message longer than the whole budget still becomes a window,
+    and it takes nothing else with it."""
+    cfg = UnitsCfg(window_gap_min=30, window_max_msgs=100, window_max_chars=70)
     messages = [
         _msg(1, 0, text="a" * 500),
         _msg(2, 1, text="b" * 500),
@@ -156,6 +175,7 @@ def test_cut_windows_oversized_message_is_its_own_window() -> None:
     windows = _run(messages, cfg)
     assert _ids(windows) == [[1], [2], [3, 4]]
     assert len(windows[0].text) > 500
+    assert len(windows[2].text) <= 70
 
 
 def test_cut_windows_char_budget_counts_rendered_lines_and_their_newlines() -> None:
@@ -165,6 +185,28 @@ def test_cut_windows_char_budget_counts_rendered_lines_and_their_newlines() -> N
     cfg = UnitsCfg(window_gap_min=30, window_max_msgs=100, window_max_chars=2 * len(line) + 1)
     windows = _run([_msg(i, i, text="ab") for i in range(1, 5)], cfg)
     assert _ids(windows) == [[1, 2], [3, 4]]
+    assert all(len(window.text) <= cfg.window_max_chars for window in windows)
+
+
+def test_cut_windows_default_cap_holds_over_a_real_sized_conversation() -> None:
+    """The overflow the v0.1.1 index measured: under the floor rule a window closed only *after*
+    passing ``window_max_chars``, so it held the cap plus whatever message carried it over —
+    median 1,274 characters against a 1,500 cap with a tail to 3,453, and 15.8% of a 400-window
+    sample past the embedder's 512-token limit. At the shipped defaults nothing passes the cap
+    now, and the character limit is what does most of the cutting.
+    """
+    cfg = UnitsCfg()
+    rng = random.Random(11)
+    messages = [_msg(i, i // 3, text="слово " * rng.randint(1, 90)) for i in range(1, 400)]
+    windows = _run(messages, cfg)
+    assert max(len(window.text) for window in windows) <= cfg.window_max_chars
+    # the cut is char-driven, not an artefact of the message-count limit
+    assert max(len(window.msg_ids) for window in windows) < cfg.window_max_msgs
+    # and it would have overflowed under the old rule: every closed window is one line short
+    by_id = {msg.msg_id: msg for msg in messages}
+    for window in windows[:-1]:
+        following = by_id[window.msg_id_end + 1]
+        assert len(window.text) + 1 + len(units.render_line(following)) > cfg.window_max_chars
 
 
 def test_cut_windows_text_is_rendered_lines() -> None:
@@ -208,7 +250,8 @@ def test_cut_windows_respects_every_limit() -> None:
         assert 1 <= len(window.msg_ids) <= CFG.window_max_msgs
         lines = [units.render_line(by_id[msg_id]) for msg_id in window.msg_ids]
         assert window.text == "\n".join(lines)
-        assert len("\n".join(lines[:-1])) < CFG.window_max_chars
+        # the cap is a ceiling; only a single message longer than the whole budget may pass it
+        assert len(window.text) <= CFG.window_max_chars or len(window.msg_ids) == 1
         dates = [by_id[msg_id].date for msg_id in window.msg_ids]
         assert all(b - a <= 30 * 60 for a, b in zip(dates, dates[1:], strict=False))
 

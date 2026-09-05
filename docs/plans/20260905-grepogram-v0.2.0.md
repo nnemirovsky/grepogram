@@ -422,22 +422,25 @@ Task 15's `sources add` guard, or the import protection silently evaporates.
 
 **Files:**
 - Modify: `grepogram/units.py`
+- Modify: `grepogram/embed.py` (➕ its `BgeM3Embedder` docstring also described the floor)
 - Modify: `README.md`
 - Modify: `tests/test_units_windows.py`
+- Modify: `tests/test_units_recipe.py` (➕ its `_bump` targets were absolute; now relative to
+  `RECIPE_VERSION`, so a bump does not rewrite the file)
 - Delete: `docs/backlog/window-char-cap-is-a-floor-not-a-ceiling.md`
 
-- [ ] change `_OpenWindow.must_cut_before` (units.py:119-126) to cut when appending `msg` *would*
+- [x] change `_OpenWindow.must_cut_before` (units.py:119-126) to cut when appending `msg` *would*
       exceed `window_max_chars`, not when the window already has
-- [ ] keep a single oversized message forming a window of its own (the empty-window guard)
-- [ ] render each line once — `must_cut_before` and `add` (units.py:129) both need its length
-- [ ] bump `units.RECIPE_VERSION` to 2
-- [ ] update the `cut_windows` docstring, which describes the old behaviour
-- [ ] rewrite README's "Unit length and the token cap" (README.md:385-410), which currently
+- [x] keep a single oversized message forming a window of its own (the empty-window guard)
+- [x] render each line once — `must_cut_before` and `add` (units.py:129) both need its length
+- [x] bump `units.RECIPE_VERSION` to 2
+- [x] update the `cut_windows` docstring, which describes the old behaviour
+- [x] rewrite README's "Unit length and the token cap" (README.md:385-410), which currently
       explains the floor behaviour and recommends `max_seq_length` as the mitigation
-- [ ] write tests: a window never exceeds the cap; an oversized single message still stands alone;
+- [x] write tests: a window never exceeds the cap; an oversized single message still stands alone;
       a message that exactly hits the cap is kept; the measured 15.8% overflow case now passes
-- [ ] `git rm` the backlog file in this task's commit
-- [ ] run tests — must pass before task 3
+- [x] `git rm` the backlog file in this task's commit
+- [x] run tests — must pass before task 3
 
 ### Task 3: Add schema step 6 for extracted text and unit reactions
 

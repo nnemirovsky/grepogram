@@ -128,10 +128,10 @@ class BgeM3Embedder:
     surfaces as :class:`ModelUnavailable` right here, where the caller can degrade. On ``mps``
     the weights are halved to fp16; the text is truncated at ``max_seq_length`` tokens
     (``models.max_seq_length``, 512 by default), so a unit longer than that is embedded only up
-    to it while the FTS tables still hold it whole. ``units.window_max_chars`` does not bound
-    this: it is the size at which a window *closes*, so a finished window is at least that long
-    (see the README). Encoding is serialized with a lock because the MCP server may call it from
-    several threads.
+    to it while the FTS tables still hold it whole. ``units.window_max_chars`` is a ceiling on a
+    window's text, so the shipped 1500 characters fit inside the shipped 512 tokens; raise one
+    and the other needs raising with it (see the README). Encoding is serialized with a lock
+    because the MCP server may call it from several threads.
     """
 
     def __init__(

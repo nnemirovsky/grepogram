@@ -9,14 +9,14 @@ original messages for deep links.
 The builders are functions over :class:`~grepogram.models.MessageRow` lists; only the channel
 side touches the database, to read a post's comments. :func:`cut_windows` walks one
 ``(chat, topic)`` in chronological order and starts a new window after a pause longer than
-``window_gap_min`` minutes, or once the open window holds ``window_max_msgs`` messages or
-``window_max_chars`` characters of rendered text; forum chats are split into topics first with
-:func:`group_by_topic`. :func:`build_threads` follows ``reply_to_msg_id`` from every root (a
-replied-to message with no parent in the chat) and caps a thread at ``thread_max_msgs``
-messages, continuing in further units that repeat the root. :func:`build_posts` makes one
-``post`` per channel message and, when comments are synced, a ``thread`` of the post with its
-comments read from the linked discussion chat. :func:`units_for_chat` picks the builders for a
-chat's kind.
+``window_gap_min`` minutes, once the open window holds ``window_max_msgs`` messages, or before a
+message that would take its rendered text past ``window_max_chars`` — a ceiling, not a floor;
+forum chats are split into topics first with :func:`group_by_topic`. :func:`build_threads`
+follows ``reply_to_msg_id`` from every root (a replied-to message with no parent in the chat)
+and caps a thread at ``thread_max_msgs`` messages, continuing in further units that repeat the
+root. :func:`build_posts` makes one ``post`` per channel message and, when comments are synced,
+a ``thread`` of the post with its comments read from the linked discussion chat.
+:func:`units_for_chat` picks the builders for a chat's kind.
 
 :data:`RECIPE_VERSION` names how this build cuts and renders units, and :func:`recut_chat` cuts a
 whole chat again when the two disagree — the only thing that reaches a closed window.
@@ -40,7 +40,7 @@ UNKNOWN_SENDER = "unknown"
 EMPTY_PLACEHOLDER = "[empty]"
 STAMP_FORMAT = "%Y-%m-%d %H:%M"
 
-RECIPE_VERSION = 1
+RECIPE_VERSION = 2
 """How this build cuts and renders units, recorded as ``meta.unit_recipe``.
 
 Bumped by every change that would make a stored unit differ from what this code cuts today: a
@@ -134,17 +134,24 @@ class _OpenWindow:
     lines: list[str] = field(default_factory=list)
     chars: int = 0
 
-    def must_cut_before(self, msg: MessageRow, cfg: UnitsCfg) -> bool:
+    def must_cut_before(self, msg: MessageRow, line: str, cfg: UnitsCfg) -> bool:
+        """Whether this window must close before ``line`` (``msg`` rendered) is appended.
+
+        The character limit is a ceiling on the finished text, so it is tested against the
+        length the window *would* have: ``line`` and the newline joining it to what is already
+        there. An empty window never cuts — that is what lets a single message longer than
+        ``window_max_chars`` form a window of its own instead of no window at all.
+        """
         if not self.messages:
             return False
         return (
             msg.date - self.messages[-1].date > cfg.window_gap_min * 60
             or len(self.messages) >= cfg.window_max_msgs
-            or self.chars >= cfg.window_max_chars
+            or self.chars + 1 + len(line) > cfg.window_max_chars
         )
 
-    def add(self, msg: MessageRow) -> None:
-        line = render_line(msg)
+    def add(self, msg: MessageRow, line: str) -> None:
+        """Append ``msg``, already rendered as ``line`` by the caller — rendered once, not twice."""
         if self.lines:
             self.chars += 1
         self.chars += len(line)
@@ -165,16 +172,19 @@ def cut_windows(
 
     The input is sorted chronologically first, so the result does not depend on its order. A
     window closes before a message that arrives more than ``window_gap_min`` minutes after the
-    previous one, or when it already holds ``window_max_msgs`` messages or ``window_max_chars``
-    characters of rendered text; a single oversized message therefore forms a window of its own.
+    previous one, when it already holds ``window_max_msgs`` messages, or when appending that
+    message *would* take its rendered text past ``window_max_chars``. The character limit is
+    therefore a ceiling: a finished window never exceeds it, and the one exception is a single
+    message longer than the whole budget, which forms a window of its own rather than none.
     """
     windows: list[UnitRow] = []
     window = _OpenWindow()
     for msg in chronological(messages):
-        if window.must_cut_before(msg, cfg):
+        line = render_line(msg)
+        if window.must_cut_before(msg, line, cfg):
             windows.append(window.close(chat_id, topic_id))
             window = _OpenWindow()
-        window.add(msg)
+        window.add(msg, line)
     if window.messages:
         windows.append(window.close(chat_id, topic_id))
     return windows
