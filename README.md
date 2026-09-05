@@ -86,18 +86,22 @@ Everything lives in one SQLite file.
 
 1. Create an application at https://my.telegram.org/apps and note the `api_id` and `api_hash`.
 
-2. Install. Either as a tool, from a checkout:
+2. Install as a tool, straight from GitHub — no checkout needed:
+
+   ```sh
+   uv tool install --managed-python --python 3.12 \
+       'grepogram[dense] @ git+https://github.com/nnemirovsky/grepogram'
+   ```
+
+   which puts `grepogram` and `grepogram-mcp` into `$(uv tool dir --bin)`. Drop `[dense]` for a
+   lexical-only install. Append `@v0.1.1` — any tag, branch or commit — to the URL to pin a
+   version; without one you get the tip of `main`.
+
+   From a checkout instead, to run it in place or to work on it:
 
    ```sh
    git clone https://github.com/nnemirovsky/grepogram
    cd grepogram
-   uv tool install --managed-python --python 3.12 '.[dense]'   # drop [dense] for lexical-only
-   ```
-
-   which puts `grepogram` and `grepogram-mcp` into `$(uv tool dir --bin)`, or from the checkout
-   without installing:
-
-   ```sh
    uv sync --managed-python --extra dense   # or plain `uv sync --managed-python`
    uv run grepogram --help                  # prefix every command below with `uv run`
    ```
@@ -664,13 +668,8 @@ connections are held open rather than refused — a firewall prompt nobody answe
 
 ## Roadmap
 
-- `sources prune` for chats that left a folder
-- OCR of photos through macOS Vision, feeding the unit text
-- Voice and video-note transcription (whisper.cpp)
-- Text extraction from PDF and DOCX attachments
-- `grepogram import <tdesktop export dir>` for chats no longer accessible from the account
-- Handling of deleted messages; reaction counts as a ranking signal
-- Publishing to PyPI
+- Voice and video-note transcription through whisper.cpp, joining the extraction registry that
+  already carries the OCR and document extractors rather than becoming a second pipeline
 
 ## Development
 
@@ -681,7 +680,9 @@ HF_HUB_OFFLINE=1 uv run pytest -m slow # real bge-m3 and reranker, once they are
 uv run ruff check . && uv run ruff format --check . && uv run mypy
 ```
 
-Conventions for contributors and coding agents are in [CLAUDE.md](CLAUDE.md).
+[CONTRIBUTING.md](CONTRIBUTING.md) has the setup, the gates and the commit convention;
+[CLAUDE.md](CLAUDE.md) has the invariants a change is reviewed against, written for coding
+agents and equally the contributor guide.
 
 ## License
 

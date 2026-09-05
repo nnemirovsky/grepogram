@@ -893,18 +893,33 @@ name in an export, or a slug an earlier import claimed) with the chat's own id �
 - Create: `.github/ISSUE_TEMPLATE/bug_report.md`
 - Modify: `README.md`
 
-- [ ] run `gitleaks detect --log-opts="--all"` over the full history and **report the verbatim
+- [x] run `gitleaks detect --log-opts="--all"` over the full history and **report the verbatim
       result in the task output** — this gates every Post-Completion step
-- [ ] grep the history for the user's `api_id` / `api_hash` shape and for absolute home paths, and
+- [x] grep the history for the user's `api_id` / `api_hash` shape and for absolute home paths, and
       report anything found rather than rewriting history unasked
-- [ ] write `CONTRIBUTING.md`: the uv setup, the four gates, the commit convention, and that tests
+- [x] write `CONTRIBUTING.md`: the uv setup, the four gates, the commit convention, and that tests
       never touch the network
-- [ ] add a bug-report issue template asking for the grepogram version, the macOS version and
+- [x] add a bug-report issue template asking for the grepogram version, the macOS version and
       whether the extras are installed
-- [ ] update README's install instructions for a public repository, and its Roadmap (whisper
+- [x] update README's install instructions for a public repository, and its Roadmap (whisper
       transcription is what remains)
-- [ ] no tests apply — verification is the scan output and the rendered files
-- [ ] run the full gate — must pass before task 17
+- [x] no tests apply — verification is the scan output and the rendered files
+- [x] run the full gate — must pass before task 17
+
+**Secret scan result — clean.** `gitleaks detect --log-opts="--all"` (8.30.1) scanned all 22
+commits reachable from every ref, 1.86 MB, and reported `no leaks found`. Every `api_id` /
+`api_hash` value in the history is synthetic (`12345`, `42`, `777`, `1`, `0`, `"fakehash"`, `"h"`,
+`"abc"`, `"hash"`); the only 32-char hex strings are PyPI URL path segments in `uv.lock`; no bot
+token, session blob, phone number or `.env` / `config.toml` / `index.db` was ever tracked. The
+real config lives outside the repository, at `~/.config/grepogram/config.toml`.
+
+⚠️ One non-credential finding, **left alone rather than rewritten**: the local home path
+`/Users/nemirovsky/Developer/grepogram` appears once, in
+`docs/plans/completed/20260903-grepogram-v1.md:21`, and therefore in every commit that carries
+that file. It exposes the macOS account name only — already the GitHub owner name — so it is
+cosmetic, not a secret. Removing it from history would mean a rewrite and a force-push of a
+shared branch; the user decides. Fixing it in `main` alone (one line edit) leaves the old copies
+reachable and is the cheaper half-measure if it is worth doing at all.
 
 ### Task 17: Add the PyPI publish job to the release workflow
 
