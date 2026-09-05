@@ -1,3 +1,4 @@
+import dataclasses
 import random
 import sqlite3
 
@@ -483,3 +484,25 @@ def test_comments_enabled_matches_the_chat_source() -> None:
     assert units.comments_enabled(cfg, _channel("chat:42")) is True
     assert units.comments_enabled(cfg, _channel("chat:@gone")) is False
     assert units.comments_enabled(Config(), _channel()) is False
+
+
+def test_build_posts_carry_the_post_own_reaction_total(conn: sqlite3.Connection) -> None:
+    """A channel's most-reacted posts are exactly what the ranking bonus is for, and a post
+    thread is built by hand rather than through ``_unit``, so it would sit at zero without help.
+
+    The thread's total is the post's and not the chunk's: its ``msg_ids`` list the post alone —
+    comment ids live in the discussion group's id space, where no ``json_each`` over
+    ``units.msg_ids`` reaches them — so it is the only number
+    :func:`grepogram.db.refresh_unit_reactions` could ever recompute for it. The comments' own
+    reactions are carried by the group's window units.
+    """
+    _with_discussion(conn, [_comment(1, 10, 20), _comment(2, 10, 25)])
+    conn.execute("UPDATE messages SET reactions_total = 6 WHERE chat_id = ?", (DISC,))
+    post = dataclasses.replace(_post(10), reactions_total=9)
+    result = units.build_posts(conn, [post], _channel(), True, CFG)
+    assert [(u.kind, u.msg_ids, u.reactions) for u in result] == [
+        ("post", [10], 9),
+        ("thread", [10], 9),
+    ]
+    plain = units.build_posts(conn, [_post(11)], _channel(), True, CFG)
+    assert [(u.kind, u.reactions) for u in plain] == [("post", 0)]

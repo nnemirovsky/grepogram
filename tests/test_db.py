@@ -1318,6 +1318,63 @@ def test_units_roundtrip_a_reaction_total(conn: sqlite3.Connection) -> None:
     assert db.get_units_by_ids(conn, [ids[0]])[0].reactions == 17
 
 
+def test_refresh_unit_reactions_recomputes_over_telegram_msg_ids(
+    conn: sqlite3.Connection,
+) -> None:
+    """The refresh reads ``units.msg_ids``, which holds Telegram ids, so the chat here starts its
+    history above its rowids — the two coincide from 1 in a naive fixture and hide the mistake.
+
+    Reactions arrive long after a unit was cut and no rebuild reaches a closed window, so this is
+    a direct ``UPDATE``: it rewrites the total and nothing else, leaving the text and the
+    ``dirty`` flag alone, because a reaction changes the ranking and not the embedding.
+    """
+    db.upsert_chat(conn, _chat(1))
+    db.upsert_chat(conn, _chat(2))
+    rowids = db.upsert_messages(
+        conn,
+        [
+            _message(1, 101, reactions_total=3),
+            _message(1, 102),
+            _message(1, 103, reactions_total=7),
+            _message(2, 101, reactions_total=99),
+        ],
+    )
+    assert set(rowids).isdisjoint({101, 102, 103})
+    held, apart, other = db.insert_units(
+        conn, [_unit(1, [101, 102]), _unit(1, [103]), _unit(2, [101])]
+    )
+    assert db.refresh_unit_reactions(conn, 1, [101, 103]) == 2
+    assert {u.id: u.reactions for u in db.get_units(conn, 1)} == {held: 3, apart: 7}
+    assert db.get_units_by_ids(conn, [other])[0].reactions == 0
+    conn.execute("UPDATE messages SET reactions_total = 5 WHERE chat_id = 1 AND msg_id = 102")
+    assert db.refresh_unit_reactions(conn, 1, [102]) == 1
+    stored = db.get_units_by_ids(conn, [held])[0]
+    assert (stored.reactions, stored.text, stored.dirty) == (8, "unit text", True)
+
+
+def test_refresh_unit_reactions_ignores_rowids_and_empty_input(conn: sqlite3.Connection) -> None:
+    """Handed ``messages.id`` values instead, the refresh matches no unit at all — which is what
+    the caller's conversion buys, and what a fixture chat numbered from 1 would never show."""
+    db.upsert_chat(conn, _chat(1))
+    rowids = db.upsert_messages(conn, [_message(1, 101, reactions_total=4)])
+    unit = db.insert_units(conn, [_unit(1, [101])])[0]
+    assert db.refresh_unit_reactions(conn, 1, rowids) == 0
+    assert db.get_units_by_ids(conn, [unit])[0].reactions == 0
+    assert db.refresh_unit_reactions(conn, 1, []) == 0
+    assert db.refresh_unit_reactions(conn, 1, [101]) == 1
+    assert db.get_units_by_ids(conn, [unit])[0].reactions == 4
+
+
+def test_refresh_unit_reactions_zeroes_a_unit_nobody_reacted_to(conn: sqlite3.Connection) -> None:
+    """A reaction that is taken back is as real as one that is added."""
+    db.upsert_chat(conn, _chat(1))
+    db.upsert_messages(conn, [_message(1, 101, reactions_total=2)])
+    unit = db.insert_units(conn, [_unit(1, [101], reactions=2)])[0]
+    conn.execute("UPDATE messages SET reactions_total = 0 WHERE chat_id = 1 AND msg_id = 101")
+    assert db.refresh_unit_reactions(conn, 1, [101]) == 1
+    assert db.get_units_by_ids(conn, [unit])[0].reactions == 0
+
+
 def test_delete_units_by_id(conn: sqlite3.Connection) -> None:
     db.upsert_chat(conn, _chat(1))
     ids = db.insert_units(conn, [_unit(1, [1]), _unit(1, [2]), _unit(1, [3])])

@@ -776,6 +776,12 @@ async def _refetch_edits(run: _Run, sync_cfg: SyncCfg) -> list[int]:
     channel with comments it also refreshes the threads of the re-fetched posts that grew
     (:func:`_refresh_comments`); the ids of those posts are returned along with the edited rows
     so their post-thread units are rebuilt.
+
+    The stored units' reaction totals are brought up to date here as well
+    (:func:`grepogram.db.refresh_unit_reactions`) and not through the rebuild that follows: a
+    reaction is not part of a unit's content, so :func:`grepogram.units._apply` keeps the stored
+    row when it re-cuts an identical unit, and the closed window nearly every re-fetched message
+    sits in is never re-cut in the first place.
     """
     if sync_cfg.edit_refetch <= 0:
         return []
@@ -799,6 +805,10 @@ async def _refetch_edits(run: _Run, sync_cfg: SyncCfg) -> list[int]:
             "chat %s: %d of %d re-fetched messages changed", chat.id, len(changed), len(fresh)
         )
     ids = run.store(changed)
+    # Telegram msg ids, never the rowids `store` just returned: `units.msg_ids` is the other
+    # space, and the two coincide only in a chat whose history starts at 1 (see
+    # `db.refresh_unit_reactions`).
+    db.refresh_unit_reactions(run.conn, chat.id, [row.msg_id for row in changed])
     if run.discussion is not None:
         ids += await _refresh_comments(run, stored, replies)
     return ids

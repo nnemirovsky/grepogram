@@ -688,32 +688,38 @@ Task 15's `sources add` guard, or the import protection silently evaporates.
 - Modify: `grepogram/db.py`
 - Modify: `tests/test_units_windows.py`
 - Modify: `tests/test_sync.py`
+- Modify: `tests/test_units_threads.py` (➕ `_post_thread` is built by `build_posts`, whose tests
+  and `conn`-backed discussion fixtures live there)
+- Modify: `tests/test_db.py` (➕ `refresh_unit_reactions` is a `db.py` function; the id-space
+  guard is pinned where the unit round-trip already is)
+- Modify: `tests/test_units_incremental.py` (➕ `test_edit_that_leaves_unit_text_unchanged_keeps
+  _every_row` already fails if `reactions` joins `_content_key`; its docstring now names that)
 
-- [ ] fill `UnitRow.reactions` in `units._unit` by summing `reactions_total` over its messages —
+- [x] fill `UnitRow.reactions` in `units._unit` by summing `reactions_total` over its messages —
       **and in `units._post_thread` (units.py:306-316), which constructs `UnitRow` directly and
       would otherwise take the default 0**, so a channel's most-reacted post threads get no bonus
-- [ ] add `db.refresh_unit_reactions(conn, chat_id, msg_ids)` recomputing totals with a direct
+- [x] add `db.refresh_unit_reactions(conn, chat_id, msg_ids)` recomputing totals with a direct
       `UPDATE` over `json_each(units.msg_ids)`. **`msg_ids` here are Telegram `msg_id`s**, the
       space `units.msg_ids` stores (units.py:96) — everything on the `edit_refetch` path carries
       `messages.id` rowids instead, so the caller must convert. In a fixture chat rowid and
       `msg_id` both start at 1 and coincide, which is exactly how this ships broken
-- [ ] call it from the `edit_refetch` path, **independent of the unit rebuild** — `_content_key`
+- [x] call it from the `edit_refetch` path, **independent of the unit rebuild** — `_content_key`
       (units.py:559-567) excludes reactions so `_apply` keeps the stored row, and a closed window
       is never re-cut (units.py:456-457); a rebuild-driven refresh is inert by construction
-- [ ] **do not add `reactions` to `_content_key`.** It looks like the fix and is the opposite of
+- [x] **do not add `reactions` to `_content_key`.** It looks like the fix and is the opposite of
       one: every reaction change would invalidate, delete, re-insert and re-embed the unit, with
       `edit_refetch = 200` messages per chat per sync, forever. `_apply` keeping the stored row is
       what preserves the refreshed total
-- [ ] scope the refresh to the unit's own chat and note in the docstring that a post thread
+- [x] scope the refresh to the unit's own chat and note in the docstring that a post thread
       reflects the post's messages, its comments' reactions being carried by the discussion group's
       own window units
-- [ ] bump `units.RECIPE_VERSION` to 4
-- [ ] write tests, **in a chat where rowid and `msg_id` differ** so the id-space confusion cannot
+- [x] bump `units.RECIPE_VERSION` to 4
+- [x] write tests, **in a chat where rowid and `msg_id` differ** so the id-space confusion cannot
       hide: a unit's total is the sum of its messages; **a reaction count that changes after the
       unit was cut is picked up by the refresh** (the test that matters); a closed window's total
       updates without the unit being re-cut; **a post thread carries a non-zero total**; zero when
       none react; a round-trip
-- [ ] run tests — must pass before task 11
+- [x] run tests — must pass before task 11
 
 ### Task 11: Apply a bounded reaction bonus on a defined score scale
 

@@ -209,6 +209,10 @@ def test_edit_inside_a_closed_window_is_not_recut_but_its_thread_is(
 def test_edit_that_leaves_unit_text_unchanged_keeps_every_row(
     conn: sqlite3.Connection, chat: ChatRow
 ) -> None:
+    """A reaction arriving is the case ``_content_key`` deliberately cannot see, and this is
+    what says so: with ``reactions`` in the key every reaction anyone adds would delete,
+    re-insert and re-embed the unit holding it — ``edit_refetch`` re-reads 200 messages per chat
+    per sync — while keeping the stored row is what preserves a refreshed total instead."""
     first = _sync(conn, chat, [_msg(1, 0), _msg(2, 1, reply_to=1)])
     ids = _ids_by_shape(conn)
     delta = _sync(conn, chat, [_msg(2, 1, reply_to=1, reactions_total=5)])

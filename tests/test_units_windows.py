@@ -395,3 +395,30 @@ def test_build_unit_renders_in_given_order() -> None:
 def test_build_unit_rejects_empty() -> None:
     with pytest.raises(ValueError, match="at least one message"):
         units.build_unit("window", [], CHAT)
+
+
+def test_build_unit_sums_the_reactions_of_its_messages() -> None:
+    """A unit's ``reactions`` is a ranking signal, so it has to be the whole unit's, not one
+    message's — and it is summed over exactly the messages ``msg_ids`` lists, which is what lets
+    :func:`grepogram.db.refresh_unit_reactions` recompute the same number in place later."""
+    messages = [
+        _msg(1, 0, reactions_total=4),
+        _msg(2, 1),
+        _msg(3, 2, reactions_total=11),
+    ]
+    assert units.build_unit("window", messages, CHAT).reactions == 15
+
+
+def test_build_unit_reactions_are_zero_when_nobody_reacted() -> None:
+    assert units.build_unit("window", [_msg(1), _msg(2, 1)], CHAT).reactions == 0
+
+
+def test_cut_windows_carries_each_window_own_reaction_total() -> None:
+    """The totals follow the boundaries: a reaction counts for the window that holds it."""
+    messages = [
+        _msg(1, 0, reactions_total=2),
+        _msg(2, 1, reactions_total=3),
+        _msg(3, 2),
+        _msg(4, 90, reactions_total=7),
+    ]
+    assert [window.reactions for window in _run(messages)] == [5, 7]

@@ -4,7 +4,9 @@ Single messages are too small to embed and too many to store as vectors, so sear
 *units*: time windows of a chat, reply threads and channel posts. A unit's ``text`` is one
 rendered line per message — ``[YYYY-MM-DD HH:MM] name: text`` — with a ``[photo]``-style marker
 for what a message attached and whatever an extractor read off it after that marker, and its
-``msg_ids`` keep the mapping back to the original messages for deep links.
+``msg_ids`` keep the mapping back to the original messages for deep links. ``reactions`` sums
+what those messages collected — a ranking signal, refreshed in place by
+:func:`grepogram.db.refresh_unit_reactions` because nothing about it is part of a unit's content.
 
 The builders are functions over :class:`~grepogram.models.MessageRow` lists; only the channel
 side touches the database, to read a post's comments. :func:`cut_windows` walks one
@@ -44,7 +46,7 @@ UNKNOWN_SENDER = "unknown"
 EMPTY_PLACEHOLDER = "[empty]"
 STAMP_FORMAT = "%Y-%m-%d %H:%M"
 
-RECIPE_VERSION = 3
+RECIPE_VERSION = 4
 """How this build cuts and renders units, recorded as ``meta.unit_recipe``.
 
 Bumped by every change that would make a stored unit differ from what this code cuts today: a
@@ -146,6 +148,12 @@ def _unit(
     chat_id: int,
     topic_id: int | None,
 ) -> UnitRow:
+    """One unit over ``messages``, its ``reactions`` the sum of what they collected.
+
+    The sum is over the very messages ``msg_ids`` lists, which is what lets
+    :func:`grepogram.db.refresh_unit_reactions` recompute the same number in place later: a
+    reaction arrives long after the unit was cut, and no rebuild reaches a closed window.
+    """
     msg_ids = [msg.msg_id for msg in messages]
     return UnitRow(
         chat_id=chat_id,
@@ -157,6 +165,7 @@ def _unit(
         date_start=min(msg.date for msg in messages),
         date_end=max(msg.date for msg in messages),
         text="\n".join(lines),
+        reactions=sum(msg.reactions_total for msg in messages),
     )
 
 
@@ -367,6 +376,16 @@ def build_posts(
 
 
 def _post_thread(post: MessageRow, chunk: Sequence[MessageRow], chat_id: int) -> UnitRow:
+    """One piece of a post's comment thread: the post's ``msg_ids``, the chunk's text.
+
+    ``reactions`` is the post's own total and not the chunk's, because ``msg_ids`` lists the post
+    alone — comment ids belong to the discussion group's id space and no ``json_each`` over
+    ``units.msg_ids`` reaches them, so :func:`grepogram.db.refresh_unit_reactions` can only ever
+    recompute the post's. The comments' own reactions are carried by the discussion group's
+    window units, which hold those messages. This is built by hand rather than through
+    :func:`_unit` — the text spans the comments while the ids do not — so the sum has to be
+    written out here or a channel's most-reacted threads would all sit at zero.
+    """
     return UnitRow(
         chat_id=chat_id,
         kind="thread",
@@ -376,6 +395,7 @@ def _post_thread(post: MessageRow, chunk: Sequence[MessageRow], chat_id: int) ->
         date_start=post.date,
         date_end=max(msg.date for msg in chunk),
         text="\n".join(render_line(msg) for msg in chunk),
+        reactions=post.reactions_total,
     )
 
 
@@ -773,6 +793,12 @@ def _apply(
 
     A rebuilt unit identical to a stored one (same kind, topic, messages, dates and text — a
     reaction count changing on a message inside it, say) keeps its id and its embedding.
+
+    ``reactions`` is deliberately outside :func:`_content_key`, and keeping the stored row is
+    exactly what preserves a total :func:`grepogram.db.refresh_unit_reactions` wrote after the
+    unit was cut. Putting it in the key would look like the fix and be the opposite of one: with
+    ``edit_refetch`` re-reading 200 messages per chat per sync, every reaction anyone adds would
+    delete, re-insert and re-embed the unit holding it, for ever.
     """
     kept: dict[tuple[object, ...], UnitRow] = {}
     for unit in {unit.id: unit for unit in stale}.values():

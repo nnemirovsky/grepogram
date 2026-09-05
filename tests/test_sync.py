@@ -500,6 +500,59 @@ async def test_edit_refetch_keeps_extracted_media_text_across_syncs(
     assert after.media_state == db.MEDIA_EXTRACTED
 
 
+def _reacted_history() -> list[types.Message]:
+    """Three messages numbered from 101, so the chat's rowids and its Telegram ids differ.
+
+    They coincide from 1 in a chat fetched whole into an empty index, which is exactly how a
+    reaction refresh handed the wrong id space passes its tests and refreshes nothing in the
+    field. ``tl.message`` dates a message at its id in minutes, so 201 opens a second window.
+    """
+    return [
+        tl.message(ARG_ID, 101, "where do I renew a residence permit", sender=1),
+        tl.message(
+            ARG_ID, 102, "at the migraciones office", sender=2, reactions=tl.reactions({"👍": 2})
+        ),
+        tl.message(ARG_ID, 103, "thanks", sender=1),
+    ]
+
+
+async def test_edit_refetch_refreshes_the_reaction_total_of_a_closed_window(
+    conn: sqlite3.Connection, paths: Paths
+) -> None:
+    """The signal only works if it keeps up: a reaction lands days after the window was cut.
+
+    Nothing about the rebuild can deliver it — ``_content_key`` does not see reactions, so
+    ``_apply`` keeps the stored row, and a closed window is never re-cut at all — so the refresh
+    is a direct ``UPDATE`` on the ``edit_refetch`` path, and this asserts the unit's id survives
+    it: a re-cut here would mean the total is being carried by a delete and re-embed instead.
+    """
+    client = _client(messages={ARG_ID: _reacted_history()})
+    cfg = _cfg(ARG_SOURCE)
+    await _run(client, conn, paths, cfg)
+    reacted = db.get_message(conn, ARG_ID, 102)
+    assert reacted is not None and reacted.id != reacted.msg_id
+    assert [(u.msg_ids, u.reactions) for u in db.get_units(conn, ARG_ID)] == [([101, 102, 103], 2)]
+
+    client.messages[ARG_ID].append(tl.message(ARG_ID, 201, "any update?", sender=1))
+    await _run(client, conn, paths, cfg)
+    before = {u.msg_ids[0]: u.id for u in db.get_units(conn, ARG_ID) if u.kind == "window"}
+    assert sorted(before) == [101, 201]
+
+    client.messages[ARG_ID][1] = tl.message(
+        ARG_ID,
+        102,
+        "at the migraciones office",
+        sender=2,
+        reactions=tl.reactions({"👍": 2, "🔥": 5}),
+    )
+    await _run(client, conn, paths, cfg)
+    windows = {u.msg_ids[0]: u for u in db.get_units(conn, ARG_ID) if u.kind == "window"}
+    assert {start: unit.id for start, unit in windows.items()} == before
+    assert windows[101].reactions == 7
+    assert windows[201].reactions == 0
+    assert "migraciones" in windows[101].text
+
+
 async def test_edit_refetch_is_skipped_when_nothing_changed_or_disabled(
     conn: sqlite3.Connection,
 ) -> None:

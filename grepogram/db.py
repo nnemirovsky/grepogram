@@ -1386,6 +1386,41 @@ def insert_units(conn: sqlite3.Connection, units: Iterable[UnitRow]) -> list[int
     return ids
 
 
+_REFRESH_REACTIONS = """
+    UPDATE units SET reactions = COALESCE((
+        SELECT sum(messages.reactions_total) FROM json_each(units.msg_ids)
+        JOIN messages ON messages.chat_id = units.chat_id
+                     AND messages.msg_id = json_each.value), 0)
+    WHERE chat_id = ? AND EXISTS (
+        SELECT 1 FROM json_each(units.msg_ids) WHERE json_each.value IN ({marks}))"""
+
+
+def refresh_unit_reactions(conn: sqlite3.Connection, chat_id: int, msg_ids: Iterable[int]) -> int:
+    """Recompute ``units.reactions`` for the units of ``chat_id`` holding any of ``msg_ids``.
+
+    ``msg_ids`` are **Telegram message ids** — the space ``units.msg_ids`` stores
+    (:func:`grepogram.units._unit`). Every caller on the ``edit_refetch`` path carries
+    ``messages.id`` rowids instead (:meth:`grepogram.sync._Run.store` returns them), and in a
+    fixture chat both spaces start at 1 and coincide, so a caller that hands over rowids passes
+    its tests and refreshes nothing — or the wrong units — against real history. Convert first.
+
+    This is a direct ``UPDATE`` rather than anything the unit rebuild does, and it has to be:
+    reactions are not part of :func:`grepogram.units._content_key`, so a rebuild that re-cuts an
+    identical unit keeps the stored row, and a closed window is never re-cut at all
+    (:func:`grepogram.units._recut_start`). The total is summed over the messages the unit lists,
+    within the unit's own chat — a channel's post thread therefore reflects the post alone, its
+    comments' reactions being carried by the discussion group's own window units. Nothing here
+    touches ``text``, so no unit is flagged ``dirty``: a reaction changes the ranking, not the
+    embedding. Returns how many unit rows the update covered.
+    """
+    updated = 0
+    with transaction(conn):
+        for chunk in _chunks(msg_ids):
+            cursor = conn.execute(_REFRESH_REACTIONS.format(marks=_marks(chunk)), [chat_id, *chunk])
+            updated += max(cursor.rowcount, 0)
+    return updated
+
+
 def delete_units(conn: sqlite3.Connection, ids: Iterable[int]) -> None:
     """Delete units by id; their FTS and vector rows are the indexer's to drop by the same ids."""
     with transaction(conn):
