@@ -111,6 +111,27 @@ def test_config_path_moves_with_the_override(
     assert str(tmp_path / "grepogram-home") not in result.output
 
 
+def test_a_broken_config_prints_the_error_and_its_hint(tmp_home: Path) -> None:
+    """A key a newer grepogram wrote reaches the terminal with what to do about it."""
+    paths = Paths.from_env()
+    paths.ensure_dirs()
+    paths.config_file.write_text("[models]\nmax_seq_length_v2 = 1\n")
+    result = runner.invoke(cli.app, ["sources", "ls"])
+    assert result.exit_code == 1, result.output
+    assert "unknown key: models.max_seq_length_v2" in result.output
+    assert "hint: " in result.output and "restart" in result.output
+
+
+def test_a_broken_config_without_a_hint_prints_only_the_error(tmp_home: Path) -> None:
+    paths = Paths.from_env()
+    paths.ensure_dirs()
+    paths.config_file.write_text("[search]\nk = '10'\n")
+    result = runner.invoke(cli.app, ["sources", "ls"])
+    assert result.exit_code == 1, result.output
+    assert "invalid value for search.k" in result.output
+    assert "hint: " not in result.output
+
+
 # --- config init -----------------------------------------------------------------------------
 
 

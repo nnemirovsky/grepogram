@@ -211,7 +211,7 @@ def sync_cmd(
         current = functools.partial(config.load, paths)
         report = asyncio.run(_run_sync(client, conn, current, paths, budget, embedder))
     except (tg.AuthRequired, tg.SessionError, sync.SyncInProgress, ConfigError) as exc:
-        fail(str(exc))
+        fail(str(exc), hint=getattr(exc, "hint", None))
     except (tg_errors.RPCError, ConnectionError) as exc:
         fail(f"telegram error: {exc}")
     finally:
@@ -501,7 +501,7 @@ def sources_add(
         dialog = None if added.folder is not None else added.dialogs[0]
         config.update(paths, lambda current: sources.with_source(current, added.source, dialog))
     except (sources.SourceError, tg.AuthRequired, tg.SessionError, ConfigError) as exc:
-        fail(str(exc))
+        fail(str(exc), hint=getattr(exc, "hint", None))
     except (tg_errors.RPCError, ConnectionError) as exc:
         fail(f"telegram error: {exc}")
     if added.folder is not None:
@@ -584,7 +584,7 @@ def sources_rm(
             if removed.source is not None:
                 config.save(removed.config, paths)
     except (sources.SourceError, sync.SyncInProgress, ConfigError) as exc:
-        fail(str(exc))
+        fail(str(exc), hint=getattr(exc, "hint", None))
     finally:
         conn.close()
     typer.echo(f"removed {removed.source_id} ({len(removed.chat_ids)} chats deleted)")
@@ -620,9 +620,11 @@ def config_init() -> None:
     )
 
 
-def fail(message: str, code: int = 1) -> NoReturn:
-    """Print ``error: <message>`` to stderr and exit with ``code``."""
+def fail(message: str, code: int = 1, *, hint: str | None = None) -> NoReturn:
+    """Print ``error: <message>`` to stderr, then ``hint: <hint>`` when there is one, and exit."""
     typer.echo(f"error: {message}", err=True)
+    if hint:
+        typer.echo(f"hint: {hint}", err=True)
     raise typer.Exit(code)
 
 
@@ -631,7 +633,7 @@ def _load_config(paths: Paths) -> Config:
     try:
         return config.load(paths)
     except ConfigError as exc:
-        fail(str(exc))
+        fail(str(exc), hint=exc.hint)
 
 
 def _require_api_keys(cfg: Config, paths: Paths) -> None:

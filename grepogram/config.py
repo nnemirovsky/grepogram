@@ -72,8 +72,30 @@ _POSITIVE_KEYS = frozenset({"models.max_seq_length"})
 """Integer settings a zero or a negative value is meaningless for, checked after the type."""
 
 
+UNKNOWN_SECTION_HINT = (
+    f"known sections: {', '.join(f'[{name}]' for name in _SECTIONS)} and [[sources]]"
+)
+
+
+def _stale_build_hint(section: str) -> str:
+    """For a key this build does not know inside a section it does. Either the key is misspelled
+    or a newer grepogram wrote it, which is what a long-running MCP server sees after an upgrade."""
+    return (
+        f"[{section}] is a section this build knows, so check the key for a typo; if a newer "
+        "grepogram wrote it, upgrade and restart any running MCP server"
+    )
+
+
 class ConfigError(Exception):
-    """The config file is malformed or contains keys grepogram does not know."""
+    """The config file is malformed or contains keys grepogram does not know.
+
+    ``hint`` says what to do about it when the raise site knows something the message does not;
+    it survives the re-wrap in :func:`load` and reaches both the CLI and the MCP result.
+    """
+
+    def __init__(self, message: str, hint: str | None = None) -> None:
+        super().__init__(message)
+        self.hint = hint
 
 
 def load(paths: Paths) -> Config:
@@ -85,7 +107,7 @@ def load(paths: Paths) -> Config:
     try:
         return loads(text)
     except ConfigError as exc:
-        raise ConfigError(f"{paths.config_file}: {exc}") from exc
+        raise ConfigError(f"{paths.config_file}: {exc}", exc.hint) from exc
 
 
 def loads(text: str) -> Config:
@@ -99,7 +121,7 @@ def loads(text: str) -> Config:
 def from_dict(raw: dict[str, Any]) -> Config:
     for key in raw:
         if key not in _SECTIONS and key != "sources":
-            raise ConfigError(f"unknown key: {key}")
+            raise ConfigError(f"unknown key: {key}", UNKNOWN_SECTION_HINT)
     return Config(
         telegram=_section(TelegramCfg, raw, "telegram"),
         models=_section(ModelsCfg, raw, "models"),
@@ -182,7 +204,7 @@ def _section[SectionT: (TelegramCfg, ModelsCfg, SearchCfg, UnitsCfg, SyncCfg)](
     kwargs: dict[str, Any] = {}
     for key, value in data.items():
         if key not in hints:
-            raise ConfigError(f"unknown key: {name}.{key}")
+            raise ConfigError(f"unknown key: {name}.{key}", _stale_build_hint(name))
         where = f"{name}.{key}"
         checked = _checked(value, hints[key], where)
         if where in _POSITIVE_KEYS and isinstance(checked, int) and checked < 1:
@@ -232,7 +254,10 @@ def _source(entry: dict[str, Any], where: str) -> Source:
     kwargs: dict[str, Any] = {}
     for key, value in entry.items():
         if key not in _SOURCE_KEYS:
-            raise ConfigError(f"unknown key: {where}.{key}")
+            raise ConfigError(
+                f"unknown key: {where}.{key}",
+                f"a source takes only {', '.join(_SOURCE_KEYS)}",
+            )
         if key == "chat":
             if isinstance(value, bool) or not isinstance(value, str | int):
                 raise ConfigError(

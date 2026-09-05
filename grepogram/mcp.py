@@ -120,6 +120,10 @@ CHAT_HINT = (
 )
 PICK_HINT = "retry with one of the candidates: an id, @username or folder:<name>"
 MESSAGE_HINT = "chat_id and msg_id come from a hit (chat.id and anchor_msg_id) or a message view"
+CONFIG_HINT = (
+    "fix the file `grepogram config path` prints; its keys are the ones README's Configuration "
+    "section documents"
+)
 NO_SOURCES_HINT = "find chats with dialogs, add them with sources_add, then sync"
 SYNC_NEXT_HINT = "call sync to fetch and index its history"
 
@@ -384,6 +388,8 @@ def hint_for(exc: BaseException) -> str | None:
         return AUTH_HINT
     if isinstance(exc, NotConfigured):
         return SETUP_HINT
+    if isinstance(exc, ConfigError):
+        return exc.hint or CONFIG_HINT
     if isinstance(exc, SessionError):
         return SESSION_HINT
     if isinstance(exc, SyncInProgress):
