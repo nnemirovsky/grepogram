@@ -405,6 +405,63 @@ def test_remove_source_ambiguous_and_unknown(conn: sqlite3.Connection) -> None:
     assert len(db.list_chats(conn)) == 4
 
 
+def test_remove_source_of_an_import_by_a_short_slug(conn: sqlite3.Connection) -> None:
+    """``sources rm import:<slug>`` is the command every guard of an import points at.
+
+    It went through the fuzzy matcher, which scored the whole typed string — the seven-character
+    ``import:`` prefix included — against the bare slug, so nothing five characters or shorter
+    could reach ``FUZZY_MIN_RATIO``: a chat titled "Mama" or "Дом" could be removed by no
+    spelling at all, and could therefore never be converted to a live source either.
+    """
+    _store(conn, _chat(ARG_ID, "import:mama", title="Mama"), 2)
+    _store(conn, _chat(GEORGIA_ID, "import:дом", title="Дом"), 1)
+    cfg = _cfg()
+    for raw in ("import:mama", "import:MAMA", "Mama", str(ARG_ID)):
+        assert sources.find_source(cfg, conn, sources.parse_target(raw)) == "import:mama"
+    assert sources.find_source(cfg, conn, sources.parse_target("import:дом")) == "import:дом"
+
+    removed = sources.remove_source(cfg, conn, sources.parse_target("import:mama"))
+    assert (removed.source_id, removed.chat_ids, removed.source) == ("import:mama", [ARG_ID], None)
+    assert [c.id for c in db.list_chats(conn)] == [GEORGIA_ID]
+
+
+def test_remove_source_of_an_import_disambiguated_by_its_chat_id(
+    conn: sqlite3.Connection,
+) -> None:
+    """The shape ``import_source_ids`` derives for a slug collision: ``<slug>-<id>``.
+
+    An exact match has to win over the score, or the two ids a collision leaves behind would be
+    ambiguous against each other for good — ``import:x-123`` scores against ``x-123-123`` too.
+    """
+    _store(conn, _chat(ARG_ID, "import:x-123", title="x"), 1)
+    _store(conn, _chat(GEORGIA_ID, "import:x-123-123", title="x-123"), 1)
+    cfg = _cfg()
+    assert sources.find_source(cfg, conn, sources.parse_target("import:x-123")) == "import:x-123"
+    found = sources.find_source(cfg, conn, sources.parse_target("import:x-123-123"))
+    assert found == "import:x-123-123"
+    with pytest.raises(AmbiguousTarget) as excinfo:
+        sources.find_source(cfg, conn, sources.parse_target("import:x-12"))
+    assert excinfo.value.candidates == ["import:x-123", "import:x-123-123"]
+    with pytest.raises(UnknownSource, match="no imported source named 'import:zzz'"):
+        sources.find_source(cfg, conn, sources.parse_target("import:zzz"))
+
+
+def test_remove_source_of_an_import_named_by_its_title_or_id(conn: sqlite3.Connection) -> None:
+    """An ``import:`` tag covers exactly one chat, so naming that chat is not indirect.
+
+    ``import_source_ids`` gives every colliding chat a tag of its own, which makes the tag and
+    the chat one to one — unlike a folder source or a channel's discussion group, where the
+    refusal exists because removing the source would take other chats with it.
+    """
+    _store(conn, _chat(NEWS_ID, "import:news-chat", title="News chat", username="news_chat"), 2)
+    for raw in ("News chat", str(NEWS_ID), "@news_chat"):
+        found = sources.find_source(_cfg(), conn, sources.parse_target(raw))
+        assert found == "import:news-chat", raw
+    removed = sources.remove_source(_cfg(), conn, sources.parse_target("News chat"))
+    assert (removed.source_id, removed.chat_ids) == ("import:news-chat", [NEWS_ID])
+    assert db.list_chats(conn) == []
+
+
 def test_remove_source_handles_data_whose_entry_left_the_config(conn: sqlite3.Connection) -> None:
     _populate(conn)
     removed = sources.remove_source(_cfg(), conn, sources.parse_target("chat:@alice"))

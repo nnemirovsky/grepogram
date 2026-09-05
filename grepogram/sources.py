@@ -512,7 +512,17 @@ def remove_source(cfg: Config, conn: sqlite3.Connection, target: Target) -> Remo
 
 
 def find_source(cfg: Config, conn: sqlite3.Connection, target: Target) -> str:
-    """The source id ``target`` refers to, among configured entries and ``chats.source_id``."""
+    """The source id ``target`` refers to, among configured entries and ``chats.source_id``.
+
+    An ``import:<slug>`` is matched exactly, like a ``folder:`` name and unlike everything else
+    here: it names no ``[[sources]]`` entry and there is nothing to resolve it through, and the
+    fuzzy fallback scores the *whole typed string* against the bare slug — with a seven-character
+    prefix in front of it, no slug of five characters or fewer could ever reach
+    :data:`grepogram.dialogs.FUZZY_MIN_RATIO`. An imported chat titled "Mama" or "Дом" could
+    therefore not be removed by any spelling, which is the one command every guard this feature
+    added tells the user to run (:func:`refuse_imported`, :func:`_refuse_live`,
+    :func:`grepogram.sync.link_discussion_chat` and :func:`resolve_sources`' log line).
+    """
     chats = db.list_chats(conn)
     known = [s.id for s in cfg.sources]
     known += sorted({c.source_id for c in chats if c.source_id and c.source_id not in known})
@@ -523,6 +533,8 @@ def find_source(cfg: Config, conn: sqlite3.Connection, target: Target) -> str:
         if named is not None:
             return named
         return _indexed_source(conn, chats, target)
+    if target.text.casefold().startswith(IMPORT_PREFIX):
+        return _import_source(target.text, known)
     return _fuzzy_source(target.text, known, chats)
 
 
@@ -568,6 +580,29 @@ def _folder_source(name: str, known: list[str]) -> str:
     raise UnknownSource(f"no folder source named {name!r} (sources: {', '.join(known) or 'none'})")
 
 
+def _import_source(text: str, known: list[str]) -> str:
+    """The ``import:`` id ``text`` names, matched the way :func:`_folder_source` matches a folder.
+
+    Exactly first, on the normalized slug, so ``import:x-123`` reaches the chat of that name and
+    not the ``import:x-123-123`` that :func:`import_source_ids` derived beside it; only then a
+    score over the other import ids, which is what answers a half-remembered slug with a single
+    candidate or with the list to choose from.
+    """
+    wanted = dialogs.normalize(text[len(IMPORT_PREFIX) :])
+    imports = [s for s in known if s.casefold().startswith(IMPORT_PREFIX)]
+    for source_id in imports:
+        if dialogs.normalize(source_id[len(IMPORT_PREFIX) :]) == wanted:
+            return source_id
+    hits = [s for s in imports if dialogs.score(wanted, s[len(IMPORT_PREFIX) :]) > 0]
+    if len(hits) == 1:
+        return hits[0]
+    if hits:
+        raise AmbiguousTarget(text, hits)
+    raise UnknownSource(
+        f"no imported source named {text!r} (sources: {', '.join(known) or 'none'})"
+    )
+
+
 def _chat_source(chat: ChatRow | None, label: str) -> str:
     if chat is None or not chat.source_id:
         raise UnknownSource(f"{label} is not an indexed chat")
@@ -579,7 +614,13 @@ def _refuse_indirect(chat: ChatRow, label: str) -> None:
     """Refuse a target that names a chat whose source covers more than that chat: a member of a
     folder source, or a channel's discussion group indexed through the channel's source — the
     group a channel was unlinked from included, which keeps that source until it is removed
-    (:func:`discussion_source_id` owns that rule)."""
+    (:func:`discussion_source_id` owns that rule).
+
+    An ``import:<slug>`` covers nothing but this chat and is therefore not indirect:
+    :func:`import_source_ids` gives every colliding chat a tag of its own, so the tag and the
+    chat are one to one and removing it removes exactly what was named. Refusing it sent the
+    user to ``sources rm import:<slug>`` for a chat they had just named a perfectly good way.
+    """
     if not chat.source_id:
         return
     if chat.source_id.startswith(FOLDER_PREFIX):
@@ -587,7 +628,7 @@ def _refuse_indirect(chat: ChatRow, label: str) -> None:
             f"{label} is indexed through {chat.source_id}; remove that folder source instead "
             "or take the chat out of the folder in Telegram"
         )
-    if _own_source(chat):
+    if chat.source_id.startswith(IMPORT_PREFIX) or _own_source(chat):
         return
     owner = (
         ""
