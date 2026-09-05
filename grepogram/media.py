@@ -408,22 +408,38 @@ def _recut(
     re-embed that tail fifty times over. The indexing is here rather than in ``units`` because
     :mod:`grepogram.index` imports :class:`~grepogram.units.UnitDelta` from there.
 
+    An extracted **comment** is followed to the channel it was left under
+    (:func:`grepogram.sync._invalidate_comment_posts`), the same way a deleted one is. A post
+    thread quotes its comments' rendered lines while listing the post alone in ``msg_ids``, so no
+    ``json_each`` over ``units.msg_ids`` reaches a comment id and the discussion group's own
+    invalidation cannot touch that thread; ``comment_of_chat_id`` / ``comment_of_msg_id`` on the
+    comment's row is the only route to it. Without this the group's window carried the text a
+    photo was read for and the channel's thread kept the bare ``[photo]`` for good — no flag is
+    left behind that would repair it.
+
     The message rows are re-indexed and un-flagged in this same transaction. ``msg_fts`` holds
     the extracted text too (:func:`grepogram.index.message_index_text`) — it is what anchors a
     hit on the right message — so the rebuild ``db.set_media_text``'s ``indexed = 0`` asks for
     happens here, where it is bounded by the batch, and the flag is cleared with it. Leaving it
     raised would hand the next sync's *unbudgeted* rebuild loops (``_sync_chats``' per-chat and
     deferred ``index_pending``) every extracted row in every chat at once — a 20-second auto-sync
-    inside an MCP ``search`` included. The one case that stays flagged is the one this cannot
-    cover: a chat that is gone by the time the batch is stored, whose rows
-    :func:`grepogram.sync.index_stranded` reaches later.
+    inside an MCP ``search`` included. What stays flagged is exactly what this cannot cover, and
+    :func:`grepogram.sync.index_stranded` reaches all of it later: a chat that is gone by the
+    time the batch is stored, and a row in a ``(chat, topic)`` that holds no window at all
+    (:func:`grepogram.units.uncut_rows`). The second is the state a first sync interrupted
+    between storing its rows and cutting their units leaves behind — the one
+    ``messages.indexed = 0`` exists to repair — and an invalidation reaches none of it, so
+    clearing the flag there would strand those rows in no unit for good. Both branches leave the
+    flag raised for the same reason and it is bounded either way: a chat, not the index.
     """
     if chat is None or not row_ids:
         return
-    delta = units.invalidate_units_for(conn, chat, cfg, db.get_messages_by_ids(conn, row_ids))
-    index.index_units(conn, delta)
+    rows = db.get_messages_by_ids(conn, row_ids)
+    stranded = {msg.id for msg in units.uncut_rows(conn, chat, rows)}
+    index.index_units(conn, units.invalidate_units_for(conn, chat, cfg, rows))
+    sync._invalidate_comment_posts(conn, cfg, rows)
     index.index_messages(conn, row_ids)
-    db.mark_indexed(conn, row_ids)
+    db.mark_indexed(conn, [row_id for row_id in row_ids if row_id not in stranded])
 
 
 def media_size(media: Any) -> int | None:

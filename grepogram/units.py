@@ -566,6 +566,34 @@ def _invalidation_start(
     return min(starts) if starts else None
 
 
+def uncut_rows(
+    conn: sqlite3.Connection, chat: ChatRow, rows: Sequence[MessageRow]
+) -> list[MessageRow]:
+    """Those of ``rows`` :func:`invalidate_units_for` leaves alone for want of a window to re-cut.
+
+    :func:`_invalidation_start` answers ``None`` for a ``(chat, topic)`` that holds no window at
+    all — there is nothing stale to replace and cutting only the tail from here would leave the
+    messages before it in no window — so an invalidation covers such a row not at all. A first
+    sync interrupted between storing a chat's rows and cutting their units is what leaves that
+    state behind, and ``messages.indexed = 0`` is the whole of the handle on it
+    (:func:`grepogram.sync.index_stranded` reaches :func:`rebuild_for_chat`, which *does* cut a
+    topic's first windows from nothing). A caller that clears the flag after an invalidation
+    therefore has to keep it raised for these rows, or the repair loses its only way back to
+    them — :func:`grepogram.media._recut` is the one that does.
+
+    A broadcast channel yields nothing: its rows go to :func:`_invalidate_posts`, which builds
+    the ``post`` units it finds missing rather than skipping them.
+    """
+    if chat.is_broadcast:
+        return []
+    return [
+        msg
+        for topic_id, group in group_by_topic(chat, rows).items()
+        if db.open_window(conn, chat.id, topic_id) is None
+        for msg in group
+    ]
+
+
 def _invalidate_threads(
     conn: sqlite3.Connection, chat: ChatRow, cfg: UnitsCfg, rows: Sequence[MessageRow]
 ) -> tuple[list[UnitRow], list[UnitRow]]:

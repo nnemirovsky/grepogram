@@ -356,9 +356,9 @@ async def test_the_offline_states_are_resolved_with_no_client_call_at_all(
 async def test_a_pdf_is_downloaded_extracted_and_stored(
     conn: sqlite3.Connection, scratch: Path
 ) -> None:
-    db.upsert_chat(conn, _chat())
-    ids = db.upsert_messages(conn, [_pdf_row(CHAT_ID, 1)])
-    db.mark_indexed(conn, ids)
+    # through `_synced`, so the chat carries the units a sync leaves behind: a chat with none is
+    # the stranded state the flag is kept raised for, which its own test below covers
+    _synced(conn, [_pdf_row(CHAT_ID, 1)], _cfg())
     client = _pdf_client(1)
     report = await media.run(conn, client, _cfg(), SyncBudget())
     assert report.extracted == 1
@@ -1044,3 +1044,140 @@ async def test_a_truncated_answer_leaves_the_rows_it_left_out_for_a_retry(
     assert (report.extracted, report.failed) == (1, 1)
     assert _states(conn) == {1: db.MEDIA_FAILED, 2: db.MEDIA_EXTRACTED}
     assert [args["msg_id"] for name, args in client.calls if name == "download_media"] == [2]
+
+
+# --- the two places a re-cut has to reach -----------------------------------------------------
+
+CHANNEL_ID = -1000000000900
+GROUP_ID = -1000000000901
+_CHANNEL_SOURCE = Source(chat="@news", comments=True)
+
+
+def _comments_cfg() -> Config:
+    return Config(
+        telegram=TelegramCfg(api_id=1, api_hash="h"),
+        media=MediaCfg(),
+        sources=[_CHANNEL_SOURCE],
+    )
+
+
+def _channel_with_comments(conn: sqlite3.Connection, cfg: Config) -> tuple[ChatRow, ChatRow]:
+    """A channel whose linked group holds one text comment and one photo comment on post 10."""
+    channel = db.upsert_chat(
+        conn,
+        ChatRow(
+            id=CHANNEL_ID, type="channel", title="News", username="news", source_id="chat:@news"
+        ),
+    )
+    group = db.upsert_chat(
+        conn,
+        ChatRow(id=GROUP_ID, type="supergroup", title="News chat", discussion_of=CHANNEL_ID),
+    )
+    comments = [
+        _message(GROUP_ID, 1, text="first", comment_of_chat_id=CHANNEL_ID, comment_of_msg_id=10),
+        _message(
+            GROUP_ID, 2, media_kind="photo", comment_of_chat_id=CHANNEL_ID, comment_of_msg_id=10
+        ),
+    ]
+    sync.on_chat_synced(conn, group, cfg, db.upsert_messages(conn, comments))
+    post = _message(CHANNEL_ID, 10, text="the post")
+    sync.on_chat_synced(conn, channel, cfg, db.upsert_messages(conn, [post]))
+    return channel, group
+
+
+def _post_thread(conn: sqlite3.Connection) -> str:
+    return next(unit.text for unit in db.get_units(conn, CHANNEL_ID) if unit.kind == "thread")
+
+
+async def test_ocr_on_a_comment_reaches_the_channels_post_thread(
+    conn: sqlite3.Connection, scratch: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The route the deletion path already knew and this one did not.
+
+    A post thread quotes its comments' rendered lines while listing only the post in ``msg_ids``,
+    so no ``json_each`` over ``units.msg_ids`` reaches a comment id: without following
+    ``comment_of_*`` the group's window carries the text and the channel's thread keeps the bare
+    ``[photo]`` for good, with no flag left that would repair it.
+    """
+    cfg = _comments_cfg()
+    _channel_with_comments(conn, cfg)
+    assert "[photo]" in _post_thread(conn)
+
+    monkeypatch.setattr(extract, "registry", lambda: {"photo": _stub("ОТКРЫТО с 9:00")})
+    client = FakeClient(
+        messages={GROUP_ID: [tl.photo_message(GROUP_ID, 2)]},
+        downloads={(GROUP_ID, 2): b"jpeg bytes"},
+    )
+    assert (await media.run(conn, client, cfg, SyncBudget())).extracted == 1
+    assert "[photo] ОТКРЫТО с 9:00" in _units(conn, GROUP_ID)[(1, 2)], "the group's own window"
+    assert "[photo] ОТКРЫТО с 9:00" in _post_thread(conn), "and the channel's post thread"
+    assert not index.unit_index_gaps(conn, CHANNEL_ID)
+    assert _indexed(conn) == {1: 1, 2: 1, 10: 1}
+
+
+async def test_a_photo_that_is_not_a_comment_costs_the_channel_nothing(
+    conn: sqlite3.Connection, scratch: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A row with no ``comment_of_*`` names no post, so the follow-through does nothing."""
+    cfg = _comments_cfg()
+    _channel_with_comments(conn, cfg)
+    plain = _message(GROUP_ID, 3, media_kind="photo")
+    group = db.get_chat(conn, GROUP_ID)
+    assert group is not None
+    sync.on_chat_synced(conn, group, cfg, db.upsert_messages(conn, [plain]))
+    before = _post_thread(conn)
+
+    monkeypatch.setattr(extract, "registry", lambda: {"photo": _stub("unrelated")})
+    client = FakeClient(
+        messages={GROUP_ID: [tl.photo_message(GROUP_ID, 3)]},
+        downloads={(GROUP_ID, 3): b"jpeg bytes"},
+    )
+    assert (await media.run(conn, client, cfg, SyncBudget())).extracted == 1
+    assert _post_thread(conn) == before
+
+
+async def test_a_chat_with_no_units_keeps_the_flag_for_index_stranded(
+    conn: sqlite3.Connection, scratch: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A first sync that stored the rows and died before cutting their units leaves a chat with
+    no window at all. ``invalidate_units_for`` reaches nothing there — ``_invalidation_start``
+    answers ``None`` for a topic that holds no window — so clearing ``indexed`` would hide the
+    rows from ``index_stranded``, the one pass that rebuilds them, and they would sit in no unit
+    for good."""
+    cfg = _cfg()
+    db.upsert_chat(conn, _chat())
+    db.upsert_messages(conn, [_message(CHAT_ID, 1, media_kind="photo")])
+    assert db.get_units(conn, CHAT_ID) == []
+
+    monkeypatch.setattr(extract, "registry", lambda: {"photo": _stub("ОТКРЫТО")})
+    client = FakeClient(
+        messages={CHAT_ID: [tl.photo_message(CHAT_ID, 1)]},
+        downloads={(CHAT_ID, 1): b"jpeg bytes"},
+    )
+    assert (await media.run(conn, client, cfg, SyncBudget())).extracted == 1
+    assert _text(conn, 1) == "ОТКРЫТО"
+    assert _indexed(conn) == {1: 0}, "the repair keeps its only handle on the row"
+
+    await sync.index_stranded(conn, cfg)
+    assert "[photo] ОТКРЫТО" in _units(conn)[(1,)]
+    assert _indexed(conn) == {1: 1}
+
+
+async def test_a_row_a_window_holds_is_unflagged_even_when_nothing_changed(
+    conn: sqlite3.Connection, scratch: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An extractor that read nothing leaves every unit identical, so the delta is empty — and
+    the flag still clears, because the rows *were* covered. Keeping it raised for an empty delta
+    would hand the next sync's unbudgeted rebuild loops every photo an OCR found no text on."""
+    cfg = _cfg()
+    _synced(conn, [_message(CHAT_ID, 1, media_kind="photo")], cfg)
+    before = _units(conn)
+
+    monkeypatch.setattr(extract, "registry", lambda: {"photo": _stub("")})
+    client = FakeClient(
+        messages={CHAT_ID: [tl.photo_message(CHAT_ID, 1)]},
+        downloads={(CHAT_ID, 1): b"jpeg bytes"},
+    )
+    assert (await media.run(conn, client, cfg, SyncBudget())).extracted == 1
+    assert _units(conn) == before
+    assert _indexed(conn) == {1: 1}

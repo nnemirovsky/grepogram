@@ -519,11 +519,17 @@ def _signed_in(tmp_home: Path, extra: str = "") -> Paths:
 
 
 def _extract_chat(paths: Paths) -> FakeClient:
-    """One indexed chat holding one pending PDF, and the client that answers for it."""
+    """One indexed chat holding one pending PDF, and the client that answers for it.
+
+    Through ``on_chat_synced``, so the chat carries units: a chat whose rows were stored and
+    never cut is what ``media._recut`` keeps the ``indexed`` flag raised for.
+    """
     conn = db.connect(paths)
     db.migrate(conn)
-    db.upsert_chat(conn, ChatRow(id=EXTRACT_ID, type="supergroup", title="Chat", source_id="x"))
-    db.upsert_messages(
+    chat = db.upsert_chat(
+        conn, ChatRow(id=EXTRACT_ID, type="supergroup", title="Chat", source_id="x")
+    )
+    ids = db.upsert_messages(
         conn,
         [
             MessageRow(
@@ -535,6 +541,7 @@ def _extract_chat(paths: Paths) -> FakeClient:
             )
         ],
     )
+    sync.on_chat_synced(conn, chat, Config(), ids)
     conn.close()
     return FakeClient(
         messages={EXTRACT_ID: [tl.document_message(EXTRACT_ID, 1, "note.pdf")]},

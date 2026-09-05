@@ -1895,17 +1895,20 @@ def _prune_batch(
 def _invalidate_comment_posts(
     conn: sqlite3.Connection, cfg: Config, rows: Sequence[MessageRow]
 ) -> None:
-    """Re-cut the post threads of the channels whose comments these deleted rows were.
+    """Re-cut the post threads of the channels whose comments ``rows`` are.
 
-    The only way from a deleted comment to the unit quoting it. A channel's post thread carries
-    the post followed by its comments while listing the post alone in ``msg_ids``, so no
+    The only way from a comment to the unit quoting it, and therefore the follow-through every
+    pass that changes a comment outside its own chat owes: :func:`_prune_batch` after a deletion
+    and :func:`grepogram.media._recut` after an extraction. A channel's post thread carries the
+    post followed by its comments while listing the post alone in ``msg_ids``, so no
     ``json_each`` over ``units.msg_ids`` reaches a comment id and neither the group's own
     invalidation nor any lookup by unit could find that thread; ``comment_of_chat_id`` /
     ``comment_of_msg_id`` on the comment's row is what names it.
 
-    The posts are re-read from the channel's own rows and handed to the same primitive, which
-    rebuilds the thread from the comments still stored — this runs after the delete, so the one
-    that has just gone is not among them.
+    ``rows`` name the comments and nothing else: the posts are re-read from the channel's own
+    rows and the threads rebuilt from the comments **stored now**, so a deleted comment is
+    already gone from them (this runs after the delete) and an extracted one is already carrying
+    its text. Rows that are not comments cost nothing — they name no post.
     """
     posts: dict[int, set[int]] = {}
     for row in rows:
