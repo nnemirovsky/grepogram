@@ -864,22 +864,86 @@ def prunable(cfg: Config, conn: sqlite3.Connection, folders: FolderMembership) -
     return PruneScan(prunable=[] if unresolved else offered, kept=kept, unresolved=unresolved)
 
 
-def prune_chats(conn: sqlite3.Connection, chat_ids: Sequence[int]) -> list[int]:
+def prune_chats(conn: sqlite3.Connection, candidates: Sequence[PruneCandidate]) -> list[int]:
     """Delete the chats :func:`prunable` offered, with their messages, units and index rows.
 
-    One transaction for the lot, and a chat that is no longer stored is skipped rather than
-    raised: the scan runs before the sync lock is taken — a network round trip must never be
-    held across it — so a sync may have removed a chat in between. Returns the ids removed.
+    One transaction for the lot, and every candidate is put to :func:`_still_prunable` again
+    inside it. The re-check is not belt and braces: the scan and the confirmation both happen
+    *before* the sync lock is taken, because a network round trip must never be held across it,
+    so the verdict this acts on can be seconds or minutes old and another process is free to
+    have changed the chat in between — to have taken it over, linked it as a discussion group,
+    or removed the live source and imported the same chat, which is the one that cannot be
+    undone. What the offer rested on is re-read here instead of assumed. Returns the ids
+    actually removed, which is how the caller notices that a candidate was dropped; each drop is
+    logged with the reason.
+
+    ``candidates`` and not ids for that reason: :attr:`PruneCandidate.chat` carries the
+    ``source_id`` the offer was made under, which is what "unchanged" is measured against.
     """
     removed: list[int] = []
     with db.transaction(conn):
-        for chat_id in chat_ids:
-            if db.get_chat(conn, chat_id) is None:
+        for candidate in candidates:
+            stored = db.get_chat(conn, candidate.chat.id)
+            if stored is None or not _still_prunable(conn, stored, candidate):
                 continue
-            db.delete_chat(conn, chat_id)
-            removed.append(chat_id)
+            db.delete_chat(conn, stored.id)
+            removed.append(stored.id)
     log.info("pruned %d chats", len(removed))
     return removed
+
+
+def _still_prunable(conn: sqlite3.Connection, stored: ChatRow, candidate: PruneCandidate) -> bool:
+    """Whether ``stored`` is still the chat :func:`prunable` offered, re-read under the lock.
+
+    Three questions, in the order of what they cost if missed:
+
+    * is it an import now? :func:`imported_tag` is the question every path that touches
+      ``chats.source_id`` has to ask, and this one deletes rows rather than writing the column,
+      which makes it the worst place to skip: an imported history has no dialog behind it and
+      Telegram cannot hand it back. ``sources rm folder:X`` followed by an import of the same
+      chat is all it takes, and neither command takes longer than a confirmation prompt;
+    * does it still carry the source id it was offered under? The whole verdict was "*this*
+      folder source brought it in and no resolved source covers it any more", so any other value
+      in the column — another source's id after a sync resolved it, a folder entry rewritten —
+      says the scan is describing a chat that no longer exists in that form;
+    * is it a channel's discussion group now? :func:`prunable` keeps one for the reason that it
+      is indexed through the link and not through a folder listing, and
+      :func:`grepogram.sync.link_discussion_chat` can have made it one since.
+
+    Everything here is a database read: this runs under the :class:`~grepogram.sync.SyncLock`,
+    where a Telegram round trip has no business. Re-resolving the folders is what the next
+    ``sources prune`` is for.
+    """
+    chat_id = stored.id
+    held = imported_tag(conn, chat_id)
+    if held is not None:
+        log.warning(
+            "chat %s (%s) is held as %s since the prune was scanned; it was not deleted — "
+            "an imported history cannot be fetched again",
+            chat_id,
+            stored.title,
+            held,
+        )
+        return False
+    if (stored.source_id or "") != (candidate.chat.source_id or ""):
+        log.warning(
+            "chat %s (%s) was offered under source %s and now carries %s; it was not deleted",
+            chat_id,
+            stored.title,
+            candidate.chat.source_id or "-",
+            stored.source_id or "-",
+        )
+        return False
+    if stored.discussion_of is not None and db.get_chat(conn, stored.discussion_of) is not None:
+        log.warning(
+            "chat %s (%s) is the discussion group of channel %s since the prune was scanned; "
+            "it was not deleted",
+            chat_id,
+            stored.title,
+            stored.discussion_of,
+        )
+        return False
+    return True
 
 
 # --- import ----------------------------------------------------------------------------------

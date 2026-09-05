@@ -1265,14 +1265,57 @@ def test_prunable_keeps_a_chat_whose_source_is_no_longer_configured(
     ]
 
 
+def _offered(chat: ChatRow) -> sources.PruneCandidate:
+    """The candidate ``prunable`` would build for a chat it offers."""
+    return sources.PruneCandidate(
+        chat=chat, reason=f"{chat.source_id} no longer lists it", messages=0
+    )
+
+
 def test_prune_chats_deletes_the_rows_and_skips_ids_that_are_gone(
     conn: sqlite3.Connection,
 ) -> None:
     _populate(conn)
-    removed = sources.prune_chats(conn, [NEWS_ID, GHOST_ID, NEWS_ID])
+    news = _offered(_chat(NEWS_ID, "folder:Argentina", type="channel", title="News"))
+    ghost = _offered(_chat(GHOST_ID, "folder:Argentina"))
+    removed = sources.prune_chats(conn, [news, ghost, news])
     assert removed == [NEWS_ID]
     assert [c.id for c in db.list_chats(conn)] == sorted([ARG_ID, GEORGIA_ID, 1])
     assert db.message_counts(conn) == {ARG_ID: 3, GEORGIA_ID: 4, 1: 1}
+
+
+def test_prune_chats_keeps_a_chat_imported_since_the_scan(conn: sqlite3.Connection) -> None:
+    """The race the scan cannot close: the offer predates the sync lock by a confirmation
+    prompt, and `sources rm` plus an import of the same chat fit inside one. An imported
+    history has no dialog behind it, so deleting it on a stale verdict loses it for good."""
+    _populate(conn)
+    offer = _offered(_chat(NEWS_ID, "folder:Argentina", type="channel", title="News"))
+    db.upsert_chat(conn, _chat(NEWS_ID, "import:news", type="channel", title="News"))
+    assert sources.prune_chats(conn, [offer]) == []
+    assert db.message_counts(conn)[NEWS_ID] == 2
+
+
+def test_prune_chats_keeps_a_chat_another_source_took_over(conn: sqlite3.Connection) -> None:
+    """A sync that resolved the chat under a different source between the scan and the lock:
+    the verdict was about the folder that no longer lists it, and it no longer describes
+    this row."""
+    _populate(conn)
+    offer = _offered(_chat(NEWS_ID, "folder:Argentina", type="channel", title="News"))
+    db.upsert_chat(conn, _chat(NEWS_ID, "folder:Other", type="channel", title="News"))
+    assert sources.prune_chats(conn, [offer]) == []
+    assert db.message_counts(conn)[NEWS_ID] == 2
+
+
+def test_prune_chats_keeps_a_chat_linked_as_a_discussion_group_since_the_scan(
+    conn: sqlite3.Connection,
+) -> None:
+    """`prunable` keeps a channel's discussion group; a sync can have made it one since."""
+    _populate(conn)
+    group = _chat(NEWS_ID, "folder:Argentina", type="supergroup", title="News chat")
+    _store(conn, group, 2)
+    db.set_discussion_chat(conn, ARG_ID, NEWS_ID)
+    assert sources.prune_chats(conn, [_offered(group)]) == []
+    assert db.get_chat(conn, NEWS_ID) is not None
 
 
 # --- prune, through the CLI ------------------------------------------------------------------
@@ -1392,11 +1435,13 @@ def test_cli_sources_prune_resolves_before_it_takes_the_sync_lock(
             order.append("resolved")
         return await real_membership(client, cfg)
 
-    def prune_under_the_lock(conn: sqlite3.Connection, chat_ids: Sequence[int]) -> list[int]:
+    def prune_under_the_lock(
+        conn: sqlite3.Connection, candidates: Sequence[sources.PruneCandidate]
+    ) -> list[int]:
         with pytest.raises(sync.SyncInProgress), sync.SyncLock(paths):
             pass
         order.append("deleted")
-        return real_prune(conn, chat_ids)
+        return real_prune(conn, candidates)
 
     monkeypatch.setattr(cli, "_folder_membership", membership_without_the_lock)
     monkeypatch.setattr(sources, "prune_chats", prune_under_the_lock)

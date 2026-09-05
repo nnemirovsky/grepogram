@@ -885,6 +885,10 @@ def sources_prune(
     config to save, because a chat that left a folder changes no source entry. Nothing goes
     without a confirmation, and a source Telegram will not answer for stops the prune — a folder
     that failed to resolve is not a folder that lists nothing.
+
+    The scan and the confirmation both predate the lock, so every chat is put to the offer's
+    terms again under it (:func:`grepogram.sources.prune_chats`) and one another process changed
+    meanwhile survives; that is why the count printed at the end can be lower than the table's.
     """
     paths, cfg, conn = _load()
     _require_api_keys(cfg, paths)
@@ -917,8 +921,14 @@ def sources_prune(
             typer.echo("nothing removed")
             return
         with sync.SyncLock(paths):
-            removed = sources.prune_chats(conn, [c.chat.id for c in scan.prunable])
+            removed = sources.prune_chats(conn, scan.prunable)
         typer.echo(f"removed {len(removed)} chats")
+        if len(removed) < len(scan.prunable):
+            typer.echo(
+                f"{len(scan.prunable) - len(removed)} changed since the scan and were kept; "
+                "run `grepogram sources prune` again to see them",
+                err=True,
+            )
     except (tg.AuthRequired, tg.SessionError, sync.SyncInProgress, ConfigError) as exc:
         fail(str(exc), hint=getattr(exc, "hint", None))
     except (tg_errors.RPCError, ConnectionError) as exc:
