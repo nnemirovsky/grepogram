@@ -965,6 +965,13 @@ def test_failure_results(exc: Exception, error: str, hint: str | None) -> None:
     assert tools.failure(exc) == {"error": error, "hint": hint}
 
 
+def test_config_failures_carry_a_hint() -> None:
+    plain = config.ConfigError("/x/config.toml: invalid TOML: line 3")
+    assert tools.failure(plain) == {"error": str(plain), "hint": tools.CONFIG_HINT}
+    keyed = config.ConfigError("/x/config.toml: unknown key: models.k", "upgrade and restart")
+    assert tools.failure(keyed) == {"error": str(keyed), "hint": "upgrade and restart"}
+
+
 def test_failure_results_carry_candidates() -> None:
     unknown = UnknownChat("x", ["folder:A (1 chats)", "'B' (id 2)"])
     assert tools.failure(unknown) == {

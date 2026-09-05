@@ -150,6 +150,44 @@ def test_unknown_key_names_the_key(text: str, key: str) -> None:
         config.loads(text)
 
 
+def test_an_unknown_top_level_key_lists_the_sections() -> None:
+    with pytest.raises(ConfigError) as caught:
+        config.loads("foo = 1\n")
+    assert caught.value.hint == config.UNKNOWN_SECTION_HINT
+    assert "[telegram]" in config.UNKNOWN_SECTION_HINT
+    assert "[[sources]]" in config.UNKNOWN_SECTION_HINT
+
+
+def test_an_unknown_key_in_a_known_section_points_at_a_newer_build() -> None:
+    """What a long-running MCP server sees after the CLI writes a key its build predates."""
+    with pytest.raises(ConfigError) as caught:
+        config.loads("[models]\nmax_seq_length_v2 = 1\n")
+    hint = caught.value.hint
+    assert hint is not None and "[models]" in hint and "restart" in hint
+
+
+def test_an_unknown_source_key_names_the_keys_a_source_takes() -> None:
+    with pytest.raises(ConfigError) as caught:
+        config.loads("[[sources]]\nfolder = 'x'\nbar = 2\n")
+    hint = caught.value.hint
+    assert hint is not None and "folder" in hint and "comments" in hint
+
+
+def test_a_wrong_type_leaves_the_hint_to_the_caller() -> None:
+    """The message already names the key and the expected type; MCP fills the generic hint in."""
+    with pytest.raises(ConfigError) as caught:
+        config.loads("[search]\nk = '10'\n")
+    assert caught.value.hint is None
+
+
+def test_the_hint_survives_the_file_name_prefix(paths: Paths) -> None:
+    paths.config_file.write_text("[models]\nnope = 1\n")
+    with pytest.raises(ConfigError) as caught:
+        config.load(paths)
+    assert str(paths.config_file) in str(caught.value)
+    assert caught.value.hint is not None and "[models]" in caught.value.hint
+
+
 @pytest.mark.parametrize(
     ("text", "key"),
     [
