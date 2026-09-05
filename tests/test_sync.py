@@ -17,7 +17,7 @@ from telethon.tl import functions, types
 from telethon.tl.types import messages as tl_messages
 from typer.testing import CliRunner
 
-from grepogram import cli, db, search, sources, sync, tg, units
+from grepogram import cli, db, index, search, sources, sync, tg, units
 from grepogram.config import ConfigError
 from grepogram.models import (
     ChatRow,
@@ -29,6 +29,7 @@ from grepogram.models import (
     SyncCfg,
     SyncReport,
     TelegramCfg,
+    UnitsCfg,
 )
 from grepogram.paths import Paths
 from grepogram.sync import SyncBudget, SyncInProgress, SyncLock
@@ -1082,6 +1083,31 @@ async def test_the_sweep_resolves_its_chats_before_it_asks_about_stored_ids(
     assert _texts(conn, ARG_ID) == {101: "m101"}
 
 
+async def test_the_sweep_caps_the_flood_sleep_before_the_warm_up_asks_anything(
+    conn: sqlite3.Connection, paths: Paths, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The warm-up is a Telegram request like any other, and it went out first.
+
+    With the cap applied only inside the per-chat loop, a client still carrying the configured
+    120-second ``flood_sleep_threshold`` would sleep a sub-threshold flood wait on ``get_dialogs``
+    out in full — far past the whole budget — before the sweep had asked its first question.
+    """
+    client = _client(messages={ARG_ID: _talk(101, 102)})
+    cfg = _cfg(ARG_SOURCE)
+    await _run(client, conn, paths, cfg)
+    listed = client.get_dialogs
+    seen: list[float] = []
+
+    async def watched(*args: Any, **kwargs: Any) -> list[Any]:
+        seen.append(client.flood_sleep_threshold)
+        return await listed(*args, **kwargs)
+
+    monkeypatch.setattr(client, "get_dialogs", watched)
+    await _prune(client, conn, paths, cfg, SyncBudget(5))
+
+    assert seen == [5], "the budget bounds the warm-up too, not only the sweep behind it"
+
+
 async def test_a_chat_the_account_cannot_resolve_costs_that_chat_its_turn(
     conn: sqlite3.Connection, paths: Paths
 ) -> None:
@@ -1124,25 +1150,31 @@ async def test_a_session_revoked_mid_sweep_stops_it_with_the_auth_hint(
         await _prune(client, conn, paths, cfg)
 
 
-@pytest.mark.parametrize("at", ["dialogs", "channel"])
+@pytest.mark.parametrize("at", ["dialogs", "username", "channel"])
 async def test_the_warm_up_reraises_a_revoked_session_and_swallows_the_rest(
     at: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The warm-up is worth failing a pass for in one case only.
 
     A chat it cannot resolve is left to the caller's per-chat handler — that is the whole of its
-    contract — but a session Telegram has revoked resolves nothing at all, ever, and both of its
-    handlers caught ``RPCError``, of which every ``UnauthorizedError`` is one. The pass behind it
-    then reported every chat as unresolvable and exited 0.
+    contract — but a session Telegram has revoked resolves nothing at all, ever, and every one of
+    its handlers caught ``RPCError``, of which every ``UnauthorizedError`` is one. The pass behind
+    it then reported every chat as unresolvable and exited 0. The re-raise has to lead each
+    handler, the ``@handle`` route included.
     """
     client = _client()
     chats = [ChatRow(id=DISC_ID, type="supergroup", title="News chat", discussion_of=NEWS_ID)]
+    if at == "username":
+        chats = [ChatRow(id=OTHER_ID, type="channel", title="Other news", username="other_news")]
     revoked = errors.AuthKeyUnregisteredError(request=None)
     other: Exception = errors.ChannelPrivateError(request=None)
 
     def arm(error: Exception) -> None:
         if at == "channel":
             client.responses[functions.channels.GetFullChannelRequest] = error
+            return
+        if at == "username":
+            client.entity_errors["other_news"] = error
             return
 
         async def raising(*_: Any, **__: Any) -> list[Any]:
@@ -1159,6 +1191,69 @@ async def test_the_warm_up_reraises_a_revoked_session_and_swallows_the_rest(
     async with tg.connected(client):
         # anything else is still swallowed: the chat is left to the caller's per-chat handler
         await sync.warm_peer_cache(client, chats)
+
+
+async def test_the_sweep_resolves_a_public_chat_the_dialog_list_never_lists(
+    conn: sqlite3.Connection, paths: Paths
+) -> None:
+    """A channel followed without joining has no dialog at all, so the dialog list cannot warm it.
+
+    A sync never notices, because it reaches such a chat through the ``@name`` its source
+    names — and that handle is stored on the row as ``chats.username``. Warming from the dialog
+    list alone left ``prune-deleted`` and ``extract`` failing their by-id requests for exactly
+    the chats the warm-up was added for.
+    """
+    client = _client(
+        entities=[DISC, OTHER],
+        messages={
+            OTHER_ID: [tl.channel_post(OTHER_ID, 1, "post 1"), tl.channel_post(OTHER_ID, 2, "gone")]
+        },
+    )
+    cfg = _cfg(Source(chat="@other_news"))
+    await _run(client, conn, paths, cfg)
+    stored = db.get_chat(conn, OTHER_ID)
+    assert stored is not None and stored.username == "other_news"
+    assert OTHER_ID not in {dialog.id for dialog in client.dialogs}, "and never a dialog"
+    client.calls.clear()
+    del client.messages[OTHER_ID][1]
+
+    report = await _prune(client, conn, paths, cfg)
+
+    assert ("get_entity", {"key": "other_news"}) in client.calls
+    assert report.chats_done == [OTHER_ID]
+    assert (report.removed, report.warnings) == (1, [])
+    assert _texts(conn, OTHER_ID) == {1: "post 1"}
+
+
+async def test_the_warm_up_resolves_a_channel_before_asking_it_for_its_discussion_group() -> None:
+    """``GetFullChannelRequest`` names the channel, so a channel outside the dialog list cannot
+    be asked about either — and the group hanging off it stays unresolvable with it.
+
+    The handle pass therefore runs over the whole list before the first group is asked for, which
+    is what makes the second route work for a channel the account follows without joining.
+    """
+    group = make_channel(205, "Other news chat", megagroup=True)
+    group_id = -1000000000205
+
+    def full(request: Any) -> tl_messages.ChatFull:
+        if int(request.channel) not in client.resolved:
+            raise ValueError(f"Could not find the input entity for {request.channel!r}")
+        return _full_channel(group_id, chats=[OTHER, group])
+
+    client = _client(
+        entities=[DISC, OTHER, group],
+        responses={functions.channels.GetFullChannelRequest: full},
+    )
+    client.forget_entities()
+    chats = [
+        ChatRow(id=group_id, type="supergroup", title="Other news chat", discussion_of=OTHER_ID),
+        ChatRow(id=OTHER_ID, type="channel", title="Other news", username="other_news"),
+    ]
+
+    async with tg.connected(client):
+        await sync.warm_peer_cache(client, chats)
+
+    assert {OTHER_ID, group_id} <= client.resolved
 
 
 async def test_an_imported_or_unavailable_chat_is_never_asked_about(
@@ -3619,3 +3714,66 @@ async def test_edit_refetch_re_queues_a_photo_replaced_by_a_document(
     assert (after.media_kind, after.media_filename) == ("document", "contract.pdf")
     assert after.extracted_text is None
     assert after.media_state == db.MEDIA_PENDING, "and back in the extraction queue"
+
+
+def _unit_fts(conn: sqlite3.Connection, chat_id: int) -> list[str]:
+    """The text ``unit_fts`` answers a search from for a chat, unit by unit."""
+    rows = conn.execute("SELECT raw FROM unit_fts WHERE chat_id = ? ORDER BY rowid", (chat_id,))
+    return [str(row["raw"]) for row in rows]
+
+
+async def test_a_replaced_attachment_cuts_the_old_text_out_of_a_closed_window(
+    conn: sqlite3.Connection, paths: Paths
+) -> None:
+    """Clearing ``extracted_text`` is only half the reset, and the other half had no owner.
+
+    The unit built from that text still held it, and nothing would ever have repaired it: a
+    rebuild does not re-cut a closed window, ``on_chat_synced`` clears ``indexed`` whether or not
+    anything was rebuilt, and the row is no longer pending media — so no flag and no queue leads
+    back to it. The replaced file's text stayed searchable in ``units`` and ``unit_fts`` for good.
+    """
+    cfg = Config(
+        telegram=TELEGRAM,
+        sync=SyncCfg(edit_refetch=200),
+        units=UnitsCfg(window_gap_min=30, window_max_msgs=3, window_max_chars=4000),
+        sources=[ARG_SOURCE],
+    )
+    history = [
+        tl.message(ARG_ID, 101, "m101", sender=1),
+        tl.document_message(ARG_ID, 102, "old.pdf", "at the embassy", sender=1),
+        *(tl.message(ARG_ID, i, f"m{i}", sender=1) for i in (103, 104, 105, 106)),
+    ]
+    client = _client(messages={ARG_ID: list(history)})
+    await _run(client, conn, paths, cfg)
+
+    chat = db.get_chat(conn, ARG_ID)
+    row = db.get_message(conn, ARG_ID, 102)
+    assert chat is not None and row is not None
+    with db.transaction(conn):  # what the extraction pass leaves behind
+        conn.execute(
+            "UPDATE messages SET extracted_text = ?, media_state = ? WHERE id = ?",
+            ("отдел виз работает с 9:00", db.MEDIA_EXTRACTED, row.id),
+        )
+        extracted = db.get_message(conn, ARG_ID, 102)
+        assert extracted is not None
+        index.index_units(conn, units.invalidate_units_for(conn, chat, cfg, [extracted]))
+    holder = db.containing_unit(conn, ARG_ID, 102, None)
+    assert holder is not None and 106 not in holder.msg_ids, "the window it sits in is closed"
+    assert "отдел виз работает с 9:00" in holder.text
+    assert any("отдел виз" in raw for raw in _unit_fts(conn, ARG_ID))
+
+    swapped = list(history)
+    swapped[1] = tl.document_message(
+        ARG_ID, 102, "new.zip", "at the embassy", mime_type="application/zip", sender=1
+    )
+    client.messages[ARG_ID] = swapped
+    await _run(client, conn, paths, cfg)
+
+    after = db.get_message(conn, ARG_ID, 102)
+    assert after is not None
+    assert (after.media_filename, after.extracted_text) == ("new.zip", None)
+    assert after.media_state == db.MEDIA_PENDING
+    stored = [unit.text for unit in db.get_units(conn, ARG_ID)]
+    assert not any("отдел виз" in text for text in stored), "the old file's text left the unit"
+    assert not any("отдел виз" in raw for raw in _unit_fts(conn, ARG_ID)), "and left unit_fts"
+    assert not index.unit_index_gaps(conn, ARG_ID)

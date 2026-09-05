@@ -669,6 +669,32 @@ async def test_the_flood_sleep_threshold_shrinks_with_the_time_left(
     assert client.flood_sleep_threshold == 120, "an unlimited run leaves the configured threshold"
 
 
+async def test_the_threshold_is_capped_before_the_warm_up_asks_anything(
+    conn: sqlite3.Connection, scratch: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The warm-up is a Telegram request like any other, and it went out first.
+
+    With the cap applied only inside the per-chat loop, a client still carrying the configured
+    120-second ``flood_sleep_threshold`` would sleep a sub-threshold flood wait on ``get_dialogs``
+    out in full — a minute against a five-second extraction budget — before a chat was looked at.
+    """
+    db.upsert_chat(conn, _chat())
+    db.upsert_messages(conn, [_pdf_row(CHAT_ID, 1)])
+    client = _pdf_client(1)
+    client.flood_sleep_threshold = 120
+    listed = client.get_dialogs
+    seen: list[float] = []
+
+    async def watched(*args: Any, **kwargs: Any) -> list[Any]:
+        seen.append(client.flood_sleep_threshold)
+        return await listed(*args, **kwargs)
+
+    monkeypatch.setattr(client, "get_dialogs", watched)
+    await media.run(conn, client, _cfg(), SyncBudget(5.0))
+
+    assert seen == [5], "the budget bounds the warm-up too, not only the extraction behind it"
+
+
 async def test_a_flood_wait_keeps_what_the_run_earned_and_stops(
     conn: sqlite3.Connection, scratch: Path
 ) -> None:

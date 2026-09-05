@@ -155,7 +155,10 @@ async def run(
     once it knows that one — and a client grepogram builds knows none:
     :func:`grepogram.sync.warm_peer_cache` reads the dialog list first, for the reasons written
     there. Without it this pass resolved *nothing* on a real account and every chat left a
-    "Could not find the input entity" warning below.
+    "Could not find the input entity" warning below. The cap goes on **before** that warm-up:
+    it makes requests of its own, and a client still at the default 120-second threshold would
+    sleep a sub-threshold flood wait out well past a five-second extraction budget before the
+    first chat had been looked at.
     """
     warnings: list[str] = []
     if not cfg.media.enabled:
@@ -176,6 +179,7 @@ async def run(
     with _scratch() as scratch:
         chats = _fetchable_rows(conn)
         if not budget.expired:
+            sync._cap_flood_sleep(client, cfg.sync, budget)
             await sync.warm_peer_cache(client, chats)
         for chat_id in [chat.id for chat in chats]:
             if budget.expired:

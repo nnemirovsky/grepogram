@@ -83,8 +83,18 @@ never change the git identity.
   the session); a pass that walks `chats` rows instead — `sync.prune_deleted` and `media.run`,
   the two that re-fetch by id — must call `sync.warm_peer_cache` first, or every
   `client.get_messages(chat.id, ids=…)` raises a plain `ValueError` that is not an `RPCError`.
-  `warm_peer_cache` also resolves a link-only discussion group through
-  `GetFullChannelRequest(chat.discussion_of)`, the one chat a dialog list can miss. The MCP server builds a fresh client per Telegram-using tool
+  The dialog list is not the whole account, and `warm_peer_cache` walks the two stored handles a
+  `chats` row can carry for what it misses, **in this order**: `chats.username` through
+  `client.get_entity`, for a public chat the account follows without joining (a sync only ever
+  reaches such a chat through the `@name` its source names, and that handle is on the row —
+  skipping it left `extract` and `prune-deleted` failing by-id requests for exactly the chats the
+  warm-up was added for), and then `GetFullChannelRequest(chat.discussion_of)` for a link-only
+  discussion group. The order is load-bearing: that request *names* the channel, so a channel
+  outside the dialog list has to be resolved by its own handle before its group can be asked for.
+  Those two are the whole of it — `source_id` is a source id and not a peer, `title` is fuzzy
+  text matched against the dialog list this already read, and a legacy `PeerChat` id needs no
+  access hash at all. What no route resolves costs that chat its turn with a warning, and only an
+  `UnauthorizedError` is re-raised, ahead of every handler. The MCP server builds a fresh client per Telegram-using tool
   call (`AppState.telegram()`): Telethon caches the authorization check per instance and
   concurrent calls must never share a connection one of them will close. Syncs in the server go
   through `AppState.sync_lock`, config writes through `AppState.editing_config()`, and
@@ -225,7 +235,19 @@ never change the git identity.
   and nothing else: a caption edit moves neither, and keying this on `edit_date` or `text` would
   re-download every extracted photo in the index for a typo fix, `edit_refetch` messages per
   chat per sync. `sync._differs` compares both columns in full, so a replaced attachment always
-  reaches the upsert as an edit.
+  reaches the upsert as an edit. **Clearing the column is only half of the reset**: the units and
+  `unit_fts` rows cut from that text still hold it, and `indexed = 0` reaches none of it — a
+  rebuild does not re-cut a closed window and `on_chat_synced` clears the flag anyway, so with no
+  row left flagged and no media left pending nothing would ever lead back to it. Invalidating is
+  the caller's job, `db` knowing nothing of `units`: `sync._Run.store` asks
+  `db.attachment_replaced` over the row as it is stored *before* the upsert, and for the rows
+  that actually carried text runs `units.invalidate_units_for` + `index.index_units` and
+  `sync._invalidate_comment_posts` in the upsert's own transaction — the same pairing
+  `media._recut` runs in the other direction, off the event loop (`_joined_to_thread`) because a
+  re-cut runs to the end of the chat. Rows that carried no text are deliberately left alone: a
+  changed rendered line inside a closed window is the documented v1 limitation
+  (`units.rebuild_for_chat`), and widening this to every attachment change would re-cut a chat's
+  tail for edits the design accepts.
 - An extractor **degrades rather than fails**. `extract.registry()` is re-derived on every call,
   never frozen at import, because what a kind maps to is a property of the environment: `pypdf`
   and `python-docx` come with the `media` extra, and OCR needs macOS and

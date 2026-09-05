@@ -248,7 +248,15 @@ no file for a photo), as is a document replaced by one of the same name; ``extra
 --retry-failed`` does not reach those either, and re-syncing the chat from scratch is what
 clears them. Resetting to :data:`MEDIA_PENDING` rather than to the state the row held puts the
 row back at the top of the pass, where the offline half parks it again if the new kind has no
-extractor or is switched off."""
+extractor or is switched off.
+
+Clearing the column is only half of the reset: the units and ``unit_fts`` rows cut from that
+text still carry it, and ``indexed = 0`` alone never reaches them — a rebuild does not re-cut a
+closed window, which is where all but the newest handful of a chat's history lives, and
+:func:`grepogram.sync.on_chat_synced` clears the flag regardless. Invalidating them is the
+caller's job for the reason it is :func:`grepogram.media._recut`'s after an extraction: this
+module may not import :mod:`grepogram.units`. :func:`attachment_replaced` is the predicate the
+caller asks with, and :meth:`grepogram.sync._Run.store` is the caller."""
 
 _UNIT_INSERT = """
     INSERT INTO units(chat_id, topic_id, kind, msg_id_start, msg_id_end, msg_ids,
@@ -1049,6 +1057,22 @@ def upsert_messages(conn: sqlite3.Connection, batch: Iterable[MessageRow]) -> li
             ).fetchone()
             ids.append(int(row["id"]))
     return ids
+
+
+def attachment_replaced(stored: MessageRow, fresh: MessageRow) -> bool:
+    """Whether storing ``fresh`` over ``stored`` would trip :data:`_ATTACHMENT_REPLACED`.
+
+    The Python half of that SQL predicate, kept beside it so "the attachment moved" is defined
+    once: ``!=`` is what the SQL's ``IS NOT`` means, both columns being nullable and ``None``
+    comparing equal to ``None`` on both sides.
+
+    A caller asks **before** the upsert, because the reset the predicate triggers clears
+    ``extracted_text`` — and the units cut from that text are the caller's to invalidate, which
+    an upsert cannot do for it (this module knows nothing of ``units``). The one caller is
+    :meth:`grepogram.sync._Run.store`; nothing else re-stores a message that may already carry
+    an extraction.
+    """
+    return stored.media_kind != fresh.media_kind or stored.media_filename != fresh.media_filename
 
 
 def unindexed_message_ids(conn: sqlite3.Connection, chat_id: int) -> list[int]:
