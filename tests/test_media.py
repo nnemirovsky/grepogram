@@ -194,6 +194,8 @@ def test_pending_queries_see_only_media_at_pending(conn: sqlite3.Connection) -> 
     assert [row.chat_id for row in db.messages_pending_media(conn, 10, CHAT_ID)] == [CHAT_ID]
     assert [row.chat_id for row in db.messages_pending_media(conn, 10, OTHER_ID)] == [OTHER_ID]
     assert len(db.messages_pending_media(conn, 1, CHAT_ID)) == 1
+    assert db.count_pending_media(conn, [CHAT_ID]) == 1
+    assert db.count_pending_media(conn, []) == 0, "an empty scope is not the whole index"
     db.set_media_state(conn, [1], db.MEDIA_UNSUPPORTED)
     assert db.count_pending_media(conn) == 1
 
@@ -685,16 +687,24 @@ async def test_an_imported_chat_is_never_re_fetched(
     assert report.extracted == 1
     assert _fetches(client) == [{"chat_id": CHAT_ID, "limit": None, "ids": [1]}]
     assert _states(conn) == {1: db.MEDIA_EXTRACTED, 2: db.MEDIA_PENDING}
+    assert (report.remaining, report.unreachable) == (0, 1), (
+        "the queue this pass can drain is drained; the import's row is not work to offer"
+    )
 
 
 async def test_an_unavailable_chat_is_never_re_fetched(
     conn: sqlite3.Connection, scratch: Path
 ) -> None:
-    """Telegram refuses it, so a request per batch would buy nothing."""
+    """Telegram refuses it, so a request per batch would buy nothing.
+
+    Its rows stay at ``MEDIA_PENDING`` for good, which is why they are not ``remaining``:
+    ``remaining`` is the pass's only completion signal — `cli._print_media_report` prints "run
+    extract again" for it and a script may loop until it reaches zero — so counting work no run
+    can ever do would make that signal permanently wrong."""
     db.upsert_chat(conn, dataclasses.replace(_chat(), unavailable=True))
     db.upsert_messages(conn, [_pdf_row(CHAT_ID, 1)])
     report = await media.run(conn, _pdf_client(1), _cfg(), SyncBudget())
-    assert (report.extracted, report.remaining) == (0, 1)
+    assert (report.extracted, report.remaining, report.unreachable) == (0, 0, 1)
     assert _states(conn) == {1: db.MEDIA_PENDING}
 
 

@@ -289,7 +289,8 @@ class MediaReport:
     The offline counters (``unsupported``, ``disabled``, ``requeued``) come from the bulk
     updates that park media on what the stored ``media_kind`` alone says, before a single
     Telegram request; the rest are messages the pass actually re-fetched. ``remaining`` is what
-    a budget or a flood wait left in the queue for the next run.
+    a budget or a flood wait left in the queue for the next run, and only the next run's own
+    work: media in a chat nothing may re-fetch is counted in ``unreachable`` instead.
     """
 
     extracted: int = 0
@@ -304,6 +305,9 @@ class MediaReport:
     requeued: int = 0
     """Put back in the queue: a kind switched back on, or ``--retry-failed``."""
     remaining: int = 0
+    """Pending media a further run could still read — what "run extract again" is offered for."""
+    unreachable: int = 0
+    """Pending media in a chat no run may re-fetch: an imported or an unavailable one."""
     warnings: list[str] = field(default_factory=list)
 
 

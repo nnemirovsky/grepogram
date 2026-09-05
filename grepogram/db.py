@@ -1145,11 +1145,27 @@ def chats_with_pending_media(conn: sqlite3.Connection) -> list[int]:
     return [int(row["chat_id"]) for row in rows]
 
 
-def count_pending_media(conn: sqlite3.Connection) -> int:
-    """How many rows are left in the extraction queue — what a stopped pass reports as remaining."""
+def count_pending_media(conn: sqlite3.Connection, chat_ids: Sequence[int] | None = None) -> int:
+    """How many rows are left in the extraction queue; ``chat_ids`` scopes it to those chats.
+
+    The scoped figure is what ``grepogram extract`` reports as ``remaining``, over the chats the
+    pass can actually re-fetch (:func:`grepogram.media._fetchable_chats`). A row in an imported
+    or unavailable chat never leaves :data:`MEDIA_PENDING`, so the index-wide count would tell
+    the user to "run extract again" for work no run can ever do, and a script looping until it
+    reaches zero would never stop. An empty ``chat_ids`` is an empty scope, not the whole index.
+    """
+    if chat_ids is None:
+        scope: str = ""
+        params: tuple[int, ...] = ()
+    elif chat_ids:
+        scope = f" AND chat_id IN ({','.join('?' * len(chat_ids))})"
+        params = tuple(chat_ids)
+    else:
+        return 0
     row = conn.execute(
         f"SELECT COUNT(*) AS n FROM messages WHERE media_state = {MEDIA_PENDING} "
-        "AND media_kind IS NOT NULL"
+        f"AND media_kind IS NOT NULL{scope}",
+        params,
     ).fetchone()
     return int(row["n"])
 

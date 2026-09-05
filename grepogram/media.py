@@ -154,8 +154,10 @@ async def run(
     warnings: list[str] = []
     if not cfg.media.enabled:
         log.info("[media] enabled is false; the extraction pass did nothing")
+        remaining, unreachable = _queue_left(conn)
         return MediaReport(
-            remaining=db.count_pending_media(conn),
+            remaining=remaining,
+            unreachable=unreachable,
             warnings=["[media] enabled is false in the config; nothing was extracted"],
         )
     extractors = extract.registry()
@@ -182,6 +184,7 @@ async def run(
             except (errors.RPCError, ValueError) as exc:
                 log.warning("chat %s: %s; its media was skipped this run", chat_id, exc)
                 warnings.append(f"chat {chat_id}: {exc}")
+    remaining, unreachable = _queue_left(conn)
     return MediaReport(
         extracted=tally[db.MEDIA_EXTRACTED],
         failed=tally[db.MEDIA_FAILED],
@@ -189,9 +192,25 @@ async def run(
         unsupported=unsupported + tally[db.MEDIA_UNSUPPORTED],
         disabled=disabled,
         requeued=requeued,
-        remaining=db.count_pending_media(conn),
+        remaining=remaining,
+        unreachable=unreachable,
         warnings=warnings,
     )
+
+
+def _queue_left(conn: sqlite3.Connection) -> tuple[int, int]:
+    """What the queue still holds, split into what a next run could read and what none can.
+
+    ``remaining`` is the pass's only completion signal — ``grepogram extract`` prints "run
+    extract again" for it and a script may loop on it — so it counts the chats this pass would
+    walk, not the whole index (:func:`_fetchable_chats`, :func:`grepogram.db.count_pending_media`).
+    An imported chat's media carries a ``media_kind`` like any other and sits at
+    ``MEDIA_PENDING`` for good, since nothing may ever re-fetch the message it hangs on: counted
+    with the rest it would make every run after any import report work that can never be done.
+    It is reported as ``unreachable`` instead, which says what it is and asks for nothing.
+    """
+    fetchable = db.count_pending_media(conn, _fetchable_chats(conn))
+    return fetchable, db.count_pending_media(conn) - fetchable
 
 
 def _fetchable_chats(conn: sqlite3.Connection) -> list[int]:

@@ -585,6 +585,27 @@ def test_extract_passes_retry_failed_through(
     assert "warning: careful" in result.stderr
 
 
+def test_extract_reports_unreachable_media_apart_from_the_queue(
+    tmp_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Media in an imported or unavailable chat sits at pending for good, so it is never what
+    "run extract again" is offered for: that line is the pass's only completion signal, and a
+    script looping until it stops appearing would never stop."""
+    _signed_in(tmp_home)
+
+    async def parked(
+        conn: object, client: object, cfg: object, budget: object, **kw: object
+    ) -> Any:
+        return MediaReport(unreachable=4)
+
+    monkeypatch.setattr(tg, "make_client", lambda cfg, paths: FakeClient())
+    monkeypatch.setattr(media, "run", parked)
+    result = runner.invoke(cli.app, ["extract"])
+    assert result.exit_code == 0, result.output
+    assert "in chats nothing can re-fetch: 4" in result.stdout
+    assert "run extract again" not in result.stdout
+
+
 def test_extract_without_api_keys_is_a_clean_error(tmp_home: Path) -> None:
     result = runner.invoke(cli.app, ["extract"])
     assert result.exit_code == 1

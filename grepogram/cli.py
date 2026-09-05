@@ -331,6 +331,7 @@ def _print_media_report(report: MediaReport) -> None:
         ("no extractor here", report.unsupported),
         ("switched off in [media]", report.disabled),
         ("queued again", report.requeued),
+        ("in chats nothing can re-fetch", report.unreachable),
     ):
         if count:
             typer.echo(f"{label}: {count}")
