@@ -86,6 +86,75 @@ def test_render_line_sender_fallbacks(
     assert line == f"[2024-01-15 10:30] {expected}: x"
 
 
+# --- render_line with extracted text ----------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("overrides", "expected"),
+    [
+        (
+            {"text": "", "media_kind": "photo", "extracted_text": "ОТКРЫТО с 9:00"},
+            "[photo] ОТКРЫТО с 9:00",
+        ),
+        (
+            {"text": "смотри", "media_kind": "photo", "extracted_text": "ОТКРЫТО с 9:00"},
+            "смотри [photo] ОТКРЫТО с 9:00",
+        ),
+        (
+            {
+                "text": "",
+                "media_kind": "document",
+                "media_filename": "cv.pdf",
+                "extracted_text": "Anna Petrova",
+            },
+            "[document: cv.pdf] Anna Petrova",
+        ),
+        ({"text": "", "media_kind": "photo", "extracted_text": ""}, "[photo]"),
+        ({"text": "", "media_kind": "photo", "extracted_text": "  \n "}, "[photo]"),
+        ({"text": "caption", "media_kind": "photo", "extracted_text": ""}, "caption"),
+        ({"text": "caption", "media_kind": "photo", "extracted_text": None}, "caption"),
+        ({"text": "", "media_kind": None, "extracted_text": "orphaned"}, "[empty]"),
+        ({"text": "typed", "media_kind": None, "extracted_text": "orphaned"}, "typed"),
+    ],
+)
+def test_render_line_carries_what_an_extractor_read(
+    overrides: dict[str, Any], expected: str
+) -> None:
+    """The marker never goes away: a reader has to see that a machine read those words."""
+    assert units.render_line(_msg(1, **overrides)) == f"[2024-01-15 10:30] Alice: {expected}"
+
+
+def test_extracted_text_folds_onto_one_line() -> None:
+    """A unit is one line per message and ``msg_ids`` maps back position by position, so a
+    PDF's own newlines — which ``extract._capped`` deliberately keeps — are folded here."""
+    msg = _msg(
+        1,
+        text="",
+        media_kind="document",
+        media_filename="prices.pdf",
+        extracted_text="Bread\t2.50\n\nMilk   1.20\n",
+    )
+    assert units.render_line(msg) == (
+        "[2024-01-15 10:30] Alice: [document: prices.pdf] Bread 2.50 Milk 1.20"
+    )
+    assert "\n" not in units.render_line(msg)
+
+
+def test_extracted_line_is_empty_when_nothing_was_read() -> None:
+    assert units.extracted_line(_msg(1, media_kind="photo")) == ""
+    assert units.extracted_line(_msg(1, media_kind="photo", extracted_text="  ")) == ""
+    assert units.extracted_line(_msg(1, media_kind="photo", extracted_text=" a  b ")) == "a b"
+
+
+def test_an_extracted_message_counts_against_the_window_ceiling() -> None:
+    """The rendered line is what the cap measures, so OCR text is part of the budget."""
+    cfg = UnitsCfg(window_gap_min=30, window_max_msgs=99, window_max_chars=120, thread_max_msgs=40)
+    long = _msg(1, text="", media_kind="photo", extracted_text="x" * 200)
+    windows = units.cut_windows([long, _msg(2, 1, text="after")], cfg, CHAT)
+    assert _ids(windows) == [[1], [2]]
+    assert len(windows[0].text) > cfg.window_max_chars
+
+
 # --- cut_windows -----------------------------------------------------------------------------
 
 

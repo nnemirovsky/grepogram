@@ -12,9 +12,9 @@ import pytest
 from telethon import errors
 from telethon.tl import types
 
-from grepogram import db, extract, media
+from grepogram import db, extract, index, media, sync, units
 from grepogram.extract import ExtractError
-from grepogram.models import ChatRow, Config, MediaCfg, MessageRow, TelegramCfg
+from grepogram.models import ChatRow, Config, MediaCfg, MessageRow, TelegramCfg, UnitsCfg
 from grepogram.sync import SyncBudget
 from tests.fakes import FakeClient
 from tests.fixtures import tl
@@ -657,3 +657,117 @@ async def test_an_extract_error_out_of_the_registry_becomes_a_failed_row(
     monkeypatch.setattr(extract, "registry", lambda: {"document": boom})
     report = await media.run(conn, _pdf_client(1), _cfg(), SyncBudget())
     assert report.failed == 1
+
+
+# --- the re-cut that makes the text searchable ---------------------------------------------
+
+
+def _units(conn: sqlite3.Connection, chat_id: int = CHAT_ID) -> dict[tuple[int, ...], str]:
+    """Every unit of a chat as ``msg_ids`` to text."""
+    return {tuple(unit.msg_ids): unit.text for unit in db.get_units(conn, chat_id)}
+
+
+def _fts(conn: sqlite3.Connection, chat_id: int = CHAT_ID) -> list[str]:
+    rows = conn.execute("SELECT raw FROM unit_fts WHERE chat_id = ? ORDER BY rowid", (chat_id,))
+    return [str(row["raw"]) for row in rows]
+
+
+def _synced(conn: sqlite3.Connection, rows: list[MessageRow], cfg: Config) -> ChatRow:
+    """A chat with its messages stored and its units cut, exactly as a first sync leaves it."""
+    chat = db.upsert_chat(conn, _chat())
+    sync.on_chat_synced(conn, chat, cfg, db.upsert_messages(conn, rows))
+    return chat
+
+
+def _text_row(msg_id: int) -> MessageRow:
+    return _message(CHAT_ID, msg_id, text=f"message {msg_id}")
+
+
+async def test_ocr_text_reaches_the_closed_window_the_photo_sits_in(
+    conn: sqlite3.Connection, scratch: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """What the whole feature comes down to: without the re-cut the text is written to a column
+    nothing renders, because a sync never re-cuts a closed window and clears the flag anyway."""
+    cfg = _cfg()
+    windows = UnitsCfg(window_gap_min=30, window_max_msgs=3, window_max_chars=4000)
+    cfg = Config(telegram=cfg.telegram, media=cfg.media, units=windows)
+    photo = _message(CHAT_ID, 2, media_kind="photo")
+    _synced(conn, [_text_row(1), photo, *(_text_row(i) for i in (3, 4, 5))], cfg)
+    assert "[photo]" in _units(conn)[(1, 2, 3)]
+
+    monkeypatch.setattr(extract, "registry", lambda: {"photo": _stub("ОТКРЫТО с 9:00")})
+    client = FakeClient(
+        messages={CHAT_ID: [tl.photo_message(CHAT_ID, 2)]},
+        downloads={(CHAT_ID, 2): b"jpeg bytes"},
+    )
+    assert (await media.run(conn, client, cfg, SyncBudget())).extracted == 1
+    assert "[photo] ОТКРЫТО с 9:00" in _units(conn)[(1, 2, 3)]
+    assert any("ОТКРЫТО с 9:00" in raw for raw in _fts(conn)), "and it is searchable"
+    assert not index.unit_index_gaps(conn, CHAT_ID)
+
+
+async def test_one_batch_recuts_the_chat_once_not_once_per_message(
+    conn: sqlite3.Connection, scratch: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Fifty photos in one chat would otherwise re-cut and re-embed its tail fifty times."""
+    ids = list(range(1, media.BATCH + 1))
+    cfg = _cfg()
+    _synced(conn, [_message(CHAT_ID, i, media_kind="photo") for i in ids], cfg)
+    calls: list[int] = []
+    real = units.invalidate_units_for
+
+    def counted(c: sqlite3.Connection, chat: ChatRow, config: Config, rows: Any) -> units.UnitDelta:
+        calls.append(len(rows))
+        return real(c, chat, config, rows)
+
+    monkeypatch.setattr(units, "invalidate_units_for", counted)
+    monkeypatch.setattr(extract, "registry", lambda: {"photo": _stub("read")})
+    client = FakeClient(
+        messages={CHAT_ID: [tl.photo_message(CHAT_ID, i) for i in ids]},
+        downloads={(CHAT_ID, i): b"jpeg bytes" for i in ids},
+    )
+    assert (await media.run(conn, client, cfg, SyncBudget())).extracted == len(ids)
+    assert calls == [len(ids)]
+    assert all("[photo] read" in text for text in _units(conn).values())
+
+
+async def test_a_batch_that_read_nothing_recuts_nothing(
+    conn: sqlite3.Connection, scratch: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = _cfg()
+    _synced(conn, [_message(CHAT_ID, 1, media_kind="photo")], cfg)
+    before = _units(conn)
+    calls: list[int] = []
+
+    def never(*_: Any) -> units.UnitDelta:
+        calls.append(1)
+        return units.UnitDelta()
+
+    monkeypatch.setattr(units, "invalidate_units_for", never)
+    monkeypatch.setattr(extract, "registry", lambda: {"photo": _stub("never reached")})
+    client = FakeClient(messages={CHAT_ID: [tl.photo_message(CHAT_ID, 1)]})
+    assert (await media.run(conn, client, cfg, SyncBudget())).failed == 1
+    assert calls == []
+    assert _units(conn) == before
+
+
+async def test_a_chat_whose_row_is_gone_extracts_without_recutting(
+    conn: sqlite3.Connection, scratch: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The text is still stored; there is no chat left to cut units for.
+
+    The foreign key takes a chat's messages with it, so this is the guard rather than a path a
+    sync can walk — and it is the difference between a stopped pass and a ``None`` attribute
+    error inside the worker thread if the two ever come apart.
+    """
+    cfg = _cfg()
+    _synced(conn, [_message(CHAT_ID, 1, media_kind="photo")], cfg)
+    monkeypatch.setattr(db, "get_chat", lambda *_: None)
+    monkeypatch.setattr(extract, "registry", lambda: {"photo": _stub("read anyway")})
+    client = FakeClient(
+        messages={CHAT_ID: [tl.photo_message(CHAT_ID, 1)]},
+        downloads={(CHAT_ID, 1): b"jpeg bytes"},
+    )
+    assert (await media.run(conn, client, cfg, SyncBudget())).extracted == 1
+    assert _text(conn, 1) == "read anyway"
+    assert "[photo] read anyway" not in " ".join(_units(conn).values())

@@ -260,6 +260,20 @@ async def test_a_bump_applies_the_rule_in_force_now(
     assert len(db.get_units(conn, chat.id)) == 3
 
 
+async def test_a_recut_picks_up_text_extracted_since_the_units_were_cut(
+    conn: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The upgrade path for media read before this build knew how to render it: a unit cut when
+    a photo was a bare ``[photo]`` carries what was read off it once the recipe moves on."""
+    chat = _store(conn, _chat(GROUP), [_msg(1, text="", media_kind="photo"), _msg(2, minutes=1)])
+    assert any("[photo]" in text for text in _texts(conn, chat.id))
+    conn.execute("UPDATE messages SET extracted_text = ? WHERE msg_id = 1", ("ОТКРЫТО с 9:00",))
+    _bump(monkeypatch, NEXT)
+    assert await sync.recut_pending_chats(conn, CFG, SyncBudget()) == 1
+    assert any("[photo] ОТКРЫТО с 9:00" in text for text in _texts(conn, chat.id))
+    assert not index.unit_index_gaps(conn, chat.id)
+
+
 async def test_an_index_with_rows_and_no_recipe_is_recut(
     conn: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -22,6 +22,13 @@ Then, over what is left, chat by chat and oldest first: re-fetch a batch, check 
 against ``[media] max_download_mb``, download into a scratch directory, extract, and commit the
 whole batch at once so a flood wait keeps what the run earned. The temp file goes in a
 ``finally``, whatever happened.
+
+A batch that read something ends by cutting the units holding those messages again
+(:func:`grepogram.units.invalidate_units_for`, once per batch) and indexing the delta. That is
+not optional bookkeeping: the ``indexed = 0`` flag ``set_media_text`` raises is cleared by the
+next sync whether or not anything was rebuilt, and a sync never re-cuts a closed window — which
+is where all but the newest handful of a chat's messages live — so without this step the text
+this pass reads would be written to a column nothing ever renders.
 """
 
 import functools
@@ -36,9 +43,9 @@ from typing import Any, get_args
 
 from telethon import errors
 
-from grepogram import db, extract, sync
+from grepogram import db, extract, index, sync, units
 from grepogram.extract import ExtractError, Extractor
-from grepogram.models import Config, MediaKind, MediaReport, MessageRow
+from grepogram.models import ChatRow, Config, MediaKind, MediaReport, MessageRow
 
 log = logging.getLogger(__name__)
 
@@ -199,12 +206,15 @@ async def _extract_chat(
     tally: dict[int, int],
 ) -> None:
     """One chat's queue, batch by batch, each batch committed on its own."""
+    chat = db.get_chat(conn, chat_id)
     while not budget.expired:
         rows = db.messages_pending_media(conn, BATCH, chat_id)
         if not rows:
             return
         outcomes = await _extract_batch(client, chat_id, rows, extractors, cfg, scratch, budget)
-        await sync._joined_to_thread(functools.partial(_store, conn, outcomes), budget.cancel)
+        await sync._joined_to_thread(
+            functools.partial(_store, conn, chat, cfg, outcomes), budget.cancel
+        )
         for outcome in outcomes:
             tally[outcome.state] += 1
         if len(outcomes) < len(rows):
@@ -305,22 +315,54 @@ def _remove(path: Path | None) -> None:
         log.debug("could not remove the temporary file %s: %s", path, exc)
 
 
-def _store(conn: sqlite3.Connection, outcomes: Sequence[_Outcome]) -> None:
-    """Write one batch's outcomes in a single transaction, through both writers.
+def _store(
+    conn: sqlite3.Connection,
+    chat: ChatRow | None,
+    cfg: Config,
+    outcomes: Sequence[_Outcome],
+) -> None:
+    """Write one batch's outcomes in a single transaction, through both writers, and re-cut.
 
     Extracted text goes through :func:`grepogram.db.set_media_text`, which flags the row for a
     rebuild because its rendered line changed; every other state goes through
     :func:`grepogram.db.set_media_state`, which leaves ``indexed`` exactly as it found it.
     """
     parked: dict[int, list[int]] = {}
+    extracted: list[int] = []
     with db.transaction(conn):
         for outcome in outcomes:
             if outcome.state == db.MEDIA_EXTRACTED:
                 db.set_media_text(conn, outcome.row_id, outcome.text or "")
+                extracted.append(outcome.row_id)
             else:
                 parked.setdefault(outcome.state, []).append(outcome.row_id)
         for state, ids in parked.items():
             db.set_media_state(conn, ids, state)
+        _recut(conn, chat, cfg, extracted)
+
+
+def _recut(
+    conn: sqlite3.Connection, chat: ChatRow | None, cfg: Config, row_ids: Sequence[int]
+) -> None:
+    """Re-cut the units holding this batch's extracted messages and index what changed.
+
+    The step that makes the whole feature do anything at all. ``db.set_media_text`` flags the row
+    ``indexed = 0``, but a flag on its own is thrown away: a sync's rebuild never re-cuts a closed
+    window (:func:`grepogram.units._recut_start` returns ``None``) and ``on_chat_synced`` clears
+    the flag regardless, so the text would be dropped for all but the newest handful of messages
+    in every chat. :func:`grepogram.units.invalidate_units_for` reaches a closed window, and the
+    :data:`grepogram.units.RECIPE_VERSION` bump is no substitute: that one-time re-cut runs on the
+    first sync after the upgrade, long before this pass has worked through the backlog.
+
+    Once per batch, never per message: ``db.windows_from`` replaces every window from the earliest
+    touched one to the end of the chat, so fifty photos in one chat would otherwise re-cut and
+    re-embed that tail fifty times over. The indexing is here rather than in ``units`` because
+    :mod:`grepogram.index` imports :class:`~grepogram.units.UnitDelta` from there.
+    """
+    if chat is None or not row_ids:
+        return
+    delta = units.invalidate_units_for(conn, chat, cfg, db.get_messages_by_ids(conn, row_ids))
+    index.index_units(conn, delta)
 
 
 def media_size(media: Any) -> int | None:

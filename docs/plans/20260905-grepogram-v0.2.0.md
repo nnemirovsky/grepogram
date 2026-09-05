@@ -596,54 +596,57 @@ Task 15's `sources add` guard, or the import protection silently evaporates.
 - Modify: `grepogram/media.py`
 - Modify: `tests/test_units_windows.py`
 - Modify: `tests/test_media.py`
+- Modify: `tests/test_units_incremental.py` (➕ `tests/test_units_windows.py` opens no database,
+  and `invalidate_units_for` is stored-unit work — the rebuild suite is where it belongs)
+- Modify: `tests/test_units_recipe.py` (➕ "the recipe bump re-cuts" is a recipe-pass assertion)
 
-- [ ] use `extracted_text` in `render_line` (units.py:44-53): a caption keeps its text and gains
+- [x] use `extracted_text` in `render_line` (units.py:44-53): a caption keeps its text and gains
       the extracted text; a caption-less photo renders it in place of the bare `[photo]`
-- [ ] keep the placeholder when `extracted_text` is empty or absent, so nothing regresses
-- [ ] keep the marker visible — a reader must be able to tell a machine read this off an image
-- [ ] add `units.invalidate_units_for(conn, chat, cfg, rows)` taking **`Sequence[MessageRow]`**,
+- [x] keep the placeholder when `extracted_text` is empty or absent, so nothing regresses
+- [x] keep the marker visible — a reader must be able to tell a machine read this off an image
+- [x] add `units.invalidate_units_for(conn, chat, cfg, rows)` taking **`Sequence[MessageRow]`**,
       not ids: it needs each row's topic, and Task 12 calls it after deleting the rows, so the
       caller must carry what it read
-- [ ] take the topic from **`units.window_topic(chat, msg)`**, never `msg.topic_id` — non-forum
+- [x] take the topic from **`units.window_topic(chat, msg)`**, never `msg.topic_id` — non-forum
       windows carry `topic_id = NULL` while Telegram populates `messages.topic_id` outside forums
       for legacy threads (CLAUDE.md measures 124 of 13,227 rows in a real supergroup), and
       `_WINDOW_SCOPE` is `topic_id IS ?` (db.py:45), so the raw value finds no window and the
       invalidation silently does nothing. Every fixture chat has `topic_id = None`, so this passes
       in tests and fails on real data
-- [ ] `db.containing_unit` (db.py:1238-1260) returns a **window or a post, never a thread**. Also
+- [x] `db.containing_unit` (db.py:1238-1260) returns a **window or a post, never a thread**. Also
       take `db.threads_touching(conn, chat.id, msg_ids)` as stale, and a channel's post thread
       (`units._post_thread`, units.py:306-316) alongside its post unit, or a message's text survives
       in every thread unit quoting it
-- [ ] **`rows` supply only `msg_id`, `chat_id` and `window_topic` — never rendered text.** Every
+- [x] **`rows` supply only `msg_id`, `chat_id` and `window_topic` — never rendered text.** Every
       message the primitive renders must be **re-read from the database**. `_chain_tops`
       (units.py:504-525) appends the *passed* row as a thread top when its parent is unstored and
       `build_threads` renders it at the head (units.py:495-503); `_rebuild_posts` (units.py:404)
       renders `changed` directly. Handing it the rows as-read would make Task 12 **resurrect a
       deleted message into a fresh thread or post unit**, undoing the deletion in the index, and
       would make Task 8 re-render a thread-rooted photo with its stale `[photo]` placeholder
-- [ ] a stale thread whose root is no longer stored is **dropped, not rebuilt** — which is also
+- [x] a stale thread whose root is no longer stored is **dropped, not rebuilt** — which is also
       what makes Task 12's "a unit left with no messages is dropped" true for threads
-- [ ] call it **once per chat per batch**, on the minimum start across the rows —
+- [x] call it **once per chat per batch**, on the minimum start across the rows —
       `db.windows_from` (db.py:1226-1235) returns every window from there to the end of the chat, so
       a per-message call would re-cut and re-embed the chat's tail once per extracted photo
-- [ ] hand the returned `UnitDelta` to `index.index_units` from the **caller** (units.py cannot
+- [x] hand the returned `UnitDelta` to `index.index_units` from the **caller** (units.py cannot
       import index — index.py:48 is a cycle), or the chat's `unit_fts` stays torn until the next sync
-- [ ] call it from the extraction pass for every message whose `extracted_text` changed. **Without
+- [x] call it from the extraction pass for every message whose `extracted_text` changed. **Without
       this the feature is inert for existing history**: `_recut_start` (units.py:436-460) returns
       `None` when every changed message sits in a closed window — its own docstring says closed
       windows are never re-cut — and `on_chat_synced` then calls `mark_indexed` anyway, so the flag
       clears and the extracted text is silently discarded. Flagging `indexed = 0` is not enough,
       and the `RECIPE_VERSION` bump does not save it either: the one-time re-cut fires on the first
       sync after upgrade, long before `grepogram extract` has worked through the backlog
-- [ ] Task 12 reuses this primitive for deletions — build it here, once
-- [ ] bump `units.RECIPE_VERSION` to 3 so units cut before this render change pick the text up
-- [ ] write tests: rendering with and without `extracted_text`, with and without a caption; **a
+- [x] Task 12 reuses this primitive for deletions — build it here, once
+- [x] bump `units.RECIPE_VERSION` to 3 so units cut before this render change pick the text up
+- [x] write tests: rendering with and without `extracted_text`, with and without a caption; **a
       photo inside an already closed window gets its OCR text into that window's unit text** (the
       test that matters); a group chat, not just a channel post; **a non-forum chat carrying a
       legacy `topic_id`**; a thread unit quoting the message is rebuilt too; a batch of 50 extracted
       messages in one chat re-cuts its tail once, not 50 times; **a photo that heads a reply thread
       gets its text into the thread unit, not the stale placeholder**; the recipe bump re-cuts
-- [ ] run tests — must pass before task 9
+- [x] run tests — must pass before task 9
 
 ### Task 9: Add `sources prune`
 

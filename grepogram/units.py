@@ -2,9 +2,9 @@
 
 Single messages are too small to embed and too many to store as vectors, so search runs over
 *units*: time windows of a chat, reply threads and channel posts. A unit's ``text`` is one
-rendered line per message — ``[YYYY-MM-DD HH:MM] name: text`` — with a ``[photo]``-style
-placeholder for media without a caption, and its ``msg_ids`` keep the mapping back to the
-original messages for deep links.
+rendered line per message — ``[YYYY-MM-DD HH:MM] name: text`` — with a ``[photo]``-style marker
+for what a message attached and whatever an extractor read off it after that marker, and its
+``msg_ids`` keep the mapping back to the original messages for deep links.
 
 The builders are functions over :class:`~grepogram.models.MessageRow` lists; only the channel
 side touches the database, to read a post's comments. :func:`cut_windows` walks one
@@ -20,6 +20,10 @@ a ``thread`` of the post with its comments read from the linked discussion chat.
 
 :data:`RECIPE_VERSION` names how this build cuts and renders units, and :func:`recut_chat` cuts a
 whole chat again when the two disagree — the only thing that reaches a closed window.
+
+:func:`invalidate_units_for` is the other one: it re-cuts the units holding a handful of named
+messages whatever window they sit in, which is what makes an extractor's text — and, later, a
+deletion — reach the history a sync's incremental rebuild will never touch again.
 
 :func:`rebuild_for_chat` keeps the stored units in step with a sync: it re-cuts the open window
 of every touched ``(chat, topic)``, rebuilds the reply threads reachable from the changed
@@ -40,7 +44,7 @@ UNKNOWN_SENDER = "unknown"
 EMPTY_PLACEHOLDER = "[empty]"
 STAMP_FORMAT = "%Y-%m-%d %H:%M"
 
-RECIPE_VERSION = 2
+RECIPE_VERSION = 3
 """How this build cuts and renders units, recorded as ``meta.unit_recipe``.
 
 Bumped by every change that would make a stored unit differ from what this code cuts today: a
@@ -62,13 +66,44 @@ delete-all. A database built from empty is stamped at this version by
 def render_line(msg: MessageRow) -> str:
     """``[YYYY-MM-DD HH:MM] name: text`` for one message; the stamp is UTC.
 
-    Media without a caption renders as ``[photo]`` / ``[voice]`` / ``[document: name.pdf]`` so
-    the line still tells what was posted; a message with neither text nor media renders as
-    ``[empty]``.
+    Media renders as ``[photo]`` / ``[voice]`` / ``[document: name.pdf]`` so the line still tells
+    what was posted, and what an extractor read off that media follows the marker — a
+    photographed announcement becomes ``[photo] ОТКРЫТО с 9:00`` and a contract
+    ``[document: contract.pdf] …``. The marker stays whatever was read: a reader has to be able
+    to tell that a machine took those words off an image rather than someone typing them, and a
+    caption keeps its own text in front of it.
+
+    Nothing changes for media no text was read from — the caption alone where there is one, the
+    bare placeholder where there is not — and a message with neither text nor media still renders
+    as ``[empty]``.
     """
     stamp = dt.datetime.fromtimestamp(msg.date, tz=dt.UTC).strftime(STAMP_FORMAT)
-    text = msg.text.strip() or media_placeholder(msg)
-    return f"[{stamp}] {sender_name(msg)}: {text}"
+    return f"[{stamp}] {sender_name(msg)}: {message_body(msg)}"
+
+
+def message_body(msg: MessageRow) -> str:
+    """What one message says on its line: its caption, its media marker and the text read off it.
+
+    The marker joins a caption only when something was read off the media — a captioned photo
+    nothing was extracted from renders exactly as it always has, which is what keeps the change
+    to what extraction actually adds.
+    """
+    caption = msg.text.strip()
+    read = extracted_line(msg) if msg.media_kind is not None else ""
+    if read:
+        return f"{caption} {media_placeholder(msg)} {read}".lstrip()
+    return caption or media_placeholder(msg)
+
+
+def extracted_line(msg: MessageRow) -> str:
+    """``msg.extracted_text`` folded onto one line; ``""`` when nothing was read off the media.
+
+    :func:`grepogram.extract._capped` keeps a form's or a price list's own line breaks and says
+    that rendering them is the renderer's decision. This is that decision: a unit is one line per
+    message, ``msg_ids`` maps back position by position, and a 400-page PDF's newlines would turn
+    one message into hundreds of lines nothing could map.
+    """
+    return " ".join((msg.extracted_text or "").split())
 
 
 def sender_name(msg: MessageRow) -> str:
@@ -413,6 +448,142 @@ def recut_chat(conn: sqlite3.Connection, chat: ChatRow, cfg: Config) -> UnitDelt
         fresh = units_for_chat(conn, db.get_messages(conn, chat.id), chat, cfg)
         inserted = db.insert_units(conn, fresh)
     return UnitDelta(inserted_ids=inserted, deleted_ids=stale)
+
+
+def invalidate_units_for(
+    conn: sqlite3.Connection, chat: ChatRow, cfg: Config, rows: Sequence[MessageRow]
+) -> UnitDelta:
+    """Cut every unit holding one of ``rows`` again, closed windows included.
+
+    The primitive for a change that happened *outside* a sync: an extractor reading text off a
+    photo posted two years ago, or a message that has been deleted. A sync's incremental rebuild
+    cannot serve either — :func:`_recut_start` returns ``None`` when every changed message sits
+    in a closed window, and closed windows are all but the last of a chat's history — so
+    ``messages.indexed = 0`` alone would clear on the next ``mark_indexed`` with nothing rebuilt
+    and the change would be lost in silence.
+
+    ``rows`` are :class:`~grepogram.models.MessageRow` and not ids because the topic a window is
+    scoped by has to come off the row, and the caller that deletes messages no longer has the row
+    to read by the time this runs. **They supply nothing else.** Every message this renders is
+    re-read from the database: :func:`_chain_tops` would make a passed row a thread top when its
+    parent is unstored and :func:`build_threads` would render it at the head, and
+    :func:`_rebuild_posts` renders what it is handed — so rendering from ``rows`` would write a
+    deleted message straight back into a fresh unit, and would re-render an extracted photo with
+    the stale ``[photo]`` its caller read before the extraction.
+
+    The topic is :func:`window_topic`, never ``msg.topic_id``: windows outside a forum carry
+    ``topic_id = NULL`` while Telegram populates the column for legacy threads there anyway, and
+    ``db``'s window scope matches it with ``topic_id IS ?``, so the raw value would find no
+    window and this would quietly do nothing on exactly the chats it exists for.
+
+    Call it once per chat per batch. :func:`grepogram.db.windows_from` returns every window from
+    the earliest touched one to the end of the chat, so a call per message would re-cut and
+    re-embed the same tail once per message. Units whose content did not change keep their row
+    and their embedding (:func:`_apply`), and a stale thread whose root is no longer stored is
+    dropped rather than rebuilt. Everything is one transaction, and the caller hands the returned
+    delta to :func:`grepogram.index.index_units` — this module cannot import the indexer, which
+    imports :class:`UnitDelta` from here.
+    """
+    if not rows:
+        return UnitDelta()
+    with db.transaction(conn):
+        if chat.is_broadcast:
+            return _invalidate_posts(conn, chat, cfg, rows)
+        return _invalidate_conversation(conn, chat, cfg, rows)
+
+
+def _invalidate_conversation(
+    conn: sqlite3.Connection, chat: ChatRow, cfg: Config, rows: Sequence[MessageRow]
+) -> UnitDelta:
+    stale: list[UnitRow] = []
+    fresh: list[UnitRow] = []
+    for topic_id, group in group_by_topic(chat, rows).items():
+        start = _invalidation_start(conn, chat.id, topic_id, group)
+        if start is None:
+            continue
+        stale += db.windows_from(conn, chat.id, topic_id, start)
+        fresh += cut_windows(
+            _stored_since(conn, chat, topic_id, start), cfg.units, chat.id, topic_id
+        )
+    old, new = _invalidate_threads(conn, chat, cfg.units, rows)
+    return _apply(conn, stale + old, fresh + new)
+
+
+def _invalidation_start(
+    conn: sqlite3.Connection, chat_id: int, topic_id: int | None, rows: Sequence[MessageRow]
+) -> int | None:
+    """Where the re-cut of ``(chat, topic)`` begins; ``None`` when the topic holds no window yet.
+
+    The earliest start among the windows holding these messages — a closed window as readily as
+    the open one, which is the whole point. A message no window's range covers takes the start of
+    the window before it, or its own id when none precedes it, exactly as :func:`_recut_start`
+    treats one that arrived below the open window.
+
+    A topic with no windows at all is left to the next rebuild: there is nothing stale to replace
+    and cutting only the tail from here would leave the messages before it in no window.
+    """
+    if db.open_window(conn, chat_id, topic_id) is None:
+        return None
+    starts: list[int] = []
+    for msg in rows:
+        unit = db.containing_unit(conn, chat_id, msg.msg_id, topic_id)
+        if unit is not None and unit.kind == "window":
+            starts.append(unit.msg_id_start)
+            continue
+        before = db.window_before(conn, chat_id, topic_id, msg.msg_id)
+        starts.append(msg.msg_id if before is None else before.msg_id_start)
+    return min(starts) if starts else None
+
+
+def _invalidate_threads(
+    conn: sqlite3.Connection, chat: ChatRow, cfg: UnitsCfg, rows: Sequence[MessageRow]
+) -> tuple[list[UnitRow], list[UnitRow]]:
+    """The thread units holding these messages and their replacements, re-read from the database.
+
+    A thread is found through the units that quote it and rebuilt from its root down —
+    ``msg_ids[0]`` names the root in every chunk (:func:`thread_chunks`) — so the root is looked
+    up rather than taken from ``rows``, and a thread whose root is gone yields no replacement at
+    all. The members of the rebuilt threads join the ids the stale lookup runs over, because a
+    thread longer than ``thread_max_msgs`` spans several units and only one of them holds the
+    message this started from.
+    """
+    touched = [msg.msg_id for msg in rows]
+    quoting = db.threads_touching(conn, chat.id, touched)
+    roots = {unit.msg_ids[0] for unit in quoting if unit.msg_ids}
+    if not roots:
+        return [], []
+    stored = db.get_messages_by_msg_id(conn, chat.id, roots)
+    fresh: list[UnitRow] = []
+    members: list[int] = []
+    for root_id in sorted(roots):
+        root = stored.get(root_id)
+        if root is None:
+            continue
+        replies = db.get_descendants(conn, chat.id, root_id)
+        if not replies:
+            continue
+        members += [root_id, *(reply.msg_id for reply in replies)]
+        fresh += build_threads([root, *replies], cfg, chat.id, roots=[root_id])
+    return db.threads_touching(conn, chat.id, [*touched, *members]), fresh
+
+
+def _invalidate_posts(
+    conn: sqlite3.Connection, chat: ChatRow, cfg: Config, rows: Sequence[MessageRow]
+) -> UnitDelta:
+    """A channel's ``post`` units and the post threads that quote them, both re-read and re-cut.
+
+    A post thread carries the post followed by its comments, so it holds the post's own rendered
+    line and goes stale with it; ``db.containing_unit`` answers with the post unit alone, which
+    is why :func:`db.threads_touching` runs here as well. A comment's own text is another matter
+    — no ``json_each`` over ``units.msg_ids`` reaches a comment id, so a comment that changes is
+    followed through ``comment_of_chat_id`` / ``comment_of_msg_id`` and not from here.
+    """
+    post_ids = sorted({msg.msg_id for msg in rows})
+    stale = db.post_units(conn, chat.id, post_ids) + db.threads_touching(conn, chat.id, post_ids)
+    stored = db.get_messages_by_msg_id(conn, chat.id, post_ids)
+    posts = [stored[post_id] for post_id in post_ids if post_id in stored]
+    fresh = build_posts(conn, posts, chat, comments_enabled(cfg, chat), cfg.units) if posts else []
+    return _apply(conn, stale, fresh)
 
 
 def rebuild_for_chat(
