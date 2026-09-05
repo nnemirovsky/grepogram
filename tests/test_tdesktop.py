@@ -400,6 +400,20 @@ def test_an_integer_unixtime_is_accepted(tmp_path: Path) -> None:
     assert _one(tmp_path, date_unixtime=1700000000).date == 1700000000
 
 
+def test_a_date_with_no_offset_is_read_as_utc(tmp_path: Path) -> None:
+    """An old export carries only ``date``, the exporting machine's local wall clock with no
+    offset on it. UTC is the only reading available, and off by the exporter's offset at worst."""
+    row = _one(tmp_path, date="2024-03-01T09:00:00", date_unixtime=None)
+    assert row.date == 1709283600
+
+
+def test_a_date_that_carries_an_offset_keeps_it(tmp_path: Path) -> None:
+    """The other half of the same branch: an ISO stamp that *does* name a zone is not re-stamped
+    as UTC — doing so would move every message of such an export by the exporter's offset."""
+    row = _one(tmp_path, date="2024-03-01T09:00:00+03:00", date_unixtime=None)
+    assert row.date == 1709283600 - 3 * 3600
+
+
 def test_a_bare_text_string_flattens(tmp_path: Path) -> None:
     message = _message(text="просто текст")
     del message["text_entities"]

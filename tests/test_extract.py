@@ -545,6 +545,18 @@ def test_ocr_is_available_on_a_mac_carrying_the_extra(monkeypatch: pytest.Monkey
     assert extract._ocr_unavailable() is None
 
 
+def test_the_cap_does_not_leave_a_dangling_space(tmp_path: Path) -> None:
+    """The cut lands wherever the character count runs out, and a truncation ending in a space
+    (or in a newline, half a line into the next one) is text with a ragged edge — one that shows
+    up in a unit's rendered line and in a search snippet."""
+    assert extract._capped("x " * EXTRACT_MAX_CHARS) == "x " * (EXTRACT_MAX_CHARS // 2 - 1) + "x"
+    assert extract._capped("a" * (EXTRACT_MAX_CHARS - 1) + " b").endswith("a")
+
+
+def test_the_cap_leaves_a_short_text_exactly_as_it_is() -> None:
+    assert extract._capped("  first \n\n  second  ") == "first\nsecond"
+
+
 # --- the registry ------------------------------------------------------------------------------
 
 

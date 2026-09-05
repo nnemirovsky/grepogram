@@ -812,6 +812,31 @@ def _swept(client: FakeClient) -> list[int]:
     return list(dict.fromkeys(int(chat_id) for chat_id in asked))
 
 
+async def test_the_sweep_reads_a_message_empty_slot_as_a_deletion(
+    conn: sqlite3.Connection, paths: Paths, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Telethon hands ``MessageEmpty`` over as ``None`` — usually. It is a real TL type and the
+    raw object can reach the caller, so both shapes have to read as "this id is gone": treating a
+    ``MessageEmpty`` as a live message would make every id look alive and ``prune-deleted``
+    silently remove nothing at all.
+    """
+    client = _client(messages={ARG_ID: _talk(101, 102, 103)})
+    cfg = _cfg(ARG_SOURCE)
+    await _run(client, conn, paths, cfg)
+    answer = client.get_messages
+
+    async def with_empties(*args: Any, **kwargs: Any) -> Any:
+        got = await answer(*args, **kwargs)
+        empty = types.MessageEmpty(id=102, peer_id=tl.peer(ARG_ID))
+        return [empty if m is not None and m.id == 102 else m for m in got]
+
+    monkeypatch.setattr(client, "get_messages", with_empties)
+    report = await _prune(client, conn, paths, cfg)
+
+    assert (report.removed, report.checked) == (1, 3)
+    assert _texts(conn, ARG_ID) == {101: "m101", 103: "m103"}
+
+
 async def test_the_sweeps_flood_sleep_threshold_shrinks_with_the_time_left(
     conn: sqlite3.Connection, paths: Paths
 ) -> None:

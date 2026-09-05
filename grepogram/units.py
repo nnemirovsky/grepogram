@@ -547,6 +547,11 @@ def _invalidation_start(
 
     A topic with no windows at all is left to the next rebuild: there is nothing stale to replace
     and cutting only the tail from here would leave the messages before it in no window.
+
+    The ``kind == "window"`` test is not redundant with the lookup:
+    :func:`grepogram.db.containing_unit` falls back to a channel's ``post`` unit when no window
+    holds the message, and a ``post``'s ``msg_id_start`` is the post's own id — not a window
+    boundary to re-cut from.
     """
     if db.open_window(conn, chat_id, topic_id) is None:
         return None

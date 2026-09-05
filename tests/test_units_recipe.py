@@ -414,6 +414,27 @@ async def test_the_pass_writes_no_message_row(
     assert db.chats_with_unindexed(conn) == []
 
 
+async def test_a_recut_repairs_a_unit_index_an_older_build_tore(
+    conn: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A ``UnitDelta`` describes only the units *this* re-cut replaced, and an older build that
+    deleted a unit without dropping its ``unit_fts`` row left one no delta names. The row still
+    matches queries and resolves to nothing, and the re-cut's own delete-all cannot reach it —
+    the unit is already gone. ``repair_unit_index`` compares the two tables by rowid instead,
+    which is why the re-cut ends with it."""
+    chat = _group(conn)
+    orphan = max(_unit_ids(conn, chat.id)) + 1000
+    conn.execute(
+        "INSERT INTO unit_fts(rowid, raw, stemmed, chat_id, date_start) VALUES (?, ?, ?, ?, ?)",
+        (orphan, "text of a unit that is gone", "text of a unit that is gone", chat.id, BASE),
+    )
+    assert index.unit_index_gaps(conn, chat.id).orphans == [orphan]
+    _bump(monkeypatch, NEXT)
+    assert await sync.recut_pending_chats(conn, CFG, SyncBudget()) == 1
+    assert index.unit_index_gaps(conn, chat.id) == index.IndexGaps()
+    assert _fts_ids(conn, chat.id) == _unit_ids(conn, chat.id)
+
+
 # --- when a re-cut is allowed to start -------------------------------------------------------
 
 

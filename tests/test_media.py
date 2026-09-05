@@ -776,6 +776,19 @@ async def test_an_extract_error_out_of_the_registry_becomes_a_failed_row(
     assert report.failed == 1
 
 
+def test_the_temp_name_keeps_only_a_clean_extension() -> None:
+    """The stored filename is attacker-shaped text that has no business becoming a path, and the
+    only thing about it that matters downstream is the extension the dispatcher reads."""
+    assert media._temp_name(_pdf_row(CHAT_ID, 1, "note.pdf")).endswith(".pdf")
+    assert media._temp_name(_pdf_row(CHAT_ID, 1, "/etc/passwd")) == f"{CHAT_ID}_1"
+    assert media._temp_name(_pdf_row(CHAT_ID, 1, "../../evil.pdf")) == f"{CHAT_ID}_1.pdf"
+    assert media._temp_name(_pdf_row(CHAT_ID, 1, "x.p df")) == f"{CHAT_ID}_1.pdf"
+    assert media._temp_name(_pdf_row(CHAT_ID, 1, "x.p/../d")) == f"{CHAT_ID}_1"
+    assert media._temp_name(_message(CHAT_ID, 1, media_kind="photo")) == f"{CHAT_ID}_1"
+    long_suffix = media._temp_name(_pdf_row(CHAT_ID, 1, "x." + "y" * 300))
+    assert len(long_suffix) == len(f"{CHAT_ID}_1") + media._SUFFIX_MAX
+
+
 # --- the re-cut that makes the text searchable ---------------------------------------------
 
 

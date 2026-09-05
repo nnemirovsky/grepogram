@@ -1114,6 +1114,19 @@ async def test_folder_membership_lists_every_peer_a_folder_names() -> None:
     assert membership.failed == {}
 
 
+async def test_folder_membership_drops_a_peer_the_folder_also_excludes() -> None:
+    """A folder can name a peer in ``include``/``pinned`` and in ``exclude`` at once, and
+    ``exclude`` wins in Telegram. Reading the peer as listed would make ``sources prune`` keep a
+    chat the folder has actually dropped — and the explicit-peer union is exactly the half that
+    would keep it, because ``folder_dialogs`` already leaves it out."""
+    folder = make_folder(3, "Argentina", include=[ARG, GHOST_ID], pinned=[NEWS], exclude=[NEWS])
+    client = FakeClient(dialogs=[make_dialog(ARG), make_dialog(NEWS)], folders=[folder])
+    membership = await sources.folder_membership(
+        _cfg(Source(folder="Argentina")), DialogCatalog(client)
+    )
+    assert membership.listed == {"folder:Argentina": {ARG_ID, GHOST_ID}}
+
+
 async def test_folder_membership_records_an_unresolvable_source_instead_of_skipping_it() -> None:
     cfg = _cfg(Source(folder="Xyz"), Source(folder="Argentina"))
     membership = await sources.folder_membership(cfg, _catalog())
