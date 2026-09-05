@@ -4,6 +4,7 @@ Nothing here reaches Telegram — ``FakeClient`` answers ``get_messages`` and ``
 from the fixtures registered on it, and the committed ``sample.pdf`` is what a download writes.
 """
 
+import dataclasses
 import sqlite3
 from pathlib import Path
 from typing import Any
@@ -651,6 +652,50 @@ async def test_an_rpc_error_costs_one_chat_its_turn_and_the_rest_runs(
     assert report.extracted == 1
     assert report.warnings and str(CHAT_ID) in report.warnings[0]
     assert _states(conn) == {1: db.MEDIA_PENDING, 2: db.MEDIA_EXTRACTED}
+
+
+async def test_an_unresolvable_peer_is_a_warning_not_a_traceback(
+    conn: sqlite3.Connection, scratch: Path
+) -> None:
+    """Telethon raises a plain ``ValueError`` — not an ``RPCError`` — for a peer it cannot
+    resolve, and `grepogram extract` would end as a traceback rather than a report."""
+    db.upsert_chat(conn, _chat())
+    db.upsert_messages(conn, [_pdf_row(CHAT_ID, 1)])
+    client = FakeClient(failures={CHAT_ID: ValueError("Could not find the input entity")})
+    report = await media.run(conn, client, _cfg(), SyncBudget())
+    assert report.warnings and "Could not find the input entity" in report.warnings[0]
+    assert _states(conn) == {1: db.MEDIA_PENDING}
+
+
+async def test_an_imported_chat_is_never_re_fetched(
+    conn: sqlite3.Connection, scratch: Path
+) -> None:
+    """An import has no Telegram history behind it, so its media can never be downloaded.
+
+    ``sources.prunable`` and the deletion sweep both skip such a chat; without the same rule here
+    every run asked Telegram about a peer the account cannot resolve.
+    """
+    db.upsert_chat(conn, _chat())
+    db.upsert_chat(
+        conn, ChatRow(id=OTHER_ID, type="supergroup", title="Imported", source_id="import:imported")
+    )
+    db.upsert_messages(conn, [_pdf_row(CHAT_ID, 1), _pdf_row(OTHER_ID, 2)])
+    client = _pdf_client(1)
+    report = await media.run(conn, client, _cfg(), SyncBudget())
+    assert report.extracted == 1
+    assert _fetches(client) == [{"chat_id": CHAT_ID, "limit": None, "ids": [1]}]
+    assert _states(conn) == {1: db.MEDIA_EXTRACTED, 2: db.MEDIA_PENDING}
+
+
+async def test_an_unavailable_chat_is_never_re_fetched(
+    conn: sqlite3.Connection, scratch: Path
+) -> None:
+    """Telegram refuses it, so a request per batch would buy nothing."""
+    db.upsert_chat(conn, dataclasses.replace(_chat(), unavailable=True))
+    db.upsert_messages(conn, [_pdf_row(CHAT_ID, 1)])
+    report = await media.run(conn, _pdf_client(1), _cfg(), SyncBudget())
+    assert (report.extracted, report.remaining) == (0, 1)
+    assert _states(conn) == {1: db.MEDIA_PENDING}
 
 
 async def test_a_chat_that_fails_is_not_retried_in_the_same_run(

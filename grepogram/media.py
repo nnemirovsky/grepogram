@@ -166,7 +166,7 @@ async def run(
         (db.MEDIA_EXTRACTED, db.MEDIA_FAILED, db.MEDIA_SKIPPED, db.MEDIA_UNSUPPORTED), 0
     )
     with _scratch() as scratch:
-        for chat_id in db.chats_with_pending_media(conn):
+        for chat_id in _fetchable_chats(conn):
             if budget.expired:
                 break
             sync._cap_flood_sleep(client, cfg.sync, budget)
@@ -179,7 +179,7 @@ async def run(
                     "requests; run `grepogram extract` again later"
                 )
                 break
-            except errors.RPCError as exc:
+            except (errors.RPCError, ValueError) as exc:
                 log.warning("chat %s: %s; its media was skipped this run", chat_id, exc)
                 warnings.append(f"chat {chat_id}: {exc}")
     return MediaReport(
@@ -192,6 +192,24 @@ async def run(
         remaining=db.count_pending_media(conn),
         warnings=warnings,
     )
+
+
+def _fetchable_chats(conn: sqlite3.Connection) -> list[int]:
+    """The chats holding pending media this pass can actually re-fetch, in id order.
+
+    Every download starts from a ``Message`` Telegram just returned, so the queue is only worth
+    walking for a chat Telegram will answer about at all — :func:`grepogram.sync.refetchable`'s
+    rule, the same one the deletion sweep uses. An imported chat is the case that bites: its rows
+    sit at ``MEDIA_PENDING`` for good and every run would ask for a peer the account cannot
+    resolve, which Telethon answers with a plain ``ValueError`` — not an ``RPCError``, so it
+    would leave ``grepogram extract`` as a traceback rather than a warning.
+    """
+    stored = {chat.id: chat for chat in db.list_chats(conn)}
+    return [
+        chat_id
+        for chat_id in db.chats_with_pending_media(conn)
+        if (chat := stored.get(chat_id)) is not None and sync.refetchable(chat)
+    ]
 
 
 @contextmanager

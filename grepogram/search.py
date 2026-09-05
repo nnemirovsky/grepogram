@@ -69,7 +69,7 @@ from grepogram.models import (
 )
 from grepogram.rerank import Reranker
 from grepogram.stem import FtsOp, fts_query, stem_token, tokenize
-from grepogram.units import chronological, media_placeholder, render_line, window_topic
+from grepogram.units import chronological, message_body, render_line, window_topic
 
 log = logging.getLogger(__name__)
 
@@ -724,14 +724,20 @@ def _reaction_share(reactions: int) -> float:
 def message_view(chat: ChatRow, msg: MessageRow) -> MessageView:
     """``msg`` as the caller sees it: linked through :func:`grepogram.links.message_url`, with a
     ``[photo]``-style placeholder as ``text`` when it has media and no caption and ``chat.id``
-    as ``chat_id`` — the chat the message is really in, which :func:`thread` mixes."""
+    as ``chat_id`` — the chat the message is really in, which :func:`thread` mixes.
+
+    The text is rendered by :func:`grepogram.units.message_body`, the same function that writes
+    a unit's line, so what an extractor read off the media is here too. Anything else would hide
+    it: the tools tell the caller to open ``thread`` or ``context`` rather than conclude from a
+    snippet, and an OCR'd announcement that a search *found* would vanish on the way to the tool
+    it was told to trust."""
     link = links.message_url(chat, msg.msg_id, msg.topic_id)
     return MessageView(
         chat_id=chat.id,
         msg_id=msg.msg_id,
         date=msg.date,
         from_name=msg.from_name,
-        text=msg.text.strip() or media_placeholder(msg),
+        text=message_body(msg),
         url=link.url,
         fallback_url=link.fallback_url,
         reply_to_msg_id=msg.reply_to_msg_id,

@@ -1481,6 +1481,32 @@ def test_import_source_ids_avoid_a_slug_an_earlier_import_claimed(
     assert sources.import_source_ids(conn, [_imported(ARG_ID, "Anna")]) == {ARG_ID: "import:anna"}
 
 
+def test_import_source_ids_disambiguate_again_when_the_first_fallback_collides(
+    conn: sqlite3.Connection,
+) -> None:
+    """The fallback is ``<slug>-<abs(chat_id)>``, which is itself a title someone can have.
+
+    Sharing an id would make ``sources rm`` on either delete both histories, so the chat id is
+    appended again until nothing else holds the result.
+    """
+    chats = [_imported(LEFT_ID, "Anna"), _imported(ARG_ID, "Anna"), _imported(NEWS_ID, "Anna")]
+    ids = sources.import_source_ids(conn, [*chats, _imported(GEORGIA_ID, f"Anna {abs(ARG_ID)}")])
+    assert len(set(ids.values())) == 4, "no two chats of one export share a source id"
+    assert {ids[ARG_ID], ids[GEORGIA_ID]} == {
+        f"import:anna-{abs(ARG_ID)}",
+        f"import:anna-{abs(ARG_ID)}-{abs(ARG_ID)}",
+    }
+
+
+def test_import_source_ids_do_not_depend_on_the_order_of_the_export(
+    conn: sqlite3.Connection,
+) -> None:
+    chats = [_imported(LEFT_ID, "Anna"), _imported(ARG_ID, "Anna"), _imported(NEWS_ID, "Anna")]
+    assert sources.import_source_ids(conn, chats) == sources.import_source_ids(
+        conn, list(reversed(chats))
+    )
+
+
 def test_import_source_ids_fall_back_to_the_chat_id_for_a_nameless_chat(
     conn: sqlite3.Connection,
 ) -> None:

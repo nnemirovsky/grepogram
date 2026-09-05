@@ -815,13 +815,13 @@ async def _refetch_edits(run: _Run, cfg: Config) -> list[int]:
     # space, and the two coincide only in a chat whose history starts at 1 (see
     # `db.refresh_unit_reactions`).
     db.refresh_unit_reactions(run.conn, chat.id, [row.msg_id for row in changed])
-    _drop_deleted(run, cfg, stored, seen)
+    await _drop_deleted(run, cfg, stored, seen)
     if run.discussion is not None:
         ids += await _refresh_comments(run, stored, replies)
     return ids
 
 
-def _drop_deleted(
+async def _drop_deleted(
     run: _Run, cfg: Config, stored: Mapping[int, MessageRow], seen: set[int]
 ) -> list[int]:
     """Remove the rows of the messages this re-fetch proves are gone, and re-cut their units.
@@ -846,6 +846,12 @@ def _drop_deleted(
     by, which lives on a row that no longer exists by then. It renders nothing from them, so a
     message that heads a reply thread does not come back in the unit its removal rebuilds; a unit
     left holding no messages is dropped instead of being rebuilt empty. Returns the ids removed.
+
+    That transaction goes to a worker thread joined even under cancellation
+    (:func:`_joined_to_thread`), like every other write a sync makes:
+    :func:`grepogram.units.invalidate_units_for` re-cuts every window from the deleted message to
+    the end of the chat, which is exactly the work :func:`on_chat_synced` is pushed off the event
+    loop for — the client's keepalives run on while it happens.
     """
     lo, hi = min(seen), max(seen)
     gone = [
@@ -856,9 +862,9 @@ def _drop_deleted(
     if not gone:
         return []
     msg_ids = [row.msg_id for row in gone]
-    with db.transaction(run.conn):
-        db.delete_messages(run.conn, run.chat.id, msg_ids)
-        index.index_units(run.conn, units.invalidate_units_for(run.conn, run.chat, cfg, gone))
+    await _joined_to_thread(
+        functools.partial(_apply_drop, run, cfg, gone, msg_ids), run.budget.cancel
+    )
     log.info(
         "chat %s (%s): %d messages were deleted in Telegram and dropped from the index",
         run.chat.id,
@@ -866,6 +872,13 @@ def _drop_deleted(
         len(gone),
     )
     return msg_ids
+
+
+def _apply_drop(run: _Run, cfg: Config, gone: Sequence[MessageRow], msg_ids: Sequence[int]) -> None:
+    """Delete one re-fetch's proven-gone rows and re-cut what held them — one transaction."""
+    with db.transaction(run.conn):
+        db.delete_messages(run.conn, run.chat.id, list(msg_ids))
+        index.index_units(run.conn, units.invalidate_units_for(run.conn, run.chat, cfg, gone))
 
 
 def _differs(stored: MessageRow, fresh: MessageRow) -> bool:
@@ -1676,24 +1689,35 @@ def _sweep_targets(conn: sqlite3.Connection, chat_id: int | None) -> list[ChatRo
     comment this pass's to find without a special case.
 
     Two kinds of chat are left out rather than asked about, because Telegram's answer for them
-    would say nothing about deletions: one whose history never came from Telegram at all (an
-    ``import:`` source, where every id would come back empty and the whole chat would be dropped)
-    and one already known to be unavailable, which would cost a refused request per batch.
+    would say nothing about deletions: an ``import:`` source, where every id would come back
+    empty and the whole chat would be dropped, and one already known to be unavailable
+    (:func:`refetchable`).
     """
     if chat_id is None:
         chats = db.list_chats(conn)
     else:
         found = (db.get_chat(conn, chat_id), db.get_discussion_chat(conn, chat_id))
         chats = sorted((chat for chat in found if chat is not None), key=lambda chat: chat.id)
-    return [chat for chat in chats if _sweepable(chat)]
+    return [chat for chat in chats if refetchable(chat)]
 
 
-def _sweepable(chat: ChatRow) -> bool:
+def refetchable(chat: ChatRow) -> bool:
+    """Whether a pass may ask Telegram about this chat's stored messages again.
+
+    Two kinds of chat are left alone rather than asked about. One whose history never came from
+    Telegram at all (an ``import:`` source) has no ids Telegram knows: the sweep would read every
+    empty slot as a deletion and drop the whole chat, and the extraction pass would re-fetch a
+    peer the account cannot even resolve — for which Telethon raises a plain ``ValueError``. One
+    already known to be unavailable would cost a refused request per batch.
+
+    Shared by :func:`_sweep_targets` and :func:`grepogram.media.run`, the two passes that
+    re-fetch stored rows by id rather than following a chat's history forward.
+    """
     if chat.unavailable:
-        log.debug("chat %s is unavailable; the sweep left it alone", chat.id)
+        log.debug("chat %s is unavailable; it was left alone", chat.id)
         return False
     if (chat.source_id or "").startswith(IMPORT_PREFIX):
-        log.debug("chat %s was imported, not synced; the sweep left it alone", chat.id)
+        log.debug("chat %s was imported, not synced; it was left alone", chat.id)
         return False
     return True
 
@@ -1715,7 +1739,8 @@ async def _sweep_chat(
 
     An answer that does not line up with the page is not an answer: the chat's turn ends with its
     cursor untouched, so the next run asks the same page again instead of taking the silence for
-    a hundred deletions.
+    a hundred deletions. ``checked`` counts the pages that *were* answered, for the same reason —
+    a refused page has told the report nothing, and the next run asks about it again.
     """
     cursor = db.prune_cursor(conn, chat.id)
     while not budget.expired:
@@ -1724,7 +1749,6 @@ async def _sweep_chat(
             db.clear_prune_cursor(conn, chat.id)
             return True
         gone = _empty_slots(page, await client.get_messages(chat.id, ids=page))
-        tally.checked += len(page)
         if gone is None:
             log.warning(
                 "chat %s (%s): Telegram's answer did not line up with the %d ids asked about; "
@@ -1738,6 +1762,7 @@ async def _sweep_chat(
                 f"{len(page)} ids asked about; nothing was removed"
             )
             return False
+        tally.checked += len(page)
         cursor = page[-1]
         tally.removed += await _joined_to_thread(
             functools.partial(_prune_batch, conn, cfg, chat, gone, cursor), budget.cancel

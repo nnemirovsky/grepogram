@@ -734,6 +734,31 @@ async def test_a_service_message_is_not_mistaken_for_a_deletion(
     assert _windows(conn, ARG_ID) == before
 
 
+async def test_a_service_message_still_bounds_the_range_a_deletion_is_read_from(
+    conn: sqlite3.Connection, paths: Paths
+) -> None:
+    """The other half of the same rule: a service id is in ``seen`` although no row is stored.
+
+    ``seen`` is what says how far the iteration reached, and a service message is as much an
+    answer as any other. Counting only the ids that mapped to a row would pull ``max(seen)`` back
+    below the deleted message, which would then read as "never asked about" and stay indexed for
+    good — this pass never reaches it again once a newer message is stored above it.
+    """
+    client = _client(messages={ARG_ID: _talk(101, 102)})
+    cfg = _cfg(ARG_SOURCE, edit_refetch=2)
+    await _run(client, conn, paths, cfg)
+    assert _texts(conn, ARG_ID) == {101: "m101", 102: "m102"}
+
+    client.messages[ARG_ID] = [
+        tl.message(ARG_ID, 101, "m101", sender=1),
+        tl.service_message(ARG_ID, 103),
+    ]
+    await _run(client, conn, paths, cfg)
+
+    assert _texts(conn, ARG_ID) == {101: "m101"}, "102 was deleted between the two runs"
+    assert _windows(conn, ARG_ID) == [[101]]
+
+
 async def test_a_deleted_comment_is_left_to_the_full_sweep(
     conn: sqlite3.Connection, paths: Paths
 ) -> None:
@@ -917,7 +942,7 @@ async def test_an_answer_that_does_not_line_up_with_the_page_removes_nothing(
     monkeypatch.setattr(client, "get_messages", truncated)
     report = await _prune(client, conn, paths, cfg)
 
-    assert (report.removed, report.checked) == (0, 3)
+    assert (report.removed, report.checked) == (0, 0), "a refused page has checked nothing"
     assert report.chats_remaining == [ARG_ID]
     assert any("did not line up" in warning for warning in report.warnings)
     assert _texts(conn, ARG_ID) == {101: "m101", 102: "m102", 103: "m103"}

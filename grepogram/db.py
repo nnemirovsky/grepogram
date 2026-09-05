@@ -499,10 +499,14 @@ def migrate(conn: sqlite3.Connection) -> int:
                 + f": MIGRATIONS has to run from v{BASE_VERSION} to v{SCHEMA_VERSION} without a "
                 "gap, and a mis-keyed step is a bug in grepogram, not in the database"
             )
-        version = _apply(
-            conn, [MIGRATIONS[version] for version in range(BASE_VERSION, SCHEMA_VERSION + 1)]
-        )
-        _stamp_unit_recipe(conn)
+        # one transaction for the schema and the stamp: a crash between them would leave a
+        # fresh index with the full schema and no `unit_recipe`, which reads as a v0.1.1 index
+        # and costs the first sync a full re-cut and re-embed of the units it just cut correctly
+        with transaction(conn):
+            version = _apply(
+                conn, [MIGRATIONS[version] for version in range(BASE_VERSION, SCHEMA_VERSION + 1)]
+            )
+            _stamp_unit_recipe(conn)
         return version
     if current > SCHEMA_VERSION:
         raise SchemaError(
@@ -530,7 +534,9 @@ def _stamp_unit_recipe(conn: sqlite3.Connection) -> None:
     left to the sync-time pass: by the time that runs, :func:`grepogram.sync.index_pending` has
     cut units for every chat the run fetched, so "the database holds no units" is never true and
     a brand-new index would re-cut everything it has just cut correctly. Without the stamp the
-    first sync of a fresh install pays a full re-cut and re-embed of its own work.
+    first sync of a fresh install pays a full re-cut and re-embed of its own work. Its caller
+    runs it inside the transaction that writes the schema, for the same reason: a stamp that can
+    be lost on its own is a decision the code below can no longer make.
 
     :mod:`grepogram.units` imports this module, so the version is read inside the function.
     """
@@ -853,6 +859,13 @@ def delete_chat(conn: sqlite3.Connection, chat_id: int) -> None:
     case is a channel deleted while its group lives on under a source of its own: the group keeps
     every message it holds, and only the link goes — with the comment mapping under it, which
     :func:`drop_comment_units` clears for the groups the delete unlinks.
+
+    The chat's two per-chat ``meta`` markers go too, because nothing else would ever remove them
+    and a chat id can come back — re-added after a ``sources rm``, or re-listed by a folder after
+    a ``sources prune``. A surviving ``prune_sweep:`` cursor would make
+    :func:`grepogram.sync.prune_deleted` resume the fresh history from the old chat's high-water
+    mark, report the chat done and never ask about anything below it; a surviving ``unit_recut:``
+    marker would make the next recipe bump skip the chat outright.
     """
     with transaction(conn):
         chat = get_chat(conn, chat_id)
@@ -874,6 +887,10 @@ def delete_chat(conn: sqlite3.Connection, chat_id: int) -> None:
                 f"DELETE FROM {VEC_TABLE} WHERE rowid IN (SELECT id FROM units WHERE chat_id = ?)",
                 (chat_id,),
             )
+        conn.execute(
+            "DELETE FROM meta WHERE key IN (?, ?)",
+            (f"{META_PRUNE_PREFIX}{chat_id}", f"{META_RECUT_PREFIX}{chat_id}"),
+        )
         conn.execute("DELETE FROM chats WHERE id = ?", (chat_id,))
 
 

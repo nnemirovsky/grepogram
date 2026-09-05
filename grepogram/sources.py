@@ -940,9 +940,13 @@ def import_source_ids(conn: sqlite3.Connection, chats: Sequence[ChatRow]) -> dic
 
     Two chats can want the same slug — two contacts of one name in a single export, or a title
     an earlier import already claimed — and sharing a source id would make ``sources rm`` on
-    either delete both, so every colliding chat carries its own id instead. Both rules read only
-    the export and the index, never the order the chats came in, so the answer is stable across
-    runs.
+    either delete both, so every colliding chat carries its own id instead: the chat's own id is
+    appended, and appended again while the result is *still* taken. That last loop is not
+    theoretical — a chat titled ``x`` with id 123 and a chat titled ``x-123`` both land on
+    ``import:x-123`` at the first attempt.
+
+    The chats are walked in id order rather than the export's, so the answer depends only on the
+    export and the index and is stable across runs.
     """
     slugs = {chat.id: import_slug(chat.title) or f"chat-{abs(chat.id)}" for chat in chats}
     shared = {slug for slug, count in collections.Counter(slugs.values()).items() if count > 1}
@@ -952,10 +956,20 @@ def import_source_ids(conn: sqlite3.Connection, chats: Sequence[ChatRow]) -> dic
         if (chat.source_id or "").startswith(IMPORT_PREFIX)
     }
     ids: dict[int, str] = {}
-    for chat_id, slug in slugs.items():
+    taken: set[str] = set()
+
+    def claimed(source_id: str, chat_id: int) -> bool:
+        """Whether ``source_id`` belongs to some other chat — in this export or in the index."""
+        return source_id in taken or held.get(source_id, chat_id) != chat_id
+
+    for chat_id in sorted(slugs):
+        slug = slugs[chat_id]
         source_id = f"{IMPORT_PREFIX}{slug}"
-        if slug in shared or held.get(source_id, chat_id) != chat_id:
+        if slug in shared or claimed(source_id, chat_id):
             source_id = f"{IMPORT_PREFIX}{slug}-{abs(chat_id)}"
+        while claimed(source_id, chat_id):
+            source_id = f"{source_id}-{abs(chat_id)}"
+        taken.add(source_id)
         ids[chat_id] = source_id
     return ids
 
