@@ -1,5 +1,13 @@
 # grepogram v1
 
+> Historical. This plan is what was designed before implementation, kept as a record of the
+> intent; it was last edited during review and does not describe the shipped code. Where it
+> disagrees with `README.md` and `CLAUDE.md`, those are right. Known divergences: a channel
+> comment is mapped to its post by `comment_of_chat_id` / `comment_of_msg_id`, not by reusing
+> `topic_id`; the schema is versioned from `db.BASE_VERSION = 5`, above the pre-release chain
+> this plan describes; the `open_message` tool was dropped, and every reader instead returns a
+> `url` per message; each MCP call opens its own session copy rather than sharing one client.
+
 ## Overview
 
 grepogram is a local search engine over opt-in Telegram chats, exposed to Claude Code through MCP (plus a thin CLI). It syncs messages through the Telegram user API (Telethon), stores them in one SQLite file, builds conversation-level search units (time windows, reply threads, channel posts), indexes them lexically (FTS5 with RU/EN stemming) and densely (sqlite-vec with `bge-m3` computed locally on the Mac GPU), fuses both with Reciprocal Rank Fusion, reranks with a local cross-encoder, and returns hits with deep links that open the original message in Telegram.
