@@ -69,6 +69,22 @@ class SyncCfg:
     flood_sleep_threshold: int = 120
 
 
+@dataclass(frozen=True, slots=True)
+class MediaCfg:
+    """What the extraction pass reads out of media, and how much of it it will download.
+
+    ``enabled`` switches the whole pass off; ``ocr`` and ``documents`` switch one kind of
+    extractor off, which parks that media at ``db.MEDIA_DISABLED`` instead of re-reading it on
+    every pass. ``max_download_mb`` is checked against the size Telegram reports before anything
+    is fetched, so an oversized file costs no traffic at all.
+    """
+
+    enabled: bool = True
+    ocr: bool = True
+    documents: bool = True
+    max_download_mb: int = 20
+
+
 @dataclass(frozen=True, slots=True, kw_only=True)
 class Source:
     """One ``[[sources]]`` entry: a Telegram folder or a single chat."""
@@ -99,6 +115,7 @@ class Config:
     search: SearchCfg = field(default_factory=SearchCfg)
     units: UnitsCfg = field(default_factory=UnitsCfg)
     sync: SyncCfg = field(default_factory=SyncCfg)
+    media: MediaCfg = field(default_factory=MediaCfg)
     sources: list[Source] = field(default_factory=list)
 
 

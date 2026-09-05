@@ -22,7 +22,16 @@ from typing import Any, get_type_hints
 
 import tomli_w
 
-from grepogram.models import Config, ModelsCfg, SearchCfg, Source, SyncCfg, TelegramCfg, UnitsCfg
+from grepogram.models import (
+    Config,
+    MediaCfg,
+    ModelsCfg,
+    SearchCfg,
+    Source,
+    SyncCfg,
+    TelegramCfg,
+    UnitsCfg,
+)
 from grepogram.paths import PRIVATE_FILE_MODE, FileLock, Paths
 
 TEMPLATE = """\
@@ -55,6 +64,12 @@ thread_max_msgs = 40
 edit_refetch = 200
 flood_sleep_threshold = 120
 
+[media]
+enabled = true                         # master switch for the extraction pass
+ocr = true                             # photos through macOS Vision (the `media` extra)
+documents = true                       # pdf and docx
+max_download_mb = 20                   # anything larger is skipped, never downloaded
+
 # Sources are opt-in. Add them with `grepogram sources add <target>` or by hand:
 #
 # [[sources]]
@@ -66,9 +81,9 @@ flood_sleep_threshold = 120
 # comments = false                     # channels only: also index linked discussion threads
 """
 
-_SECTIONS = ("telegram", "models", "search", "units", "sync")
+_SECTIONS = ("telegram", "models", "search", "units", "sync", "media")
 _SOURCE_KEYS = ("folder", "chat", "since", "comments")
-_POSITIVE_KEYS = frozenset({"models.max_seq_length"})
+_POSITIVE_KEYS = frozenset({"models.max_seq_length", "media.max_download_mb"})
 """Integer settings a zero or a negative value is meaningless for, checked after the type."""
 
 
@@ -128,6 +143,7 @@ def from_dict(raw: dict[str, Any]) -> Config:
         search=_section(SearchCfg, raw, "search"),
         units=_section(UnitsCfg, raw, "units"),
         sync=_section(SyncCfg, raw, "sync"),
+        media=_section(MediaCfg, raw, "media"),
         sources=_sources(raw.get("sources", [])),
     )
 
@@ -194,7 +210,7 @@ def write_private(path: Path, text: str) -> None:
     os.replace(tmp, path)
 
 
-def _section[SectionT: (TelegramCfg, ModelsCfg, SearchCfg, UnitsCfg, SyncCfg)](
+def _section[SectionT: (TelegramCfg, ModelsCfg, SearchCfg, UnitsCfg, SyncCfg, MediaCfg)](
     cls: type[SectionT], raw: dict[str, Any], name: str
 ) -> SectionT:
     data = raw.get(name, {})

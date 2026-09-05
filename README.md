@@ -306,6 +306,12 @@ thread_max_msgs = 40
 edit_refetch = 200
 flood_sleep_threshold = 120
 
+[media]
+enabled = true                         # master switch for the extraction pass
+ocr = true                             # photos through macOS Vision (the `media` extra)
+documents = true                       # pdf and docx
+max_download_mb = 20                   # anything larger is skipped, never downloaded
+
 # Sources are opt-in. Add them with `grepogram sources add <target>` or by hand:
 #
 # [[sources]]
@@ -336,6 +342,10 @@ flood_sleep_threshold = 120
 | `units.thread_max_msgs` | a reply thread longer than this continues in further units, each repeating the root |
 | `sync.edit_refetch` | how many of the newest messages of each chat are re-read to pick up edits and reaction counts — after every sync that finishes the chat's incremental pass (skipped on the chat's first sync and when the budget stops the chat); for a channel with `comments` the re-read posts whose reply count grew get their threads fetched again |
 | `sync.flood_sleep_threshold` | Telethon sleeps through a `FloodWait` up to this many seconds; a longer one stops the run with a warning and the chats resume next time |
+| `media.enabled` | master switch for the extraction pass: with it off, no media is downloaded and no text is read out of one |
+| `media.ocr` | read text off photos with macOS Vision; needs the `media` extra and a Mac, and is simply unavailable elsewhere |
+| `media.documents` | read text out of PDF and DOCX attachments; needs the `media` extra |
+| `media.max_download_mb` | a file Telegram reports as larger than this is skipped without being downloaded |
 | `sources[].folder` | a Telegram folder by name; its membership (included and pinned chats minus excluded ones, plus category flags) is re-resolved on every sync |
 | `sources[].chat` | one chat: `@username`, `https://t.me/…` link or the id printed by `grepogram dialogs` (Telethon's marked form, `-100…` for channels and supergroups) |
 | `sources[].since` | `YYYY-MM-DD`; history before this date is skipped on the first sync of the chat |

@@ -483,15 +483,15 @@ Task 15's `sources add` guard, or the import protection silently evaporates.
 - Modify: `README.md`
 - Modify: `tests/test_config.py`
 
-- [ ] add `MediaCfg` with `enabled`, `ocr`, `documents`, `max_download_mb`
-- [ ] register it in `_SECTIONS`, in `Config`, and in `TEMPLATE` with comments matching the style
-- [ ] add the dotted key `"media.max_download_mb"` to `_POSITIVE_KEYS` (config.py:71)
-- [ ] update README's Configuration block (README.md:273-320) by hand — **no test pins README
+- [x] add `MediaCfg` with `enabled`, `ocr`, `documents`, `max_download_mb`
+- [x] register it in `_SECTIONS`, in `Config`, and in `TEMPLATE` with comments matching the style
+- [x] add the dotted key `"media.max_download_mb"` to `_POSITIVE_KEYS` (config.py:71)
+- [x] update README's Configuration block (README.md:273-320) by hand — **no test pins README
       against `TEMPLATE` today**; `tests/test_cli.py:142,156` only pin the *written file*
-- [ ] add that missing pin: a test asserting README's config block matches `config.TEMPLATE`
+- [x] add that missing pin: a test asserting README's config block matches `config.TEMPLATE`
       verbatim, so this drift cannot ship again
-- [ ] write tests: defaults, each key's type rejection, a zero `max_download_mb` refused
-- [ ] run tests — must pass before task 5
+- [x] write tests: defaults, each key's type rejection, a zero `max_download_mb` refused
+- [x] run tests — must pass before task 5
 
 ### Task 5: Build the extractor registry with PDF and DOCX, and teach `FakeClient` to fetch
 

@@ -14,7 +14,7 @@ import pytest
 from grepogram import config
 from grepogram.config import TEMPLATE, ConfigError
 from grepogram.log import redact, setup_logging, shutdown_logging
-from grepogram.models import Config, ModelsCfg, SearchCfg, Source, TelegramCfg
+from grepogram.models import Config, MediaCfg, ModelsCfg, SearchCfg, Source, TelegramCfg
 from grepogram.paths import Paths, env_flag
 from tests.conftest import file_mode
 
@@ -280,6 +280,77 @@ def test_max_seq_length_rejects_non_positive(value: int) -> None:
 def test_positive_rule_leaves_other_numeric_keys_alone() -> None:
     """The rule is keyed by name, so a setting zero is meaningful for keeps accepting it."""
     assert config.loads("[search]\nrerank_top = 0\n").search.rerank_top == 0
+
+
+# --- [media] ---------------------------------------------------------------------------------
+
+
+def test_media_defaults() -> None:
+    assert MediaCfg() == MediaCfg(enabled=True, ocr=True, documents=True, max_download_mb=20)
+    assert config.loads("").media == MediaCfg()
+    assert config.loads(TEMPLATE).media == MediaCfg()
+    assert Config().media == MediaCfg()
+
+
+def test_media_round_trips_through_save_and_load(paths: Paths) -> None:
+    cfg = Config(media=MediaCfg(enabled=False, ocr=False, documents=True, max_download_mb=5))
+    config.save(cfg, paths)
+    assert "max_download_mb = 5" in paths.config_file.read_text()
+    assert config.load(paths) == cfg
+
+
+@pytest.mark.parametrize(
+    ("text", "key", "expected"),
+    [
+        ("[media]\nenabled = 1\n", "media.enabled", "bool"),
+        ("[media]\nocr = 'yes'\n", "media.ocr", "bool"),
+        ("[media]\ndocuments = 0\n", "media.documents", "bool"),
+        ("[media]\nmax_download_mb = '20'\n", "media.max_download_mb", "int"),
+        ("[media]\nmax_download_mb = 20.0\n", "media.max_download_mb", "int"),
+        ("[media]\nmax_download_mb = true\n", "media.max_download_mb", "int"),
+    ],
+)
+def test_media_rejects_wrong_types(text: str, key: str, expected: str) -> None:
+    pattern = rf"invalid value for {re.escape(key)}: expected {expected}"
+    with pytest.raises(ConfigError, match=pattern):
+        config.loads(text)
+
+
+@pytest.mark.parametrize("value", [0, -1])
+def test_media_max_download_mb_rejects_non_positive(value: int) -> None:
+    """Downloading nothing is what `enabled = false` says; a zero cap would say it by accident."""
+    with pytest.raises(ConfigError, match=r"invalid value for media\.max_download_mb: .*positive"):
+        config.loads(f"[media]\nmax_download_mb = {value}\n")
+
+
+def test_media_is_a_known_section_with_its_own_unknown_key_hint() -> None:
+    assert "[media]" in config.UNKNOWN_SECTION_HINT
+    with pytest.raises(ConfigError, match=r"unknown key: media\.nope") as caught:
+        config.loads("[media]\nnope = 1\n")
+    assert caught.value.hint is not None and "[media]" in caught.value.hint
+
+
+# --- README ----------------------------------------------------------------------------------
+
+
+def _readme_config_block() -> str:
+    """The single ```toml fence of README's Configuration section."""
+    text = (Path(__file__).resolve().parents[1] / "README.md").read_text(encoding="utf-8")
+    blocks = re.findall(r"^```toml\n(.*?)^```\n", text, re.DOTALL | re.MULTILINE)
+    assert len(blocks) == 1, f"expected one toml block in README, found {len(blocks)}"
+    return str(blocks[0])
+
+
+def test_readme_config_block_is_the_template_verbatim() -> None:
+    """README documents the file `config init` writes, so drift between the two is a bug."""
+    assert _readme_config_block() == TEMPLATE
+
+
+def test_readme_documents_every_config_key() -> None:
+    text = (Path(__file__).resolve().parents[1] / "README.md").read_text(encoding="utf-8")
+    for section in config._SECTIONS:
+        for field in dataclasses.fields(getattr(Config(), section)):
+            assert f"`{section}.{field.name}`" in text, f"{section}.{field.name} is undocumented"
 
 
 # --- config lock -----------------------------------------------------------------------------
