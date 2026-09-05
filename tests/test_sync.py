@@ -1917,6 +1917,117 @@ async def test_a_run_short_of_the_recut_floor_leaves_the_units_alone(
     assert db.unit_recipe(conn) is None
 
 
+def _v011_index() -> sqlite3.Connection:
+    """A database exactly as v0.1.1 left one: the v5 schema, its rows, a unit, and no recipe.
+
+    Every other re-cut test moves :data:`grepogram.units.RECIPE_VERSION` under the code, which
+    proves the comparison and not the shipped number. This one is the upgrade an installed
+    v0.1.1 actually walks, at the version this build carries. The rows are what
+    :func:`grepogram.sync.map_message` writes for :func:`_arg_history`, so the edit-refetch pass
+    finds nothing to re-store and the only thing that can move a unit is the re-cut itself.
+    """
+    connection = db.connect(":memory:")
+    for statement in db.MIGRATIONS[db.BASE_VERSION]:
+        connection.execute(statement)
+    connection.execute("INSERT INTO meta(key, value) VALUES ('schema_version', '5')")
+    chat = ChatRow(
+        id=ARG_ID,
+        type="supergroup",
+        title="Argentina chat",
+        username="arg_chat",
+        source_id="folder:Argentina",
+    )
+    connection.execute(
+        "INSERT INTO chats(id, type, title, username, source_id, last_msg_id, last_sync_at) "
+        "VALUES (?, ?, ?, ?, ?, 3, ?)",
+        (chat.id, chat.type, chat.title, chat.username, chat.source_id, int(time.time()) - 60),
+    )
+    names = {
+        user_id: user.display_name
+        for user_id, user in sync.collect_users([ALICE, BOB]).items()
+        if user.display_name
+    }
+    rows = [
+        row for msg in _arg_history() if (row := sync.map_message(msg, chat, names)) is not None
+    ]
+    for row in rows:
+        connection.execute(
+            "INSERT INTO messages(chat_id, msg_id, date, from_id, from_name, reply_to_msg_id, "
+            "text, indexed) VALUES (?, ?, ?, ?, ?, ?, ?, 1)",
+            (
+                row.chat_id,
+                row.msg_id,
+                row.date,
+                row.from_id,
+                row.from_name,
+                row.reply_to_msg_id,
+                row.text,
+            ),
+        )
+    connection.execute(
+        "INSERT INTO units(chat_id, kind, msg_id_start, msg_id_end, msg_ids, date_start, "
+        "date_end, text) VALUES (?, 'window', 1, 3, '[1,2,3]', ?, ?, 'cut by the older rule')",
+        (ARG_ID, rows[0].date, rows[-1].date),
+    )
+    return connection
+
+
+async def test_an_installed_v011_index_recuts_once_at_the_shipped_recipe(
+    paths: Paths, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The whole upgrade, unpatched: migrating a v5 database records no recipe, the first sync
+    re-cuts the chat once and stamps :data:`grepogram.units.RECIPE_VERSION`, and the sync after
+    it re-cuts nothing — the re-index a v0.1.1 upgrader pays for happens exactly once."""
+    connection = _v011_index()
+    assert db.migrate(connection) == db.SCHEMA_VERSION
+    assert db.unit_recipe(connection) is None
+    before = [u.id for u in db.get_units(connection, ARG_ID)]
+    recut: list[int] = []
+    original = sync._recut_one
+
+    def counted(conn_: sqlite3.Connection, cfg_: Config, chat: ChatRow) -> bool:
+        recut.append(chat.id)
+        return original(conn_, cfg_, chat)
+
+    monkeypatch.setattr(sync, "_recut_one", counted)
+    cfg = _cfg(ARG_SOURCE)
+    await _run(_client(messages={ARG_ID: _arg_history()}), connection, paths, cfg)
+    assert recut == [ARG_ID]
+    assert db.unit_recipe(connection) == units.RECIPE_VERSION
+    assert db.recut_markers(connection) == {}
+    after = [u.id for u in db.get_units(connection, ARG_ID)]
+    assert not set(before) & set(after)
+    assert db.chats_with_unindexed(connection) == []
+    recut.clear()
+    await _run(_client(messages={ARG_ID: _arg_history()}), connection, paths, cfg)
+    assert recut == []
+    assert [u.id for u in db.get_units(connection, ARG_ID)] == after
+    connection.close()
+
+
+async def test_the_auto_sync_budget_never_recuts_an_installed_v011_index(
+    paths: Paths, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The same index under the 20-second budget a ``search`` call syncs with: nothing starts."""
+    connection = _v011_index()
+    db.migrate(connection)
+    before = [u.id for u in db.get_units(connection, ARG_ID)]
+    recut: list[int] = []
+
+    def counted(conn_: sqlite3.Connection, cfg_: Config, chat: ChatRow) -> bool:
+        recut.append(chat.id)
+        return True
+
+    monkeypatch.setattr(sync, "_recut_one", counted)
+    cfg = _cfg(ARG_SOURCE)
+    client = _client(messages={ARG_ID: _arg_history()})
+    await _run(client, connection, paths, cfg, cfg.search.auto_sync_budget_s)
+    assert recut == []
+    assert [u.id for u in db.get_units(connection, ARG_ID)] == before
+    assert db.unit_recipe(connection) is None
+    connection.close()
+
+
 async def test_comments_are_not_fetched_without_the_flag(conn: sqlite3.Connection) -> None:
     client = _news_client()
     news = db.upsert_chat(conn, ChatRow(id=NEWS_ID, type="channel", source_id="chat:@news"))

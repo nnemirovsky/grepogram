@@ -953,19 +953,68 @@ upload. `actionlint` 1.7.12 reports no findings.
 
 ### Task 18: Verify acceptance criteria
 
-- [ ] verify all eight Overview items are implemented and reachable from the CLI, and from MCP
-      where they belong (`sources prune` and `prune-deleted` deliberately are not)
-- [ ] verify the re-index happens exactly once for a v0.1.1 upgrader: a database with rows and no
-      recorded recipe re-cuts, ends at `RECIPE_VERSION = 4`, and a second sync re-cuts nothing
-- [ ] verify a short-budget run never starts a re-cut and never empties a chat's units outside its
-      own transaction
-- [ ] verify graceful degradation with the `media` extra absent and on a non-darwin platform
-- [ ] verify `reaction_weight = 0` reproduces v0.1.1 ordering exactly
-- [ ] run the full suite: `uv run pytest`
-- [ ] run the slow suite: `HF_HUB_OFFLINE=1 uv run pytest -m slow`
-- [ ] run `uv run ruff check . && uv run ruff format --check . && uv run mypy`
-- [ ] verify coverage has not dropped below the **v0.1.1 baseline of 99%** (3,954 statements, 29
-      missed), measured with `uv run pytest --cov=grepogram`
+- [x] verify all eight Overview items are implemented and reachable from the CLI, and from MCP
+      where they belong (`sources prune` and `prune-deleted` deliberately are not) — ⚠️ **note**:
+      `extract` and `import` are CLI-only too, not just the two the checkbox names. Neither Task 7
+      nor Task 15 ever asked for an MCP tool (extraction is a long flood-exposed network pass;
+      `import` reads a directory the server cannot see), so this is a gap in the checkbox's
+      parenthetical, not in the code. The full matrix, from the live command lists — CLI leaves
+      `auth, config init, config path, context, dialogs, embed, extract, import, prune-deleted,
+      search, sources add, sources ls, sources prune, sources rm, sync, thread`; MCP tools
+      `context, dialogs, search, sources, sources_add, sources_remove, sync, thread` — is: OCR and
+      document extraction → CLI `extract`; the window-cap fix → any `sync` (CLI and MCP) plus the
+      recipe re-cut; `sources prune` → CLI only, by design; reactions → `search` (CLI and MCP);
+      deletions → every `sync` (CLI and MCP) for the edit-refetch pass, CLI `prune-deleted` for
+      the sweep, by design; PyPI → the gated `pypi` job in `release.yml` (`actionlint` exit 0);
+      `import` → CLI only
+- [x] verify the re-index happens exactly once for a v0.1.1 upgrader: a database with rows and no
+      recorded recipe re-cuts, ends at `RECIPE_VERSION = 4`, and a second sync re-cuts nothing —
+      ➕ pinned by two new tests, `test_an_installed_v011_index_recuts_once_at_the_shipped_recipe`
+      and `test_the_auto_sync_budget_never_recuts_an_installed_v011_index`, over a `_v011_index()`
+      helper that builds the real v5 schema with rows, a stale unit and no `unit_recipe`. Every
+      re-cut test before them moved `RECIPE_VERSION` under the code with `monkeypatch`, which
+      proves the comparison and not the shipped number; these run unpatched at `RECIPE_VERSION =
+      4`. Verified: `migrate` walks v5 → v6 and stamps nothing, the first sync calls `_recut_one`
+      exactly once, the recipe lands on 4, markers clear, the stale unit id is gone, nothing is
+      left unindexed, and the second sync calls `_recut_one` zero times and leaves every unit id
+      where it was
+- [x] verify a short-budget run never starts a re-cut and never empties a chat's units outside its
+      own transaction — `auto_sync_budget_s = 20` is below `RECUT_MIN_BUDGET_S = 60`, so
+      `recut_pending_chats` returns before `_finish_recut`: the new test asserts `_recut_one` is
+      never called, the units are untouched and `unit_recipe` stays `None`. Every unit deletion in
+      the tree is id-scoped and transactional — `units.recut_chat` (delete + insert in one
+      `db.transaction`), `units._apply`, `db._drop_units_and_index` — and `_recut_one` wraps the
+      re-cut, the indexing and the marker in one more; nothing deletes units index-wide
+- [x] verify graceful degradation with the `media` extra absent and on a non-darwin platform — the
+      CI environment exactly (`uv sync --locked --group dev`, no extras: no `Vision`, no `torch`,
+      no `sentence_transformers`) runs the whole suite green, 1673 passed. With `pypdf` and
+      `python-docx` uninstalled on top of that, every `grepogram` module still imports,
+      `grepogram extract --help` still works, `extract.registry()` is `{}` and a `media.run` over a
+      PDF and a photo parks both at `unsupported` with **zero** client calls and no `indexed`
+      change. Non-darwin (`sys.platform = "linux"`) drops `photo` and keeps `document`, with
+      `_ocr_unavailable()` naming the reason
+- [x] verify `reaction_weight = 0` reproduces v0.1.1 ordering exactly — measured against the real
+      v0.1.1 code in a git worktree at `c803339`, both builds loading the same
+      `tests/fixtures/chat_ru.py` corpus through the same fake models: the cut units are
+      byte-identical, and over 10 queries × 3 modes the hit lists match **including the scores to
+      nine decimals**. At the shipped `0.05` the order is the same and only the scores move (the
+      min-max normalisation), which is what proves the branch is live rather than dead
+- [x] run the full suite: `uv run pytest` — 1673 passed, 11 deselected
+- [x] run the slow suite: `HF_HUB_OFFLINE=1 uv run pytest -m slow` — 11 passed
+- [x] run `uv run ruff check . && uv run ruff format --check . && uv run mypy` — all checks passed,
+      67 files formatted, no issues in 58 source files
+- [x] verify coverage has not dropped below the **v0.1.1 baseline of 99%** (3,954 statements, 29
+      missed), measured with `uv run pytest --cov=grepogram` — 5,223 statements, 27 missed, 99%.
+      The same measurement run on the `c803339` worktree reports 3,954 / 27 / 99%, so the baseline
+      is reproduced exactly on statements and the release adds 1,269 covered statements without
+      losing a point
+
+**Two findings, both recorded rather than papered over.** The MCP parenthetical above is the
+first. The second: the MCP `sync` tool defaults to `budget_s = 45`, below the 60-second re-cut
+floor, so an MCP-only user who calls it with the default never starts the one-time re-cut either.
+That is consistent with the design — `search.RECUT_PENDING` tells such a user to run `grepogram
+sync`, and the plan's own "The unit recipe" section says a re-cut is started deliberately — but it
+means the CLI is the only default-configuration door to it. Task 19's README work should say so.
 
 ### Task 19: [Final] Update documentation and release
 
