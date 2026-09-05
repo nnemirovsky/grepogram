@@ -143,6 +143,12 @@ class MessageRow:
     discussion group holds and ``None`` on every other row, a forum topic message included. The
     two are independent because their ids are: a forum topic root and a channel post both start
     at 1 and a discussion group can be a forum, so one column could never carry both.
+
+    ``extracted_text`` is what an extractor read out of the attached media — OCR of a photo, the
+    text of a PDF or a DOCX — and ``media_state`` how far the extraction pass got with this row
+    (:data:`grepogram.db.MEDIA_PENDING` and the states beside it). Both are written by that pass
+    alone: :func:`grepogram.db.upsert_messages` never touches them, so a re-store of a message
+    Telegram re-read does not throw away what was extracted from its media.
     """
 
     id: int | None = None
@@ -161,6 +167,8 @@ class MessageRow:
     media_kind: MediaKind | None = None
     media_filename: str | None = None
     reactions_total: int = 0
+    extracted_text: str | None = None
+    media_state: int = 0
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -175,6 +183,8 @@ class UnitRow:
     date_start: int
     date_end: int
     text: str
+    reactions: int = 0
+    """Reactions on the messages this unit holds, summed when it is cut."""
     dirty: bool = True
     embedded_model: str | None = None
 

@@ -450,30 +450,30 @@ Task 15's `sources add` guard, or the import protection silently evaporates.
 - Modify: `grepogram/sync.py`
 - Modify: `tests/test_db.py`
 
-- [ ] add **migration step 6 only** — `MIGRATIONS[6]` with the four statements from Technical
+- [x] add **migration step 6 only** — `MIGRATIONS[6]` with the four statements from Technical
       Details. **Do not touch `_V5`**: `migrate()` applies every step from `BASE_VERSION` for a
       fresh database (db.py:455-462), so a column in both places raises `duplicate column name` and
       fails `tests/conftest.py`'s shared fixture, i.e. the entire suite
-- [ ] give `messages_media_pending` the predicate `media_state = 0 AND media_kind IS NOT NULL`
-- [ ] keep a re-store from clobbering `extracted_text` / `media_state` by **omitting both from the
+- [x] give `messages_media_pending` the predicate `media_state = 0 AND media_kind IS NOT NULL`
+- [x] keep a re-store from clobbering `extracted_text` / `media_state` by **omitting both from the
       upsert's SET clause entirely** (db.py:150-181). The COALESCE idiom used for `topic_id` cannot
       work here: it relies on `None` meaning "not supplied", and `media_state` is
       `NOT NULL DEFAULT 0`, so a freshly mapped row carries `0` and would reset every extracted
       message to pending on every sync
-- [ ] add `extracted_text` / `media_state` to `MessageRow` and `reactions` to `UnitRow`, and wire
+- [x] add `extracted_text` / `media_state` to `MessageRow` and `reactions` to `UnitRow`, and wire
       **all three** through the row mappings and `_UNIT_INSERT` (db.py:184-188) in this task, so no
       later task inherits a half-wired column
-- [ ] **exclude** `extracted_text` and `media_state` from `_differs`'s comparison by normalising
+- [x] **exclude** `extracted_text` and `media_state` from `_differs`'s comparison by normalising
       both sides (`dataclasses.replace(row, extracted_text=None, media_state=0)`) before comparing.
       The existing "kept" idiom (sync.py:793-797) tests `is None`, so it would exempt
       `extracted_text` correctly but **not** `media_state`, whose fresh value is `0`. Without this,
       every extracted message inside the `edit_refetch` window counts as an edit on every sync and
       is re-cut and re-embedded forever
-- [ ] write tests: a v5 database migrates to v6 keeping its rows; a fresh database migrates once
+- [x] write tests: a v5 database migrates to v6 keeping its rows; a fresh database migrates once
       with no duplicate-column error; a re-store preserves extracted text and state; `_differs`
       ignores both columns; a unit round-trips a non-zero `reactions` value; `EXPLAIN QUERY PLAN`
       shows the partial index used **and** a test asserting it does not cover media-less rows
-- [ ] run tests — must pass before task 4
+- [x] run tests — must pass before task 4
 
 ### Task 4: Add the `[media]` config section
 

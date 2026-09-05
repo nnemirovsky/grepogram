@@ -126,6 +126,35 @@ _V5: tuple[str, ...] = (
         raw, stemmed, chat_id UNINDEXED, date_start UNINDEXED, tokenize='{FTS_TOKENIZE}')""",
 )
 
+_V6: tuple[str, ...] = (
+    # what an extractor read out of a message's media, and how far the extraction pass got with
+    # that message (the MEDIA_* states below). Both are the pass's alone to write: the message
+    # upsert names neither column, so a re-store of a re-read message keeps what was extracted.
+    "ALTER TABLE messages ADD COLUMN extracted_text TEXT",
+    "ALTER TABLE messages ADD COLUMN media_state INTEGER NOT NULL DEFAULT 0",
+    # reactions on the messages a unit holds, summed when it is cut and refreshed in place
+    "ALTER TABLE units ADD COLUMN reactions INTEGER NOT NULL DEFAULT 0",
+    # the extraction pass's work queue. The predicate carries `media_kind IS NOT NULL` as well as
+    # the state: without it the index would cover every row of the table forever — text messages
+    # sit at MEDIA_PENDING and never leave it — and the pending query would stay a scan.
+    """CREATE INDEX messages_media_pending ON messages(chat_id, id)
+       WHERE media_state = 0 AND media_kind IS NOT NULL""",
+)
+
+MEDIA_PENDING = 0
+"""``messages.media_state``: media nothing has looked at yet — the extraction pass's queue."""
+MEDIA_EXTRACTED = 1
+"""Extraction ran; ``extracted_text`` may still be empty, an image holding no text."""
+MEDIA_UNSUPPORTED = 2
+"""No extractor is registered for this kind, so there is nothing to retry."""
+MEDIA_FAILED = 3
+"""Extraction was attempted and failed — a timeout, a corrupt file; retryable."""
+MEDIA_SKIPPED = 4
+"""Larger than ``media.max_download_mb``, so it was never downloaded."""
+MEDIA_DISABLED = 5
+"""The kind is switched off in config; re-queued to :data:`MEDIA_PENDING` when it comes back, so
+a disabled kind drains once instead of being re-read on every pass."""
+
 BASE_VERSION = 5
 """The version :data:`_V5` alone produces — the lowest number this build ever records.
 
@@ -137,7 +166,7 @@ rest of the code querying columns that are not there. Every version below this o
 belongs to that chain and is refused outright; :func:`migrate` upgrades only from a version this
 build itself wrote."""
 
-MIGRATIONS: dict[int, tuple[str, ...]] = {BASE_VERSION: _V5}
+MIGRATIONS: dict[int, tuple[str, ...]] = {BASE_VERSION: _V5, 6: _V6}
 """The schema, keyed by the version each step brings a database to.
 
 :data:`BASE_VERSION` builds it from nothing and only an empty file gets that step;
@@ -184,11 +213,18 @@ _MESSAGE_UPSERT = """
         reactions_total = excluded.reactions_total,
         indexed = 0
     RETURNING id"""
+"""Store a message, keeping what only the extraction pass knows.
+
+``extracted_text`` and ``media_state`` appear in neither the column list nor the SET clause, so
+Telegram re-reading a message cannot undo what was extracted from its media. The ``COALESCE``
+idiom the topic and comment columns use cannot serve here: it reads ``None`` as "not supplied",
+and ``media_state`` is ``NOT NULL DEFAULT 0`` — a freshly mapped row carries :data:`MEDIA_PENDING`
+and would reset every extracted message to pending on every sync."""
 
 _UNIT_INSERT = """
     INSERT INTO units(chat_id, topic_id, kind, msg_id_start, msg_id_end, msg_ids,
-                      date_start, date_end, text, dirty, embedded_model)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                      date_start, date_end, text, reactions, dirty, embedded_model)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     RETURNING id"""
 
 
@@ -905,9 +941,10 @@ def upsert_messages(conn: sqlite3.Connection, batch: Iterable[MessageRow]) -> li
     rowid. A ``topic_id`` and a ``comment_of_*`` pair already stored survive a row without them:
     a channel's comment fetch stores a discussion group's message as a comment on one of its
     posts, and the group's own history sync stores the same message with no comment relation at
-    all — either may arrive first. Every row written, new or
-    updated, is flagged ``indexed = 0`` until a rebuild covers it (:func:`mark_indexed`). The
-    chat row must exist (foreign key).
+    all — either may arrive first. ``extracted_text`` and ``media_state`` are not written here at
+    all (see :data:`_MESSAGE_UPSERT`): they belong to the extraction pass, which owns them through
+    its own writers. Every row written, new or updated, is flagged ``indexed = 0`` until a rebuild
+    covers it (:func:`mark_indexed`). The chat row must exist (foreign key).
     """
     ids: list[int] = []
     with transaction(conn):
@@ -1244,6 +1281,7 @@ def insert_units(conn: sqlite3.Connection, units: Iterable[UnitRow]) -> list[int
                     unit.date_start,
                     unit.date_end,
                     unit.text,
+                    unit.reactions,
                     int(unit.dirty),
                     unit.embedded_model,
                 ),
@@ -1467,6 +1505,8 @@ def _message_row(row: sqlite3.Row) -> MessageRow:
         media_kind=row["media_kind"],
         media_filename=row["media_filename"],
         reactions_total=row["reactions_total"],
+        extracted_text=row["extracted_text"],
+        media_state=row["media_state"],
     )
 
 
@@ -1482,6 +1522,7 @@ def _unit_row(row: sqlite3.Row) -> UnitRow:
         date_start=row["date_start"],
         date_end=row["date_end"],
         text=row["text"],
+        reactions=row["reactions"],
         dirty=bool(row["dirty"]),
         embedded_model=row["embedded_model"],
     )

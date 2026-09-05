@@ -810,12 +810,27 @@ def _differs(stored: MessageRow, fresh: MessageRow) -> bool:
     Compared with the values the upsert would keep: a comment re-read as part of its discussion
     group's own history arrives with no comment relation — and, outside a forum, with no topic —
     and must not count as an edit for want of what the upsert would have preserved anyway.
+
+    ``extracted_text`` and ``media_state`` are normalised away on both sides instead, because the
+    upsert does not write them at all: a message Telegram maps carries no extracted text and
+    :data:`db.MEDIA_PENDING`, so every extracted message inside the ``edit_refetch`` window would
+    otherwise count as an edit on every sync and be re-cut and re-embedded forever. The "kept"
+    idiom above cannot do it — it reads ``None`` as "not supplied", and a fresh row's
+    ``media_state`` is ``0``.
     """
     kept = {
         field: getattr(stored, field) if getattr(fresh, field) is None else getattr(fresh, field)
         for field in ("topic_id", "comment_of_chat_id", "comment_of_msg_id")
     }
-    return dataclasses.replace(stored, id=None) != dataclasses.replace(fresh, **kept)
+    return _comparable(dataclasses.replace(stored, id=None)) != _comparable(
+        dataclasses.replace(fresh, **kept)
+    )
+
+
+def _comparable(row: MessageRow) -> MessageRow:
+    """``row`` without the columns :func:`db.upsert_messages` never writes — see
+    :func:`_differs`."""
+    return dataclasses.replace(row, extracted_text=None, media_state=db.MEDIA_PENDING)
 
 
 async def _refresh_comments(

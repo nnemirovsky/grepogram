@@ -1,4 +1,5 @@
 import asyncio
+import dataclasses
 import datetime as dt
 import sqlite3
 import stat
@@ -445,6 +446,58 @@ async def test_edit_refetch_updates_text_and_keeps_row_ids(conn: sqlite3.Connect
     assert len(refetch) == 1
     assert refetch[0]["limit"] == 3
     assert refetch[0]["reverse"] is False
+
+
+def test_differs_ignores_the_columns_the_upsert_never_writes() -> None:
+    """``extracted_text`` and ``media_state`` are the extraction pass's, and a row Telegram maps
+    carries neither. Comparing them would make every extracted message inside the
+    ``edit_refetch`` window an edit on every sync, re-cut and re-embedded for ever."""
+    stored = MessageRow(
+        id=7,
+        chat_id=ARG_ID,
+        msg_id=2,
+        date=100,
+        text="",
+        media_kind="photo",
+        extracted_text="visa office notice",
+        media_state=db.MEDIA_EXTRACTED,
+    )
+    mapped = MessageRow(chat_id=ARG_ID, msg_id=2, date=100, text="", media_kind="photo")
+    assert not sync._differs(stored, mapped)
+    assert sync._differs(stored, dataclasses.replace(mapped, text="caption"))
+
+
+async def test_edit_refetch_keeps_extracted_media_text_across_syncs(
+    conn: sqlite3.Connection,
+) -> None:
+    """End to end over the pass that re-reads: the photo's OCR survives, and the message does not
+    come back as an edit."""
+    client = _client(
+        messages={
+            ARG_ID: [
+                tl.message(ARG_ID, 1, "m1", sender=1),
+                tl.photo_message(ARG_ID, 2, "at the embassy", sender=1),
+            ]
+        }
+    )
+    chat = db.upsert_chat(conn, ChatRow(id=ARG_ID, type="supergroup"))
+    first = await sync.sync_chat(
+        client, conn, chat, ARG_SOURCE, SyncBudget(), sync_cfg=SyncCfg(edit_refetch=2)
+    )
+    row = db.get_message(conn, ARG_ID, 2)
+    assert row is not None and row.media_kind == "photo"
+    conn.execute(
+        "UPDATE messages SET extracted_text = ?, media_state = ? WHERE id = ?",
+        ("visa office notice", db.MEDIA_EXTRACTED, row.id),
+    )
+    again = await sync.sync_chat(
+        client, conn, first.chat, ARG_SOURCE, SyncBudget(), sync_cfg=SyncCfg(edit_refetch=2)
+    )
+    assert again.new_msg_ids == []
+    after = db.get_message(conn, ARG_ID, 2)
+    assert after is not None
+    assert after.extracted_text == "visa office notice"
+    assert after.media_state == db.MEDIA_EXTRACTED
 
 
 async def test_edit_refetch_is_skipped_when_nothing_changed_or_disabled(

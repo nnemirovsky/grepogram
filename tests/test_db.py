@@ -21,6 +21,7 @@ INDEXES = {
     "messages_unindexed",
     "chats_discussion_of",
     "messages_comments",
+    "messages_media_pending",
 }
 
 
@@ -161,11 +162,11 @@ def test_connection_usable_from_second_thread(conn: sqlite3.Connection) -> None:
 def test_fresh_migrate_creates_schema() -> None:
     connection = db.connect(":memory:")
     assert db.schema_version(connection) == 0
-    assert db.migrate(connection) == db.SCHEMA_VERSION == 5
+    assert db.migrate(connection) == db.SCHEMA_VERSION == 6
     assert TABLES <= _names(connection, "table")
     assert INDEXES <= _names(connection, "index")
-    assert db.schema_version(connection) == 5
-    assert db.get_meta(connection, "schema_version") == "5"
+    assert db.schema_version(connection) == 6
+    assert db.get_meta(connection, "schema_version") == "6"
     assert not db.has_vec_table(connection)
     assert not connection.in_transaction
     messages_sql = connection.execute(
@@ -176,6 +177,8 @@ def test_fresh_migrate_creates_schema() -> None:
     assert "indexed INTEGER NOT NULL DEFAULT 0" in messages_sql
     assert "comment_of_chat_id INTEGER" in messages_sql
     assert "comment_of_msg_id INTEGER" in messages_sql
+    assert _columns(connection, "messages") >= {"extracted_text", "media_state"}
+    assert "reactions" in _columns(connection, "units")
     units_sql = connection.execute("SELECT sql FROM sqlite_master WHERE name = 'units'").fetchone()
     assert "AUTOINCREMENT" in units_sql[0]
     for fts in ("msg_fts", "unit_fts"):
@@ -188,6 +191,56 @@ def test_migrate_twice_is_noop(conn: sqlite3.Connection) -> None:
     assert db.migrate(conn) == db.SCHEMA_VERSION
     assert _schema(conn) == before
     assert db.get_meta(conn, "schema_version") == str(db.SCHEMA_VERSION)
+
+
+def test_migrate_upgrades_a_v5_database_and_keeps_its_rows() -> None:
+    """The first step above the base: an index in the field gains the columns without losing a
+    row, and still owes the re-cut its units were not cut for."""
+    connection = db.connect(":memory:")
+    for statement in db.MIGRATIONS[db.BASE_VERSION]:
+        connection.execute(statement)
+    connection.execute("INSERT INTO meta(key, value) VALUES ('schema_version', '5')")
+    connection.execute("INSERT INTO chats(id, type, title) VALUES (1, 'supergroup', 'c')")
+    connection.execute(
+        "INSERT INTO messages(chat_id, msg_id, date, text, media_kind, reactions_total) "
+        "VALUES (1, 7, 100, 'hello', 'photo', 3)"
+    )
+    connection.execute(
+        "INSERT INTO units(chat_id, kind, msg_id_start, msg_id_end, msg_ids, date_start, "
+        "date_end, text) VALUES (1, 'window', 7, 7, '[7]', 100, 100, 'hello')"
+    )
+    assert db.migrate(connection) == db.SCHEMA_VERSION == 6
+    stored = db.get_message(connection, 1, 7)
+    assert stored is not None
+    assert (stored.text, stored.media_kind, stored.reactions_total) == ("hello", "photo", 3)
+    assert stored.extracted_text is None
+    assert stored.media_state == db.MEDIA_PENDING
+    (unit,) = db.get_units(connection, 1)
+    assert unit.text == "hello"
+    assert unit.reactions == 0
+    assert "messages_media_pending" in _names(connection, "index")
+    assert db.unit_recipe(connection) is None
+    connection.close()
+
+
+def test_fresh_migrate_adds_the_v6_columns_exactly_once() -> None:
+    """A database with no schema objects runs every step from the base, so a column named in
+    both ``_V5`` and step 6 would raise ``duplicate column name`` — and take the shared ``conn``
+    fixture, i.e. the whole suite, down with it. ``_V5`` names none of them."""
+    base = " ".join(db.MIGRATIONS[db.BASE_VERSION])
+    assert "extracted_text" not in base
+    assert "media_state" not in base
+    assert "reactions INTEGER" not in base
+    connection = db.connect(":memory:")
+    assert db.migrate(connection) == 6
+    for table, column in (
+        ("messages", "extracted_text"),
+        ("messages", "media_state"),
+        ("units", "reactions"),
+    ):
+        names = [row["name"] for row in connection.execute(f"PRAGMA table_info({table})")]
+        assert names.count(column) == 1
+    connection.close()
 
 
 def test_migrate_refuses_a_version_no_chain_of_steps_reaches(
@@ -303,8 +356,8 @@ def test_migrate_walks_up_a_version_it_holds_every_step_for(
 
 def test_migrate_rolls_back_on_failure(monkeypatch: pytest.MonkeyPatch) -> None:
     connection = db.connect(":memory:")
-    broken = (*db.MIGRATIONS[db.SCHEMA_VERSION][:3], "CREATE TABLE ?")
-    monkeypatch.setattr(db, "MIGRATIONS", {db.SCHEMA_VERSION: broken})
+    broken = (*db.MIGRATIONS[db.BASE_VERSION][:3], "CREATE TABLE ?")
+    monkeypatch.setattr(db, "MIGRATIONS", {**db.MIGRATIONS, db.BASE_VERSION: broken})
     with pytest.raises(sqlite3.OperationalError):
         db.migrate(connection)
     assert _names(connection, "table") == set()
@@ -898,6 +951,70 @@ def test_upsert_messages_returns_ids_and_stores_all_columns(conn: sqlite3.Connec
     assert db.upsert_messages(conn, []) == []
 
 
+def test_upsert_messages_never_writes_extracted_text_or_media_state(
+    conn: sqlite3.Connection,
+) -> None:
+    """The two columns the extraction pass owns are named in neither half of the upsert, so a
+    message Telegram re-reads keeps what was read out of its media. A ``COALESCE`` would not do
+    it: ``media_state`` is ``NOT NULL DEFAULT 0``, so a freshly mapped row carries
+    :data:`db.MEDIA_PENDING` and would reset every extracted message on every sync."""
+    db.upsert_chat(conn, _chat(1))
+    (row_id,) = db.upsert_messages(
+        conn,
+        [_message(1, 5, media_kind="photo", extracted_text="mapped", media_state=db.MEDIA_FAILED)],
+    )
+    fresh = db.get_message(conn, 1, 5)
+    assert fresh is not None
+    assert fresh.extracted_text is None
+    assert fresh.media_state == db.MEDIA_PENDING
+    conn.execute(
+        "UPDATE messages SET extracted_text = ?, media_state = ? WHERE id = ?",
+        ("visa office notice", db.MEDIA_EXTRACTED, row_id),
+    )
+    assert db.upsert_messages(
+        conn, [_message(1, 5, text="caption edited", media_kind="photo")]
+    ) == [row_id]
+    stored = db.get_message(conn, 1, 5)
+    assert stored is not None
+    assert stored.text == "caption edited"
+    assert stored.extracted_text == "visa office notice"
+    assert stored.media_state == db.MEDIA_EXTRACTED
+
+
+def test_media_pending_index_answers_the_queue_and_excludes_media_less_rows(
+    conn: sqlite3.Connection,
+) -> None:
+    """The partial index is the extraction pass's work queue. Its predicate carries
+    ``media_kind IS NOT NULL`` as well as the state: without that it would cover every row in the
+    table — text messages sit at :data:`db.MEDIA_PENDING` for ever — and the query it exists for
+    would still be a scan."""
+    db.upsert_chat(conn, _chat(1))
+    db.upsert_messages(
+        conn,
+        [
+            _message(1, 1, media_kind="photo"),
+            _message(1, 2),
+            _message(1, 3, media_kind="document", media_filename="rules.pdf"),
+        ],
+    )
+    conn.execute("UPDATE messages SET media_state = ? WHERE msg_id = 3", (db.MEDIA_EXTRACTED,))
+    pending = (
+        "SELECT msg_id FROM messages WHERE chat_id = ? AND media_state = 0 "
+        "AND media_kind IS NOT NULL ORDER BY id"
+    )
+    plan = " ".join(
+        str(row["detail"]) for row in conn.execute(f"EXPLAIN QUERY PLAN {pending}", (1,))
+    )
+    assert "messages_media_pending" in plan
+    assert [row["msg_id"] for row in conn.execute(pending, (1,))] == [1]
+    # a query that does not name the predicate has no solution in this index — which is the
+    # index saying, in SQLite's own words, that it holds no row without media
+    with pytest.raises(sqlite3.OperationalError, match="no query solution"):
+        conn.execute(
+            "SELECT msg_id FROM messages INDEXED BY messages_media_pending WHERE chat_id = ?", (1,)
+        )
+
+
 def test_upsert_flags_rows_until_they_are_marked_indexed(conn: sqlite3.Connection) -> None:
     """Every row written — inserted or updated, changed or not — waits for a rebuild; the
     flag is cleared per row, in chunks larger than one ``IN`` list, and can be raised again for
@@ -1189,6 +1306,16 @@ def test_insert_and_get_units_roundtrip(conn: sqlite3.Connection) -> None:
     assert [u.id for u in db.get_units(conn, 1) if u.kind == "thread"] == [2]
     assert db.get_units(conn, 3) == []
     assert db.insert_units(conn, []) == []
+
+
+def test_units_roundtrip_a_reaction_total(conn: sqlite3.Connection) -> None:
+    """``units.reactions`` is written by the insert and read back by the mapping, so the column
+    is whole from the schema step that adds it — no later task inherits half of it."""
+    db.upsert_chat(conn, _chat(1))
+    ids = db.insert_units(conn, [_unit(1, [1], reactions=17), _unit(1, [2])])
+    stored = db.get_units(conn, 1)
+    assert [(u.id, u.reactions) for u in stored] == [(ids[0], 17), (ids[1], 0)]
+    assert db.get_units_by_ids(conn, [ids[0]])[0].reactions == 17
 
 
 def test_delete_units_by_id(conn: sqlite3.Connection) -> None:
