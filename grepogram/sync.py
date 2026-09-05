@@ -1705,7 +1705,16 @@ async def prune_deleted(
     with ``MessageEmpty`` — so **here an empty slot is the deletion signal** (:func:`_empty_slots`
     is where that is read, and where an answer that does not line up with the question is refused
     instead). Nothing else counts as evidence: an ``RPCError``, a chat that went private
-    mid-sweep, a flood wait, all end the chat's turn with nothing removed.
+    mid-sweep, a flood wait, all end the chat's turn with nothing removed — and so does the
+    ``ValueError`` Telethon raises for a peer this account cannot resolve at all, which is a
+    plain exception rather than an ``RPCError`` and would otherwise end the whole sweep on the
+    first chat that hit it.
+
+    Addressing a chat by its stored id is only possible once the client knows that peer, and a
+    client grepogram builds knows none: :func:`warm_peer_cache` reads the dialog list first, for
+    the reasons written there. A sync gets that for free from
+    :func:`~grepogram.sources.resolve_sources`; this pass walks ``chats`` rows instead of a
+    source list, so it asks by hand.
 
     It is a whole-index pass of about one request per hundred stored messages, so it is never
     automatic and never an MCP tool: like ``sources prune``, deleting indexed history stays a
@@ -1729,6 +1738,7 @@ async def prune_deleted(
     with SyncLock(paths):
         targets = _sweep_targets(conn, chat_id)
         tally = _PruneTally()
+        await warm_peer_cache(client, targets)
         for position, chat in enumerate(targets):
             if budget.expired:
                 tally.remaining.extend(rest.id for rest in targets[position:])
@@ -1744,7 +1754,7 @@ async def prune_deleted(
                 )
                 tally.remaining.extend(rest.id for rest in targets[position:])
                 break
-            except errors.RPCError as exc:
+            except (errors.RPCError, ValueError) as exc:
                 log.warning(
                     "chat %s (%s): %s; nothing was removed from it", chat.id, chat.title, exc
                 )
@@ -1794,6 +1804,65 @@ def refetchable(chat: ChatRow) -> bool:
         log.debug("chat %s was imported, not synced; it was left alone", chat.id)
         return False
     return True
+
+
+async def warm_peer_cache(client: Any, chats: Sequence[ChatRow]) -> None:
+    """Teach ``client`` the peers of ``chats`` before anything addresses them by bare id.
+
+    :func:`grepogram.tg.load_session` copies the data centre and the auth key out of the session
+    file and nothing else, so **the entity cache of every client grepogram builds starts empty**
+    — the docstring there states the rule and every Telegram-facing pass has to honour it. A
+    request that names a chat by its stored id and nothing else, which is what
+    ``client.get_messages(chat.id, ids=[…])`` is, has no access hash to build an ``InputPeer``
+    from: Telethon 1.44 asks the session, gets nothing, and its network fallback
+    (``channels.getChannels`` / ``users.getUsers`` with ``access_hash = 0``) is documented to
+    answer only for a bot's private chats or a contact. For a user session on a private
+    supergroup it ends in a plain ``ValueError: Could not find the input entity``, which is not
+    an ``RPCError`` and reaches a caller as a skipped chat or a traceback.
+
+    One ``get_dialogs()`` is the whole fix: Telethon writes the peers of every answer into the
+    session (``session.process_entities``), so the dialog list makes every chat the account has
+    a dialog with addressable for the rest of the client's life. It is the same warm-up a sync
+    gets for free from :func:`~grepogram.sources.resolve_sources` and the reason no path that
+    goes through a :class:`~grepogram.dialogs.DialogCatalog` ever had to think about this; the
+    two passes that walk stored rows instead of a source list — :func:`prune_deleted` and
+    :func:`grepogram.media.run` — are the ones that must ask for it by hand. The client's own
+    call rather than that catalog, because neither pass has any use for the folder list the
+    catalog reads beside it.
+
+    A channel's discussion group is the one chat a dialog list can miss: it is indexed through
+    the channel's link (:func:`link_discussion_chat`) and the account need not have joined it.
+    ``GetFullChannelRequest`` on the channel answers with the group among ``full.chats``, which
+    caches it exactly as the dialog list caches a dialog — and the channel itself is a source, so
+    it is in the list this just read.
+
+    Nothing here is worth failing a pass for: a chat neither route resolves is left to the
+    caller's per-chat handler, which costs that chat its turn and reports it, and a Telegram
+    error during the warm-up (a flood wait included) resurfaces on the very next request the
+    pass makes, where it is handled properly.
+    """
+    if not chats:
+        return
+    try:
+        listed = {int(dialog.id) for dialog in await client.get_dialogs(ignore_migrated=True)}
+    except (errors.RPCError, ValueError) as exc:
+        log.warning("could not read the dialog list to resolve %d chats: %s", len(chats), exc)
+        return
+    log.debug("warmed the entity cache with %d dialogs", len(listed))
+    for chat in chats:
+        if chat.id in listed or chat.discussion_of is None:
+            continue
+        try:
+            await client(functions.channels.GetFullChannelRequest(chat.discussion_of))
+        except (errors.RPCError, ValueError) as exc:
+            log.warning(
+                "chat %s (%s): channel %s, which it holds the comments of, could not be read, "
+                "so the group may not resolve: %s",
+                chat.id,
+                chat.title,
+                chat.discussion_of,
+                exc,
+            )
 
 
 async def _sweep_chat(

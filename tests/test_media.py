@@ -11,7 +11,7 @@ from typing import Any
 
 import pytest
 from telethon import errors
-from telethon.tl import types
+from telethon.tl import functions, types
 
 from grepogram import db, extract, index, media, search, sync, tg, units
 from grepogram.extract import ExtractError
@@ -81,10 +81,60 @@ def _fetches(client: FakeClient) -> list[dict[str, Any]]:
     return [args for name, args in client.calls if name == "get_messages"]
 
 
+ACCOUNT = [
+    make_channel(100, "chat", username="xchat", megagroup=True),
+    make_channel(101, "other chat", megagroup=True),
+    make_channel(900, "News", username="news"),
+]
+"""The dialogs of the account these tests run against: the two chats and the channel.
+
+The discussion group (901) is deliberately not one of them — it is indexed through the channel's
+link and the account never joined it, which is the one chat the pass has to resolve through
+``GetFullChannelRequest`` rather than through the dialog list.
+"""
+
+
+def _news_full() -> types.messages.ChatFull:
+    """``GetFullChannelRequest`` on the channel, answering with its linked group among ``chats``.
+
+    That answer is what caches the group: Telethon writes the peers of every result into the
+    session, which is the whole of how a link-only group becomes addressable by id.
+    """
+    return types.messages.ChatFull(
+        full_chat=types.ChannelFull(
+            id=900,
+            about="",
+            read_inbox_max_id=0,
+            read_outbox_max_id=0,
+            unread_count=0,
+            chat_photo=types.PhotoEmpty(id=0),
+            notify_settings=types.PeerNotifySettings(),
+            bot_info=[],
+            pts=0,
+            linked_chat_id=901,
+        ),
+        chats=[ACCOUNT[2], make_channel(901, "News chat", megagroup=True)],
+        users=[],
+    )
+
+
+def _client(**kwargs: Any) -> FakeClient:
+    """A ``FakeClient`` as ``grepogram extract`` meets one: the account's dialogs, cache empty.
+
+    ``tg.make_client`` hands the command a private in-memory copy of the session file holding the
+    data centre and the auth key alone, so nothing is addressable by bare id until the pass warms
+    the cache itself (:func:`grepogram.sync.warm_peer_cache`). Every client here starts that way,
+    which is what makes these tests able to fail when it does not.
+    """
+    kwargs.setdefault("dialogs", [make_dialog(entity) for entity in ACCOUNT])
+    kwargs.setdefault("responses", {functions.channels.GetFullChannelRequest: _news_full()})
+    return FakeClient(**kwargs)
+
+
 def _pdf_client(*msg_ids: int, chat_id: int = CHAT_ID, name: str = "note.pdf") -> FakeClient:
     """A client holding one PDF message per id, each downloading the committed fixture."""
     payload = SAMPLE_PDF.read_bytes()
-    return FakeClient(
+    return _client(
         messages={chat_id: [tl.document_message(chat_id, i, name) for i in msg_ids]},
         downloads={(chat_id, i): payload for i in msg_ids},
     )
@@ -275,7 +325,7 @@ async def test_a_document_nothing_can_read_is_never_downloaded(
     """End to end: no ``get_messages``, no ``download_media``, and no failed row to retry."""
     db.upsert_chat(conn, _chat())
     db.upsert_messages(conn, [_pdf_row(CHAT_ID, 1, "prices.xlsx")])
-    client = FakeClient(
+    client = _client(
         messages={CHAT_ID: [tl.document_message(CHAT_ID, 1, "prices.xlsx")]},
         downloads={(CHAT_ID, 1): b"x" * 5_000_000},
     )
@@ -341,7 +391,7 @@ async def test_the_offline_states_are_resolved_with_no_client_call_at_all(
     monkeypatch.setattr(
         extract, "registry", lambda: {"document": extract.extract_document, "photo": _stub()}
     )
-    client = FakeClient()
+    client = _client()
     report = await media.run(conn, client, _cfg(ocr=False, documents=False), SyncBudget())
     assert client.calls == []
     assert report.disabled == 2
@@ -385,7 +435,7 @@ async def test_the_temp_file_is_removed_after_a_failed_extraction(
 ) -> None:
     db.upsert_chat(conn, _chat())
     db.upsert_messages(conn, [_pdf_row(CHAT_ID, 1)])
-    client = FakeClient(
+    client = _client(
         messages={CHAT_ID: [tl.document_message(CHAT_ID, 1, "note.pdf")]},
         downloads={(CHAT_ID, 1): b"not a pdf at all"},
     )
@@ -417,7 +467,7 @@ async def test_a_file_over_the_cap_is_skipped_before_it_is_downloaded(
     db.mark_indexed(conn, ids)
     message = tl.document_message(CHAT_ID, 1, "huge.pdf")
     message.media.document.size = 21 * 1024 * 1024
-    client = FakeClient(messages={CHAT_ID: [message]}, downloads={(CHAT_ID, 1): b"never read"})
+    client = _client(messages={CHAT_ID: [message]}, downloads={(CHAT_ID, 1): b"never read"})
     report = await media.run(conn, client, _cfg(), SyncBudget())
     assert report.skipped == 1
     assert _states(conn) == {1: db.MEDIA_SKIPPED}
@@ -432,7 +482,7 @@ async def test_a_file_at_the_cap_is_still_downloaded(
     db.upsert_messages(conn, [_pdf_row(CHAT_ID, 1)])
     message = tl.document_message(CHAT_ID, 1, "note.pdf")
     message.media.document.size = 20 * 1024 * 1024
-    client = FakeClient(
+    client = _client(
         messages={CHAT_ID: [message]}, downloads={(CHAT_ID, 1): SAMPLE_PDF.read_bytes()}
     )
     report = await media.run(conn, client, _cfg(), SyncBudget())
@@ -444,7 +494,7 @@ async def test_a_message_telegram_no_longer_returns_is_failed_not_lost(
 ) -> None:
     db.upsert_chat(conn, _chat())
     db.upsert_messages(conn, [_pdf_row(CHAT_ID, 1)])
-    report = await media.run(conn, FakeClient(messages={CHAT_ID: []}), _cfg(), SyncBudget())
+    report = await media.run(conn, _client(messages={CHAT_ID: []}), _cfg(), SyncBudget())
     assert report.failed == 1
     assert _states(conn) == {1: db.MEDIA_FAILED}
 
@@ -454,7 +504,7 @@ async def test_media_that_will_not_download_is_failed(
 ) -> None:
     db.upsert_chat(conn, _chat())
     db.upsert_messages(conn, [_pdf_row(CHAT_ID, 1)])
-    client = FakeClient(messages={CHAT_ID: [tl.document_message(CHAT_ID, 1, "note.pdf")]})
+    client = _client(messages={CHAT_ID: [tl.document_message(CHAT_ID, 1, "note.pdf")]})
     report = await media.run(conn, client, _cfg(), SyncBudget())
     assert report.failed == 1
     assert _states(conn) == {1: db.MEDIA_FAILED}
@@ -465,7 +515,7 @@ async def test_a_failed_extraction_is_retried_only_with_retry_failed(
 ) -> None:
     db.upsert_chat(conn, _chat())
     db.upsert_messages(conn, [_pdf_row(CHAT_ID, 1)])
-    broken = FakeClient(
+    broken = _client(
         messages={CHAT_ID: [tl.document_message(CHAT_ID, 1, "note.pdf")]},
         downloads={(CHAT_ID, 1): b"not a pdf at all"},
     )
@@ -485,7 +535,7 @@ async def test_retry_failed_requeues_what_an_earlier_build_could_not_read(
     """Installing the ``media`` extra is the only way out of ``MEDIA_UNSUPPORTED``."""
     db.upsert_chat(conn, _chat())
     db.upsert_messages(conn, [_message(CHAT_ID, 1, media_kind="photo")])
-    client = FakeClient(
+    client = _client(
         messages={CHAT_ID: [tl.photo_message(CHAT_ID, 1)]},
         downloads={(CHAT_ID, 1): b"jpeg bytes"},
     )
@@ -507,7 +557,7 @@ async def test_a_photo_is_read_by_the_registered_extractor(
     db.upsert_chat(conn, _chat())
     db.upsert_messages(conn, [_message(CHAT_ID, 1, media_kind="photo")])
     monkeypatch.setattr(extract, "registry", lambda: {"photo": lambda path: f"read {path.name}"})
-    client = FakeClient(
+    client = _client(
         messages={CHAT_ID: [tl.photo_message(CHAT_ID, 1)]},
         downloads={(CHAT_ID, 1): b"jpeg bytes"},
     )
@@ -522,7 +572,7 @@ async def test_an_image_holding_no_text_is_extracted_not_failed(
     db.upsert_chat(conn, _chat())
     db.upsert_messages(conn, [_message(CHAT_ID, 1, media_kind="photo")])
     monkeypatch.setattr(extract, "registry", lambda: {"photo": _stub("")})
-    client = FakeClient(
+    client = _client(
         messages={CHAT_ID: [tl.photo_message(CHAT_ID, 1)]},
         downloads={(CHAT_ID, 1): b"jpeg bytes"},
     )
@@ -538,7 +588,7 @@ async def test_a_kind_with_no_extractor_that_reaches_the_loop_is_parked_not_down
     db.upsert_chat(conn, _chat())
     db.upsert_messages(conn, [_message(CHAT_ID, 1, media_kind="video")])
     monkeypatch.setattr(media, "resolve_offline_states", lambda *_, **__: (0, 0, 0))
-    client = FakeClient(
+    client = _client(
         messages={CHAT_ID: [tl.document_message(CHAT_ID, 1, "clip.mp4")]},
         downloads={(CHAT_ID, 1): b"video bytes"},
     )
@@ -594,7 +644,7 @@ async def test_an_expired_budget_reads_nothing_and_still_resolves_the_offline_st
     conn: sqlite3.Connection, scratch: Path
 ) -> None:
     _mixed(conn)
-    client = FakeClient()
+    client = _client()
     budget = SyncBudget()
     budget.cancel()
     report = await media.run(conn, client, _cfg(), budget)
@@ -642,7 +692,7 @@ async def test_an_rpc_error_costs_one_chat_its_turn_and_the_rest_runs(
     db.upsert_chat(conn, _chat(OTHER_ID))
     db.upsert_messages(conn, [_pdf_row(CHAT_ID, 1), _pdf_row(OTHER_ID, 2)])
     payload = SAMPLE_PDF.read_bytes()
-    client = FakeClient(
+    client = _client(
         messages={
             CHAT_ID: [tl.document_message(CHAT_ID, 1, "note.pdf")],
             OTHER_ID: [tl.document_message(OTHER_ID, 2, "note.pdf")],
@@ -660,13 +710,67 @@ async def test_an_unresolvable_peer_is_a_warning_not_a_traceback(
     conn: sqlite3.Connection, scratch: Path
 ) -> None:
     """Telethon raises a plain ``ValueError`` — not an ``RPCError`` — for a peer it cannot
-    resolve, and `grepogram extract` would end as a traceback rather than a report."""
-    db.upsert_chat(conn, _chat())
-    db.upsert_messages(conn, [_pdf_row(CHAT_ID, 1)])
-    client = FakeClient(failures={CHAT_ID: ValueError("Could not find the input entity")})
+    resolve, and `grepogram extract` would end as a traceback rather than a report.
+
+    A chat the account has left is the shape of it: the warm-up reads the dialog list and this
+    one is not in it, so nothing can turn its stored id into an ``InputPeer``.
+    """
+    gone = -1000000000777
+    db.upsert_chat(conn, _chat(gone))
+    db.upsert_messages(conn, [_pdf_row(gone, 1)])
+    client = _client()
     report = await media.run(conn, client, _cfg(), SyncBudget())
     assert report.warnings and "Could not find the input entity" in report.warnings[0]
     assert _states(conn) == {1: db.MEDIA_PENDING}
+
+
+async def test_the_pass_resolves_its_chats_before_it_re_fetches_by_id(
+    conn: sqlite3.Connection, scratch: Path
+) -> None:
+    """The whole feature turns on this and nothing else pins it.
+
+    ``tg.make_client`` copies the data centre and the auth key out of the session file, so the
+    client `grepogram extract` runs on knows no peer at all — and the pass names a chat by its
+    stored id alone. Without the dialog list read first, every chat here raises
+    ``ValueError: Could not find the input entity``, ``media read`` stays 0 and the queue never
+    drains: the release's headline feature, inert on every real account.
+    """
+    db.upsert_chat(conn, _chat())
+    db.upsert_messages(conn, [_pdf_row(CHAT_ID, 1)])
+    client = _pdf_client(1)
+    assert client.resolved == set(), "a client built from the session file knows nothing"
+
+    report = await media.run(conn, client, _cfg(), SyncBudget())
+
+    assert [name for name, _ in client.calls][0] == "get_dialogs", "the dialog list comes first"
+    assert (report.extracted, report.warnings) == (1, [])
+    assert _states(conn) == {1: db.MEDIA_EXTRACTED}
+
+
+async def test_a_link_only_discussion_group_is_resolved_through_its_channel(
+    conn: sqlite3.Connection, scratch: Path
+) -> None:
+    """The one chat the dialog list cannot warm.
+
+    A discussion group is indexed through the channel's link and the account need not have
+    joined it, so it is in ``chats`` with a ``discussion_of`` and in no dialog. Its comments
+    carry the photos an OCR is for, and ``GetFullChannelRequest`` on the channel — which *is* a
+    dialog — answers with the group among ``full.chats``, which caches it.
+    """
+    db.upsert_chat(conn, ChatRow(id=GROUP_ID, type="supergroup", title="News chat"))
+    db.upsert_messages(conn, [_pdf_row(GROUP_ID, 1)])
+    client = _pdf_client(1, chat_id=GROUP_ID)
+    assert GROUP_ID not in {int(dialog.id) for dialog in await client.get_dialogs()}
+    client.forget_entities()
+
+    unlinked = await media.run(conn, client, _cfg(), SyncBudget())
+    assert (unlinked.extracted, unlinked.warnings[0].startswith(f"chat {GROUP_ID}")) == (0, True)
+
+    db.upsert_chat(conn, ChatRow(id=GROUP_ID, type="supergroup", discussion_of=CHANNEL_ID))
+    client.forget_entities()
+    linked = await media.run(conn, client, _cfg(), SyncBudget())
+    assert (linked.extracted, linked.warnings) == (1, [])
+    assert _states(conn) == {1: db.MEDIA_EXTRACTED}
 
 
 async def test_an_imported_chat_is_never_re_fetched(
@@ -714,7 +818,7 @@ async def test_a_chat_that_fails_is_not_retried_in_the_same_run(
     """The loop must never spin on a batch it cannot resolve."""
     db.upsert_chat(conn, _chat())
     db.upsert_messages(conn, [_pdf_row(CHAT_ID, i) for i in (1, 2)])
-    client = FakeClient(failures={CHAT_ID: errors.ChannelPrivateError(request=None)})
+    client = _client(failures={CHAT_ID: errors.ChannelPrivateError(request=None)})
     report = await media.run(conn, client, _cfg(), SyncBudget())
     assert report.remaining == 2
     assert len([name for name, _ in client.calls if name == "get_messages"]) == 1
@@ -836,7 +940,7 @@ async def test_ocr_text_reaches_the_closed_window_the_photo_sits_in(
     assert "[photo]" in _units(conn)[(1, 2, 3)]
 
     monkeypatch.setattr(extract, "registry", lambda: {"photo": _stub("ОТКРЫТО с 9:00")})
-    client = FakeClient(
+    client = _client(
         messages={CHAT_ID: [tl.photo_message(CHAT_ID, 2)]},
         downloads={(CHAT_ID, 2): b"jpeg bytes"},
     )
@@ -862,7 +966,7 @@ async def test_one_batch_recuts_the_chat_once_not_once_per_message(
 
     monkeypatch.setattr(units, "invalidate_units_for", counted)
     monkeypatch.setattr(extract, "registry", lambda: {"photo": _stub("read")})
-    client = FakeClient(
+    client = _client(
         messages={CHAT_ID: [tl.photo_message(CHAT_ID, i) for i in ids]},
         downloads={(CHAT_ID, i): b"jpeg bytes" for i in ids},
     )
@@ -885,7 +989,7 @@ async def test_a_batch_that_read_nothing_recuts_nothing(
 
     monkeypatch.setattr(units, "invalidate_units_for", never)
     monkeypatch.setattr(extract, "registry", lambda: {"photo": _stub("never reached")})
-    client = FakeClient(messages={CHAT_ID: [tl.photo_message(CHAT_ID, 1)]})
+    client = _client(messages={CHAT_ID: [tl.photo_message(CHAT_ID, 1)]})
     assert (await media.run(conn, client, cfg, SyncBudget())).failed == 1
     assert calls == []
     assert _units(conn) == before
@@ -904,7 +1008,7 @@ async def test_a_chat_whose_row_is_gone_extracts_without_recutting(
     _synced(conn, [_message(CHAT_ID, 1, media_kind="photo")], cfg)
     monkeypatch.setattr(db, "get_chat", lambda *_: None)
     monkeypatch.setattr(extract, "registry", lambda: {"photo": _stub("read anyway")})
-    client = FakeClient(
+    client = _client(
         messages={CHAT_ID: [tl.photo_message(CHAT_ID, 1)]},
         downloads={(CHAT_ID, 1): b"jpeg bytes"},
     )
@@ -940,7 +1044,7 @@ async def test_the_extracted_text_reaches_msg_fts_and_anchors_the_hit(
     assert 4 not in _msg_fts(conn), "a caption-less photo has nothing to index yet"
 
     monkeypatch.setattr(extract, "registry", lambda: {"photo": _stub("ОТКРЫТО с 9:00")})
-    client = FakeClient(
+    client = _client(
         messages={CHAT_ID: [tl.photo_message(CHAT_ID, 4)]},
         downloads={(CHAT_ID, 4): b"jpeg bytes"},
     )
@@ -978,7 +1082,7 @@ async def test_a_sync_after_an_extraction_keeps_the_text_and_finds_nothing_to_re
         tl.message(CHAT_ID, 3, "спасибо", sender=1),
         tl.message(CHAT_ID, 4, "ещё вопрос", sender=1, date=tl.at(200)),
     ]
-    client = FakeClient(
+    client = _client(
         dialogs=[make_dialog(entity)],
         folders=[],
         messages={CHAT_ID: history},
@@ -1012,7 +1116,7 @@ async def test_a_reordered_answer_still_matches_each_row_by_its_id(
     """
     db.upsert_chat(conn, _chat())
     db.upsert_messages(conn, [_pdf_row(CHAT_ID, 1), _pdf_row(CHAT_ID, 2)])
-    client = FakeClient(
+    client = _client(
         messages={CHAT_ID: [tl.document_message(CHAT_ID, i, "note.pdf") for i in (1, 2)]},
         downloads={(CHAT_ID, 1): SAMPLE_PDF.read_bytes(), (CHAT_ID, 2): b"not a pdf at all"},
     )
@@ -1104,7 +1208,7 @@ async def test_ocr_on_a_comment_reaches_the_channels_post_thread(
     assert "[photo]" in _post_thread(conn)
 
     monkeypatch.setattr(extract, "registry", lambda: {"photo": _stub("ОТКРЫТО с 9:00")})
-    client = FakeClient(
+    client = _client(
         messages={GROUP_ID: [tl.photo_message(GROUP_ID, 2)]},
         downloads={(GROUP_ID, 2): b"jpeg bytes"},
     )
@@ -1128,7 +1232,7 @@ async def test_a_photo_that_is_not_a_comment_costs_the_channel_nothing(
     before = _post_thread(conn)
 
     monkeypatch.setattr(extract, "registry", lambda: {"photo": _stub("unrelated")})
-    client = FakeClient(
+    client = _client(
         messages={GROUP_ID: [tl.photo_message(GROUP_ID, 3)]},
         downloads={(GROUP_ID, 3): b"jpeg bytes"},
     )
@@ -1150,7 +1254,7 @@ async def test_a_chat_with_no_units_keeps_the_flag_for_index_stranded(
     assert db.get_units(conn, CHAT_ID) == []
 
     monkeypatch.setattr(extract, "registry", lambda: {"photo": _stub("ОТКРЫТО")})
-    client = FakeClient(
+    client = _client(
         messages={CHAT_ID: [tl.photo_message(CHAT_ID, 1)]},
         downloads={(CHAT_ID, 1): b"jpeg bytes"},
     )
@@ -1174,7 +1278,7 @@ async def test_a_row_a_window_holds_is_unflagged_even_when_nothing_changed(
     before = _units(conn)
 
     monkeypatch.setattr(extract, "registry", lambda: {"photo": _stub("")})
-    client = FakeClient(
+    client = _client(
         messages={CHAT_ID: [tl.photo_message(CHAT_ID, 1)]},
         downloads={(CHAT_ID, 1): b"jpeg bytes"},
     )

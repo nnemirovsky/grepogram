@@ -447,14 +447,22 @@ DISCUSSION = -1000000000400
 
 
 def _client() -> FakeClient:
+    """A client whose entity cache is already warm, for the tests about message iteration.
+
+    Peer resolution has its own tests below; every caller that iterates messages for real has
+    listed its dialogs first (:func:`grepogram.sync.warm_peer_cache`), so stating that here
+    keeps these assertions about ordering, offsets and failures alone.
+    """
     supergroup = make_channel(200, "Argentina", username="ru_argentina", megagroup=True)
     channel = make_channel(300, "News", username="news_channel")
-    return FakeClient(
+    client = FakeClient(
         dialogs=[make_dialog(supergroup, pinned=True), make_dialog(make_user(7, "Bob"))],
         entities=[channel, make_group(5, "Old group")],
         messages={GROUP: [make_message(GROUP, i, f"m{i}") for i in (3, 1, 2, 4, 5)]},
         comments={(CHANNEL, 10): [make_message(DISCUSSION, 100, "comment")]},
     )
+    client.resolved.update({GROUP, CHANNEL, 7})
+    return client
 
 
 async def _collect(client: FakeClient, entity: object, **kwargs: Any) -> list[int]:
@@ -619,3 +627,70 @@ async def test_fake_call_dispatches_raw_requests() -> None:
     with pytest.raises(NotImplementedError, match="GetConfigRequest"):
         await client(functions.help.GetConfigRequest())
     assert client.requests[0] is request
+
+
+async def test_fake_refuses_a_peer_it_never_learned() -> None:
+    """The fake fails on an unlearned int peer exactly where Telethon 1.44 does.
+
+    ``tg.load_session`` copies the data centre and the auth key out of the session file and
+    nothing else, so a client grepogram builds starts with an empty entity cache and
+    ``get_messages(chat_id, ids=[…])`` has no access hash to build an ``InputPeer`` from —
+    ``MemorySession().get_input_entity(-1001234567890)`` raises ``ValueError`` and the network
+    fallback answers only for a bot's private chats or a contact. A fake that resolved any id
+    was the reason `grepogram extract` shipped resolving none.
+    """
+    cold = FakeClient(
+        dialogs=[make_dialog(make_channel(200, "Argentina", megagroup=True))],
+        messages={GROUP: [make_message(GROUP, 1, "m1")]},
+    )
+    with pytest.raises(ValueError, match="Could not find the input entity for -1000000000200"):
+        await cold.get_messages(GROUP, ids=[1])
+    assert await cold.get_messages(-5, ids=[]) == [], "a legacy group needs no access hash"
+
+    await cold.get_dialogs()
+    assert [m.id for m in await cold.get_messages(GROUP, ids=[1])] == [1]
+
+    cold.forget_entities()
+    with pytest.raises(ValueError, match="Could not find the input entity"):
+        await cold.get_messages(GROUP, ids=[1])
+
+
+async def test_fake_learns_the_peers_of_a_raw_answer_like_process_entities() -> None:
+    """Telethon writes the peers of every RPC answer into the session, which is how a
+    ``GetFullChannelRequest`` makes a discussion group addressable without a dialog for it."""
+    group = make_channel(400, "News chat", megagroup=True)
+    client = FakeClient(
+        responses={functions.channels.GetFullChannelRequest: _CHAT_FULL_WITH(group)},
+        messages={DISCUSSION: [make_message(DISCUSSION, 7, "comment")]},
+        strict_entities=True,
+    )
+    with pytest.raises(ValueError, match="Could not find the input entity"):
+        await client.get_messages(DISCUSSION, ids=[7])
+    await client(functions.channels.GetFullChannelRequest(types.InputChannel(300, 300)))
+    assert [m.id for m in await client.get_messages(DISCUSSION, ids=[7])] == [7]
+
+
+async def test_fake_can_be_told_to_resolve_anything() -> None:
+    """``strict_entities=False`` is the old behaviour, for a test with no route to warm up."""
+    loose = FakeClient(messages={GROUP: [make_message(GROUP, 1, "m1")]}, strict_entities=False)
+    assert [m.id for m in await loose.get_messages(GROUP, ids=[1])] == [1]
+
+
+def _CHAT_FULL_WITH(*chats: types.Channel) -> types.messages.ChatFull:
+    return types.messages.ChatFull(
+        full_chat=types.ChannelFull(
+            id=300,
+            about="",
+            read_inbox_max_id=0,
+            read_outbox_max_id=0,
+            unread_count=0,
+            chat_photo=types.PhotoEmpty(id=0),
+            notify_settings=types.PeerNotifySettings(),
+            bot_info=[],
+            pts=0,
+            participants_count=0,
+            linked_chat_id=400,
+        ),
+        chats=list(chats),
+        users=[],
+    )

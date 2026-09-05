@@ -193,6 +193,14 @@ class FakeClient:
     that message, or to an exception it raises; ``folders`` registers a
     ``GetDialogFiltersRequest`` response (the default "All chats" entry first, like Telegram).
     Every method call is recorded in ``calls`` as ``(name, kwargs)``.
+
+    ``entities`` is the *world*, not the client's cache: a peer this client could learn about,
+    the way Telegram knows one whether or not the session has its access hash. What the session
+    holds is :attr:`resolved`, which starts empty exactly as ``tg.load_session``'s does, and
+    ``strict_entities`` (the default) makes addressing an unlearned peer by bare id fail with
+    the plain ``ValueError`` Telethon raises for it — see :meth:`_require_resolved`. Pass
+    ``strict_entities=False`` only for a test whose subject is not peer resolution and that has
+    no realistic route to warm the cache.
     """
 
     def __init__(
@@ -210,6 +218,7 @@ class FakeClient:
         authorized: bool = True,
         me: types.User | None = None,
         two_factor: bool = False,
+        strict_entities: bool = True,
     ) -> None:
         self.dialogs = list(dialogs)
         self.entities: dict[int, Any] = {}
@@ -231,6 +240,8 @@ class FakeClient:
         self.authorized = authorized
         self.me = me
         self.two_factor = two_factor
+        self.strict_entities = strict_entities
+        self.resolved: set[int] = set()
         self.connected = False
         self.flood_sleep_threshold = 120
         self.calls: list[tuple[str, dict[str, Any]]] = []
@@ -287,6 +298,7 @@ class FakeClient:
         concurrent callers interleave the way they do against Telegram."""
         self.calls.append(("get_dialogs", {}))
         await asyncio.sleep(0)
+        self._learn(dialog.entity for dialog in self.dialogs)
         return [
             dialog
             for dialog in self.dialogs
@@ -305,6 +317,7 @@ class FakeClient:
         entity = self._find_entity(key)
         if entity is None:
             raise ValueError(f"Could not find the input entity for {key!r}")
+        self._learn([entity])
         return entity
 
     # --- messages --------------------------------------------------------------------------
@@ -450,13 +463,73 @@ class FakeClient:
             if isinstance(request, cls):
                 if isinstance(response, BaseException):
                     raise response
-                return response(request) if callable(response) else response
+                answer = response(request) if callable(response) else response
+                self._learn(
+                    [
+                        *(getattr(answer, "chats", None) or ()),
+                        *(getattr(answer, "users", None) or ()),
+                    ]
+                )
+                return answer
         raise NotImplementedError(f"FakeClient has no response for {type(request).__name__}")
+
+    # --- the session's entity cache ---------------------------------------------------------
+
+    def forget_entities(self) -> None:
+        """Start over with an empty entity cache, as every freshly built client does.
+
+        ``tg.make_client`` hands out a private in-memory copy of the session file holding the
+        data centre and the auth key alone, so a CLI command that runs after a sync — ``extract``
+        and ``prune-deleted`` are the two — begins knowing no peer at all. A test that fills an
+        index through one pass and then exercises another must call this in between, or it
+        measures a cache the second pass would never have.
+        """
+        self.resolved.clear()
+
+    def _learn(self, entities: Iterable[Any]) -> None:
+        """Cache the peers of an answer, as Telethon's ``session.process_entities`` does.
+
+        Every RPC result passes through it in the real client, which is why one ``get_dialogs()``
+        is enough to make every dialog addressable by bare id afterwards, and why a
+        ``GetFullChannelRequest`` makes the discussion group in its ``chats`` addressable even
+        when the account never joined it. A legacy group brings the supergroup it migrated to,
+        the way Telegram returns both in one ``chats`` list.
+        """
+        for entity in entities:
+            try:
+                self.resolved.add(int(utils.get_peer_id(entity)))
+            except (TypeError, AttributeError):
+                continue
+            target = getattr(entity, "migrated_to", None)
+            if target is not None:
+                self.resolved.add(utils.get_peer_id(types.PeerChannel(target.channel_id)))
+
+    def _require_resolved(self, marked_id: int) -> None:
+        """Refuse a peer this client never learned, the way Telethon 1.44 refuses one.
+
+        ``tg.load_session`` copies the data centre and the auth key out of the session file and
+        nothing else, so the entity cache of every client grepogram builds starts empty. With
+        it empty, ``get_input_entity`` finds no access hash and its network fallback
+        (``channels.getChannels`` / ``users.getUsers`` with ``access_hash = 0``) answers only
+        for a bot's private chats or a contact — for a user session on a private supergroup it
+        ends in ``ValueError: Could not find the input entity``. A legacy group is the one id
+        that needs no hash: Telethon turns a ``PeerChat`` straight into an ``InputPeerChat``.
+
+        This is what ``FakeClient`` used to be more permissive than the real client about, and
+        it is why nine review rounds passed over a ``grepogram extract`` that resolved no chat
+        at all on a real account.
+        """
+        if not self.strict_entities or marked_id in self.resolved:
+            return
+        if utils.resolve_id(marked_id)[1] is types.PeerChat:
+            return
+        raise ValueError(f"Could not find the input entity for {marked_id!r}")
 
     # --- helpers ---------------------------------------------------------------------------
 
     def _peer_id(self, entity: Any) -> int:
         if isinstance(entity, int):
+            self._require_resolved(entity)
             return entity
         if isinstance(entity, str):
             found = self._find_entity(entity)

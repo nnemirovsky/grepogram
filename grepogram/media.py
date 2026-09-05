@@ -150,6 +150,12 @@ async def run(
     can never spin on a batch it cannot resolve. The client's ``flood_sleep_threshold`` is capped
     against the time left exactly as a sync caps it (:func:`grepogram.sync._cap_flood_sleep`), so
     a bounded run never sleeps through a wait longer than it has.
+
+    The re-fetch names a chat by its stored id alone, which a client can only turn into a peer
+    once it knows that one — and a client grepogram builds knows none:
+    :func:`grepogram.sync.warm_peer_cache` reads the dialog list first, for the reasons written
+    there. Without it this pass resolved *nothing* on a real account and every chat left a
+    "Could not find the input entity" warning below.
     """
     warnings: list[str] = []
     if not cfg.media.enabled:
@@ -168,7 +174,10 @@ async def run(
         (db.MEDIA_EXTRACTED, db.MEDIA_FAILED, db.MEDIA_SKIPPED, db.MEDIA_UNSUPPORTED), 0
     )
     with _scratch() as scratch:
-        for chat_id in _fetchable_chats(conn):
+        chats = _fetchable_rows(conn)
+        if not budget.expired:
+            await sync.warm_peer_cache(client, chats)
+        for chat_id in [chat.id for chat in chats]:
             if budget.expired:
                 break
             sync._cap_flood_sleep(client, cfg.sync, budget)
@@ -214,6 +223,11 @@ def _queue_left(conn: sqlite3.Connection) -> tuple[int, int]:
 
 
 def _fetchable_chats(conn: sqlite3.Connection) -> list[int]:
+    """The ids of :func:`_fetchable_rows`, which is what the queue counts are keyed by."""
+    return [chat.id for chat in _fetchable_rows(conn)]
+
+
+def _fetchable_rows(conn: sqlite3.Connection) -> list[ChatRow]:
     """The chats holding pending media this pass can actually re-fetch, in id order.
 
     Every download starts from a ``Message`` Telegram just returned, so the queue is only worth
@@ -222,10 +236,13 @@ def _fetchable_chats(conn: sqlite3.Connection) -> list[int]:
     sit at ``MEDIA_PENDING`` for good and every run would ask for a peer the account cannot
     resolve, which Telethon answers with a plain ``ValueError`` — not an ``RPCError``, so it
     would leave ``grepogram extract`` as a traceback rather than a warning.
+
+    The rows rather than the ids, because :func:`grepogram.sync.warm_peer_cache` needs
+    ``discussion_of`` to reach a group the dialog list does not list.
     """
     stored = {chat.id: chat for chat in db.list_chats(conn)}
     return [
-        chat_id
+        chat
         for chat_id in db.chats_with_pending_media(conn)
         if (chat := stored.get(chat_id)) is not None and sync.refetchable(chat)
     ]

@@ -76,7 +76,15 @@ never change the git identity.
   `tg.connected(client)`. Only `grepogram auth` opens the session file for writing
   (`tg.make_login_client`); every other client works on an in-memory copy (`tg.make_client` →
   `tg.load_session`), because two Telethon clients on one session database block each other and
-  fail with `database is locked`. The MCP server builds a fresh client per Telegram-using tool
+  fail with `database is locked`. **That copy carries the data centre and the auth key and
+  nothing else, so its entity cache starts empty and no chat is addressable by its stored id
+  until something warms it.** A pass that walks a source list gets that for free
+  (`sources.resolve_sources` → `DialogCatalog` → `get_dialogs`, whose peers Telethon writes into
+  the session); a pass that walks `chats` rows instead — `sync.prune_deleted` and `media.run`,
+  the two that re-fetch by id — must call `sync.warm_peer_cache` first, or every
+  `client.get_messages(chat.id, ids=…)` raises a plain `ValueError` that is not an `RPCError`.
+  `warm_peer_cache` also resolves a link-only discussion group through
+  `GetFullChannelRequest(chat.discussion_of)`, the one chat a dialog list can miss. The MCP server builds a fresh client per Telegram-using tool
   call (`AppState.telegram()`): Telethon caches the authorization check per instance and
   concurrent calls must never share a connection one of them will close. Syncs in the server go
   through `AppState.sync_lock`, config writes through `AppState.editing_config()`, and
@@ -417,6 +425,15 @@ never change the git identity.
   conveniences: a list `ids` answers one slot per id and `None` where a message is gone, which is
   what `sync.prune_deleted` and `media.run` both key on, and the `downloads=` mapping keyed by
   `(chat_id, msg_id)` is what a download writes (bytes, or an exception to raise).
+  **`FakeClient` refuses a peer it has not learned**, like the real one: `entities=` is the world
+  and `resolved` is the session cache, which starts empty and is filled by `get_dialogs()`, by a
+  successful `get_entity`, and by the `chats` / `users` of any raw answer — Telethon's
+  `session.process_entities`. Addressing an unlearned id raises `ValueError: Could not find the
+  input entity` (a legacy `PeerChat` id needs no access hash and is allowed, as in Telethon).
+  `forget_entities()` models the fresh client `extract` and `prune-deleted` each build after a
+  sync, and `strict_entities=False` is for a test with no realistic route to warm up. A fake more
+  permissive than production is a fake that hides bugs: this one hid a `grepogram extract` that
+  resolved no chat at all on a real account through nine review rounds.
 - `tests/fixtures/tl.py` — real Telethon `types.Message` objects built without a client (text,
   caption with photo, voice, document with filename, reply, forum topic, forward, service message,
   reactions, channel post).

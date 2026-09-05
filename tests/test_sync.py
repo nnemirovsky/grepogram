@@ -71,6 +71,15 @@ def paths(tmp_path: Path) -> Paths:
 
 
 def _client(**kwargs: object) -> FakeClient:
+    """A client that has already listed its dialogs, which is every sync's starting point.
+
+    ``sync_all`` resolves its sources through a ``DialogCatalog`` before it fetches anything, so
+    by the time ``sync_chat`` addresses a chat by id the entity cache holds every dialog; the
+    tests that call the inner passes directly state that here instead of routing through a
+    resolve they are not about. The passes that do *not* get it for free — ``prune-deleted`` and
+    the extraction pass, which walk stored rows on a client built after the sync — start from a
+    cold cache in their own tests (:func:`_prune`, ``tests/test_media.py``).
+    """
     dialogs = [
         make_dialog(ALICE),
         make_dialog(BOB),
@@ -82,7 +91,9 @@ def _client(**kwargs: object) -> FakeClient:
     kwargs.setdefault("folders", [make_folder(3, "Argentina", include=[ARG])])
     kwargs.setdefault("entities", [DISC])
     kwargs.setdefault("me", ME)
-    return FakeClient(dialogs=dialogs, **kwargs)  # type: ignore[arg-type]
+    client = FakeClient(dialogs=dialogs, **kwargs)  # type: ignore[arg-type]
+    client.resolved.update(client.entities)
+    return client
 
 
 def _cfg(*entries: Source, edit_refetch: int = 200) -> Config:
@@ -801,6 +812,14 @@ async def _prune(
     *,
     chat_id: int | None = None,
 ) -> PruneReport:
+    """Run the sweep the way ``grepogram prune-deleted`` does: on a client of its own.
+
+    The command builds its client from the session file after the sync that filled the index has
+    long finished, so its entity cache is empty and every ``get_messages(chat.id, ids=…)`` here
+    has to be made resolvable by the sweep itself. Reusing the warm client the fixtures synced
+    with is what hid that the sweep resolved nothing at all on a real account.
+    """
+    client.forget_entities()
     async with tg.connected(client):
         return await sync.prune_deleted(
             client, conn, cfg, paths, budget or SyncBudget(), chat_id=chat_id
@@ -1037,6 +1056,52 @@ async def test_the_sweep_of_one_chat_reaches_the_discussion_group_it_links(
     assert _swept(client) == [DISC_ID, NEWS_ID]
     assert report.removed == 1
     assert sorted(report.chats_done) == sorted([DISC_ID, NEWS_ID])
+
+
+async def test_the_sweep_resolves_its_chats_before_it_asks_about_stored_ids(
+    conn: sqlite3.Connection, paths: Paths
+) -> None:
+    """``prune-deleted`` builds its own client, so its entity cache is empty when it starts.
+
+    Every id it asks about is a bare stored id and nothing else, which Telethon can only turn
+    into a peer once the session knows that peer; without the dialog list read first the very
+    first chat raises ``ValueError: Could not find the input entity`` and the sweep removes
+    nothing at all.
+    """
+    client = _client(messages={ARG_ID: _talk(101, 102)})
+    cfg = _cfg(ARG_SOURCE)
+    await _run(client, conn, paths, cfg)
+    client.calls.clear()
+    del client.messages[ARG_ID][1]
+
+    report = await _prune(client, conn, paths, cfg)
+
+    asked = [name for name, _ in client.calls if name in ("get_dialogs", "get_messages")]
+    assert asked[0] == "get_dialogs", "the dialog list comes before any id is asked about"
+    assert (report.removed, report.warnings) == (1, [])
+    assert _texts(conn, ARG_ID) == {101: "m101"}
+
+
+async def test_a_chat_the_account_cannot_resolve_costs_that_chat_its_turn(
+    conn: sqlite3.Connection, paths: Paths
+) -> None:
+    """A plain ``ValueError`` is not an ``RPCError``, so nothing caught it and the first chat the
+    account has left ended the whole sweep as a traceback out of `grepogram prune-deleted`."""
+    client = _client(messages={ARG_ID: _talk(101, 102)})
+    cfg = _cfg(ARG_SOURCE)
+    await _run(client, conn, paths, cfg)
+    gone = -1000000000999
+    db.upsert_chat(conn, ChatRow(id=gone, type="supergroup", title="Left", source_id="chat:@left"))
+    db.upsert_messages(conn, [MessageRow(chat_id=gone, msg_id=7, date=1)])
+    del client.messages[ARG_ID][1]
+
+    report = await _prune(client, conn, paths, cfg)
+
+    assert report.chats_remaining == [gone]
+    assert report.chats_done == [ARG_ID]
+    assert report.warnings == [f"chat {gone} (Left): Could not find the input entity for {gone}"]
+    assert report.removed == 1, "the chats it could resolve were still swept"
+    assert db.get_message(conn, gone, 7) is not None, "and the one it could not kept its rows"
 
 
 async def test_an_imported_or_unavailable_chat_is_never_asked_about(

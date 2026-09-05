@@ -664,15 +664,25 @@ def test_documents_are_available_when_either_library_imports(
 
 CHAT_ID = -1001234567890
 
+# The three ``get_messages`` tests below are about the *shape* of an answer, not about resolving
+# the peer that was asked for, so they switch the entity cache off: a real client would have
+# listed its dialogs first (``sync.warm_peer_cache``), and saying so here would only add a dialog
+# fixture to assertions that never look at one. The resolution rule has its own tests in
+# ``tests/test_tg.py``.
+
 
 async def test_fake_get_messages_answers_none_for_a_missing_id() -> None:
-    client = FakeClient(messages={CHAT_ID: [make_message(CHAT_ID, 1, "one")]})
+    client = FakeClient(
+        messages={CHAT_ID: [make_message(CHAT_ID, 1, "one")]}, strict_entities=False
+    )
     got = await client.get_messages(CHAT_ID, ids=[1, 2])
     assert [None if m is None else m.id for m in got] == [1, None]
 
 
 async def test_fake_get_messages_answers_one_message_for_an_int_id() -> None:
-    client = FakeClient(messages={CHAT_ID: [make_message(CHAT_ID, 7, "seven")]})
+    client = FakeClient(
+        messages={CHAT_ID: [make_message(CHAT_ID, 7, "seven")]}, strict_entities=False
+    )
     one = await client.get_messages(CHAT_ID, ids=7)
     assert one.id == 7
     assert await client.get_messages(CHAT_ID, ids=8) is None
@@ -680,7 +690,8 @@ async def test_fake_get_messages_answers_one_message_for_an_int_id() -> None:
 
 async def test_fake_get_messages_defaults_to_one_message() -> None:
     client = FakeClient(
-        messages={CHAT_ID: [make_message(CHAT_ID, 1, "one"), make_message(CHAT_ID, 2, "two")]}
+        messages={CHAT_ID: [make_message(CHAT_ID, 1, "one"), make_message(CHAT_ID, 2, "two")]},
+        strict_entities=False,
     )
     got = await client.get_messages(CHAT_ID)
     assert [m.id for m in got] == [2]
