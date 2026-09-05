@@ -839,15 +839,21 @@ Task 15's `sources add` guard, or the import protection silently evaporates.
 - Create: `tests/test_tdesktop.py`
 - Create: `tests/fixtures/tdesktop_export.json`
 
-- [ ] parse `result.json` (and a single-chat `messages.json`) into `MessageRow`s: id, date, sender,
-      reply, text runs (the `text` field is a list of strings and entity dicts), media kind
-- [ ] map the export's chat types onto grepogram's, and its ids onto the **marked** ids the rest of
-      the code uses — an export writes bare ids for channels
-- [ ] tolerate a truncated or partial export: report what was skipped, never raise mid-file
-- [ ] write tests over a small hand-written fixture: text runs flatten correctly, replies survive,
+- [x] parse `result.json` (and a single-chat `messages.json`) into `MessageRow`s: id, date, sender,
+      reply, text runs (the `text` field is a list of strings and entity dicts; newer exports also
+      carry `text_entities`, which `flatten_text` prefers), media kind
+- [x] map the export's chat types onto grepogram's, and its ids onto the **marked** ids the rest of
+      the code uses — an export writes bare ids for channels. `marked_chat_id` applies the mark
+      through `telethon.utils.get_peer_id`, the convention `links.strip_channel_prefix` undoes,
+      never string surgery on the `-100` prefix
+- [x] tolerate a truncated or partial export: report what was skipped, never raise mid-file. A
+      truncated JSON document is recovered up to its last complete object (`_recover`); an
+      unreadable entry is counted in `Export.skipped` and described in `Export.warnings`, bounded
+      at `MAX_WARNINGS`; `ExportError` names only the cases where there is no export to read
+- [x] write tests over a small hand-written fixture: text runs flatten correctly, replies survive,
       a service message is skipped, media becomes the right `media_kind`, a bare channel id becomes
       the marked form, a malformed entry is reported and skipped
-- [ ] run tests — must pass before task 15
+- [x] run tests — must pass before task 15
 
 ### Task 15: Add `grepogram import`
 
