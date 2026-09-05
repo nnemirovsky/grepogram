@@ -926,19 +926,30 @@ reachable and is the cheaper half-measure if it is worth doing at all.
 **Files:**
 - Modify: `.github/workflows/release.yml`
 
-- [ ] `release.yml` today is a **single job** that builds and releases. Either add the publish step
+- [x] `release.yml` today is a **single job** that builds and releases. Either add the publish step
       to that job (simplest, keeps `dist/` in place) or split into build + publish jobs wired with
       `upload-artifact` / `download-artifact` — decide and say which in the commit body; do not
       assume a second job can see `dist/`
-- [ ] use PyPI trusted publishing (`pypa/gh-action-pypi-publish`, `id-token: write`, environment
+- [x] use PyPI trusted publishing (`pypa/gh-action-pypi-publish`, `id-token: write`, environment
       `pypi`)
-- [ ] gate it on a repository variable so a tag never publishes until the trusted publisher exists —
+- [x] gate it on a repository variable so a tag never publishes until the trusted publisher exists —
       an unconfigured run must **skip**, not fail
-- [ ] keep the GitHub release step unchanged and independent of whether PyPI publishing ran
-- [ ] verify with `actionlint .github/workflows/release.yml` (installed at `~/go/bin/actionlint`);
+- [x] keep the GitHub release step unchanged and independent of whether PyPI publishing ran
+- [x] verify with `actionlint .github/workflows/release.yml` (installed at `~/go/bin/actionlint`);
       `gh workflow view` reads the remote and cannot check an unpushed edit
-- [ ] no unit tests apply; record the actionlint output in the commit body
-- [ ] run the full gate — must pass before task 18
+- [x] no unit tests apply; record the actionlint output in the commit body
+- [x] run the full gate — must pass before task 18
+
+**Split into two jobs**, not one. `environment:` and `permissions:` are job-level keys, so the
+single-job variant would have put the whole release — the tag check and `gh release create`
+included — inside the `pypi` environment and handed it `id-token: write`, making the GitHub
+release wait on whatever protection rules that environment later grows. The `release` job is
+therefore unchanged apart from one `actions/upload-artifact@v7.0.1` step, and a second `pypi`
+job (`needs: release`, `if: vars.PYPI_PUBLISH == 'true'`, `environment: pypi`,
+`permissions: id-token: write`) downloads that artifact and runs
+`pypa/gh-action-pypi-publish@v1.14.2`. The dependency runs one way only: a skipped or failed
+PyPI upload never touches the GitHub release, while a failed release stops the permanent PyPI
+upload. `actionlint` 1.7.12 reports no findings.
 
 ### Task 18: Verify acceptance criteria
 
