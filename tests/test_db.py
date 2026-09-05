@@ -1039,6 +1039,32 @@ def test_upsert_flags_rows_until_they_are_marked_indexed(conn: sqlite3.Connectio
     assert not conn.in_transaction
 
 
+def test_delete_messages_removes_the_rows_of_one_chat_with_their_fts_entries(
+    conn: sqlite3.Connection,
+) -> None:
+    """The ids are the ``msg_id`` space a sync compares against Telegram, and the chat is part of
+    the key: every chat numbers its messages from 1, so an unscoped delete would take another
+    chat's rows of the same number. The ``msg_fts`` rows go by the ``messages.id`` rowid they are
+    keyed on, or an fts5 row nothing can reach any more would be left for the next insert."""
+    db.upsert_chat(conn, _chat(1))
+    db.upsert_chat(conn, _chat(2))
+    ids = db.upsert_messages(conn, [_message(1, i) for i in range(1, db.IN_BATCH + 3)])
+    other = db.upsert_messages(conn, [_message(2, 1)])
+    for row_id in [*ids, *other]:
+        conn.execute(
+            "INSERT INTO msg_fts(rowid, raw, stemmed, chat_id, date) VALUES (?, 'a', 'a', 1, 1)",
+            (row_id,),
+        )
+
+    assert db.delete_messages(conn, 1, range(1, db.IN_BATCH + 3)) == len(ids)
+
+    assert db.get_messages(conn, 1) == []
+    assert [row.msg_id for row in db.get_messages(conn, 2)] == [1]
+    assert [r["rowid"] for r in conn.execute("SELECT rowid FROM msg_fts")] == other
+    assert db.delete_messages(conn, 1, []) == 0
+    assert not conn.in_transaction
+
+
 def test_chats_with_unindexed_names_every_chat_holding_pending_rows(
     conn: sqlite3.Connection,
 ) -> None:

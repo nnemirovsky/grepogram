@@ -24,8 +24,9 @@ a ``thread`` of the post with its comments read from the linked discussion chat.
 whole chat again when the two disagree — the only thing that reaches a closed window.
 
 :func:`invalidate_units_for` is the other one: it re-cuts the units holding a handful of named
-messages whatever window they sit in, which is what makes an extractor's text — and, later, a
-deletion — reach the history a sync's incremental rebuild will never touch again.
+messages whatever window they sit in, which is what makes an extractor's text — and a message
+deleted in Telegram (:func:`grepogram.sync._drop_deleted`) — reach the history a sync's
+incremental rebuild will never touch again.
 
 :func:`rebuild_for_chat` keeps the stored units in step with a sync: it re-cuts the open window
 of every touched ``(chat, topic)``, rebuilds the reply threads reachable from the changed

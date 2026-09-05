@@ -1016,6 +1016,37 @@ def mark_unindexed(conn: sqlite3.Connection, ids: Iterable[int]) -> None:
             conn.execute(f"UPDATE messages SET indexed = 0 WHERE id IN ({_marks(chunk)})", chunk)
 
 
+def delete_messages(conn: sqlite3.Connection, chat_id: int, msg_ids: Iterable[int]) -> int:
+    """Remove these **Telegram message ids** of ``chat_id`` with their ``msg_fts`` rows.
+
+    What a message deleted in Telegram costs the index. The ids are the ``msg_id`` space, the one
+    a sync compares against what Telegram returned, not the ``messages.id`` rowids
+    :func:`mark_indexed` and friends take. The FTS rows go first, addressed by the rowid they are
+    keyed on (:func:`grepogram.index.index_messages` writes them under ``messages.id``), because
+    an ``fts5`` row is only reachable through that rowid and deleting the message would leave it
+    behind for the next insert to collide with.
+
+    The units these messages were part of are **not** touched here: they are cut again by
+    :func:`grepogram.units.invalidate_units_for`, which the caller runs in this same transaction
+    with the rows it read *before* the delete — the topic a window is scoped by lives on a row
+    that no longer exists once this has run. Returns how many message rows went.
+    """
+    removed = 0
+    with transaction(conn):
+        for chunk in _chunks(msg_ids):
+            conn.execute(
+                f"DELETE FROM msg_fts WHERE rowid IN (SELECT id FROM messages "
+                f"WHERE chat_id = ? AND msg_id IN ({_marks(chunk)}))",
+                [chat_id, *chunk],
+            )
+            cursor = conn.execute(
+                f"DELETE FROM messages WHERE chat_id = ? AND msg_id IN ({_marks(chunk)})",
+                [chat_id, *chunk],
+            )
+            removed += max(cursor.rowcount, 0)
+    return removed
+
+
 # --- media extraction ------------------------------------------------------------------------
 
 

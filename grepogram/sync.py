@@ -555,7 +555,7 @@ async def sync_chat(
     source: Source,
     budget: SyncBudget,
     *,
-    sync_cfg: SyncCfg | None = None,
+    cfg: Config | None = None,
     me: UserRow | None = None,
 ) -> SyncedChat:
     """Fetch one chat incrementally and store what changed; the client must be connected.
@@ -565,10 +565,15 @@ async def sync_chat(
     :data:`BATCH_SIZE`, advancing ``last_msg_id`` after every batch so an interrupted run resumes
     where it stopped. A run that finishes re-fetches the newest ``edit_refetch`` messages for
     edits and reactions (only rows that actually differ are written) and stamps
-    ``last_sync_at``. Channels whose source has ``comments`` also get the comment threads of each
-    new post, stored under the linked discussion chat as comments on that post, and the
-    re-fetch pass re-reads the thread of every re-fetched post Telegram reports more
+    ``last_sync_at``. That pass also drops the messages deleted in Telegram, which it costs no
+    request at all to notice: they are the stored ids inside the range it covered that it did not
+    return (:func:`_drop_deleted`). Channels whose source has ``comments`` also get the comment
+    threads of each new post, stored under the linked discussion chat as comments on that post,
+    and the re-fetch pass re-reads the thread of every re-fetched post Telegram reports more
     replies for than are stored, so comments that arrive after the post was indexed follow.
+
+    ``cfg`` is the whole config rather than its ``[sync]`` section because a deletion re-cuts the
+    units holding the message, which is cut to ``[units]``; without one the defaults are used.
 
     A chat Telegram refuses (:data:`UNAVAILABLE_ERRORS`) is marked ``unavailable`` and reported,
     not raised; the same errors on the discussion group alone (a private one, say) switch the
@@ -591,7 +596,7 @@ async def sync_chat(
                 run.drop_comments(exc)
         fetched = await _fetch_new(run)
         if fetched.complete and chat.last_sync_at is not None:
-            _track(run.changes, await _refetch_edits(run, sync_cfg or SyncCfg()))
+            _track(run.changes, await _refetch_edits(run, cfg or Config()))
     except UNAVAILABLE_ERRORS as exc:
         log.warning("chat %s (%s) is unavailable: %s", chat.id, chat.title, exc)
         db.set_chat_unavailable(conn, chat.id, True)
@@ -768,12 +773,12 @@ async def _fetch_comments(run: _Run, post_id: int) -> list[int]:
     return stored
 
 
-async def _refetch_edits(run: _Run, sync_cfg: SyncCfg) -> list[int]:
+async def _refetch_edits(run: _Run, cfg: Config) -> list[int]:
     """Re-read the newest ``edit_refetch`` messages and rewrite only stored rows that changed.
 
     Messages that are not stored — history before ``since``, or anything the incremental pass
-    has not reached — are left alone; this pass exists for edits and reactions only. For a
-    channel with comments it also refreshes the threads of the re-fetched posts that grew
+    has not reached — are left alone; this pass exists for edits, reactions and deletions only.
+    For a channel with comments it also refreshes the threads of the re-fetched posts that grew
     (:func:`_refresh_comments`); the ids of those posts are returned along with the edited rows
     so their post-thread units are rebuilt.
 
@@ -782,23 +787,27 @@ async def _refetch_edits(run: _Run, sync_cfg: SyncCfg) -> list[int]:
     reaction is not part of a unit's content, so :func:`grepogram.units._apply` keeps the stored
     row when it re-cuts an identical unit, and the closed window nearly every re-fetched message
     sits in is never re-cut in the first place.
+
+    ``seen`` is every id the iteration yielded, service messages included — :meth:`_Run.map`
+    turns those into ``None`` and they are never stored, but they are still ids Telegram
+    answered with, and they bound the range this pass can say anything about
+    (:func:`_drop_deleted`).
     """
-    if sync_cfg.edit_refetch <= 0:
+    if cfg.sync.edit_refetch <= 0:
         return []
     chat = run.chat
     fresh: list[MessageRow] = []
     replies: dict[int, int] = {}
-    async for msg in run.client.iter_messages(chat.id, limit=sync_cfg.edit_refetch):
+    seen: set[int] = set()
+    async for msg in run.client.iter_messages(chat.id, limit=cfg.sync.edit_refetch):
+        seen.add(int(msg.id))
         row = run.map(msg, chat)
         if row is not None:
             fresh.append(row)
             replies[row.msg_id] = replies_count(msg)
-    if not fresh:
+    if not seen:
         return []
-    stored = {
-        row.msg_id: row
-        for row in db.get_messages(run.conn, chat.id, since_msg_id=min(r.msg_id for r in fresh))
-    }
+    stored = {row.msg_id: row for row in db.get_messages(run.conn, chat.id, since_msg_id=min(seen))}
     changed = [row for row in fresh if row.msg_id in stored and _differs(stored[row.msg_id], row)]
     if changed:
         log.debug(
@@ -809,9 +818,57 @@ async def _refetch_edits(run: _Run, sync_cfg: SyncCfg) -> list[int]:
     # space, and the two coincide only in a chat whose history starts at 1 (see
     # `db.refresh_unit_reactions`).
     db.refresh_unit_reactions(run.conn, chat.id, [row.msg_id for row in changed])
+    _drop_deleted(run, cfg, stored, seen)
     if run.discussion is not None:
         ids += await _refresh_comments(run, stored, replies)
     return ids
+
+
+def _drop_deleted(
+    run: _Run, cfg: Config, stored: Mapping[int, MessageRow], seen: set[int]
+) -> list[int]:
+    """Remove the rows of the messages this re-fetch proves are gone, and re-cut their units.
+
+    A deletion is a **set difference**, never an empty slot: ``iter_messages`` simply omits a
+    deleted message rather than yielding a hole for it, so what says a stored message is gone is
+    that the iteration reached its id and did not return it. The comparison is bounded to
+    ``[min(seen), max(seen)]``, the range the iteration actually covered — a stored id below
+    where it stopped, or above where it started, was never asked about and is evidence of
+    nothing. Service messages cannot make a false positive: :func:`map_message` returns ``None``
+    for them so they are never stored, and their ids are in ``seen`` regardless.
+
+    Rows that are **comments** (``comment_of_chat_id`` set) are left alone even in a discussion
+    group a source lists directly, where this pass does run over them. Dropping one here would
+    re-cut the group's own window while the channel's post thread kept its text for good: a post
+    thread lists only the post in ``msg_ids``, so no ``json_each`` over ``units.msg_ids`` reaches
+    a comment id and nothing here could invalidate it. ``grepogram prune-deleted`` follows the
+    ``comment_of_*`` pair instead and is where a deleted comment belongs.
+
+    The order is read the rows, delete them, then re-cut — one transaction, and the rows are read
+    first because :func:`grepogram.units.invalidate_units_for` needs the topic a window is scoped
+    by, which lives on a row that no longer exists by then. It renders nothing from them, so a
+    message that heads a reply thread does not come back in the unit its removal rebuilds; a unit
+    left holding no messages is dropped instead of being rebuilt empty. Returns the ids removed.
+    """
+    lo, hi = min(seen), max(seen)
+    gone = [
+        row
+        for msg_id, row in sorted(stored.items())
+        if lo <= msg_id <= hi and msg_id not in seen and row.comment_of_chat_id is None
+    ]
+    if not gone:
+        return []
+    msg_ids = [row.msg_id for row in gone]
+    with db.transaction(run.conn):
+        db.delete_messages(run.conn, run.chat.id, msg_ids)
+        index.index_units(run.conn, units.invalidate_units_for(run.conn, run.chat, cfg, gone))
+    log.info(
+        "chat %s (%s): %d messages were deleted in Telegram and dropped from the index",
+        run.chat.id,
+        run.chat.title,
+        len(gone),
+    )
+    return msg_ids
 
 
 def _differs(stored: MessageRow, fresh: MessageRow) -> bool:
@@ -1465,9 +1522,7 @@ async def _sync_chats(
         _cap_flood_sleep(client, cfg.sync, budget)
         try:
             try:
-                synced = await sync_chat(
-                    client, conn, chat, source, budget, sync_cfg=cfg.sync, me=me
-                )
+                synced = await sync_chat(client, conn, chat, source, budget, cfg=cfg, me=me)
             finally:
                 await index_pending(conn, cfg, chat)
         except errors.UnauthorizedError:

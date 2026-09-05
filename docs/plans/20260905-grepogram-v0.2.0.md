@@ -768,35 +768,35 @@ Task 15's `sources add` guard, or the import protection silently evaporates.
 - Modify: `grepogram/db.py`
 - Modify: `tests/test_sync.py`
 
-- [ ] detect deletions as a **set difference**: the stored ids inside the id range
+- [x] detect deletions as a **set difference**: the stored ids inside the id range
       `_refetch_edits`'s iteration actually covered, minus the ids it returned.
       `client.iter_messages` (sync.py:766) omits deleted messages rather than yielding an empty
       slot, so there is nothing to test for emptiness here
-- [ ] bound it to the covered range only — a stored id outside what the iteration reached is not
+- [x] bound it to the covered range only — a stored id outside what the iteration reached is not
       evidence of anything
-- [ ] add `db.delete_messages(conn, chat_id, msg_ids)` removing the rows and their `msg_fts`
+- [x] add `db.delete_messages(conn, chat_id, msg_ids)` removing the rows and their `msg_fts`
       entries in one transaction
-- [ ] reuse `units.invalidate_units_for` from Task 8 — the same primitive, since `_recut_start`
+- [x] reuse `units.invalidate_units_for` from Task 8 — the same primitive, since `_recut_start`
       (units.py:436-460) returns `None` for a closed window and `rebuild_for_chat` (units.py:377)
       can no longer reach a deleted row by id
-- [ ] the order is **read the rows → `delete_messages` → `invalidate_units_for(conn, chat, cfg,
+- [x] the order is **read the rows → `delete_messages` → `invalidate_units_for(conn, chat, cfg,
       rows)`**, all in one transaction: the primitive takes `MessageRow`s because the topic it needs
       lives on rows that no longer exist by then — and it must re-read everything it renders, or a
       deleted message that heads a thread is rendered straight back into a new unit from the row
       passed in (units.py:504-525, 495-503)
-- [ ] **skip rows with `comment_of_chat_id IS NOT NULL` and leave them to Task 13.** A *link-only*
+- [x] **skip rows with `comment_of_chat_id IS NOT NULL` and leave them to Task 13.** A *link-only*
       discussion group is never in `resolve_sources`' output (sources.py:575-612) so this pass never
       sees it — but a group listed directly by a folder or a `chat:` entry **is** a source chat, and
       `_refetch_edits` does run for it. Deleting its comment here would re-cut its window while the
       channel's post thread keeps the text forever, since no `json_each` over `units.msg_ids` can
       reach a comment (CLAUDE.md). The explicit skip is what makes the carve-out true
-- [ ] a unit left with no messages is dropped rather than rebuilt empty
-- [ ] write tests: a deleted message disappears and its containing window is re-cut; a deletion
+- [x] a unit left with no messages is dropped rather than rebuilt empty
+- [x] write tests: a deleted message disappears and its containing window is re-cut; a deletion
       inside a closed window is handled; a unit that loses every message is dropped; an id outside
       the covered range is never removed; **a deleted message that heads a reply thread does not
       come back in a rebuilt thread unit**; a service message (which `run.map` never stores) is not
       mistaken for a deletion
-- [ ] run tests — must pass before task 13
+- [x] run tests — must pass before task 13
 
 ### Task 13: Add `grepogram prune-deleted` for a full sweep
 

@@ -420,7 +420,7 @@ async def test_edit_refetch_updates_text_and_keeps_row_ids(conn: sqlite3.Connect
     )
     chat = db.upsert_chat(conn, ChatRow(id=ARG_ID, type="supergroup"))
     first = await sync.sync_chat(
-        client, conn, chat, ARG_SOURCE, SyncBudget(), sync_cfg=SyncCfg(edit_refetch=3)
+        client, conn, chat, ARG_SOURCE, SyncBudget(), cfg=Config(sync=SyncCfg(edit_refetch=3))
     )
     assert all(c["limit"] is None for c in _fetch_calls(client, ARG_ID))
     before = db.get_message(conn, ARG_ID, 2)
@@ -430,7 +430,7 @@ async def test_edit_refetch_updates_text_and_keeps_row_ids(conn: sqlite3.Connect
     )
     client.messages[ARG_ID].append(tl.message(ARG_ID, 4, "m4", sender=1))
     second = await sync.sync_chat(
-        client, conn, first.chat, ARG_SOURCE, SyncBudget(), sync_cfg=SyncCfg(edit_refetch=3)
+        client, conn, first.chat, ARG_SOURCE, SyncBudget(), cfg=Config(sync=SyncCfg(edit_refetch=3))
     )
     after = db.get_message(conn, ARG_ID, 2)
     assert after is not None
@@ -482,7 +482,7 @@ async def test_edit_refetch_keeps_extracted_media_text_across_syncs(
     )
     chat = db.upsert_chat(conn, ChatRow(id=ARG_ID, type="supergroup"))
     first = await sync.sync_chat(
-        client, conn, chat, ARG_SOURCE, SyncBudget(), sync_cfg=SyncCfg(edit_refetch=2)
+        client, conn, chat, ARG_SOURCE, SyncBudget(), cfg=Config(sync=SyncCfg(edit_refetch=2))
     )
     row = db.get_message(conn, ARG_ID, 2)
     assert row is not None and row.media_kind == "photo"
@@ -491,7 +491,7 @@ async def test_edit_refetch_keeps_extracted_media_text_across_syncs(
         ("visa office notice", db.MEDIA_EXTRACTED, row.id),
     )
     again = await sync.sync_chat(
-        client, conn, first.chat, ARG_SOURCE, SyncBudget(), sync_cfg=SyncCfg(edit_refetch=2)
+        client, conn, first.chat, ARG_SOURCE, SyncBudget(), cfg=Config(sync=SyncCfg(edit_refetch=2))
     )
     assert again.new_msg_ids == []
     after = db.get_message(conn, ARG_ID, 2)
@@ -565,10 +565,198 @@ async def test_edit_refetch_is_skipped_when_nothing_changed_or_disabled(
     assert unchanged.chat.last_sync_at is not None
     client.calls.clear()
     disabled = await sync.sync_chat(
-        client, conn, first.chat, ARG_SOURCE, SyncBudget(), sync_cfg=SyncCfg(edit_refetch=0)
+        client, conn, first.chat, ARG_SOURCE, SyncBudget(), cfg=Config(sync=SyncCfg(edit_refetch=0))
     )
     assert disabled.new_msg_ids == []
     assert all(c["limit"] is None for c in _fetch_calls(client, ARG_ID))
+
+
+# --- deletions -------------------------------------------------------------------------------
+
+
+def _talk(*ids: int) -> list[types.Message]:
+    """Messages numbered from 101, so a chat's rowids and its Telegram ids never coincide.
+
+    ``tl.message`` dates a message at its id in minutes and ``window_gap_min`` is 30, so a run of
+    consecutive ids is one window and a jump of a hundred opens the next.
+    """
+    return [tl.message(ARG_ID, i, f"m{i}", sender=1) for i in ids]
+
+
+def _unit_index(conn: sqlite3.Connection, chat_id: int) -> set[int]:
+    """The ``unit_fts`` rowids of a chat — what the index answers a search from."""
+    stored = {unit.id for unit in db.get_units(conn, chat_id)}
+    rows = conn.execute("SELECT rowid FROM unit_fts").fetchall()
+    return {int(row["rowid"]) for row in rows} & stored
+
+
+async def test_a_message_deleted_in_telegram_is_dropped_and_its_window_recut(
+    conn: sqlite3.Connection, paths: Paths
+) -> None:
+    """``iter_messages`` omits a deleted message rather than yielding a hole, so the deletion is
+    the stored id inside the range it covered that it did not return. The row, its ``msg_fts``
+    entry and its line in the window unit all go, and the unit's index row follows."""
+    client = _client(messages={ARG_ID: _talk(101, 102, 103)})
+    cfg = _cfg(ARG_SOURCE)
+    await _run(client, conn, paths, cfg)
+    gone = db.get_message(conn, ARG_ID, 102)
+    assert gone is not None and gone.id != gone.msg_id
+
+    del client.messages[ARG_ID][1]
+    await _run(client, conn, paths, cfg)
+
+    assert _texts(conn, ARG_ID) == {101: "m101", 103: "m103"}
+    assert _windows(conn, ARG_ID) == [[101, 103]]
+    text = db.get_units(conn, ARG_ID)[0].text
+    assert "m102" not in text and "m103" in text
+    indexed = conn.execute("SELECT rowid FROM msg_fts").fetchall()
+    assert gone.id not in {int(row["rowid"]) for row in indexed}
+    assert _unit_index(conn, ARG_ID) == {unit.id for unit in db.get_units(conn, ARG_ID)}
+
+
+async def test_a_deletion_inside_a_closed_window_is_noticed(
+    conn: sqlite3.Connection, paths: Paths
+) -> None:
+    """The case that matters: a rebuild never re-cuts a closed window (``_recut_start`` returns
+    ``None``), so without :func:`units.invalidate_units_for` the deleted line would stay in the
+    unit's text for good."""
+    client = _client(messages={ARG_ID: _talk(101, 102, 103)})
+    cfg = _cfg(ARG_SOURCE)
+    await _run(client, conn, paths, cfg)
+    client.messages[ARG_ID].append(tl.message(ARG_ID, 201, "later", sender=1))
+    await _run(client, conn, paths, cfg)
+    assert _windows(conn, ARG_ID) == [[101, 102, 103], [201]]
+
+    del client.messages[ARG_ID][1]
+    await _run(client, conn, paths, cfg)
+
+    assert _windows(conn, ARG_ID) == [[101, 103], [201]]
+    closed = next(u for u in db.get_units(conn, ARG_ID) if u.msg_ids == [101, 103])
+    assert "m102" not in closed.text
+
+
+async def test_a_unit_left_with_no_messages_at_all_is_dropped(
+    conn: sqlite3.Connection, paths: Paths
+) -> None:
+    """A whole window deleted between two that survive — the middle one bounds nothing, so the
+    re-cut has no messages to build it from and the unit must go rather than be rebuilt empty."""
+    client = _client(messages={ARG_ID: _talk(101, 102, 201, 202, 301)})
+    cfg = _cfg(ARG_SOURCE)
+    await _run(client, conn, paths, cfg)
+    assert _windows(conn, ARG_ID) == [[101, 102], [201, 202], [301]]
+
+    client.messages[ARG_ID] = [m for m in client.messages[ARG_ID] if m.id not in (201, 202)]
+    await _run(client, conn, paths, cfg)
+
+    assert _texts(conn, ARG_ID) == {101: "m101", 102: "m102", 301: "m301"}
+    assert _windows(conn, ARG_ID) == [[101, 102], [301]]
+    assert _unit_index(conn, ARG_ID) == {unit.id for unit in db.get_units(conn, ARG_ID)}
+
+
+async def test_a_stored_id_outside_the_covered_range_is_never_removed(
+    conn: sqlite3.Connection, paths: Paths
+) -> None:
+    """Only the ids the iteration reached are evidence, and it reaches ``edit_refetch`` of them
+    from the newest existing message down. A stored row above where it started or below where it
+    stopped was never asked about, so it stays; the full sweep is what answers for those."""
+    client = _client(messages={ARG_ID: _talk(101, 102, 103)})
+    cfg = _cfg(ARG_SOURCE)
+    await _run(client, conn, paths, cfg)
+
+    del client.messages[ARG_ID][0]
+    await _run(client, conn, paths, _cfg(ARG_SOURCE, edit_refetch=2))
+    assert _texts(conn, ARG_ID) == {101: "m101", 102: "m102", 103: "m103"}
+
+    del client.messages[ARG_ID][-1]
+    await _run(client, conn, paths, cfg)
+
+    assert _texts(conn, ARG_ID) == {101: "m101", 102: "m102", 103: "m103"}
+    assert _windows(conn, ARG_ID) == [[101, 102, 103]]
+
+
+async def test_a_deleted_thread_root_does_not_come_back_in_a_rebuilt_thread_unit(
+    conn: sqlite3.Connection, paths: Paths
+) -> None:
+    """The primitive re-reads every message it renders. Handed the rows as they were read,
+    ``_chain_tops`` would make the deleted root a thread top again and ``build_threads`` would
+    render it at the head — the deletion undone in the index by the very step meant to apply it.
+    """
+    client = _client(
+        messages={
+            ARG_ID: [
+                tl.message(ARG_ID, 100, "hi", sender=1),
+                tl.message(ARG_ID, 101, "where do I renew a residence permit", sender=1),
+                tl.message(ARG_ID, 102, "at migraciones", sender=2, reply_to=tl.reply_header(101)),
+                tl.message(ARG_ID, 301, "later", sender=1),
+            ]
+        }
+    )
+    cfg = _cfg(ARG_SOURCE)
+    await _run(client, conn, paths, cfg)
+    threads = [u for u in db.get_units(conn, ARG_ID) if u.kind == "thread"]
+    assert [u.msg_ids for u in threads] == [[101, 102]]
+
+    client.messages[ARG_ID] = [m for m in client.messages[ARG_ID] if m.id != 101]
+    await _run(client, conn, paths, cfg)
+
+    assert db.get_message(conn, ARG_ID, 101) is None
+    assert all("residence permit" not in unit.text for unit in db.get_units(conn, ARG_ID))
+    assert [u.msg_ids for u in db.get_units(conn, ARG_ID) if u.kind == "thread"] == []
+    assert _unit_index(conn, ARG_ID) == {unit.id for unit in db.get_units(conn, ARG_ID)}
+
+
+async def test_a_service_message_is_not_mistaken_for_a_deletion(
+    conn: sqlite3.Connection, paths: Paths
+) -> None:
+    """``run.map`` returns ``None`` for a service message, so it is never stored — and its id is
+    still one Telegram answered with, so nothing around it can look deleted either."""
+    client = _client(
+        messages={
+            ARG_ID: [
+                tl.message(ARG_ID, 101, "m101", sender=1),
+                tl.service_message(ARG_ID, 102),
+                tl.message(ARG_ID, 103, "m103", sender=1),
+            ]
+        }
+    )
+    cfg = _cfg(ARG_SOURCE)
+    await _run(client, conn, paths, cfg)
+    before = _windows(conn, ARG_ID)
+    assert _texts(conn, ARG_ID) == {101: "m101", 103: "m103"}
+
+    await _run(client, conn, paths, cfg)
+
+    assert _texts(conn, ARG_ID) == {101: "m101", 103: "m103"}
+    assert _windows(conn, ARG_ID) == before
+
+
+async def test_a_deleted_comment_is_left_to_the_full_sweep(
+    conn: sqlite3.Connection, paths: Paths
+) -> None:
+    """A discussion group a folder lists directly is a source chat, so this pass runs over its
+    comments too — and must leave them alone. The channel's post thread carries a comment's text
+    while listing only the post in ``msg_ids``, so no ``json_each`` over ``units.msg_ids`` reaches
+    it and nothing here could invalidate that thread; ``prune-deleted`` follows the
+    ``comment_of_*`` pair instead. The group's own messages are removed as anywhere else."""
+    client = _busy_discussion_client(DISC)
+    cfg = _cfg(Source(folder="News", comments=True))
+    await _run(client, conn, paths, cfg)
+    assert [v.text for v in search.thread(conn, NEWS_ID, 1)] == ["post 1", "g1", "g2"]
+
+    # comment 2 and plain message 5 both leave the group; Telegram reports one reply on post 1
+    # from now on, so nothing re-fetches the thread and re-stores what was dropped.
+    client.messages[DISC_ID] = [m for m in client.messages[DISC_ID] if m.id not in (2, 5)]
+    client.comments[(NEWS_ID, 1)] = [m for m in client.comments[(NEWS_ID, 1)] if m.id != 2]
+    client.messages[NEWS_ID][0] = tl.channel_post(NEWS_ID, 1, "post 1", replies=1)
+    await _run(client, conn, paths, cfg)
+
+    stored = _texts(conn, DISC_ID)
+    assert 2 in stored and 5 not in stored
+    assert [v.text for v in search.thread(conn, NEWS_ID, 1)] == ["post 1", "g1", "g2"]
+    thread = next(u for u in db.get_units(conn, NEWS_ID) if u.kind == "thread")
+    assert "g2" in thread.text
+    window = next(u for u in db.get_units(conn, DISC_ID) if 2 in u.msg_ids)
+    assert "g2" in window.text and "g5" not in window.text
 
 
 async def test_since_skips_older_history_on_the_first_run_only(conn: sqlite3.Connection) -> None:
@@ -1741,9 +1929,7 @@ async def test_plain_history_refetch_leaves_comments_and_their_post_ids_alone(
     await _run(client, conn, paths, cfg)
     group = db.get_chat(conn, DISC_ID)
     assert group is not None and group.last_sync_at is not None
-    again = await sync.sync_chat(
-        client, conn, group, cfg.sources[0], SyncBudget(), sync_cfg=cfg.sync
-    )
+    again = await sync.sync_chat(client, conn, group, cfg.sources[0], SyncBudget(), cfg=cfg)
     assert again.complete and again.new == 0 and again.new_msg_ids == []
     assert {m.msg_id: m.comment_of_msg_id for m in db.get_messages(conn, DISC_ID)} == {
         1: 1,
