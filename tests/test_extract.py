@@ -6,6 +6,7 @@ should not be. Nothing here downloads anything.
 """
 
 import importlib.util
+import logging
 import sys
 import zipfile
 from pathlib import Path
@@ -204,6 +205,318 @@ def test_text_at_the_cap_is_kept_whole(tmp_path: Path) -> None:
     assert extract.extract_document(path) == line
 
 
+# --- macOS OCR ---------------------------------------------------------------------------------
+
+# The stand-ins below are shaped after the real framework, which was driven once by hand on
+# macOS 26 before they were written: ``alloc().init()``, the two-value ``(value, error)`` returns
+# pyobjc makes of an ``NSError **`` out-parameter, ``performRequests:error:`` taking an array, and
+# ``topCandidates_(1)`` handing back objects whose ``string()`` is the recognised line. CI has no
+# Vision, so replacing ``extract._vision`` with one of these is how the extractor is exercised.
+
+
+class _FakeText:
+    def __init__(self, text: str) -> None:
+        self._text = text
+
+    def string(self) -> str:
+        return self._text
+
+
+class _FakeObservation:
+    def __init__(self, *candidates: str) -> None:
+        self._candidates = [_FakeText(text) for text in candidates]
+
+    def topCandidates_(self, count: int) -> list[_FakeText]:  # a pyobjc selector name
+        return self._candidates[:count]
+
+
+class _FakeRequest:
+    def __init__(self, vision: "_FakeVision") -> None:
+        self._vision = vision
+        self.level: object = None
+        self.correction: bool | None = None
+        self.languages: list[str] = []
+
+    def setRecognitionLevel_(self, level: object) -> None:  # a pyobjc selector name
+        self.level = level
+
+    def setUsesLanguageCorrection_(self, on: bool) -> None:  # a pyobjc selector name
+        self.correction = on
+
+    def supportedRecognitionLanguagesAndReturnError_(  # a pyobjc selector name
+        self, error: None
+    ) -> tuple[list[str], object]:
+        return self._vision.supported, self._vision.languages_error
+
+    def setRecognitionLanguages_(self, languages: list[str]) -> None:  # a pyobjc selector name
+        self.languages = list(languages)
+
+    def results(self) -> list[_FakeObservation] | None:
+        return self._vision.results
+
+
+class _RequestClass:
+    """``Vision.VNRecognizeTextRequest``: ``alloc().init()`` hands back the one request."""
+
+    def __init__(self, vision: "_FakeVision") -> None:
+        self._vision = vision
+
+    def alloc(self) -> "_RequestClass":
+        return self
+
+    def init(self) -> _FakeRequest:
+        self._vision.request = _FakeRequest(self._vision)
+        return self._vision.request
+
+
+class _FakeHandler:
+    def __init__(self, vision: "_FakeVision") -> None:
+        self._vision = vision
+
+    def performRequests_error_(  # a pyobjc selector name
+        self, requests: list[_FakeRequest], error: None
+    ) -> tuple[bool, object]:
+        self._vision.performed = list(requests)
+        return self._vision.done, self._vision.perform_error
+
+
+class _HandlerClass:
+    """``Vision.VNImageRequestHandler``: built from the image bytes, which it records."""
+
+    def __init__(self, vision: "_FakeVision") -> None:
+        self._vision = vision
+
+    def alloc(self) -> "_HandlerClass":
+        return self
+
+    def initWithData_options_(  # a pyobjc selector name
+        self, data: bytes, options: dict[str, object]
+    ) -> _FakeHandler:
+        self._vision.image = data
+        self._vision.options = options
+        return _FakeHandler(self._vision)
+
+
+class _FakeVision:
+    """The ``Vision`` module as ``extract._recognise`` uses it, and a log of what it was asked."""
+
+    VNRequestTextRecognitionLevelAccurate = "accurate"
+
+    def __init__(
+        self,
+        *,
+        lines: tuple[str, ...] = (),
+        supported: tuple[str, ...] = ("ru-RU", "en-US"),
+        languages_error: object = None,
+        done: bool = True,
+        perform_error: object = None,
+    ) -> None:
+        self.supported = list(supported)
+        self.languages_error = languages_error
+        self.done = done
+        self.perform_error = perform_error
+        self.results: list[_FakeObservation] | None = [_FakeObservation(line) for line in lines]
+        self.request: _FakeRequest | None = None
+        self.image: bytes | None = None
+        self.options: dict[str, object] | None = None
+        self.performed: list[_FakeRequest] = []
+        self.VNRecognizeTextRequest = _RequestClass(self)
+        self.VNImageRequestHandler = _HandlerClass(self)
+
+
+def _photo(tmp_path: Path, name: str = "notice.jpg") -> Path:
+    path = tmp_path / name
+    path.write_bytes(b"\xff\xd8\xff\xe0 jpeg bytes")
+    return path
+
+
+def _fake_vision(monkeypatch: pytest.MonkeyPatch, vision: _FakeVision) -> _FakeVision:
+    monkeypatch.setattr(extract, "_vision", lambda: vision)
+    return vision
+
+
+def test_ocr_returns_the_lines_vision_recognised(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    vision = _fake_vision(
+        monkeypatch, _FakeVision(lines=("Посольство Испании", "Embassy notice 2026"))
+    )
+    photo = _photo(tmp_path)
+    assert extract.ocr_image(photo) == "Посольство Испании\nEmbassy notice 2026"
+    assert vision.image == photo.read_bytes()
+    assert vision.performed == [vision.request]
+
+
+def test_ocr_asks_for_the_accurate_level_and_language_correction(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    vision = _fake_vision(monkeypatch, _FakeVision(lines=("text",)))
+    extract.ocr_image(_photo(tmp_path))
+    assert vision.request is not None
+    assert vision.request.level == _FakeVision.VNRequestTextRecognitionLevelAccurate
+    assert vision.request.correction is True
+
+
+def test_ocr_requests_the_languages_this_build_supports(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    vision = _fake_vision(monkeypatch, _FakeVision(lines=("text",)))
+    extract.ocr_image(_photo(tmp_path))
+    assert vision.request is not None
+    assert vision.request.languages == ["ru-RU", "en-US"]
+
+
+def test_ocr_drops_a_language_the_build_does_not_offer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """macOS 14 has no Russian, and a request asking for it fails outright — so it is not asked."""
+    vision = _fake_vision(monkeypatch, _FakeVision(lines=("notice",), supported=("en-US", "fr-FR")))
+    assert extract.ocr_image(_photo(tmp_path)) == "notice"
+    assert vision.request is not None
+    assert vision.request.languages == ["en-US"]
+
+
+def test_a_photo_with_no_text_extracts_to_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _fake_vision(monkeypatch, _FakeVision())
+    assert extract.ocr_image(_photo(tmp_path)) == ""
+
+
+def test_no_results_at_all_extracts_to_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Vision answers ``nil`` rather than an empty array when it recognised nothing."""
+    vision = _fake_vision(monkeypatch, _FakeVision())
+    vision.results = None
+    assert extract.ocr_image(_photo(tmp_path)) == ""
+
+
+def test_an_observation_with_no_candidate_is_skipped(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    vision = _fake_vision(monkeypatch, _FakeVision(lines=("kept",)))
+    vision.results = [_FakeObservation(), _FakeObservation("kept")]
+    assert extract.ocr_image(_photo(tmp_path)) == "kept"
+
+
+def test_ocr_text_is_capped(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _fake_vision(monkeypatch, _FakeVision(lines=tuple("x" * 100 for _ in range(100))))
+    assert len(extract.ocr_image(_photo(tmp_path))) == EXTRACT_MAX_CHARS
+
+
+def test_a_failed_vision_request_is_an_extract_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _fake_vision(monkeypatch, _FakeVision(done=False, perform_error="zero-dimensioned image"))
+    with pytest.raises(ExtractError, match="Vision could not read the image"):
+        extract.ocr_image(_photo(tmp_path))
+
+
+def test_a_language_query_error_is_an_extract_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _fake_vision(monkeypatch, _FakeVision(languages_error="Code=1"))
+    with pytest.raises(ExtractError, match="cannot report its recognition languages"):
+        extract.ocr_image(_photo(tmp_path))
+
+
+def test_an_unexpected_framework_error_is_an_extract_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _fake_vision(monkeypatch, _FakeVision())
+
+    def boom(vision: object, image: bytes) -> list[str]:
+        raise RuntimeError("objc: unrecognised selector")
+
+    monkeypatch.setattr(extract, "_recognise", boom)
+    with pytest.raises(ExtractError, match="cannot read text from notice.jpg"):
+        extract.ocr_image(_photo(tmp_path))
+
+
+def test_ocr_of_a_missing_file_is_an_extract_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _fake_vision(monkeypatch, _FakeVision())
+    with pytest.raises(ExtractError, match="cannot read text from gone.jpg"):
+        extract.ocr_image(tmp_path / "gone.jpg")
+
+
+def test_ocr_without_pyobjc_is_an_extract_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def missing() -> object:
+        raise ImportError("No module named 'Vision'")
+
+    monkeypatch.setattr(extract, "_vision", missing)
+    with pytest.raises(ExtractError, match="pyobjc-framework-Vision is not installed"):
+        extract.ocr_image(_photo(tmp_path))
+
+
+def test_the_vision_seam_hands_back_the_framework(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The one call CI cannot make; ``sys.modules`` is what stands in for the framework here."""
+    stand_in = _FakeVision()
+    monkeypatch.setitem(sys.modules, "Vision", stand_in)
+    assert extract._vision() is stand_in
+
+
+def test_the_vision_seam_raises_import_error_without_the_framework(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setitem(sys.modules, "Vision", None)
+    with pytest.raises(ImportError):
+        extract._vision()
+
+
+# --- the recognition languages -----------------------------------------------------------------
+
+
+def test_supported_languages_are_asked_for_best_first() -> None:
+    assert extract._requested_languages(["en-US", "fr-FR", "ru-RU"]) == ["ru-RU", "en-US"]
+
+
+def test_an_unsupported_language_is_dropped_rather_than_requested() -> None:
+    assert extract._requested_languages(["en-US", "fr-FR"]) == ["en-US"]
+
+
+def test_a_regional_variant_stands_in_for_the_wanted_tag() -> None:
+    assert extract._requested_languages(["en-GB", "ru-RU"]) == ["ru-RU", "en-GB"]
+
+
+def test_the_whole_tag_wins_over_a_shared_primary_subtag() -> None:
+    assert extract._requested_languages(["en-GB", "en-US"]) == ["en-US"]
+
+
+def test_a_build_offering_neither_language_requests_nothing() -> None:
+    """An empty list is Vision's "use your default" — better than a request that fails."""
+    assert extract._requested_languages(["fr-FR", "zh-Hans"]) == []
+
+
+def test_one_offer_is_never_requested_twice(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(extract, "OCR_LANGUAGES", ("en-US", "en-GB"))
+    assert extract._requested_languages(["en-US"]) == ["en-US"]
+
+
+# --- whether OCR can run at all ------------------------------------------------------------------
+
+
+def test_ocr_is_unavailable_off_darwin(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(sys, "platform", "linux")
+    assert extract._ocr_unavailable() == "macOS Vision needs darwin, not linux"
+
+
+def test_ocr_is_unavailable_without_the_extra(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(sys, "platform", "darwin")
+    monkeypatch.setattr(importlib.util, "find_spec", lambda name: None)
+    assert extract._ocr_unavailable() == "the 'media' extra brings pyobjc-framework-Vision"
+
+
+def test_ocr_is_available_on_a_mac_carrying_the_extra(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(sys, "platform", "darwin")
+    monkeypatch.setattr(importlib.util, "find_spec", lambda name: object())
+    assert extract._ocr_unavailable() is None
+
+
 # --- the registry ------------------------------------------------------------------------------
 
 
@@ -214,16 +527,32 @@ def test_registry_maps_document() -> None:
 def test_registry_leaves_the_kinds_with_no_extractor_out() -> None:
     """An absent kind is marked unsupported by the pass; voice and video notes wait for v0.3.0."""
     built = extract.registry()
-    assert "photo" not in built
     assert "voice" not in built
     assert "video_note" not in built
     assert "video" not in built
+
+
+def test_registry_maps_photo_where_vision_can_run(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(extract, "_ocr_unavailable", lambda: None)
+    assert extract.registry()["photo"] is extract.ocr_image
+
+
+def test_registry_drops_photo_where_vision_cannot(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Unmapped, so the pass parks photos as unsupported — and one debug line says why."""
+    monkeypatch.setattr(extract, "_ocr_unavailable", lambda: "macOS Vision needs darwin, not linux")
+    with caplog.at_level(logging.DEBUG, logger="grepogram.extract"):
+        built = extract.registry()
+    assert "photo" not in built
+    assert "no OCR extractor: macOS Vision needs darwin, not linux" in caplog.text
 
 
 def test_registry_drops_documents_when_the_libraries_are_absent(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(extract, "_documents_available", lambda: False)
+    monkeypatch.setattr(extract, "_ocr_unavailable", lambda: "no Vision here")
     assert extract.registry() == {}
 
 

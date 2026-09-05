@@ -20,8 +20,10 @@ holding a PDF is a mislabelled file, not a DOCX to feed to ``python-docx``.
 
 import importlib.util
 import logging
-from collections.abc import Callable
+import sys
+from collections.abc import Callable, Sequence
 from pathlib import Path
+from typing import Any
 
 from grepogram.models import MediaKind
 
@@ -38,6 +40,15 @@ sees the end of. Extractors stop reading once they are past it rather than parsi
 
 Extractor = Callable[[Path], str]
 """What every extractor is: a downloaded file in, its text out, :class:`ExtractError` on failure."""
+
+OCR_LANGUAGES = ("ru-RU", "en-US")
+"""What OCR asks Vision for, best first — these are Russian and English chats.
+
+Never handed to Vision as it is. A ``VNRecognizeTextRequest`` given a language the build does not
+recognise fails outright rather than ignoring it, and Vision only learned Russian in macOS 15, so
+the request carries this narrowed to ``supportedRecognitionLanguages`` by
+:func:`_requested_languages`.
+"""
 
 _PDF_MAGIC = b"%PDF-"
 _DOCX_MAGIC = b"PK\x03\x04"
@@ -67,6 +78,11 @@ def _build_registry() -> dict[MediaKind, Extractor]:
         built["document"] = extract_document
     else:
         log.debug("no document extractor: the 'media' extra brings pypdf and python-docx")
+    reason = _ocr_unavailable()
+    if reason is None:
+        built["photo"] = ocr_image
+    else:
+        log.debug("no OCR extractor: %s", reason)
     # "voice" and "video_note" stay unmapped on purpose: whisper.cpp transcription is v0.3.0.
     return built
 
@@ -79,6 +95,102 @@ def _documents_available() -> bool:
     its own files, which is retryable — installing the extra is what fixes it.
     """
     return any(importlib.util.find_spec(name) is not None for name in ("pypdf", "docx"))
+
+
+def _ocr_unavailable() -> str | None:
+    """Why photo OCR cannot run here, or ``None`` when it can.
+
+    A reason rather than a flag so :func:`_build_registry` can say in one debug line what would
+    fix it. Both halves matter: Vision is a macOS framework, and its Python binding lives in the
+    ``media`` extra. Absent either, ``photo`` stays unmapped and the extraction pass parks such
+    media as unsupported instead of failing every photo it meets.
+    """
+    if sys.platform != "darwin":
+        return f"macOS Vision needs darwin, not {sys.platform}"
+    if importlib.util.find_spec("Vision") is None:
+        return "the 'media' extra brings pyobjc-framework-Vision"
+    return None
+
+
+def ocr_image(path: Path) -> str:
+    """Text macOS Vision recognises in an image, capped like every other extractor.
+
+    A photo with no text in it reads as ``""`` — an empty extraction, not a failure — because
+    that is the honest answer for the majority of photos a chat posts.
+    """
+    try:
+        vision = _vision()
+    except ImportError as exc:
+        raise ExtractError(
+            "pyobjc-framework-Vision is not installed; install the 'media' extra"
+        ) from exc
+    try:
+        lines = _recognise(vision, path.read_bytes())
+    except ExtractError:
+        raise
+    except Exception as exc:
+        raise ExtractError(f"cannot read text from {path.name}: {exc}") from exc
+    return _capped("\n".join(lines))
+
+
+def _vision() -> Any:
+    """The ``Vision`` framework itself — the one call in this module CI cannot make.
+
+    Every test replaces this with a stand-in module, so the suite never needs a Mac with
+    ``pyobjc-framework-Vision`` installed and the surface that cannot run there is this import
+    rather than the extractor built on top of it.
+    """
+    import Vision
+
+    return Vision
+
+
+def _recognise(vision: Any, image: bytes) -> list[str]:
+    """One accurate-level text request over image bytes, its recognised lines in Vision's order.
+
+    Accurate rather than fast: this runs once per photo, off the sync's budget, and a
+    photographed announcement is exactly the case the fast path reads wrong.
+    """
+    request = vision.VNRecognizeTextRequest.alloc().init()
+    request.setRecognitionLevel_(vision.VNRequestTextRecognitionLevelAccurate)
+    request.setUsesLanguageCorrection_(True)
+    supported, error = request.supportedRecognitionLanguagesAndReturnError_(None)
+    if error is not None:
+        raise ExtractError(f"Vision cannot report its recognition languages: {error}")
+    request.setRecognitionLanguages_(_requested_languages(supported))
+    handler = vision.VNImageRequestHandler.alloc().initWithData_options_(image, {})
+    done, error = handler.performRequests_error_([request], None)
+    if not done:
+        raise ExtractError(f"Vision could not read the image: {error}")
+    lines: list[str] = []
+    for observation in request.results() or []:
+        candidates = observation.topCandidates_(1)
+        if candidates:
+            lines.append(candidates[0].string())
+    return lines
+
+
+def _requested_languages(supported: Sequence[str]) -> list[str]:
+    """:data:`OCR_LANGUAGES` narrowed to what this build offers, in Vision's own spelling.
+
+    A whole tag wins over a shared primary subtag, so ``en-US`` is preferred to ``en-GB`` where
+    both are offered and ``en-GB`` still stands in where it is not. A build that offers neither
+    language yields an empty list, which Vision reads as "use your default" — an unsupported
+    language is dropped, never sent, because sending it fails the whole request.
+    """
+    chosen: list[str] = []
+    for wanted in OCR_LANGUAGES:
+        exact = next((o for o in supported if o.lower() == wanted.lower()), None)
+        loose = next((o for o in supported if _primary(o) == _primary(wanted)), None)
+        offer = exact or loose
+        if offer is not None and offer not in chosen:
+            chosen.append(offer)
+    return chosen
+
+
+def _primary(tag: str) -> str:
+    """The primary subtag of a BCP 47 tag, lowercased: ``ru`` out of ``ru-RU``."""
+    return tag.split("-", 1)[0].lower()
 
 
 def extract_document(path: Path) -> str:

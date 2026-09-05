@@ -533,22 +533,22 @@ Task 15's `sources add` guard, or the import protection silently evaporates.
 - Modify: `grepogram/extract.py`
 - Modify: `tests/test_extract.py`
 
-- [ ] implement `ocr_image(path)` through `pyobjc-framework-Vision` (`VNRecognizeTextRequest`,
+- [x] implement `ocr_image(path)` through `pyobjc-framework-Vision` (`VNRecognizeTextRequest`,
       accurate level)
-- [ ] query `supportedRecognitionLanguages` and request only what is supported — **Vision gained
+- [x] query `supportedRecognitionLanguages` and request only what is supported — **Vision gained
       Russian only in macOS 15**, and requesting an unsupported language fails the whole request;
       fall back to the supported subset rather than failing
-- [ ] register it for `photo` only when the import succeeds **and** the platform is darwin;
+- [x] register it for `photo` only when the import succeeds **and** the platform is darwin;
       otherwise leave `photo` unmapped so the pass marks it unsupported instead of failing
-- [ ] put the Vision call behind **one** module-level indirection a test replaces, so the suite
+- [x] put the Vision call behind **one** module-level indirection a test replaces, so the suite
       never needs a Mac with the extra installed — and keep the un-runnable surface to that single
       call, since the repo has no coverage config or `# pragma: no cover` and Task 18 pins coverage
       at the 99% baseline
-- [ ] log once, at debug, when OCR is unavailable and why — never on stdout
-- [ ] write tests: the registry gains `photo` when the seam reports available and lacks it when
+- [x] log once, at debug, when OCR is unavailable and why — never on stdout
+- [x] write tests: the registry gains `photo` when the seam reports available and lacks it when
       not; the fake seam's text reaches the caller; a Vision failure becomes `ExtractError`; an
       unsupported language is dropped rather than raising
-- [ ] run tests — must pass before task 7
+- [x] run tests — must pass before task 7
 
 ### Task 7: Add the bounded extraction pass and its CLI command
 
