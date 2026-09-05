@@ -1579,6 +1579,31 @@ def test_refuse_imported_refuses_a_folder_holding_one_imported_chat(
         sources.refuse_imported(conn, covered)
 
 
+async def test_resolve_sources_leaves_an_imported_chat_under_its_import_tag(
+    conn: sqlite3.Connection, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The crossing `refuse_imported` does not cover: `sources add` is guarded, but the folder
+    gaining the chat on Telegram afterwards is not, and this runs on every sync.
+
+    `db.upsert_chat` writes `source_id` unconditionally, so a resolve would replace
+    `import:argentina-chat` with `folder:Argentina` — and `sources prune`, which keys on the
+    prefix, would then offer the whole imported history for deletion.
+    """
+    sources.import_chats(conn, _export(_imported(ARG_ID, "Argentina chat"), messages=3))
+    with caplog.at_level(logging.WARNING, logger="grepogram.sources"):
+        rows = await sources.resolve_sources(_cfg(Source(folder="Argentina")), _client(), conn)
+    assert ARG_ID not in [row.id for row in rows], "an import is not a chat to sync"
+    chat = db.get_chat(conn, ARG_ID)
+    assert chat is not None and chat.source_id == "import:argentina-chat"
+    assert chat.unavailable and chat.last_msg_id == 0
+    assert "import:argentina-chat" in caplog.text and "sources rm" in caplog.text
+    scan = sources.prunable(
+        _cfg(Source(folder="Argentina")), conn, _membership({"folder:Argentina": {NEWS_ID}})
+    )
+    assert ARG_ID not in [c.chat.id for c in scan.prunable], "never offered for pruning"
+    assert db.message_counts(conn)[ARG_ID] == 3
+
+
 def _import_home(tmp_home: Path, monkeypatch: pytest.MonkeyPatch, chat_id: int) -> Paths:
     """A signed-in home whose index already holds ``chat_id`` as a Telegram Desktop import."""
     _signed_in(tmp_home)

@@ -655,6 +655,14 @@ async def resolve_sources(cfg: Config, client: Any, conn: sqlite3.Connection) ->
     and so is a stored ``discussion_of`` (:func:`grepogram.db.upsert_chat`): a channel's
     discussion group listed by a source is synced as a chat of its own and keeps holding the
     channel's comments.
+
+    **A chat held as an ``import:`` is left alone**, logged and not returned. ``upsert_chat``
+    writes ``source_id`` unconditionally, so without this a resolve would quietly replace
+    ``import:<slug>`` with the live source's id — and every protection keyed on that prefix would
+    go with it, :func:`prunable` offering the whole imported history for deletion the moment the
+    folder stopped listing the chat. :func:`refuse_imported` guards the two commands that *add* a
+    source, but nothing guards the folder gaining that chat on Telegram afterwards, and this runs
+    on every sync. Taking the chat over is a deliberate act: ``sources rm import:<slug>`` first.
     """
     catalog = DialogCatalog(client)
     rows: list[ChatRow] = []
@@ -670,6 +678,18 @@ async def resolve_sources(cfg: Config, client: Any, conn: sqlite3.Connection) ->
                 log.debug("chat %s already covered by another source, keeping the first", info.id)
                 continue
             seen.add(info.id)
+            held = _imported_tag(conn, info.id)
+            if held is not None:
+                log.warning(
+                    "chat %s (%s) is held as %s, a Telegram Desktop import; source %s does not "
+                    "take it over — run `grepogram sources rm %s` first to sync it from Telegram",
+                    info.id,
+                    info.title,
+                    held,
+                    source.id,
+                    held,
+                )
+                continue
             rows.append(
                 db.upsert_chat(
                     conn,
@@ -685,6 +705,13 @@ async def resolve_sources(cfg: Config, client: Any, conn: sqlite3.Connection) ->
             )
     log.info("resolved %d chats from %d sources", len(rows), len(cfg.sources))
     return rows
+
+
+def _imported_tag(conn: sqlite3.Connection, chat_id: int) -> str | None:
+    """The ``import:<slug>`` this chat is held under, ``None`` when it is not an import."""
+    stored = db.get_chat(conn, chat_id)
+    source_id = "" if stored is None else (stored.source_id or "")
+    return source_id if source_id.startswith(IMPORT_PREFIX) else None
 
 
 async def source_dialogs(source: Source, catalog: DialogCatalog) -> list[DialogInfo]:
@@ -892,9 +919,8 @@ def refuse_imported(conn: sqlite3.Connection, covered: Sequence[DialogInfo]) -> 
     on every sync from now on.
     """
     for dialog in covered:
-        stored = db.get_chat(conn, dialog.id)
-        source_id = "" if stored is None else (stored.source_id or "")
-        if not source_id.startswith(IMPORT_PREFIX):
+        source_id = _imported_tag(conn, dialog.id)
+        if source_id is None:
             continue
         raise ImportConflict(
             f"{dialog.title!r} (id {dialog.id}) is already in the index as {source_id}, a "
