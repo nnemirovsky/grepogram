@@ -209,7 +209,9 @@ It happens on its own, and it never takes the index down:
 being attempted inside a refresh nobody asked for, so that one refreshes messages and stops
 there — which is what the warning on every search is there to tell you. **A sync you ask for is a
 different matter**: `grepogram sync`, and the MCP `sync` tool, both move the re-cut along, four
-chats at a time, making whatever progress their budget allows. From a terminal:
+chats at a time, making whatever progress their budget allows — and never fewer than one chat,
+even when fetching messages used the whole of it, so a `--budget` short enough to be spent on the
+fetch still finishes the re-cut eventually instead of never starting it. From a terminal:
 
 ```sh
 grepogram sync                 # no --budget means unlimited
@@ -313,7 +315,9 @@ so no sync fetches it and no prune offers it. The units are embedded inline when
 available, and when it is not the command says `next: grepogram embed`. Running the same import
 again updates what it stored rather than adding a second copy, `sources add` over an imported chat
 is refused by name instead of quietly taking it over, and a live source that later comes to cover
-one keeps its hands off it as well.
+one keeps its hands off it as well — including a channel with `comments = true` whose linked
+discussion group turns out to be an imported chat: the posts are synced, the comments are not, and
+the sync says why. Taking such a chat over is `grepogram sources rm import:<slug>`, deliberately.
 
 ## Reading Text Out of Media
 
@@ -376,7 +380,7 @@ Every message with media carries a state, and `grepogram extract` reports them:
 
 | state | what it means | what to do about it |
 |---|---|---|
-| pending | not looked at yet | `grepogram extract` — except in an imported or unavailable chat, where nothing can be fetched and the media stays pending for good |
+| pending | not looked at yet | `grepogram extract` — except in an imported or unavailable chat, where nothing can be fetched and the media stays pending for good; those rows are counted apart, as `in chats nothing can re-fetch`, so `media pending` only ever names work another run could do |
 | read | the file was read; the text may still be empty, which is what a photo holding no text looks like | nothing |
 | no extractor here | this build cannot read that kind: a video, sticker or poll (which nothing reads), an attachment that is neither PDF nor DOCX (a `.xlsx`, a `.zip`, an `.apk` — decided from the file name, never downloaded), a document without the `media` extra, a photo off macOS or without the extra, or a voice message or video note — those wait for whisper in v0.3.0 | install the `media` extra if it applies, then `grepogram extract --retry-failed` |
 | could not be read | a corrupt file, a mislabelled one (a `.docx` holding a PDF), a download that failed | `grepogram extract --retry-failed` |

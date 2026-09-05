@@ -162,7 +162,13 @@ never change the git identity.
   removed: `search.auto_sync_budget_s` is user-editable, so a floor made a search's own refresh
   start whole-index re-cutting the moment the number was raised, while an explicit sync whose
   fetch had eaten the budget never got to start one. An explicit sync makes whatever progress its
-  budget allows, bounded at `RECUT_CHATS_PER_RUN` and resumable through the markers. Nothing
+  budget allows, bounded at `RECUT_CHATS_PER_RUN` and resumable through the markers — **and never
+  fewer than one chat**: `recut_pending_chats` runs after `_sync_chats` on the *same* budget, and
+  the `edit_refetch` tail of a large index can spend all of it with nothing left to fetch, so a
+  gate on `budget.expired` alone left the MCP `sync` tool at its default budget re-cutting nothing,
+  ever. The first chat is taken whatever the clock says, the rest wait for the next run, and a
+  *cancelled* budget (`SyncBudget.cancelled`) keeps nothing back — the caller and its lock are
+  going away. Nothing
   flags a pending re-cut, so `search` re-derives the condition into `search.RECUT_PENDING` and a
   user who has only ever searched is told to sync. **The re-cut touches no
   `messages` row**: unit boundaries change, message text does not, so no `indexed = 0` flagging
@@ -258,6 +264,18 @@ never change the git identity.
   *now*, so it moves along when another channel takes it over — removing the old channel then
   leaves it and removing the new one takes its comments along; a group a channel was unlinked
   from keeps the source it came in through until that source is removed.
+- **Every writer of `chats.source_id` asks `sources.imported_tag` first**, because
+  `db.upsert_chat` overwrites the column and an `import:<slug>` is the whole of what protects a
+  history Telegram cannot serve again: `resolve_sources` skips such a chat on every sync,
+  `refuse_imported` refuses the two commands that add a source, and
+  `sync.link_discussion_chat` refuses the link outright when a channel's discussion group turns
+  out to be one — `DiscussionUnavailable`, so the posts sync without comments and the run says
+  why. Refusing the link rather than only keeping the tag is deliberate: pointing `discussion_of`
+  at that group would store live comments into a chat marked `unavailable` whose rows came from
+  an export. `_check_migration` is the fourth writer and needs no guard — it copies the chat's
+  own `source_id` onto the supergroup it migrated to, and only when that supergroup is not
+  already stored. Lose the tag and `sources rm` of the live source deletes the import,
+  `prunable` offers it, and the `import:` handle every refusal tells the user to remove is gone.
 - Never decide what a `chat:` source covers by comparing `source_id` strings. `chat =` takes an
   id, an `@username`, `https://t.me/<name>` and `t.me/c/<id>`, and all four are one chat:
   `sources.parse_target` folds them into a `Target`, and `sources._names_chat` / `_same_target`
