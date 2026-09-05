@@ -452,10 +452,7 @@ def import_cmd(
         entries = _retitled(export.chats, chat_title)
         embedder = _optional_embedder(cfg)
         with sync.SyncLock(paths):
-            stored = sources.import_chats(conn, entries)
-            for item in stored:
-                pending = db.unindexed_message_ids(conn, item.chat.id)
-                sync.on_chat_synced(conn, item.chat, cfg, pending)
+            stored = _store_import(conn, cfg, entries)
             embedded = _embed_imported(conn, embedder)
     except tdesktop.ExportError as exc:
         fail(str(exc))
@@ -464,6 +461,30 @@ def import_cmd(
     finally:
         conn.close()
     _print_import(export, stored, embedded)
+
+
+def _store_import(
+    conn: sqlite3.Connection, cfg: Config, entries: Sequence[tdesktop.ImportedChat]
+) -> list[sources.Imported]:
+    """Store an export and cut its units in **one** transaction: all of it or none of it.
+
+    `sources.import_chats` commits on its own and the rebuild that makes the rows searchable
+    comes after it, so anything the rebuild could not do left the chats committed with
+    ``indexed = 0`` and the command ending in a traceback. That state is not a failed import the
+    user can retry — it is a chat every later `sync` reaches again through
+    :func:`grepogram.sync.index_stranded` and fails on in the same way, which takes the MCP
+    ``sync`` tool and every ``search`` old enough to auto-sync down with it. The same atomicity
+    :func:`grepogram.sync.on_chat_synced` already gives its own three steps, one level up.
+
+    The embedding stays outside: it is a long model run that must not hold the write lock, and a
+    missing or mismatched model is a warning the import survives (:func:`_embed_imported`).
+    """
+    with db.transaction(conn):
+        stored = sources.import_chats(conn, entries)
+        for item in stored:
+            pending = db.unindexed_message_ids(conn, item.chat.id)
+            sync.on_chat_synced(conn, item.chat, cfg, pending)
+    return stored
 
 
 def _retitled(

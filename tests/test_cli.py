@@ -28,7 +28,7 @@ from grepogram.embed import ModelUnavailable
 from grepogram.models import ChatRow, Config, MediaReport, MessageRow, PruneReport, SearchMode
 from grepogram.paths import Paths
 from tests.conftest import file_mode
-from tests.fakes import FakeClient
+from tests.fakes import FakeClient, make_channel, make_dialog
 from tests.fixtures import chat_ru, tl
 
 runner = CliRunner()
@@ -544,6 +544,7 @@ def _extract_chat(paths: Paths) -> FakeClient:
     sync.on_chat_synced(conn, chat, Config(), ids)
     conn.close()
     return FakeClient(
+        dialogs=[make_dialog(make_channel(900, "Chat", megagroup=True))],
         messages={EXTRACT_ID: [tl.document_message(EXTRACT_ID, 1, "note.pdf")]},
         downloads={(EXTRACT_ID, 1): SAMPLE_PDF.read_bytes()},
     )
@@ -674,7 +675,10 @@ def _prune_chat(paths: Paths) -> FakeClient:
         ],
     )
     conn.close()
-    return FakeClient(messages={PRUNE_ID: [tl.message(PRUNE_ID, 101, "kept", sender=1)]})
+    return FakeClient(
+        dialogs=[make_dialog(make_channel(901, "Chat", megagroup=True))],
+        messages={PRUNE_ID: [tl.message(PRUNE_ID, 101, "kept", sender=1)]},
+    )
 
 
 def test_prune_deleted_removes_what_telegram_no_longer_has(
@@ -911,6 +915,35 @@ def test_import_reports_a_held_sync_lock_as_a_clean_error(tmp_home: Path) -> Non
     assert result.exit_code == 1
     assert "another sync is running" in result.stderr
     assert _chats(paths) == {}
+
+
+def test_import_that_fails_to_index_leaves_nothing_behind(
+    tmp_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The rows and the units they are cut into are one transaction, all of it or none.
+
+    ``import_chats`` used to commit on its own with the rebuild coming after, so anything the
+    rebuild could not do left the chats stored with ``indexed = 0`` and the command ending in a
+    traceback — and that is not a failed import a user can retry: every later `sync` reaches the
+    chat again through ``index_stranded`` and fails the same way, which takes the MCP `sync`
+    tool and every `search` old enough to auto-sync down with it.
+    """
+    paths = Paths.from_env()
+
+    def refuse(*_: object, **__: object) -> None:
+        raise ValueError("year 3170843 is out of range")
+
+    monkeypatch.setattr(sync, "on_chat_synced", refuse)
+    with pytest.raises(ValueError, match="out of range"):
+        runner.invoke(cli.app, ["import", str(EXPORT)], catch_exceptions=False)
+
+    assert _chats(paths) == {}
+    conn = db.connect(paths)
+    try:
+        assert db.chats_with_unindexed(conn) == []
+        assert conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0] == 0
+    finally:
+        conn.close()
 
 
 def test_import_keeps_the_messages_when_the_dense_index_was_built_elsewhere(
