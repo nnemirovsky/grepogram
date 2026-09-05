@@ -194,7 +194,16 @@ wrong Python exactly as it is. ``uv sync`` re-creates the ``.venv`` on its own."
 
 _VEC_DIM_RE = re.compile(r"FLOAT\[(\d+)\]")
 
-_MESSAGE_UPSERT = """
+_ATTACHMENT_REPLACED = (
+    "(excluded.media_kind IS NOT messages.media_kind "
+    "OR excluded.media_filename IS NOT messages.media_filename)"
+)
+"""Whether a re-stored message carries a *different* attachment from the one already stored.
+
+``IS NOT`` and not ``<>``: both columns are nullable, and a message that never had media has
+``NULL`` on both sides of every sync. See :data:`_MESSAGE_UPSERT` for what it decides."""
+
+_MESSAGE_UPSERT = f"""
     INSERT INTO messages(chat_id, msg_id, date, edit_date, from_id, from_name, reply_to_msg_id,
                          topic_id, comment_of_chat_id, comment_of_msg_id, fwd_from, text,
                          media_kind, media_filename, reactions_total)
@@ -213,15 +222,33 @@ _MESSAGE_UPSERT = """
         media_kind = excluded.media_kind,
         media_filename = excluded.media_filename,
         reactions_total = excluded.reactions_total,
+        extracted_text = CASE WHEN {_ATTACHMENT_REPLACED}
+            THEN NULL ELSE messages.extracted_text END,
+        media_state = CASE WHEN {_ATTACHMENT_REPLACED}
+            THEN {MEDIA_PENDING} ELSE messages.media_state END,
         indexed = 0
     RETURNING id"""
-"""Store a message, keeping what only the extraction pass knows.
+"""Store a message, keeping what only the extraction pass knows — unless the attachment changed.
 
-``extracted_text`` and ``media_state`` appear in neither the column list nor the SET clause, so
-Telegram re-reading a message cannot undo what was extracted from its media. The ``COALESCE``
-idiom the topic and comment columns use cannot serve here: it reads ``None`` as "not supplied",
-and ``media_state`` is ``NOT NULL DEFAULT 0`` — a freshly mapped row carries :data:`MEDIA_PENDING`
-and would reset every extracted message to pending on every sync."""
+``extracted_text`` and ``media_state`` are absent from the column list and are written by the
+SET clause **only** when the message no longer carries the attachment they were read off, so
+Telegram re-reading a message cannot undo the extraction and a message whose file was replaced
+cannot keep the previous file's text. The ``COALESCE`` idiom the topic and comment columns use
+cannot serve either half: it reads ``None`` as "not supplied", and ``media_state`` is ``NOT NULL
+DEFAULT 0`` — a freshly mapped row carries :data:`MEDIA_PENDING` and would reset every extracted
+message to pending on every sync.
+
+"Changed" is ``media_kind`` or ``media_filename`` differing (:data:`_ATTACHMENT_REPLACED`), the
+whole of what a stored row says about its attachment. Editing a **caption** changes neither, so
+an edit costs no re-download — which is the point: ``edit_refetch`` re-reads the newest messages
+of every chat on every sync, and keying this on ``edit_date`` or on ``text`` would re-queue and
+re-download every extracted photo in the index for a typo fix. The cost of reading so little is
+that a photo swapped for another photo is invisible here (neither column moves — Telegram names
+no file for a photo), as is a document replaced by one of the same name; ``extract
+--retry-failed`` does not reach those either, and re-syncing the chat from scratch is what
+clears them. Resetting to :data:`MEDIA_PENDING` rather than to the state the row held puts the
+row back at the top of the pass, where the offline half parks it again if the new kind has no
+extractor or is switched off."""
 
 _UNIT_INSERT = """
     INSERT INTO units(chat_id, topic_id, kind, msg_id_start, msg_id_end, msg_ids,

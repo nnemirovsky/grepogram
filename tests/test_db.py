@@ -979,13 +979,21 @@ def test_upsert_messages_returns_ids_and_stores_all_columns(conn: sqlite3.Connec
     assert db.upsert_messages(conn, []) == []
 
 
-def test_upsert_messages_never_writes_extracted_text_or_media_state(
+def _extracted(conn: sqlite3.Connection, row_id: int, text: str = "visa office notice") -> None:
+    """What the extraction pass leaves on a row, written directly."""
+    conn.execute(
+        "UPDATE messages SET extracted_text = ?, media_state = ? WHERE id = ?",
+        (text, db.MEDIA_EXTRACTED, row_id),
+    )
+
+
+def test_upsert_messages_takes_extracted_text_and_media_state_from_no_value_of_its_own(
     conn: sqlite3.Connection,
 ) -> None:
-    """The two columns the extraction pass owns are named in neither half of the upsert, so a
-    message Telegram re-reads keeps what was read out of its media. A ``COALESCE`` would not do
-    it: ``media_state`` is ``NOT NULL DEFAULT 0``, so a freshly mapped row carries
-    :data:`db.MEDIA_PENDING` and would reset every extracted message on every sync."""
+    """The two columns the extraction pass owns are in neither the column list nor a plain
+    assignment, so a message Telegram re-reads keeps what was read out of its media. A
+    ``COALESCE`` would not do it: ``media_state`` is ``NOT NULL DEFAULT 0``, so a freshly mapped
+    row carries :data:`db.MEDIA_PENDING` and would reset every extracted message on every sync."""
     db.upsert_chat(conn, _chat(1))
     (row_id,) = db.upsert_messages(
         conn,
@@ -995,10 +1003,7 @@ def test_upsert_messages_never_writes_extracted_text_or_media_state(
     assert fresh is not None
     assert fresh.extracted_text is None
     assert fresh.media_state == db.MEDIA_PENDING
-    conn.execute(
-        "UPDATE messages SET extracted_text = ?, media_state = ? WHERE id = ?",
-        ("visa office notice", db.MEDIA_EXTRACTED, row_id),
-    )
+    _extracted(conn, row_id)
     assert db.upsert_messages(
         conn, [_message(1, 5, text="caption edited", media_kind="photo")]
     ) == [row_id]
@@ -1007,6 +1012,42 @@ def test_upsert_messages_never_writes_extracted_text_or_media_state(
     assert stored.text == "caption edited"
     assert stored.extracted_text == "visa office notice"
     assert stored.media_state == db.MEDIA_EXTRACTED
+
+
+@pytest.mark.parametrize(
+    ("before", "after", "kept"),
+    [
+        (("photo", None), ("photo", None), True),  # a caption edit moves neither column
+        (("document", "note.pdf"), ("document", "note.pdf"), True),
+        (("photo", None), ("document", "contract.pdf"), False),  # the file itself was replaced
+        (("document", "note.pdf"), ("document", "other.pdf"), False),
+        (("document", "note.pdf"), ("photo", None), False),
+        (("photo", None), (None, None), False),  # the media was taken off the message
+    ],
+)
+def test_upsert_messages_drops_the_extraction_only_when_the_attachment_changed(
+    conn: sqlite3.Connection,
+    before: tuple[str | None, str | None],
+    after: tuple[str | None, str | None],
+    kept: bool,
+) -> None:
+    """Preserving the extraction is right for an edit and wrong for a replaced attachment: the
+    text would be attributed to a file the message no longer carries, and ``MEDIA_EXTRACTED`` is
+    terminal, so nothing — not even ``extract --retry-failed`` — would ever read the new one.
+    ``media_kind`` and ``media_filename`` are the whole of what a row says about its attachment,
+    and a caption edit moves neither, so an edit still costs no re-download."""
+    db.upsert_chat(conn, _chat(1))
+    (row_id,) = db.upsert_messages(
+        conn, [_message(1, 5, media_kind=before[0], media_filename=before[1])]
+    )
+    _extracted(conn, row_id)
+    assert db.upsert_messages(
+        conn, [_message(1, 5, text="edited", media_kind=after[0], media_filename=after[1])]
+    ) == [row_id]
+    stored = db.get_message(conn, 1, 5)
+    assert stored is not None
+    assert stored.extracted_text == ("visa office notice" if kept else None)
+    assert stored.media_state == (db.MEDIA_EXTRACTED if kept else db.MEDIA_PENDING)
 
 
 def test_media_pending_index_answers_the_queue_and_excludes_media_less_rows(

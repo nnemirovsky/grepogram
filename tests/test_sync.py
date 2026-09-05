@@ -453,7 +453,7 @@ async def test_edit_refetch_updates_text_and_keeps_row_ids(conn: sqlite3.Connect
     assert refetch[0]["reverse"] is False
 
 
-def test_differs_ignores_the_columns_the_upsert_never_writes() -> None:
+def test_differs_ignores_the_columns_a_mapped_row_never_carries() -> None:
     """``extracted_text`` and ``media_state`` are the extraction pass's, and a row Telegram maps
     carries neither. Comparing them would make every extracted message inside the
     ``edit_refetch`` window an edit on every sync, re-cut and re-embedded for ever."""
@@ -3468,3 +3468,32 @@ async def test_joined_to_thread_returns_the_result_and_propagates_failures() -> 
 
     with pytest.raises(RuntimeError, match="boom"):
         await sync._joined_to_thread(explode)
+
+
+async def test_edit_refetch_re_queues_a_photo_replaced_by_a_document(
+    conn: sqlite3.Connection,
+) -> None:
+    """The other direction of the same rule: an edit keeps the extraction, a *replaced*
+    attachment discards it. Keeping it would attribute the old file's text to the new one, and
+    ``MEDIA_EXTRACTED`` is terminal — nothing would ever read the replacement."""
+    cfg = Config(sync=SyncCfg(edit_refetch=2))
+    client = _client(messages={ARG_ID: [tl.photo_message(ARG_ID, 1, "at the embassy", sender=1)]})
+    chat = db.upsert_chat(conn, ChatRow(id=ARG_ID, type="supergroup"))
+    first = await sync.sync_chat(client, conn, chat, ARG_SOURCE, SyncBudget(), cfg=cfg)
+    row = db.get_message(conn, ARG_ID, 1)
+    assert row is not None
+    conn.execute(
+        "UPDATE messages SET extracted_text = ?, media_state = ? WHERE id = ?",
+        ("visa office notice", db.MEDIA_EXTRACTED, row.id),
+    )
+
+    swapped = tl.document_message(ARG_ID, 1, "contract.pdf", sender=1)
+    swapped.message = "at the embassy"
+    client.messages[ARG_ID] = [swapped]
+    again = await sync.sync_chat(client, conn, first.chat, ARG_SOURCE, SyncBudget(), cfg=cfg)
+    assert again.new_msg_ids == [row.id], "a different attachment is an edit"
+    after = db.get_message(conn, ARG_ID, 1)
+    assert after is not None
+    assert (after.media_kind, after.media_filename) == ("document", "contract.pdf")
+    assert after.extracted_text is None
+    assert after.media_state == db.MEDIA_PENDING, "and back in the extraction queue"
