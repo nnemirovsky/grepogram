@@ -558,7 +558,7 @@ def test_extract_reads_the_media_and_reports_what_it_did(
     row = conn.execute("SELECT extracted_text, media_state, indexed FROM messages").fetchone()
     conn.close()
     assert row["media_state"] == db.MEDIA_EXTRACTED
-    assert row["indexed"] == 0
+    assert row["indexed"] == 1, "the pass rebuilds the row it flagged, in the same transaction"
     assert "sample pdf" in str(row["extracted_text"]).lower()
 
 

@@ -12,11 +12,21 @@ import pytest
 from telethon import errors
 from telethon.tl import types
 
-from grepogram import db, extract, index, media, sync, units
+from grepogram import db, extract, index, media, search, sync, tg, units
 from grepogram.extract import ExtractError
-from grepogram.models import ChatRow, Config, MediaCfg, MessageRow, TelegramCfg, UnitsCfg
+from grepogram.models import (
+    ChatRow,
+    Config,
+    Filters,
+    MediaCfg,
+    MessageRow,
+    Source,
+    TelegramCfg,
+    UnitsCfg,
+)
+from grepogram.paths import Paths
 from grepogram.sync import SyncBudget
-from tests.fakes import FakeClient
+from tests.fakes import FakeClient, make_channel, make_dialog
 from tests.fixtures import tl
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
@@ -93,6 +103,12 @@ def one_registry(monkeypatch: pytest.MonkeyPatch) -> None:
     register their own.
     """
     monkeypatch.setattr(extract, "registry", lambda: {"document": extract.extract_document})
+
+
+@pytest.fixture
+def paths(tmp_path: Path) -> Paths:
+    """A home for the sync lock the extract-then-sync crossing takes."""
+    return Paths.under(tmp_path / "home")
 
 
 @pytest.fixture
@@ -210,6 +226,62 @@ def test_the_offline_pass_parks_every_kind_with_no_extractor(conn: sqlite3.Conne
     assert states[None] == db.MEDIA_PENDING, "a row with no media is not the pass's business"
 
 
+def test_the_offline_pass_parks_documents_no_extractor_can_read(conn: sqlite3.Connection) -> None:
+    """``document`` is ``sync.document_kind``'s fallback, so most attachments wear that kind.
+
+    Deciding on the stored filename is what keeps a 5 MB spreadsheet from being re-fetched,
+    downloaded in full and only then refused by the dispatcher — every run, and again under
+    ``--retry-failed``.
+    """
+    db.upsert_chat(conn, _chat())
+    names = ["note.pdf", "form.DOCX", "prices.xlsx", "photos.zip", "archive.pdf.gz", "readme"]
+    db.upsert_messages(conn, [_pdf_row(CHAT_ID, i, n) for i, n in enumerate(names, 1)])
+    db.upsert_messages(conn, [_message(CHAT_ID, 7, media_kind="document")])
+    parked, _, _ = media.resolve_offline_states(
+        conn, _cfg(), {"document": extract.extract_document}
+    )
+    assert parked == 4
+    assert _states(conn) == {
+        1: db.MEDIA_PENDING,
+        2: db.MEDIA_PENDING,
+        3: db.MEDIA_UNSUPPORTED,
+        4: db.MEDIA_UNSUPPORTED,
+        5: db.MEDIA_UNSUPPORTED,
+        6: db.MEDIA_UNSUPPORTED,
+        7: db.MEDIA_PENDING,
+    }
+
+
+def test_retry_failed_does_not_requeue_a_document_nothing_can_read(
+    conn: sqlite3.Connection,
+) -> None:
+    """``--retry-failed`` lifts every unsupported row back into the queue; the suffix rule then
+    puts this one straight back, so a run cannot download it again."""
+    db.upsert_chat(conn, _chat())
+    db.upsert_messages(conn, [_pdf_row(CHAT_ID, 1, "prices.xlsx"), _pdf_row(CHAT_ID, 2)])
+    db.set_media_state(conn, [1, 2], db.MEDIA_UNSUPPORTED)
+    media.resolve_offline_states(
+        conn, _cfg(), {"document": extract.extract_document}, retry_failed=True
+    )
+    assert _states(conn) == {1: db.MEDIA_UNSUPPORTED, 2: db.MEDIA_PENDING}
+
+
+async def test_a_document_nothing_can_read_is_never_downloaded(
+    conn: sqlite3.Connection, scratch: Path
+) -> None:
+    """End to end: no ``get_messages``, no ``download_media``, and no failed row to retry."""
+    db.upsert_chat(conn, _chat())
+    db.upsert_messages(conn, [_pdf_row(CHAT_ID, 1, "prices.xlsx")])
+    client = FakeClient(
+        messages={CHAT_ID: [tl.document_message(CHAT_ID, 1, "prices.xlsx")]},
+        downloads={(CHAT_ID, 1): b"x" * 5_000_000},
+    )
+    report = await media.run(conn, client, _cfg(), SyncBudget())
+    assert (report.unsupported, report.failed, report.remaining) == (1, 0, 0)
+    assert client.calls == []
+    assert _states(conn) == {1: db.MEDIA_UNSUPPORTED}
+
+
 def test_the_offline_pass_changes_no_indexed_value(conn: sqlite3.Connection) -> None:
     """The hazard this whole design is built around.
 
@@ -291,7 +363,7 @@ async def test_a_pdf_is_downloaded_extracted_and_stored(
     stored = _text(conn, 1)
     assert stored and "sample pdf" in stored.lower()
     assert _states(conn) == {1: db.MEDIA_EXTRACTED}
-    assert _indexed(conn) == {1: 0}, "the rendered line changed, so its units are behind"
+    assert _indexed(conn) == {1: 1}, "the pass rebuilt the row it flagged, in the same transaction"
     assert _fetches(client) == [{"chat_id": CHAT_ID, "limit": None, "ids": [1]}]
     assert [name for name, _ in client.calls if name == "download_media"]
 
@@ -771,3 +843,91 @@ async def test_a_chat_whose_row_is_gone_extracts_without_recutting(
     assert (await media.run(conn, client, cfg, SyncBudget())).extracted == 1
     assert _text(conn, 1) == "read anyway"
     assert "[photo] read anyway" not in " ".join(_units(conn).values())
+
+
+def _msg_fts(conn: sqlite3.Connection, chat_id: int = CHAT_ID) -> dict[int, str]:
+    """``msg_id`` to the text ``msg_fts`` holds for it — a message with no row is absent."""
+    rows = conn.execute(
+        "SELECT m.msg_id AS msg_id, f.raw AS raw FROM msg_fts f "
+        "JOIN messages m ON m.id = f.rowid WHERE m.chat_id = ? ORDER BY m.msg_id",
+        (chat_id,),
+    )
+    return {int(row["msg_id"]): str(row["raw"]) for row in rows}
+
+
+async def test_the_extracted_text_reaches_msg_fts_and_anchors_the_hit(
+    conn: sqlite3.Connection, scratch: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``msg_fts`` is what picks the message a hit links to, so the OCR'd photo must be in it.
+
+    Indexing the caption alone left a caption-less photo out of ``msg_fts`` altogether: its unit
+    matched, ``best_anchor`` found no message row and fell through to the unit's first message,
+    and the hit's deep link pointed at the wrong line.
+    """
+    cfg = _cfg()
+    windows = UnitsCfg(window_gap_min=30, window_max_msgs=6, window_max_chars=4000)
+    cfg = Config(telegram=cfg.telegram, media=cfg.media, units=windows)
+    rows = [*(_text_row(i) for i in (1, 2, 3)), _message(CHAT_ID, 4, media_kind="photo")]
+    _synced(conn, rows, cfg)
+    assert 4 not in _msg_fts(conn), "a caption-less photo has nothing to index yet"
+
+    monkeypatch.setattr(extract, "registry", lambda: {"photo": _stub("ОТКРЫТО с 9:00")})
+    client = FakeClient(
+        messages={CHAT_ID: [tl.photo_message(CHAT_ID, 4)]},
+        downloads={(CHAT_ID, 4): b"jpeg bytes"},
+    )
+    assert (await media.run(conn, client, cfg, SyncBudget())).extracted == 1
+    assert _msg_fts(conn)[4] == "ОТКРЫТО с 9:00"
+    hits = search.lexical_messages(conn, "ОТКРЫТО", Filters(), 10)
+    assert [hit.anchor_msg_id for hit in hits] == [4]
+    unit = db.get_units(conn, CHAT_ID)[0]
+    assert unit.id is not None
+    assert search.best_anchor(conn, unit, "ОТКРЫТО") == 4
+
+
+async def test_a_sync_after_an_extraction_keeps_the_text_and_finds_nothing_to_rebuild(
+    conn: sqlite3.Connection, scratch: Path, paths: Paths, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``extract`` → ``sync``, the crossing ``media._recut`` exists for.
+
+    The pass re-cuts a closed window and clears the flag it raised, both inside its own
+    transaction. What that has to survive is the next sync: its per-chat and deferred
+    ``index_pending`` loops are unbudgeted, so a flag left standing would be a whole-index
+    rebuild for whichever run came next — a 20-second auto-sync inside a ``search`` included —
+    and a rebuild that dropped the text would undo the extraction outright.
+    """
+    windows = UnitsCfg(window_gap_min=30, window_max_msgs=3, window_max_chars=4000)
+    cfg = Config(
+        telegram=TelegramCfg(api_id=1, api_hash="h"),
+        media=MediaCfg(),
+        units=windows,
+        sources=[Source(chat="@xchat")],
+    )
+    entity = make_channel(100, "chat", username="xchat", megagroup=True)
+    history = [
+        tl.message(CHAT_ID, 1, "утро", sender=1),
+        tl.photo_message(CHAT_ID, 2, sender=1),
+        tl.message(CHAT_ID, 3, "спасибо", sender=1),
+        tl.message(CHAT_ID, 4, "ещё вопрос", sender=1, date=tl.at(200)),
+    ]
+    client = FakeClient(
+        dialogs=[make_dialog(entity)],
+        folders=[],
+        messages={CHAT_ID: history},
+        downloads={(CHAT_ID, 2): b"jpeg bytes"},
+    )
+    async with tg.connected(client):
+        await sync.sync_all(client, conn, cfg, paths, SyncBudget())
+    assert "[photo]" in _units(conn)[(1, 2, 3)]
+
+    monkeypatch.setattr(extract, "registry", lambda: {"photo": _stub("ОТКРЫТО с 9:00")})
+    assert (await media.run(conn, client, cfg, SyncBudget())).extracted == 1
+    assert db.chats_with_unindexed(conn) == [], "no backlog is handed to the next sync"
+
+    async with tg.connected(client):
+        await sync.sync_all(client, conn, cfg, paths, SyncBudget())
+    assert "[photo] ОТКРЫТО с 9:00" in _units(conn)[(1, 2, 3)]
+    assert _msg_fts(conn)[2] == "ОТКРЫТО с 9:00"
+    assert _text(conn, 2) == "ОТКРЫТО с 9:00"
+    assert db.chats_with_unindexed(conn) == []
+    assert not index.unit_index_gaps(conn, CHAT_ID)

@@ -1144,9 +1144,16 @@ def set_media_text(conn: sqlite3.Connection, row_id: int, text: str) -> None:
     """Store what an extractor read out of one message's media and flag the row for a rebuild.
 
     The one writer here that touches ``indexed``: this text is rendered into the message's line
-    (``units.render_line``), so the units holding it are behind until they are cut again. Its
-    twin :func:`set_media_state` writes the state byte alone, because every other transition
-    changes no rendered text at all.
+    (``units.render_line``) and indexed in ``msg_fts``
+    (``index.message_index_text``), so both are behind until the row is rebuilt. Its twin
+    :func:`set_media_state` writes the state byte alone, because every other transition changes
+    no rendered text at all.
+
+    The flag is meant to be short-lived: ``media._recut`` does that rebuild and calls
+    :func:`mark_indexed` in the same transaction. What is left flagged afterwards is only what
+    that rebuild could not cover, which is what :func:`grepogram.sync.index_stranded` is for — a
+    flag carried across a whole extraction run would be a whole-index backlog for the
+    *unbudgeted* rebuild loops a later sync ends with.
     """
     with transaction(conn):
         conn.execute(
@@ -1190,6 +1197,34 @@ def move_media_state(conn: sqlite3.Connection, kinds: Collection[str], *, frm: i
             f"UPDATE messages SET media_state = ? WHERE media_state = ? "
             f"AND media_kind IN ({_marks(listed)})",
             [to, frm, *listed],
+        )
+        return int(cursor.rowcount)
+
+
+def park_unreadable_documents(conn: sqlite3.Connection, suffixes: Collection[str]) -> int:
+    """Park pending ``document`` rows whose filename ends in none of ``suffixes``; how many moved.
+
+    ``document`` is ``sync.document_kind``'s fallback, so a ``.xlsx``, a ``.zip`` or an ``.apk``
+    carries the one kind that *does* have an extractor — and the dispatcher that would refuse it
+    only sees the file once it is downloaded. ``messages.media_filename`` decides the same thing
+    with no request at all, which is what the whole offline half is for
+    (:func:`move_media_state`), and the state is ``MEDIA_UNSUPPORTED`` rather than
+    ``MEDIA_FAILED`` because no retry can change it — only a build that reads more formats can,
+    and ``extract --retry-failed`` re-queues both.
+
+    A row with no filename is left where it is: nothing about it can be decided from here.
+    ``indexed`` is untouched, exactly as in :func:`move_media_state`.
+    """
+    listed = [suffix.lower() for suffix in dict.fromkeys(suffixes)]
+    if not listed:
+        return 0
+    clause = " AND ".join("lower(media_filename) NOT LIKE ?" for _ in listed)
+    with transaction(conn):
+        cursor = conn.execute(
+            f"UPDATE messages SET media_state = {MEDIA_UNSUPPORTED} "
+            f"WHERE media_state = {MEDIA_PENDING} AND media_kind = 'document' "
+            f"AND media_filename IS NOT NULL AND media_filename <> '' AND {clause}",
+            [f"%{suffix}" for suffix in listed],
         )
         return int(cursor.rowcount)
 

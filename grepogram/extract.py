@@ -54,6 +54,16 @@ _PDF_MAGIC = b"%PDF-"
 _DOCX_MAGIC = b"PK\x03\x04"
 """A DOCX is an OOXML zip, so its magic is the zip local-file header."""
 
+DOCUMENT_SUFFIXES = (".pdf", ".docx")
+"""File extensions :func:`extract_document` can dispatch on, lowercased.
+
+``document`` is ``sync.document_kind``'s fallback, so ``.xlsx``, ``.zip``, ``.apk`` and every
+other attachment lands on that kind as well — and the stored ``messages.media_filename`` is
+enough to tell them apart before anything is fetched. The extraction pass parks those rows
+offline against this tuple (:func:`grepogram.db.park_unreadable_documents`) rather than
+downloading a 5 MB spreadsheet to discover the dispatcher below has nowhere to send it.
+"""
+
 
 class ExtractError(Exception):
     """This file's text cannot be read: a corrupt file, a mislabelled one, a missing library.
@@ -198,7 +208,8 @@ def extract_document(path: Path) -> str:
 
     ``MediaKind`` cannot tell the two apart — ``sync.document_kind`` calls both ``document`` —
     so the file name is what does, and the first bytes are what stop a mislabelled file from
-    being handed to the wrong parser. Anything else is an :class:`ExtractError`.
+    being handed to the wrong parser. Anything else is an :class:`ExtractError`, though the pass
+    parks most of those offline against :data:`DOCUMENT_SUFFIXES` and never gets here.
     """
     suffix = path.suffix.lower()
     if suffix == ".pdf":

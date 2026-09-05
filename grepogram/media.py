@@ -9,8 +9,9 @@ sync's budget, and it is resumable by construction: ``messages.media_state`` is 
 memory.
 
 The offline half comes first and touches no network at all. Which kinds have an extractor here
-and which are switched off in ``[media]`` follows from the stored ``media_kind`` alone, so three
-bulk ``UPDATE``s park them — and none of them flags ``indexed``. Most kinds have no extractor
+and which are switched off in ``[media]`` follows from the stored ``media_kind`` alone, and which
+attachments the document extractor could read follows from the stored ``media_filename``, so bulk
+``UPDATE``s park them — and none of them flags ``indexed``. Most kinds have no extractor
 (``video``, ``sticker``, ``audio``, ``webpage``, ``poll``, ``contact``, ``location``, ``other``,
 plus ``voice`` and ``video_note`` until whisper lands in v0.3.0), so flagging would mark tens of
 thousands of rows across every chat and hand the unbudgeted deferred ``index_pending`` loop
@@ -95,12 +96,19 @@ def resolve_offline_states(
 ) -> tuple[int, int, int]:
     """Park what the stored ``media_kind`` already decides; ``(unsupported, disabled, requeued)``.
 
-    Three bulk updates, before a single Telegram request: a kind with no extractor here is
+    Four bulk updates, before a single Telegram request: a kind with no extractor here is
     ``MEDIA_UNSUPPORTED``, a kind switched off in the config is ``MEDIA_DISABLED``, and a kind
     that was switched back on comes off ``MEDIA_DISABLED`` into the queue so it drains once
     instead of being re-read on every pass. A kind that is both switched off and unreadable here
     is unsupported: no extractor is the stronger fact, and switching it back on then leaves it
     where it is until this build can read it.
+
+    The fourth is inside the ``document`` kind rather than across kinds
+    (:func:`grepogram.db.park_unreadable_documents`): ``document`` is ``sync.document_kind``'s
+    fallback, so a spreadsheet, an archive and an installer all wear it, and only the stored
+    filename says which of them :func:`grepogram.extract.extract_document` could ever read.
+    Without this they were re-fetched, downloaded in full and *then* refused — the one case the
+    offline half exists to prevent, and the most common document a chat posts.
 
     ``retry_failed`` additionally re-queues what an earlier run could not read — and what it
     parked as unsupported, since installing the ``media`` extra is exactly what makes those
@@ -118,6 +126,8 @@ def resolve_offline_states(
     if retry_failed:
         requeued += db.move_media_state(conn, live, frm=db.MEDIA_FAILED, to=db.MEDIA_PENDING)
         requeued += db.move_media_state(conn, live, frm=db.MEDIA_UNSUPPORTED, to=db.MEDIA_PENDING)
+    if "document" in live:
+        parked += db.park_unreadable_documents(conn, extract.DOCUMENT_SUFFIXES)
     return parked, switched, requeued
 
 
@@ -325,7 +335,9 @@ def _store(
 
     Extracted text goes through :func:`grepogram.db.set_media_text`, which flags the row for a
     rebuild because its rendered line changed; every other state goes through
-    :func:`grepogram.db.set_media_state`, which leaves ``indexed`` exactly as it found it.
+    :func:`grepogram.db.set_media_state`, which leaves ``indexed`` exactly as it found it. The
+    flag lives only until :func:`_recut`, at the end of this same transaction, has done the
+    rebuild it asks for.
     """
     parked: dict[int, list[int]] = {}
     extracted: list[int] = []
@@ -358,11 +370,23 @@ def _recut(
     touched one to the end of the chat, so fifty photos in one chat would otherwise re-cut and
     re-embed that tail fifty times over. The indexing is here rather than in ``units`` because
     :mod:`grepogram.index` imports :class:`~grepogram.units.UnitDelta` from there.
+
+    The message rows are re-indexed and un-flagged in this same transaction. ``msg_fts`` holds
+    the extracted text too (:func:`grepogram.index.message_index_text`) — it is what anchors a
+    hit on the right message — so the rebuild ``db.set_media_text``'s ``indexed = 0`` asks for
+    happens here, where it is bounded by the batch, and the flag is cleared with it. Leaving it
+    raised would hand the next sync's *unbudgeted* rebuild loops (``_sync_chats``' per-chat and
+    deferred ``index_pending``) every extracted row in every chat at once — a 20-second auto-sync
+    inside an MCP ``search`` included. The one case that stays flagged is the one this cannot
+    cover: a chat that is gone by the time the batch is stored, whose rows
+    :func:`grepogram.sync.index_stranded` reaches later.
     """
     if chat is None or not row_ids:
         return
     delta = units.invalidate_units_for(conn, chat, cfg, db.get_messages_by_ids(conn, row_ids))
     index.index_units(conn, delta)
+    index.index_messages(conn, row_ids)
+    db.mark_indexed(conn, row_ids)
 
 
 def media_size(media: Any) -> int | None:

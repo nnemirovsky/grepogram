@@ -43,9 +43,9 @@ import sqlite_vec
 
 from grepogram import db
 from grepogram.embed import Embedder
-from grepogram.models import ChatRow, Filters
+from grepogram.models import ChatRow, Filters, MessageRow
 from grepogram.stem import stem_text
-from grepogram.units import UnitDelta
+from grepogram.units import UnitDelta, extracted_line
 
 log = logging.getLogger(__name__)
 
@@ -72,21 +72,36 @@ class Budget(Protocol):
     def expired(self) -> bool: ...
 
 
+def message_index_text(msg: MessageRow) -> str:
+    """What of one message ``msg_fts`` holds: its own text and what an extractor read off its
+    media, ``""`` when it has neither.
+
+    Both halves, because ``msg_fts`` is what picks the message a hit is anchored on
+    (:func:`grepogram.search.best_anchor`) and what the snippet is centred over. Indexing the
+    caption alone left a caption-less photo out of the index entirely, so an OCR'd announcement
+    made its unit match while the anchor fell through to the unit's first message — a deep link
+    to the wrong line, and a snippet centred away from the words that matched.
+
+    The media placeholder itself is deliberately *not* indexed: a unit's line carries it
+    (:func:`grepogram.units.message_body`) so a reader can tell a machine read those words off an
+    image, but ``[photo]`` as a searchable token would match every captionless photo in the index.
+    """
+    parts = (msg.text.strip(), extracted_line(msg) if msg.media_kind is not None else "")
+    return " ".join(part for part in parts if part)
+
+
 def index_messages(conn: sqlite3.Connection, message_ids: Iterable[int]) -> int:
     """(Re-)index these ``messages.id`` rows in ``msg_fts``; returns how many were indexed.
 
     Every id is removed from the index first, then the rows with text are inserted under their
-    own rowid. A message without text (media without a caption) stays out of the index, and an
-    edit that emptied one drops its old row. Ids that are not stored are just removed.
+    own rowid. A message with neither text nor extracted media text stays out of the index, and
+    an edit that emptied one drops its old row. Ids that are not stored are just removed.
     """
     ids = list(dict.fromkeys(message_ids))
     if not ids:
         return 0
-    rows = [
-        (msg.id, msg.text, stem_text(msg.text), msg.chat_id, msg.date)
-        for msg in db.get_messages_by_ids(conn, ids)
-        if msg.text.strip()
-    ]
+    indexed = ((msg, message_index_text(msg)) for msg in db.get_messages_by_ids(conn, ids))
+    rows = [(msg.id, text, stem_text(text), msg.chat_id, msg.date) for msg, text in indexed if text]
     with db.transaction(conn):
         conn.executemany("DELETE FROM msg_fts WHERE rowid = ?", [(msg_id,) for msg_id in ids])
         conn.executemany(_MSG_INSERT, rows)
