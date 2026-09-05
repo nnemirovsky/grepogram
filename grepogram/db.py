@@ -48,6 +48,10 @@ are part of every window lookup."""
 META_SCHEMA_VERSION = "schema_version"
 META_EMBED_MODEL = "embed_model"
 META_LAST_SYNC_RUN = "last_sync_run"
+META_UNIT_RECIPE = "unit_recipe"
+"""Recipe version the stored units were cut with (:data:`grepogram.units.RECIPE_VERSION`)."""
+META_RECUT_PREFIX = "unit_recut:"
+"""Prefix of the per-chat marker a re-cut writes, ``unit_recut:<chat_id>``."""
 
 _V5: tuple[str, ...] = (
     "CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT)",
@@ -457,9 +461,11 @@ def migrate(conn: sqlite3.Connection) -> int:
                 + f": MIGRATIONS has to run from v{BASE_VERSION} to v{SCHEMA_VERSION} without a "
                 "gap, and a mis-keyed step is a bug in grepogram, not in the database"
             )
-        return _apply(
+        version = _apply(
             conn, [MIGRATIONS[version] for version in range(BASE_VERSION, SCHEMA_VERSION + 1)]
         )
+        _stamp_unit_recipe(conn)
+        return version
     if current > SCHEMA_VERSION:
         raise SchemaError(
             f"database schema v{current} is newer than this grepogram supports "
@@ -477,6 +483,22 @@ def migrate(conn: sqlite3.Connection) -> int:
             f"v{SCHEMA_VERSION}; {_REBUILD_HINT}"
         )
     return _apply(conn, [MIGRATIONS[version] for version in pending])
+
+
+def _stamp_unit_recipe(conn: sqlite3.Connection) -> None:
+    """Record the unit recipe a database built from empty already satisfies.
+
+    It holds no units, so nothing in it was cut by an older rule, and the decision cannot be
+    left to the sync-time pass: by the time that runs, :func:`grepogram.sync.index_pending` has
+    cut units for every chat the run fetched, so "the database holds no units" is never true and
+    a brand-new index would re-cut everything it has just cut correctly. Without the stamp the
+    first sync of a fresh install pays a full re-cut and re-embed of its own work.
+
+    :mod:`grepogram.units` imports this module, so the version is read inside the function.
+    """
+    from grepogram.units import RECIPE_VERSION
+
+    set_unit_recipe(conn, RECIPE_VERSION)
 
 
 def has_vec_table(conn: sqlite3.Connection) -> bool:
@@ -544,6 +566,68 @@ def set_meta(conn: sqlite3.Connection, key: str, value: str) -> None:
             "INSERT INTO meta(key, value) VALUES (?, ?) "
             "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             (key, value),
+        )
+
+
+def unit_recipe(conn: sqlite3.Connection) -> int | None:
+    """The recipe the stored units were cut with, or ``None`` when none is recorded.
+
+    ``None`` names a v0.1.1 index — units cut before the recipe existed — and never a fresh one:
+    :func:`migrate` stamps a database it builds from empty, so "no recipe recorded" is a real
+    mismatch and the whole re-cut is not silently skipped. A value that is not a number is read
+    the same way, so a hand-edited marker costs one re-cut instead of a traceback.
+    """
+    value = get_meta(conn, META_UNIT_RECIPE)
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except ValueError:
+        return None
+
+
+def set_unit_recipe(conn: sqlite3.Connection, version: int) -> None:
+    """Record that every stored unit was cut with recipe ``version``."""
+    set_meta(conn, META_UNIT_RECIPE, str(version))
+
+
+def recut_markers(conn: sqlite3.Connection) -> dict[int, str]:
+    """Chat id → the recipe version that chat was last re-cut at, from ``meta.unit_recut:<id>``.
+
+    The marker holds a value rather than being a presence flag: a run that dies between the last
+    chat and the cleanup leaves markers behind, and a presence flag would then make the *next*
+    bump skip exactly the chats that are already done. The comparison is on the string, so a
+    marker this build cannot read means "not re-cut yet". A key whose suffix is not a chat id is
+    skipped rather than raised over.
+
+    The prefix match is ``substr``, not ``LIKE``: ``_`` is a single-character wildcard in
+    ``LIKE`` and the prefix carries two of them.
+    """
+    rows = conn.execute(
+        "SELECT key, value FROM meta WHERE substr(key, 1, ?) = ?",
+        (len(META_RECUT_PREFIX), META_RECUT_PREFIX),
+    ).fetchall()
+    markers: dict[int, str] = {}
+    for row in rows:
+        suffix = str(row["key"])[len(META_RECUT_PREFIX) :]
+        try:
+            markers[int(suffix)] = str(row["value"])
+        except ValueError:
+            continue
+    return markers
+
+
+def set_recut_marker(conn: sqlite3.Connection, chat_id: int, version: int) -> None:
+    """Mark ``chat_id`` as re-cut at recipe ``version``."""
+    set_meta(conn, f"{META_RECUT_PREFIX}{chat_id}", str(version))
+
+
+def clear_recut_markers(conn: sqlite3.Connection) -> None:
+    """Drop every per-chat re-cut marker; the tidy-up once the recipe itself is recorded."""
+    with transaction(conn):
+        conn.execute(
+            "DELETE FROM meta WHERE substr(key, 1, ?) = ?",
+            (len(META_RECUT_PREFIX), META_RECUT_PREFIX),
         )
 
 

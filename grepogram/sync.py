@@ -18,6 +18,9 @@ flagged until :func:`on_chat_synced` has rebuilt its units and ``msg_fts`` entry
 :func:`_sync_chats` indexes a chat's pending rows after its fetch whether that returned or raised
 (a flood wait, an RPC error, a cancellation) and, at the end of the run, those of the chats it
 never reached and of a bounded number of chats nothing leads to any more (:func:`index_stranded`).
+The run then re-cuts a bounded number of chats whose units predate this build's unit recipe
+(:func:`recut_pending_chats`), which is how a change to what a unit *is* reaches history no
+incremental rebuild can touch.
 A run that dies between a commit and the rebuild therefore leaves nothing behind that the next run
 does not pick up (:func:`grepogram.db.unindexed_message_ids`). The rebuild, the
 indexing and the flag are one transaction, so the flag never clears over derived data that is not
@@ -74,6 +77,22 @@ BATCH_SIZE = 500
 JOIN_LOG_EVERY = 30.0
 STRANDED_CHATS = 4
 """Chats outside the run's own that :func:`index_stranded` repairs per run."""
+RECUT_CHATS_PER_RUN = 4
+"""Chats :func:`recut_pending_chats` re-cuts per run.
+
+A re-cut deletes and re-inserts every unit of a chat and drops their vectors, so the chat is
+re-embedded afterwards — the expensive half. Bounding it per run is what keeps a recipe bump
+from turning one sync into a full-index rebuild, and the per-chat markers are what let the next
+run carry on where this one stopped."""
+RECUT_MIN_BUDGET_S = 60.0
+"""Seconds a run must have left before it starts a re-cut at all.
+
+A re-cut is started deliberately, never incidentally. The floor sits above
+``search.auto_sync_budget_s`` (20 s by default) so the auto-sync inside an MCP ``search`` call
+never begins one, and an unlimited budget — ``SyncBudget.remaining is None``, what
+``grepogram sync`` without ``--budget`` gives — always qualifies. A run below the floor logs
+that a re-cut is pending and writes nothing; :func:`grepogram.search.search` re-derives the same
+condition and warns, which is how an MCP-only user learns to run ``grepogram sync``."""
 SELF_NAME = "me"
 UNKNOWN_FORWARD = "unknown"
 _LOCATION_MEDIA = (types.MessageMediaGeo, types.MessageMediaGeoLive, types.MessageMediaVenue)
@@ -1130,6 +1149,120 @@ async def index_stranded(
         await _joined_to_thread(functools.partial(on_chat_synced, conn, chat, cfg, pending))
 
 
+async def recut_pending_chats(
+    conn: sqlite3.Connection,
+    cfg: Config,
+    budget: SyncBudget,
+    embedder: Embedder | None = None,
+) -> int:
+    """Re-cut the chats whose units predate :data:`grepogram.units.RECIPE_VERSION`; how many moved.
+
+    Its own step after :func:`index_stranded`, so that sweep cannot rebuild a chat this pass has
+    just finished, and never hooked into :func:`on_chat_synced`: nothing is left flagged outside
+    the transaction that rebuilds it, so no later run — least of all a 20-second auto-sync inside
+    a ``search`` — inherits a whole-index backlog to drain.
+
+    The procedure, in order:
+
+    #. a recorded recipe equal to :data:`~grepogram.units.RECIPE_VERSION` means there is nothing
+       to do. ``None`` — a v0.1.1 index — is a mismatch, not a fresh database:
+       :func:`grepogram.db.migrate` stamps the ones built from empty;
+    #. a bounded budget below :data:`RECUT_MIN_BUDGET_S` does not start one. It logs that a
+       re-cut is pending and returns; an unlimited budget (``remaining is None``) always
+       qualifies;
+    #. the candidates are **every** chat in the index, not the run's queue: a channel's
+       discussion group known only through the link never appears in ``resolve_sources``' output,
+       and its windows hold every comment the index has. At most :data:`RECUT_CHATS_PER_RUN` of
+       them move, while the budget lasts;
+    #. each chat is one transaction on a worker thread joined even under cancellation
+       (:func:`_joined_to_thread`, with :meth:`SyncBudget.cancel` as the abort): re-read the chat
+       row and skip it when it is gone, :func:`grepogram.units.recut_chat`, index the delta,
+       repair the unit index, write the marker. The indexing lives here rather than in
+       :mod:`grepogram.units`, which cannot import :mod:`grepogram.index`, and **no message ids
+       are passed**: a re-cut changes no message text, so rewriting an ``msg_fts`` row per id
+       would be the largest wasted cost available;
+    #. once every chat carries the marker, the recipe is recorded and the markers are dropped in
+       one transaction — tidy-up, not correctness. Until then a run cut short leaves the finished
+       chats marked and the next one picks up only the rest.
+    """
+    target = units.RECIPE_VERSION
+    if db.unit_recipe(conn) == target:
+        return 0
+    remaining = budget.remaining
+    if remaining is not None and remaining < RECUT_MIN_BUDGET_S:
+        log.info(
+            "a unit re-cut is pending (recipe v%s) and this run has %.0fs left, below the %.0fs "
+            "it needs; run `grepogram sync` to let it start",
+            target,
+            remaining,
+            RECUT_MIN_BUDGET_S,
+        )
+        return 0
+    marker = str(target)
+    markers = db.recut_markers(conn)
+    pending = [chat for chat in db.list_chats(conn) if markers.get(chat.id) != marker]
+    recut = 0
+    for chat in pending[:RECUT_CHATS_PER_RUN]:
+        if budget.expired:
+            break
+        done = await _joined_to_thread(
+            functools.partial(_recut_one, conn, cfg, chat), budget.cancel
+        )
+        recut += int(done)
+    if recut and embedder is None:
+        log.warning(
+            "%d chats were re-cut and their old units' vectors went with them, and this run has "
+            "no embedding model; run `grepogram embed` to make them searchable by meaning again",
+            recut,
+        )
+    _finish_recut(conn, target)
+    return recut
+
+
+def _recut_one(conn: sqlite3.Connection, cfg: Config, chat: ChatRow) -> bool:
+    """Re-cut one chat, index the result and mark it done; ``False`` when the chat is gone.
+
+    The chat row is re-read the way :func:`index_pending` does it: a chat removed under the pass
+    would otherwise reach :func:`grepogram.db.insert_units` with no parent row and raise
+    ``IntegrityError`` outside the chat loop's guard, escaping :func:`sync_all` as a traceback.
+    """
+    with db.transaction(conn):
+        row = db.get_chat(conn, chat.id)
+        if row is None:
+            log.debug("chat %s was removed before its re-cut; skipped", chat.id)
+            return False
+        delta = units.recut_chat(conn, row, cfg)
+        index.index_units(conn, delta)
+        index.repair_unit_index(conn, row.id)
+        db.set_recut_marker(conn, row.id, units.RECIPE_VERSION)
+    log.info(
+        "chat %s (%s): re-cut %d units into %d for unit recipe v%s",
+        chat.id,
+        chat.title,
+        len(delta.deleted_ids),
+        len(delta.inserted_ids),
+        units.RECIPE_VERSION,
+    )
+    return True
+
+
+def _finish_recut(conn: sqlite3.Connection, target: int) -> None:
+    """Record the recipe and drop the markers once no chat is left unmarked.
+
+    Completion is "no chat is unmarked", so an index with no chats at all is complete on the
+    spot. The two writes are one transaction: a recorded recipe next to stale markers would make
+    the next bump skip the chats those markers name.
+    """
+    marker = str(target)
+    markers = db.recut_markers(conn)
+    if any(markers.get(chat.id) != marker for chat in db.list_chats(conn)):
+        return
+    with db.transaction(conn):
+        db.set_unit_recipe(conn, target)
+        db.clear_recut_markers(conn)
+    log.info("every chat is cut with unit recipe v%s", target)
+
+
 ConfigSource = Config | Callable[[], Config]
 """A config, or a loader called once the :class:`SyncLock` is held (see :func:`sync_all`)."""
 
@@ -1169,6 +1302,7 @@ async def sync_all(
     with SyncLock(paths):
         current = cfg if isinstance(cfg, Config) else cfg()
         report = await _sync_chats(client, conn, current, budget)
+        await recut_pending_chats(conn, current, budget, embedder)
         db.set_last_sync_run(conn, int(time.time()))
         if embedder is None:
             return report

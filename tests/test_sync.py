@@ -15,7 +15,7 @@ from telethon.tl import functions, types
 from telethon.tl.types import messages as tl_messages
 from typer.testing import CliRunner
 
-from grepogram import cli, db, search, sources, sync, tg
+from grepogram import cli, db, search, sources, sync, tg, units
 from grepogram.config import ConfigError
 from grepogram.models import (
     ChatRow,
@@ -1293,6 +1293,50 @@ async def test_the_stranded_sweep_repairs_at_most_its_limit_of_chats_per_run(
     assert db.chats_with_unindexed(conn) == [NEWS_ID]
     await sync.index_stranded(conn, cfg, limit=1)
     assert db.chats_with_unindexed(conn) == []
+
+
+def _arg_history() -> list[types.Message]:
+    """Enough of a chat to cut into more than one unit: a reply thread and two windows."""
+    first = tl.message(ARG_ID, 1, "where do I renew a residence permit", sender=1)
+    return [
+        first,
+        tl.message(ARG_ID, 2, "at the migraciones office", sender=2, reply_to=tl.reply_header(1)),
+        tl.message(ARG_ID, 3, "thanks", sender=1, reply_to=tl.reply_header(1)),
+    ]
+
+
+async def test_a_full_run_recuts_the_units_of_an_index_an_older_build_cut(
+    conn: sqlite3.Connection, paths: Paths, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The v0.1.1 upgrade path end to end: the re-cut is its own step after the chat loop and
+    the stranded sweep, so nothing is left flagged for the next run's unbudgeted deferred pass."""
+    client = _client(messages={ARG_ID: _arg_history()})
+    cfg = _cfg(ARG_SOURCE)
+    await _run(client, conn, paths, cfg)
+    before = [u.id for u in db.get_units(conn, ARG_ID)]
+    conn.execute("DELETE FROM meta WHERE key = ?", (db.META_UNIT_RECIPE,))
+    monkeypatch.setattr(units, "RECIPE_VERSION", units.RECIPE_VERSION + 1)
+    report = await _run(client, conn, paths, cfg)
+    assert report.warnings == []
+    assert not set(before) & {u.id for u in db.get_units(conn, ARG_ID)}
+    assert db.unit_recipe(conn) == units.RECIPE_VERSION
+    assert db.recut_markers(conn) == {}
+    assert db.chats_with_unindexed(conn) == []
+
+
+async def test_a_run_short_of_the_recut_floor_leaves_the_units_alone(
+    conn: sqlite3.Connection, paths: Paths, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A 20-second auto-sync inside a ``search`` call must never empty a chat's units."""
+    client = _client(messages={ARG_ID: _arg_history()})
+    cfg = _cfg(ARG_SOURCE)
+    await _run(client, conn, paths, cfg)
+    before = [u.id for u in db.get_units(conn, ARG_ID)]
+    conn.execute("DELETE FROM meta WHERE key = ?", (db.META_UNIT_RECIPE,))
+    monkeypatch.setattr(units, "RECIPE_VERSION", units.RECIPE_VERSION + 1)
+    await _run(client, conn, paths, cfg, cfg.search.auto_sync_budget_s)
+    assert [u.id for u in db.get_units(conn, ARG_ID)] == before
+    assert db.unit_recipe(conn) is None
 
 
 async def test_comments_are_not_fetched_without_the_flag(conn: sqlite3.Connection) -> None:

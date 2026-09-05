@@ -18,6 +18,9 @@ messages, continuing in further units that repeat the root. :func:`build_posts` 
 comments read from the linked discussion chat. :func:`units_for_chat` picks the builders for a
 chat's kind.
 
+:data:`RECIPE_VERSION` names how this build cuts and renders units, and :func:`recut_chat` cuts a
+whole chat again when the two disagree — the only thing that reaches a closed window.
+
 :func:`rebuild_for_chat` keeps the stored units in step with a sync: it re-cuts the open window
 of every touched ``(chat, topic)``, rebuilds the reply threads reachable from the changed
 messages and the post units of changed channel posts, and reports the inserted and deleted unit
@@ -36,6 +39,21 @@ from grepogram.models import ChatRow, Config, MessageRow, UnitKind, UnitRow, Uni
 UNKNOWN_SENDER = "unknown"
 EMPTY_PLACEHOLDER = "[empty]"
 STAMP_FORMAT = "%Y-%m-%d %H:%M"
+
+RECIPE_VERSION = 1
+"""How this build cuts and renders units, recorded as ``meta.unit_recipe``.
+
+Bumped by every change that would make a stored unit differ from what this code cuts today: a
+window boundary rule, what :func:`render_line` puts on a line, a column a unit carries. The
+stored units cannot notice such a change on their own — an incremental rebuild never re-cuts a
+closed window (:func:`_recut_start`), and closed windows are almost all of a chat's history — so
+the version is what says a re-cut is owed.
+
+A bump is not free: it re-cuts and re-embeds every chat in the index, about an hour on 47k units.
+Everything one release changes about units therefore shares a single bump, and the re-cut runs
+chat by chat inside a budget (:func:`grepogram.sync.recut_pending_chats`), never as a global
+delete-all. A database built from empty is stamped at this version by
+:func:`grepogram.db.migrate`, so a fresh install never re-cuts what it has just cut correctly."""
 
 
 # --- rendering -------------------------------------------------------------------------------
@@ -353,6 +371,38 @@ class UnitDelta:
 
     inserted_ids: list[int] = field(default_factory=list)
     deleted_ids: list[int] = field(default_factory=list)
+
+
+def recut_chat(conn: sqlite3.Connection, chat: ChatRow, cfg: Config) -> UnitDelta:
+    """Cut every unit of ``chat`` again from its stored messages, replacing what is there.
+
+    What a :data:`RECIPE_VERSION` bump runs. An incremental rebuild cannot do it: closed windows
+    are never re-cut for a change inside them (:func:`_recut_start` returns ``None``), and they
+    hold nearly all of a chat's history.
+
+    It goes through :func:`units_for_chat`, not :func:`rebuild_for_chat`. After the delete-all
+    every stale lookup a rebuild makes is empty by construction — :func:`grepogram.db.open_window`
+    is ``None``, ``post_units`` and ``threads_touching`` return nothing — so a rebuild reaches
+    the same units the long way, loading the chat twice and walking one ``get_descendants`` per
+    reply chain, and its :func:`_apply` reports ``deleted_ids = []``, which is not the delta the
+    indexer has to act on.
+
+    No ``messages`` row is written. Unit boundaries change here and message text does not, so
+    ``msg_fts`` needs no rewrite and ``messages.indexed`` needs no flagging: flagging inside the
+    caller's transaction recovers nothing (it rolls back with everything else) while writing the
+    whole of ``messages``, and flagging outside one hands the next run a whole-index backlog that
+    :func:`grepogram.sync._sync_chats`'s unbudgeted deferred pass would drain in full.
+
+    The delete and the insert are one transaction; the caller indexes the returned delta, since
+    :mod:`grepogram.units` cannot import :mod:`grepogram.index` (it imports :class:`UnitDelta`
+    from here).
+    """
+    stale = [unit.id for unit in db.get_units(conn, chat.id) if unit.id is not None]
+    with db.transaction(conn):
+        db.delete_units(conn, stale)
+        fresh = units_for_chat(conn, db.get_messages(conn, chat.id), chat, cfg)
+        inserted = db.insert_units(conn, fresh)
+    return UnitDelta(inserted_ids=inserted, deleted_ids=stale)
 
 
 def rebuild_for_chat(

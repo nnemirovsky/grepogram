@@ -374,49 +374,49 @@ Task 15's `sources add` guard, or the import protection silently evaporates.
 - Modify: `tests/test_sync.py`
 - Create: `tests/test_units_recipe.py`
 
-- [ ] add `units.RECIPE_VERSION: int = 1`, `sync.RECUT_MIN_BUDGET_S` and `sync.RECUT_CHATS_PER_RUN`
+- [x] add `units.RECIPE_VERSION: int = 1`, `sync.RECUT_MIN_BUDGET_S` and `sync.RECUT_CHATS_PER_RUN`
       with docstrings naming what a bump costs and why a short-budget run must not start one
-- [ ] add `db.unit_recipe` / `db.set_unit_recipe`, the **version-valued** `unit_recut:<chat_id>`
+- [x] add `db.unit_recipe` / `db.set_unit_recipe`, the **version-valued** `unit_recut:<chat_id>`
       markers, and the `meta` helpers this needs — there is no prefix listing and no `delete_meta`
       in `db.py` today (db.py:536-549 is the whole meta surface)
-- [ ] **stamp `unit_recipe = RECIPE_VERSION` in `db.migrate`** on the branch that builds a schema
+- [x] **stamp `unit_recipe = RECIPE_VERSION` in `db.migrate`** on the branch that builds a schema
       from empty (db.py:455-462). `units.py:34` already imports `db`, so `db.py` must not import
       `units` at module level — put `RECIPE_VERSION` in `db.py`, or import it inside `migrate()`. A sync-time "no units yet" test can never fire: `index_pending`
       (sync.py:1313, 1326) has already cut units for every chat fetched by then, so a brand-new
       index would re-cut everything it just cut correctly
-- [ ] add `units.recut_chat(conn, chat, cfg)`: collect the chat's unit ids, `db.delete_units`, then
+- [x] add `units.recut_chat(conn, chat, cfg)`: collect the chat's unit ids, `db.delete_units`, then
       `db.insert_units(units_for_chat(conn, db.get_messages(conn, chat.id), chat, cfg))`, returning
       `UnitDelta(inserted_ids=…, deleted_ids=<the ids collected first>)`
-- [ ] use **`units_for_chat` (units.py:327), not `rebuild_for_chat`**: after a delete-all every
+- [x] use **`units_for_chat` (units.py:327), not `rebuild_for_chat`**: after a delete-all every
       stale lookup in `rebuild_for_chat` is empty by construction, so it is the same result reached
       the long way — loading the chat twice plus one `get_descendants` per reply chain — and its
       `_apply` reports `deleted_ids = []`, so the delta would not even be honest
-- [ ] the re-cut must **not** touch `messages`: no `indexed = 0` flagging, no `msg_fts` rewrite.
+- [x] the re-cut must **not** touch `messages`: no `indexed = 0` flagging, no `msg_fts` rewrite.
       Unit boundaries change, message text does not
-- [ ] add `sync.recut_pending_chats(conn, cfg, budget)` implementing the five-step procedure in
+- [x] add `sync.recut_pending_chats(conn, cfg, budget)` implementing the five-step procedure in
       "The unit recipe" **exactly** as written — its own step after `index_stranded`, running each
       chat through `_joined_to_thread` with `budget.cancel` as `abort`, and doing the indexing
       itself (`index.index_units` + `repair_unit_index`, **no message ids**), because `units.py`
       cannot import `index` (index.py:48 imports `UnitDelta` from units — a cycle)
-- [ ] re-read the chat row each iteration and skip a chat that is gone, as `index_pending` does
+- [x] re-read the chat row each iteration and skip a chat that is gone, as `index_pending` does
       (sync.py:1093); otherwise `insert_units` raises `IntegrityError` outside the chat loop's guard
       (sync.py:1316) and escapes `sync_all` as a traceback
-- [ ] compare the marker **by value** (`!= str(RECIPE_VERSION)` means "needs a re-cut"), and make
+- [x] compare the marker **by value** (`!= str(RECIPE_VERSION)` means "needs a re-cut"), and make
       step 5 one transaction; handle `budget.remaining is None` (unlimited) before comparing
       (sync.py:365-372)
-- [ ] have `search` re-derive a pending re-cut (`db.unit_recipe(conn) != units.RECIPE_VERSION`) and
+- [x] have `search` re-derive a pending re-cut (`db.unit_recipe(conn) != units.RECIPE_VERSION`) and
       return it in the existing `warnings` field — the short-budget path writes no flag, and the
       MCP-only user is exactly who needs the warning
-- [ ] log a warning when a re-cut drops vectors and `cfg` yields no embedder
+- [x] log a warning when a re-cut drops vectors and `cfg` yields no embedder
       (`cli._optional_embedder`, cli.py:221-227), or the chats silently end up unembedded
-- [ ] write tests: a bump re-cuts chat by chat; an equal version does nothing; a database with rows
+- [x] write tests: a bump re-cuts chat by chat; an equal version does nothing; a database with rows
       and no recipe **does** re-cut; **a freshly migrated database records the recipe and re-cuts
       nothing**; a budget below the floor does not start one and emits the warning; an unlimited
       budget does start one; a re-cut chat keeps every unit kind it had (window, thread, post);
       **a crash after the last chat but before cleanup does not make the next bump skip that chat**;
       **a link-only discussion group is re-cut**; a chat deleted mid-pass is skipped, not raised;
       at most `RECUT_CHATS_PER_RUN` chats move per run; **no `messages` row is written**
-- [ ] run tests — must pass before task 2
+- [x] run tests — must pass before task 2
 
 ### Task 2: Make `window_max_chars` a ceiling instead of a floor
 

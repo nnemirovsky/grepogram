@@ -50,7 +50,7 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from typing import get_args
 
-from grepogram import db, embed, index, links
+from grepogram import db, embed, index, links, units
 from grepogram import rerank as reranking
 from grepogram.embed import Embedder, ModelUnavailable
 from grepogram.index import EmbeddingSpaceMismatch
@@ -80,6 +80,15 @@ NO_SOURCES = (
 )
 NOTHING_INDEXED = "nothing is indexed yet: run `grepogram sync`"
 NO_VECTORS = "no units are embedded yet; run `grepogram sync` or `grepogram embed`"
+RECUT_PENDING = (
+    "this index was cut by an older grepogram and its units are being re-cut a few chats "
+    "per sync; run `grepogram sync` until it finishes for the best results"
+)
+"""Warning for the unit recipe a sync has not caught up with yet.
+
+The condition is re-derived here rather than flagged anywhere: a run whose budget is below
+:data:`grepogram.sync.RECUT_MIN_BUDGET_S` writes nothing, and an MCP-only user — whose syncs
+are the 20-second ones inside a ``search`` call — is exactly who never sees the log line."""
 _OPS: tuple[FtsOp, ...] = ("AND", "OR")
 
 EmbedderLoader = Callable[[Config], Embedder]
@@ -483,6 +492,8 @@ def search(
     if not db.list_chats(conn):
         warnings.append(NOTHING_INDEXED if cfg.sources else NO_SOURCES)
         return SearchResult(hits=[], warnings=warnings, index_age_min=age)
+    if db.unit_recipe(conn) != units.RECIPE_VERSION:
+        warnings.append(RECUT_PENDING)
     limit = max(k, cfg.search.rerank_top)
     retrieved = _retrieve(conn, cfg, query, filters, limit, mode, warnings, embedder, load_embedder)
     candidates = _fuse(conn, cfg, retrieved, limit)
