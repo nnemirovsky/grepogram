@@ -282,6 +282,34 @@ def test_positive_rule_leaves_other_numeric_keys_alone() -> None:
     assert config.loads("[search]\nrerank_top = 0\n").search.rerank_top == 0
 
 
+def test_reaction_weight_defaults_and_round_trips(paths: Paths) -> None:
+    assert SearchCfg().reaction_weight == 0.05
+    assert config.loads("").search.reaction_weight == 0.05
+    assert config.loads(TEMPLATE).search.reaction_weight == 0.05
+    config.save(Config(search=SearchCfg(reaction_weight=0.2)), paths)
+    assert "reaction_weight = 0.2" in paths.config_file.read_text()
+    assert config.load(paths).search.reaction_weight == 0.2
+
+
+def test_reaction_weight_takes_an_int_as_a_float() -> None:
+    """A user writing ``0`` to switch the bonus off must not meet a type error."""
+    off = config.loads("[search]\nreaction_weight = 0\n").search.reaction_weight
+    assert off == 0.0 and isinstance(off, float)
+
+
+@pytest.mark.parametrize("value", ["'0.05'", "true"])
+def test_reaction_weight_rejects_non_numbers(value: str) -> None:
+    with pytest.raises(ConfigError, match=r"invalid value for search\.reaction_weight: .*float"):
+        config.loads(f"[search]\nreaction_weight = {value}\n")
+
+
+def test_a_negative_reaction_weight_is_accepted_and_reads_as_off() -> None:
+    """Documented as inert rather than refused: ``_with_reaction_bonus`` treats ``<= 0`` as off
+    and hands back the reranker's own scores, so there is nothing to reject."""
+    cfg = config.loads("[search]\nreaction_weight = -1.0\n")
+    assert cfg.search.reaction_weight == -1.0
+
+
 # --- [media] ---------------------------------------------------------------------------------
 
 

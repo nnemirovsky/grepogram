@@ -382,8 +382,13 @@ def _post_thread(post: MessageRow, chunk: Sequence[MessageRow], chat_id: int) ->
     ``reactions`` is the post's own total and not the chunk's, because ``msg_ids`` lists the post
     alone — comment ids belong to the discussion group's id space and no ``json_each`` over
     ``units.msg_ids`` reaches them, so :func:`grepogram.db.refresh_unit_reactions` can only ever
-    recompute the post's. The comments' own reactions are carried by the discussion group's
-    window units, which hold those messages. This is built by hand rather than through
+    recompute the post's. The comments' own reactions rank through the discussion group's window
+    units, which do hold those messages; those totals move when the group is a source chat of its
+    own, and — for a group known only through the channel's link — when a thread the channel's
+    pass re-read carries new ones (:func:`grepogram.sync._refresh_comment_reactions`). A comment
+    whose reactions changed with no new reply under the post is not re-read at all: Telegram
+    reports a reply count on a post and nothing about its comments' reactions, so the alternative
+    is re-reading every thread on every sync. This is built by hand rather than through
     :func:`_unit` — the text spans the comments while the ids do not — so the sum has to be
     written out here or a channel's most-reacted threads would all sit at zero.
     """
@@ -600,11 +605,9 @@ def _invalidate_posts(
     followed through ``comment_of_chat_id`` / ``comment_of_msg_id`` and not from here.
     """
     post_ids = sorted({msg.msg_id for msg in rows})
-    stale = db.post_units(conn, chat.id, post_ids) + db.threads_touching(conn, chat.id, post_ids)
     stored = db.get_messages_by_msg_id(conn, chat.id, post_ids)
     posts = [stored[post_id] for post_id in post_ids if post_id in stored]
-    fresh = build_posts(conn, posts, chat, comments_enabled(cfg, chat), cfg.units) if posts else []
-    return _apply(conn, stale, fresh)
+    return _cut_posts(conn, chat, cfg, posts, post_ids)
 
 
 def rebuild_for_chat(
@@ -651,9 +654,24 @@ def _rebuild_conversation(
 def _rebuild_posts(
     conn: sqlite3.Connection, chat: ChatRow, cfg: Config, changed: list[MessageRow]
 ) -> UnitDelta:
-    post_ids = [post.msg_id for post in changed]
-    stale = db.post_units(conn, chat.id, post_ids) + db.threads_touching(conn, chat.id, post_ids)
-    fresh = build_posts(conn, changed, chat, comments_enabled(cfg, chat), cfg.units)
+    return _cut_posts(conn, chat, cfg, changed, [post.msg_id for post in changed])
+
+
+def _cut_posts(
+    conn: sqlite3.Connection,
+    chat: ChatRow,
+    cfg: Config,
+    posts: Sequence[MessageRow],
+    post_ids: Sequence[int],
+) -> UnitDelta:
+    """Replace the ``post`` units of ``post_ids`` and the post threads quoting them with the
+    units ``posts`` render to — the half :func:`_invalidate_posts` and :func:`_rebuild_posts`
+    share, they differing only in whether the rows come re-read from the database or from the
+    caller. ``posts`` empty is not a special case: :func:`build_posts` returns no unit for it,
+    which is exactly right for an invalidation whose rows are all gone."""
+    ids = list(post_ids)
+    stale = db.post_units(conn, chat.id, ids) + db.threads_touching(conn, chat.id, ids)
+    fresh = build_posts(conn, posts, chat, comments_enabled(cfg, chat), cfg.units)
     return _apply(conn, stale, fresh)
 
 

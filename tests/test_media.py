@@ -191,9 +191,9 @@ def test_pending_queries_see_only_media_at_pending(conn: sqlite3.Connection) -> 
     assert db.count_pending_media(conn) == 2
     # marked channel ids are negative, so ascending order puts the later one first
     assert db.chats_with_pending_media(conn) == [OTHER_ID, CHAT_ID]
-    assert [row.msg_id for row in db.messages_pending_media(conn, 10)] == [1, 1]
     assert [row.chat_id for row in db.messages_pending_media(conn, 10, CHAT_ID)] == [CHAT_ID]
-    assert len(db.messages_pending_media(conn, 1)) == 1
+    assert [row.chat_id for row in db.messages_pending_media(conn, 10, OTHER_ID)] == [OTHER_ID]
+    assert len(db.messages_pending_media(conn, 1, CHAT_ID)) == 1
     db.set_media_state(conn, [1], db.MEDIA_UNSUPPORTED)
     assert db.count_pending_media(conn) == 1
 
@@ -976,3 +976,48 @@ async def test_a_sync_after_an_extraction_keeps_the_text_and_finds_nothing_to_re
     assert _text(conn, 2) == "ОТКРЫТО с 9:00"
     assert db.chats_with_unindexed(conn) == []
     assert not index.unit_index_gaps(conn, CHAT_ID)
+
+
+async def test_a_reordered_answer_still_matches_each_row_by_its_id(
+    conn: sqlite3.Connection, scratch: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Telegram is asked for a page of ids and each row is matched back by id, never by position.
+
+    ``messages.getMessages`` is documented as one slot per id, but a short or reordered answer
+    would otherwise shift one row's outcome onto its neighbour — and the outcome is a state and a
+    text written to that row.
+    """
+    db.upsert_chat(conn, _chat())
+    db.upsert_messages(conn, [_pdf_row(CHAT_ID, 1), _pdf_row(CHAT_ID, 2)])
+    client = FakeClient(
+        messages={CHAT_ID: [tl.document_message(CHAT_ID, i, "note.pdf") for i in (1, 2)]},
+        downloads={(CHAT_ID, 1): SAMPLE_PDF.read_bytes(), (CHAT_ID, 2): b"not a pdf at all"},
+    )
+    answer = client.get_messages
+
+    async def reversed_answer(*args: Any, **kwargs: Any) -> Any:
+        return list(reversed(await answer(*args, **kwargs)))
+
+    monkeypatch.setattr(client, "get_messages", reversed_answer)
+    report = await media.run(conn, client, _cfg(), SyncBudget())
+    assert (report.extracted, report.failed) == (1, 1)
+    assert _states(conn) == {1: db.MEDIA_EXTRACTED, 2: db.MEDIA_FAILED}
+
+
+async def test_a_truncated_answer_leaves_the_rows_it_left_out_for_a_retry(
+    conn: sqlite3.Connection, scratch: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A row with no message in the answer is retryable, not another row's outcome."""
+    db.upsert_chat(conn, _chat())
+    db.upsert_messages(conn, [_pdf_row(CHAT_ID, 1), _pdf_row(CHAT_ID, 2)])
+    client = _pdf_client(1, 2)
+    answer = client.get_messages
+
+    async def last_only(*args: Any, **kwargs: Any) -> Any:
+        return (await answer(*args, **kwargs))[-1:]
+
+    monkeypatch.setattr(client, "get_messages", last_only)
+    report = await media.run(conn, client, _cfg(), SyncBudget())
+    assert (report.extracted, report.failed) == (1, 1)
+    assert _states(conn) == {1: db.MEDIA_FAILED, 2: db.MEDIA_EXTRACTED}
+    assert [args["msg_id"] for name, args in client.calls if name == "download_media"] == [2]

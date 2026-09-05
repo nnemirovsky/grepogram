@@ -79,10 +79,6 @@ def registry() -> dict[MediaKind, Extractor]:
     Not a module constant: availability depends on what imports here and on the platform, and
     the tests have to be able to build the map again with a different answer to both.
     """
-    return _build_registry()
-
-
-def _build_registry() -> dict[MediaKind, Extractor]:
     built: dict[MediaKind, Extractor] = {}
     if _documents_available():
         built["document"] = extract_document
@@ -110,7 +106,7 @@ def _documents_available() -> bool:
 def _ocr_unavailable() -> str | None:
     """Why photo OCR cannot run here, or ``None`` when it can.
 
-    A reason rather than a flag so :func:`_build_registry` can say in one debug line what would
+    A reason rather than a flag so :func:`registry` can say in one debug line what would
     fix it. Both halves matter: Vision is a macOS framework, and its Python binding lives in the
     ``media`` extra. Absent either, ``photo`` stays unmapped and the extraction pass parks such
     media as unsupported instead of failing every photo it meets.

@@ -11,7 +11,6 @@ import sys
 import zipfile
 from pathlib import Path
 
-import docx
 import pytest
 
 from grepogram import extract
@@ -23,8 +22,21 @@ SAMPLE_PDF = FIXTURES / "sample.pdf"
 SAMPLE_DOCX = FIXTURES / "sample.docx"
 
 
+def _needs(library: str) -> None:
+    """Skip a test that parses a real file where its optional library is not installed.
+
+    The ``media`` extra is optional and CI installs no extras, so what this module must never do
+    is *fail* there: the "no extractor here" path is the product's documented degradation and has
+    tests of its own, all of which monkeypatch and run anywhere.
+    """
+    pytest.importorskip(library, reason=f"{library} is not installed")
+
+
 def _write_pdf(path: Path, lines: list[str]) -> Path:
-    """A one-page PDF drawing ``lines``, written by hand so no generator library is needed."""
+    """A one-page PDF drawing ``lines``, written by hand so no generator library is needed.
+
+    Reading one back still needs ``pypdf``, so every caller is a test that parses it."""
+    _needs("pypdf")
     drawn = b"".join(b"(" + line.encode("ascii") + b") Tj 0 -20 Td " for line in lines)
     stream = b"BT /F1 14 Tf 72 720 Td " + drawn + b"ET\n"
     objects = [
@@ -52,6 +64,15 @@ def _write_pdf(path: Path, lines: list[str]) -> Path:
 
 
 def _write_docx(path: Path, paragraphs: list[str], table: list[list[str]] | None = None) -> Path:
+    """Build a DOCX with ``python-docx``, skipping the test where the library is not installed.
+
+    Imported here rather than at module scope: the ``media`` extra is optional and CI installs
+    no extras, so a top-level import would make the whole module uncollectable — including the
+    tests of the degradation path that exists for exactly that installation.
+    """
+    _needs("docx")
+    import docx
+
     document = docx.Document()
     for text in paragraphs:
         document.add_paragraph(text)
@@ -68,11 +89,13 @@ def _write_docx(path: Path, paragraphs: list[str], table: list[list[str]] | None
 
 
 def test_pdf_fixture_round_trips() -> None:
+    _needs("pypdf")
     text = extract.extract_document(SAMPLE_PDF)
     assert text.splitlines() == ["Grepogram sample PDF", "Embassy notice 2026"]
 
 
 def test_docx_fixture_round_trips() -> None:
+    _needs("docx")
     text = extract.extract_document(SAMPLE_DOCX)
     assert text.splitlines() == ["Grepogram sample DOCX", "Rental contract clause"]
 
@@ -101,6 +124,7 @@ def test_pdf_extension_over_docx_bytes_is_rejected(tmp_path: Path) -> None:
 
 
 def test_dispatch_ignores_extension_case(tmp_path: Path) -> None:
+    _needs("pypdf")
     shouted = tmp_path / "NOTICE.PDF"
     shouted.write_bytes(SAMPLE_PDF.read_bytes())
     assert "Embassy notice 2026" in extract.extract_document(shouted)
@@ -121,6 +145,7 @@ def test_a_name_with_no_extension_has_no_extractor(tmp_path: Path) -> None:
 
 
 def test_a_missing_file_is_an_extract_error(tmp_path: Path) -> None:
+    _needs("pypdf")
     with pytest.raises(ExtractError, match="cannot read gone.pdf"):
         extract.extract_document(tmp_path / "gone.pdf")
 
@@ -129,6 +154,7 @@ def test_a_missing_file_is_an_extract_error(tmp_path: Path) -> None:
 
 
 def test_corrupt_pdf_is_an_extract_error(tmp_path: Path) -> None:
+    _needs("pypdf")
     broken = tmp_path / "broken.pdf"
     broken.write_bytes(b"%PDF-1.4\nnot really a pdf at all\n")
     with pytest.raises(ExtractError, match="cannot read broken.pdf as a PDF"):
@@ -136,6 +162,7 @@ def test_corrupt_pdf_is_an_extract_error(tmp_path: Path) -> None:
 
 
 def test_corrupt_docx_is_an_extract_error(tmp_path: Path) -> None:
+    _needs("docx")
     broken = tmp_path / "broken.docx"
     broken.write_bytes(b"PK\x03\x04not a real zip")
     with pytest.raises(ExtractError, match="cannot read broken.docx as a DOCX"):
@@ -144,6 +171,7 @@ def test_corrupt_docx_is_an_extract_error(tmp_path: Path) -> None:
 
 def test_a_zip_that_is_not_a_docx_is_an_extract_error(tmp_path: Path) -> None:
     """Magic bytes only prove it is a zip; ``python-docx`` is what proves it is a document."""
+    _needs("docx")
     not_a_document = tmp_path / "photos.docx"
     with zipfile.ZipFile(not_a_document, "w") as archive:
         archive.writestr("hello.txt", "no OOXML parts here")
@@ -520,7 +548,8 @@ def test_ocr_is_available_on_a_mac_carrying_the_extra(monkeypatch: pytest.Monkey
 # --- the registry ------------------------------------------------------------------------------
 
 
-def test_registry_maps_document() -> None:
+def test_registry_maps_document(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(extract, "_documents_available", lambda: True)
     assert extract.registry()["document"] is extract.extract_document
 
 
@@ -558,6 +587,7 @@ def test_registry_drops_documents_when_the_libraries_are_absent(
 
 def test_registry_is_derived_on_every_call(monkeypatch: pytest.MonkeyPatch) -> None:
     """An import-time constant could not answer differently after the environment changes."""
+    monkeypatch.setattr(extract, "_documents_available", lambda: True)
     assert "document" in extract.registry()
     monkeypatch.setattr(extract, "_documents_available", lambda: False)
     assert "document" not in extract.registry()
@@ -566,9 +596,16 @@ def test_registry_is_derived_on_every_call(monkeypatch: pytest.MonkeyPatch) -> N
 def test_documents_are_available_when_either_library_imports(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """Read off ``find_spec``, never off this machine: the answer has to be asserted for an
+    installation without the ``media`` extra too, which is the one that degrades."""
+    monkeypatch.setattr(importlib.util, "find_spec", lambda name: object())
     assert extract._documents_available() is True
     monkeypatch.setattr(
         importlib.util, "find_spec", lambda name: None if name == "pypdf" else object()
+    )
+    assert extract._documents_available() is True
+    monkeypatch.setattr(
+        importlib.util, "find_spec", lambda name: None if name == "docx" else object()
     )
     assert extract._documents_available() is True
     monkeypatch.setattr(importlib.util, "find_spec", lambda name: None)

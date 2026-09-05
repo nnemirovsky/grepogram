@@ -1118,25 +1118,22 @@ def message_ids_after(
 # --- media extraction ------------------------------------------------------------------------
 
 
-def messages_pending_media(
-    conn: sqlite3.Connection, limit: int, chat_id: int | None = None
-) -> list[MessageRow]:
-    """The extraction pass's queue: rows whose media nothing has looked at yet, oldest first.
+def messages_pending_media(conn: sqlite3.Connection, limit: int, chat_id: int) -> list[MessageRow]:
+    """One chat's extraction queue: its rows whose media nothing has looked at yet, oldest first.
 
-    ``chat_id`` narrows it to one chat, which is how the pass reads it: a batch is re-fetched
-    through a single ``client.get_messages(chat_id, ids=[…])`` and cannot mix chats. The
-    predicate is spelled the way ``messages_media_pending`` is, :data:`MEDIA_PENDING` inlined
-    rather than bound, because SQLite only uses a partial index when the query's ``WHERE``
-    provably implies the index's own — a parameter proves nothing at prepare time.
+    Always one chat, never the whole index: a batch is re-fetched through a single
+    ``client.get_messages(chat_id, ids=[…])`` and cannot mix chats, so a whole-index page would
+    be a queue no caller could use. :func:`chats_with_pending_media` is what says which chats to
+    ask for. The predicate is spelled the way ``count_pending_media`` is, :data:`MEDIA_PENDING`
+    inlined rather than bound, because SQLite only uses a partial index when the query's
+    ``WHERE`` provably implies the index's own — a parameter proves nothing at prepare time.
     """
-    scope = "" if chat_id is None else " AND chat_id = ?"
-    order = "id" if chat_id is not None else "chat_id, id"
-    sql = (
+    rows = conn.execute(
         f"SELECT * FROM messages WHERE media_state = {MEDIA_PENDING} "
-        f"AND media_kind IS NOT NULL{scope} ORDER BY {order} LIMIT ?"
+        "AND media_kind IS NOT NULL AND chat_id = ? ORDER BY id LIMIT ?",
+        (chat_id, limit),
     )
-    params = [limit] if chat_id is None else [chat_id, limit]
-    return [_message_row(row) for row in conn.execute(sql, params)]
+    return [_message_row(row) for row in rows]
 
 
 def chats_with_pending_media(conn: sqlite3.Connection) -> list[int]:

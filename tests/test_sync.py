@@ -812,6 +812,25 @@ def _swept(client: FakeClient) -> list[int]:
     return list(dict.fromkeys(int(chat_id) for chat_id in asked))
 
 
+async def test_the_sweeps_flood_sleep_threshold_shrinks_with_the_time_left(
+    conn: sqlite3.Connection, paths: Paths
+) -> None:
+    """A bounded sweep never lets Telethon sleep through a wait longer than the run has.
+
+    Same rule as the sync and the extraction pass: the sweep is a whole-index pass of one request
+    per hundred stored messages, so it is the most likely of the three to meet a flood wait.
+    """
+    client = _client(messages={ARG_ID: _talk(101, 102)})
+    cfg = _cfg(ARG_SOURCE)
+    await _run(client, conn, paths, cfg)
+    client.flood_sleep_threshold = 120
+    await _prune(client, conn, paths, cfg, SyncBudget(5.0))
+    assert client.flood_sleep_threshold == 5
+    client.flood_sleep_threshold = 120
+    await _prune(client, conn, paths, cfg)
+    assert client.flood_sleep_threshold == 120, "an unlimited run leaves the configured threshold"
+
+
 async def test_the_sweep_drops_exactly_the_ids_telegram_answers_nothing_for(
     conn: sqlite3.Connection, paths: Paths
 ) -> None:
@@ -2145,6 +2164,41 @@ async def test_threads_that_grew_are_re_read_on_later_runs(
         9,
         11,
     }
+
+
+async def test_a_re_read_thread_refreshes_the_discussion_groups_reaction_totals(
+    conn: sqlite3.Connection, paths: Paths
+) -> None:
+    """A group known only through a channel's link is never a source chat, so nothing else runs
+    ``refresh_unit_reactions`` over it — and a closed window is never re-cut, so its stored total
+    would keep whatever the comments were first fetched with for good.
+    """
+    client = _news_client(
+        messages={NEWS_ID: [tl.channel_post(NEWS_ID, 1, "post 1", replies=2)]},
+        comments={
+            (NEWS_ID, 1): [
+                tl.message(DISC_ID, 1, "comment one", sender=1),
+                tl.message(DISC_ID, 2, "reply", sender=2),
+            ]
+        },
+    )
+    cfg = _cfg(NEWS_SOURCE, edit_refetch=10)
+    await _run(client, conn, paths, cfg)
+    windows = {tuple(u.msg_ids): u for u in db.get_units(conn, DISC_ID) if u.kind == "window"}
+    assert windows[(1, 2)].reactions == 0
+
+    # the thread grows far enough later to open a new window, so (1, 2) is closed for good
+    client.messages[NEWS_ID][0] = tl.channel_post(NEWS_ID, 1, "post 1", replies=3)
+    client.comments[(NEWS_ID, 1)] = [
+        tl.message(DISC_ID, 1, "comment one", sender=1, reactions=tl.reactions({"👍": 5})),
+        tl.message(DISC_ID, 2, "reply", sender=2),
+        tl.message(DISC_ID, 3, "much later", sender=1, date=tl.at(600)),
+    ]
+    await _run(client, conn, paths, cfg)
+
+    after = {tuple(u.msg_ids): u for u in db.get_units(conn, DISC_ID) if u.kind == "window"}
+    assert after[(1, 2)].id == windows[(1, 2)].id, "the closed window was refreshed, not re-cut"
+    assert after[(1, 2)].reactions == 5
 
 
 async def test_only_posts_with_replies_cost_a_getreplies_request(

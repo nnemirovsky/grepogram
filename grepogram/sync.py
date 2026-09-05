@@ -931,14 +931,17 @@ async def _refresh_comments(
     ]
     db.mark_unindexed(run.conn, [row_id for p in grown if (row_id := stored[p].id) is not None])
     touched: list[int] = []
+    reread: list[int] = []
     for post_id in grown:
         if run.budget.expired or run.discussion is None:
             break
         ids = await _fetch_comments(run, post_id)
         _track(run.comment_ids, ids)
+        reread += ids
         row_id = stored[post_id].id
         if ids and row_id is not None:
             touched.append(row_id)
+    _refresh_comment_reactions(run, reread)
     if grown:
         log.debug(
             "channel %s: %d of %d re-fetched posts had new comments; %d threads re-read",
@@ -948,6 +951,24 @@ async def _refresh_comments(
             len(touched),
         )
     return touched
+
+
+def _refresh_comment_reactions(run: _Run, row_ids: Sequence[int]) -> None:
+    """Recompute the discussion group's unit reaction totals over the comments just re-read.
+
+    A closed window is never re-cut and reactions are not part of ``units._content_key``, so
+    ``refresh_unit_reactions`` is the only thing that moves a stored total
+    (:func:`_refetch_edits` runs it for the source chat). A discussion group known only through
+    a channel's link is never a source chat, so nothing else would ever run it there — the
+    comment rows would keep the totals they were first fetched with for good.
+
+    Telegram message ids, never the rowids ``_fetch_comments`` returns: ``units.msg_ids`` is the
+    other id space, and the two coincide only in a chat whose history starts at 1.
+    """
+    if run.discussion is None or not row_ids:
+        return
+    rows = db.get_messages_by_ids(run.conn, row_ids)
+    db.refresh_unit_reactions(run.conn, run.discussion.id, [row.msg_id for row in rows])
 
 
 async def _check_migration(client: Any, conn: sqlite3.Connection, chat: ChatRow) -> ChatRow | None:
