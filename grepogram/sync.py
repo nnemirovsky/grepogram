@@ -74,7 +74,13 @@ from grepogram.models import (
     UserRow,
 )
 from grepogram.paths import FileLock, Paths
-from grepogram.sources import IMPORT_PREFIX, discussion_source_id, parse_since, resolve_sources
+from grepogram.sources import (
+    IMPORT_PREFIX,
+    discussion_source_id,
+    imported_tag,
+    parse_since,
+    resolve_sources,
+)
 from grepogram.units import UNKNOWN_SENDER
 
 log = logging.getLogger(__name__)
@@ -379,6 +385,16 @@ class SyncBudget:
         next boundary instead of waiting the whole of it out (:func:`_joined_to_thread`).
         """
         self._cancelled = True
+
+    @property
+    def cancelled(self) -> bool:
+        """Whether the run was cancelled, as opposed to having spent its allowance.
+
+        Both read as ``expired``, and a pass that keeps a slice of work for itself when the
+        clock runs out (:func:`recut_pending_chats`) must not keep one when the caller is being
+        torn down: there is nothing left to hold the :class:`SyncLock` open for.
+        """
+        return self._cancelled
 
     @property
     def remaining(self) -> float | None:
@@ -1021,6 +1037,19 @@ async def link_discussion_chat(
     still clears a link that points at a *different* group — that one is demonstrably not the
     channel's any more — while a link to the very group that failed to resolve is left untouched
     and retried next run.
+
+    **A group this index holds as a Telegram Desktop import is refused**, the same way and with
+    the same message :func:`~grepogram.sources.resolve_sources` uses
+    (:func:`~grepogram.sources.imported_tag`): this is the third writer of ``chats.source_id``,
+    and :func:`grepogram.db.upsert_chat` overwrites the column, so linking would replace
+    ``import:<slug>`` with the channel's source and hand the imported history to every rule
+    keyed on that prefix — ``sources rm`` of the channel's source would delete it,
+    :func:`~grepogram.sources.prunable` would offer it, and the ``import:`` handle the refusal
+    tells the user to remove would be gone. Refusing the link rather than only keeping the tag
+    is what also keeps live comments out of a chat marked ``unavailable``, whose rows came from
+    an export and which no sweep may re-fetch. It is reachable exactly where the import feature
+    is useful: a group the account was kicked from still comes back inside ``full.chats``, so
+    nothing else here would ever fail on it.
     """
     full = await client(functions.channels.GetFullChannelRequest(channel.id))
     linked = getattr(full.full_chat, "linked_chat_id", None)
@@ -1031,6 +1060,13 @@ async def link_discussion_chat(
         )
         return None
     linked_id = dialogs.peer_id(types.PeerChannel(int(linked)))
+    held = imported_tag(conn, linked_id)
+    if held is not None:
+        _drop_stale_link(conn, channel, linked_id)
+        raise DiscussionUnavailable(
+            f"discussion group {linked_id} is held as {held}, a Telegram Desktop import; "
+            f"run `grepogram sources rm {held}` first to sync that group from Telegram"
+        )
     entity = next((c for c in full.chats if dialogs.peer_id(c) == linked_id), None)
     if entity is None:
         try:
@@ -1285,7 +1321,13 @@ async def recut_pending_chats(
     #. the candidates are **every** chat in the index, not the run's queue: a channel's
        discussion group known only through the link never appears in ``resolve_sources``' output,
        and its windows hold every comment the index has. At most :data:`RECUT_CHATS_PER_RUN` of
-       them move, while the budget lasts;
+       them move, while the budget lasts — but **the first one is taken whether or not the
+       fetch left anything of it**. This runs after :func:`_sync_chats` on the same budget, and
+       on a large index the edit-refetch tail alone can spend all of it with the index otherwise
+       up to date, so without that guarantee the MCP ``sync`` tool at its default budget would
+       re-cut zero chats every time and the pending re-cut would never end. One chat per run
+       still ends it, and the marker makes the next run continue. A budget that was *cancelled*
+       keeps nothing back: the caller is going away and the lock with it;
     #. each chat is one transaction on a worker thread joined even under cancellation
        (:func:`_joined_to_thread`, with :meth:`SyncBudget.cancel` as the abort): re-read the chat
        row and skip it when it is gone, :func:`grepogram.units.recut_chat`, index the delta,
@@ -1304,8 +1346,13 @@ async def recut_pending_chats(
     markers = db.recut_markers(conn)
     pending = [chat for chat in db.list_chats(conn) if markers.get(chat.id) != marker]
     recut = 0
-    for chat in pending[:RECUT_CHATS_PER_RUN]:
-        if budget.expired:
+    for position, chat in enumerate(pending[:RECUT_CHATS_PER_RUN]):
+        if budget.expired and (position or budget.cancelled):
+            log.info(
+                "unit re-cut: %d chats are still cut by an older recipe and this run's budget "
+                "is spent; the next sync carries on from here",
+                len(pending) - position,
+            )
             break
         done = await _joined_to_thread(
             functools.partial(_recut_one, conn, cfg, chat), budget.cancel
@@ -1401,8 +1448,9 @@ async def sync_all(
     ``recut`` says whether this run may start the one-time unit re-cut
     (:func:`recut_pending_chats`). It is a property of the caller, not of the budget: an
     explicit sync — ``grepogram sync``, the MCP ``sync`` tool — is deliberate and makes whatever
-    progress its budget allows, bounded at :data:`RECUT_CHATS_PER_RUN` and resumable through the
-    per-chat markers; the automatic sync inside an MCP ``search`` passes ``False`` so a search
+    progress its budget allows, bounded at :data:`RECUT_CHATS_PER_RUN`, never less than one chat
+    even when the fetch spent the whole budget, and resumable through the per-chat markers; the
+    automatic sync inside an MCP ``search`` passes ``False`` so a search
     never rebuilds units incidentally, however large the user has set
     ``search.auto_sync_budget_s``.
 

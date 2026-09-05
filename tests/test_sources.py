@@ -513,6 +513,16 @@ def test_discussion_source_id_keeps_a_group_its_own_source_covers(spelling: str)
     assert sources.discussion_source_id(group, channel) == f"chat:{spelling}"
 
 
+def test_discussion_source_id_keeps_a_group_held_as_an_import() -> None:
+    """An ``import:`` tag is an ownership claim like a folder's or a ``chat:`` entry's, and the
+    one every writer of ``source_id`` has to honour: the channel's source must never replace it.
+    `sync.link_discussion_chat` refuses such a link outright before this is asked, so this is
+    the rule the refusal rests on rather than the guard itself."""
+    group = _chat(DISC_ID, "import:news-chat", title="News chat", unavailable=True)
+    channel = _chat(NEWS_ID, "folder:News", type="channel", title="News", username="news")
+    assert sources.discussion_source_id(group, channel) == "import:news-chat"
+
+
 @pytest.mark.parametrize("spelling", CHAT_SPELLINGS)
 def test_remove_source_of_a_group_configured_under_any_spelling(
     conn: sqlite3.Connection, spelling: str
@@ -1629,13 +1639,18 @@ async def test_resolve_sources_leaves_an_imported_chat_under_its_import_tag(
     prefix, would then offer the whole imported history for deletion.
     """
     sources.import_chats(conn, _export(_imported(ARG_ID, "Argentina chat"), messages=3))
-    with caplog.at_level(logging.WARNING, logger="grepogram.sources"):
+    with caplog.at_level(logging.INFO, logger="grepogram.sources"):
         rows = await sources.resolve_sources(_cfg(Source(folder="Argentina")), _client(), conn)
     assert ARG_ID not in [row.id for row in rows], "an import is not a chat to sync"
     chat = db.get_chat(conn, ARG_ID)
     assert chat is not None and chat.source_id == "import:argentina-chat"
     assert chat.unavailable and chat.last_msg_id == 0
     assert "import:argentina-chat" in caplog.text and "sources rm" in caplog.text
+    held = [record for record in caplog.records if "import:argentina-chat" in record.getMessage()]
+    assert [record.levelname for record in held] == ["INFO"], (
+        "a standing state of the index, logged once per held chat on every sync — including "
+        "every automatic one inside an MCP search — is not a warning"
+    )
     scan = sources.prunable(
         _cfg(Source(folder="Argentina")), conn, _membership({"folder:Argentina": {NEWS_ID}})
     )

@@ -663,6 +663,10 @@ async def resolve_sources(cfg: Config, client: Any, conn: sqlite3.Connection) ->
     folder stopped listing the chat. :func:`refuse_imported` guards the two commands that *add* a
     source, but nothing guards the folder gaining that chat on Telegram afterwards, and this runs
     on every sync. Taking the chat over is a deliberate act: ``sources rm import:<slug>`` first.
+
+    That last one is logged at INFO rather than WARNING: it is a standing state of the index, not
+    an event, and it would otherwise be printed once per held chat on every sync — including
+    every automatic one inside an MCP ``search``.
     """
     catalog = DialogCatalog(client)
     rows: list[ChatRow] = []
@@ -678,9 +682,9 @@ async def resolve_sources(cfg: Config, client: Any, conn: sqlite3.Connection) ->
                 log.debug("chat %s already covered by another source, keeping the first", info.id)
                 continue
             seen.add(info.id)
-            held = _imported_tag(conn, info.id)
+            held = imported_tag(conn, info.id)
             if held is not None:
-                log.warning(
+                log.info(
                     "chat %s (%s) is held as %s, a Telegram Desktop import; source %s does not "
                     "take it over — run `grepogram sources rm %s` first to sync it from Telegram",
                     info.id,
@@ -707,8 +711,15 @@ async def resolve_sources(cfg: Config, client: Any, conn: sqlite3.Connection) ->
     return rows
 
 
-def _imported_tag(conn: sqlite3.Connection, chat_id: int) -> str | None:
-    """The ``import:<slug>`` this chat is held under, ``None`` when it is not an import."""
+def imported_tag(conn: sqlite3.Connection, chat_id: int) -> str | None:
+    """The ``import:<slug>`` this chat is held under, ``None`` when it is not an import.
+
+    The one question every writer of ``chats.source_id`` has to ask before it writes, because
+    :func:`grepogram.db.upsert_chat` overwrites the column: :func:`resolve_sources` on every
+    sync, :func:`refuse_imported` for the two commands that add a source, and
+    :func:`grepogram.sync.link_discussion_chat` for a channel whose discussion group turns out
+    to be one.
+    """
     stored = db.get_chat(conn, chat_id)
     source_id = "" if stored is None else (stored.source_id or "")
     return source_id if source_id.startswith(IMPORT_PREFIX) else None
@@ -742,7 +753,11 @@ def discussion_source_id(group: ChatRow | None, channel: ChatRow) -> str | None:
       the link — removing X then leaves the group alone and removing Y takes it along, which is
       where its comments came from;
     * a group a channel was unlinked from keeps the source it came in through until that source
-      is removed: the comments stored under it were indexed through that source and go with it.
+      is removed: the comments stored under it were indexed through that source and go with it;
+    * a group held as an ``import:`` keeps that tag, like every other writer of ``source_id``
+      (:func:`imported_tag`). :func:`grepogram.sync.link_discussion_chat` refuses the link
+      before it ever gets here, so this is the invariant rather than the guard — but the rule
+      belongs with the rule it is part of, and a future caller inherits it.
 
     A channel with no source of its own (never resolved, only stored) changes nothing.
     :func:`_refuse_indirect` reads the same rule from the other end — only a group that is its
@@ -752,7 +767,7 @@ def discussion_source_id(group: ChatRow | None, channel: ChatRow) -> str | None:
     """
     if group is None or not group.source_id:
         return channel.source_id
-    if group.source_id.startswith(FOLDER_PREFIX) or _own_source(group):
+    if group.source_id.startswith((FOLDER_PREFIX, IMPORT_PREFIX)) or _own_source(group):
         return group.source_id
     return channel.source_id or group.source_id
 
@@ -919,7 +934,7 @@ def refuse_imported(conn: sqlite3.Connection, covered: Sequence[DialogInfo]) -> 
     on every sync from now on.
     """
     for dialog in covered:
-        source_id = _imported_tag(conn, dialog.id)
+        source_id = imported_tag(conn, dialog.id)
         if source_id is None:
             continue
         raise ImportConflict(

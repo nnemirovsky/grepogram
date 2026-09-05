@@ -1,6 +1,7 @@
 import asyncio
 import dataclasses
 import datetime as dt
+import logging
 import sqlite3
 import stat
 import time
@@ -1775,6 +1776,97 @@ async def test_a_handed_over_group_belongs_to_the_source_that_holds_it_now(
     assert db.get_messages(conn, DISC_ID) == []
 
 
+def _imported_group(conn: sqlite3.Connection) -> ChatRow:
+    """The channel's discussion group as a Telegram Desktop import left it: tagged
+    ``import:<slug>``, ``unavailable``, and holding a row no Telegram id belongs to
+    (:func:`grepogram.sources.import_chats`)."""
+    stored = db.upsert_chat(
+        conn,
+        ChatRow(
+            id=DISC_ID,
+            type="supergroup",
+            title="News chat",
+            source_id="import:news-chat",
+            unavailable=True,
+        ),
+    )
+    db.upsert_messages(
+        conn, [MessageRow(chat_id=DISC_ID, msg_id=1, date=1_700_000_000, text="imported comment")]
+    )
+    return stored
+
+
+async def test_a_discussion_group_held_as_an_import_is_never_linked(
+    conn: sqlite3.Connection,
+) -> None:
+    """The third writer of ``chats.source_id``, and the one nothing guarded: `db.upsert_chat`
+    overwrites the column, so the link would replace ``import:news-chat`` with the channel's
+    source and every rule keyed on that prefix would stop applying. The link is refused rather
+    than only the tag kept — pointing ``discussion_of`` at the group would store live comments
+    into a chat whose rows came out of an export and which no pass may re-fetch.
+
+    A group the account was kicked from still comes back inside ``full.chats``, so nothing else
+    here would ever fail on it: this is the shape the import feature exists for."""
+    client = _news_client()
+    _imported_group(conn)
+    news = db.upsert_chat(
+        conn, ChatRow(id=NEWS_ID, type="channel", title="News", source_id=NEWS_SOURCE.id)
+    )
+    with pytest.raises(sync.DiscussionUnavailable) as excinfo:
+        await sync.link_discussion_chat(client, conn, news)
+    assert "grepogram sources rm import:news-chat" in str(excinfo.value)
+    group = db.get_chat(conn, DISC_ID)
+    assert group is not None and group.source_id == "import:news-chat"
+    assert group.discussion_of is None and group.unavailable
+    assert db.get_discussion_chat(conn, NEWS_ID) is None
+
+
+async def test_a_channel_whose_group_is_an_import_syncs_its_posts_and_keeps_the_import(
+    conn: sqlite3.Connection, paths: Paths
+) -> None:
+    """The consequences of the refusal, end to end: the run reports why the comments are
+    missing and syncs the posts without them, no live comment is stored under the imported
+    chat, `sources rm` of the channel's own source leaves that chat and its history alone, and
+    the ``import:`` handle both refusal messages tell the user to remove still resolves."""
+    client = _news_client()
+    _imported_group(conn)
+    cfg = _cfg(NEWS_SOURCE)
+    report = await _run(client, conn, paths, cfg)
+    assert [w for w in report.warnings if "import:news-chat" in w] == report.warnings
+    assert report.warnings != []
+    assert _texts(conn, NEWS_ID) == {1: "post 1", 2: "post 2", 3: "post 3"}
+    assert _texts(conn, DISC_ID) == {1: "imported comment"}
+    removed = sources.remove_source(cfg, conn, sources.parse_target("@news"))
+    assert removed.chat_ids == [NEWS_ID]
+    group = db.get_chat(conn, DISC_ID)
+    assert group is not None and group.source_id == "import:news-chat"
+    assert _texts(conn, DISC_ID) == {1: "imported comment"}
+    found = sources.find_source(removed.config, conn, sources.parse_target("import:news-chat"))
+    assert found == "import:news-chat"
+
+
+async def test_an_imported_group_a_channel_links_is_never_offered_for_pruning(
+    conn: sqlite3.Connection,
+) -> None:
+    """The other consequence of the retag: a channel that came in through a folder would hand
+    the group ``folder:News``, and `sources.prunable` offers a ``folder:`` chat the folder does
+    not list — which is the whole imported history, for the one reason the tag exists."""
+    client = _news_client()
+    _imported_group(conn)
+    news = db.upsert_chat(
+        conn,
+        ChatRow(id=NEWS_ID, type="channel", title="News", username="news", source_id="folder:News"),
+    )
+    with pytest.raises(sync.DiscussionUnavailable):
+        await sync.link_discussion_chat(client, conn, news)
+    scan = sources.prunable(
+        _cfg(Source(folder="News", comments=True)),
+        conn,
+        sources.FolderMembership(listed={"folder:News": {NEWS_ID}}, failed={}),
+    )
+    assert [candidate.chat.id for candidate in scan.prunable] == []
+
+
 @pytest.mark.parametrize(
     "spelling", [str(DISC_ID), "@news_chat", "https://t.me/news_chat", "t.me/c/201"]
 )
@@ -2004,6 +2096,60 @@ async def test_a_short_explicit_run_still_recuts(
     await _run(client, conn, paths, cfg, cfg.search.auto_sync_budget_s)
     assert not set(before) & {u.id for u in db.get_units(conn, ARG_ID)}
     assert db.unit_recipe(conn) == units.RECIPE_VERSION
+
+
+async def test_a_recut_takes_a_chat_even_when_the_fetch_spent_the_budget(
+    conn: sqlite3.Connection, paths: Paths, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`recut_pending_chats` runs after the chat loop on the same budget, so on a large index
+    the edit-refetch tail alone can leave it nothing — and the MCP ``sync`` tool at its default
+    budget would then never advance a pending re-cut, however often it is called. The first
+    chat is taken whatever the clock says; the marker carries the rest to the next run."""
+    client = _client(messages={ARG_ID: _arg_history()})
+    cfg = _cfg(ARG_SOURCE)
+    await _run(client, conn, paths, cfg)
+    before = [u.id for u in db.get_units(conn, ARG_ID)]
+    conn.execute("DELETE FROM meta WHERE key = ?", (db.META_UNIT_RECIPE,))
+    monkeypatch.setattr(units, "RECIPE_VERSION", units.RECIPE_VERSION + 1)
+    await _run(client, conn, paths, cfg, 30, clock=_clock(0.0, 100.0))
+    assert not set(before) & {u.id for u in db.get_units(conn, ARG_ID)}
+    assert db.unit_recipe(conn) == units.RECIPE_VERSION
+
+
+async def test_a_spent_budget_stops_the_recut_after_one_chat_and_says_so(
+    conn: sqlite3.Connection, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The guarantee is one chat, not the whole run's worth: the rest wait for the next run, and
+    the old budget-floor branch's one virtue — saying why it declined — is kept."""
+    for chat_id in (ARG_ID, GEORGIA_ID, NEWS_ID):
+        db.upsert_chat(conn, ChatRow(id=chat_id, type="supergroup", source_id="chat:x"))
+    conn.execute("DELETE FROM meta WHERE key = ?", (db.META_UNIT_RECIPE,))
+    seen: list[int] = []
+
+    def counted(_conn: sqlite3.Connection, _cfg: Config, chat: ChatRow) -> bool:
+        seen.append(chat.id)
+        return True
+
+    monkeypatch.setattr(sync, "_recut_one", counted)
+    budget = SyncBudget(30, clock=_clock(0.0, 100.0))
+    with caplog.at_level(logging.INFO, logger="grepogram.sync"):
+        assert await sync.recut_pending_chats(conn, _cfg(), budget) == 1
+    assert seen == [NEWS_ID], "id order, and exactly one of the three"
+    assert "2 chats are still cut by an older recipe" in caplog.text
+    assert db.unit_recipe(conn) is None, "the recipe is recorded only once every chat is marked"
+
+
+async def test_a_cancelled_budget_keeps_no_slice_for_the_recut(
+    conn: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A cancellation is the caller going away — an MCP tool call abandoned, a killed run — so
+    there is nothing to hold the sync lock open for, and the marker means nothing is lost."""
+    db.upsert_chat(conn, ChatRow(id=ARG_ID, type="supergroup", source_id="chat:x"))
+    conn.execute("DELETE FROM meta WHERE key = ?", (db.META_UNIT_RECIPE,))
+    monkeypatch.setattr(sync, "_recut_one", lambda *_: pytest.fail("a cancelled run re-cut"))
+    budget = SyncBudget()
+    budget.cancel()
+    assert await sync.recut_pending_chats(conn, _cfg(), budget) == 0
 
 
 def _v011_index() -> sqlite3.Connection:
