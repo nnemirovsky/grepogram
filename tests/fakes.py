@@ -9,6 +9,7 @@ import asyncio
 import datetime as dt
 import inspect
 from collections.abc import AsyncIterator, Iterable, Mapping
+from pathlib import Path
 from typing import Any
 
 from telethon import errors, utils
@@ -188,9 +189,10 @@ class FakeClient:
     peer id — or ``(channel_id, post_id)`` for one comment thread — to an exception
     ``iter_messages`` raises for it, either at once or, as ``(after, exception)``, once ``after``
     messages were yielded; ``entity_errors`` maps a ``get_entity`` key to the exception it
-    raises; ``folders`` registers a ``GetDialogFiltersRequest`` response (the default "All
-    chats" entry first, like Telegram). Every method call is recorded in ``calls`` as
-    ``(name, kwargs)``.
+    raises; ``downloads`` maps ``(chat_id, msg_id)`` to the bytes ``download_media`` writes for
+    that message, or to an exception it raises; ``folders`` registers a
+    ``GetDialogFiltersRequest`` response (the default "All chats" entry first, like Telegram).
+    Every method call is recorded in ``calls`` as ``(name, kwargs)``.
     """
 
     def __init__(
@@ -203,6 +205,7 @@ class FakeClient:
         responses: Mapping[type, Any] | None = None,
         failures: Mapping[Any, Any] | None = None,
         entity_errors: Mapping[Any, BaseException] | None = None,
+        downloads: Mapping[tuple[int, int], bytes | BaseException] | None = None,
         folders: Iterable[Any] | None = None,
         authorized: bool = True,
         me: types.User | None = None,
@@ -224,6 +227,7 @@ class FakeClient:
             )
         self.failures: dict[Any, Any] = dict(failures or {})
         self.entity_errors: dict[Any, BaseException] = dict(entity_errors or {})
+        self.downloads: dict[tuple[int, int], bytes | BaseException] = dict(downloads or {})
         self.authorized = authorized
         self.me = me
         self.two_factor = two_factor
@@ -382,6 +386,50 @@ class FakeClient:
                 raise error
             self._attach_peers(message)
             yield message
+
+    async def get_messages(
+        self,
+        entity: Any,
+        limit: int | None = None,
+        *,
+        ids: int | list[int] | None = None,
+        **kwargs: Any,
+    ) -> Any:
+        """``iter_messages`` collected, with Telethon's return shapes.
+
+        A list of ``ids`` answers a list holding ``None`` where a message is deleted or was
+        never stored — the signal the extraction pass and ``prune-deleted`` read — and a single
+        int ``ids`` answers that one message or ``None``. Without ``ids`` Telethon defaults the
+        limit to one message, and so does this.
+        """
+        self.calls.append(
+            ("get_messages", {"chat_id": self._peer_id(entity), "limit": limit, "ids": ids})
+        )
+        if ids is None and limit is None:
+            limit = 1
+        got = [m async for m in self.iter_messages(entity, limit=limit, ids=ids, **kwargs)]
+        if isinstance(ids, int):
+            return got[0] if got else None
+        return got
+
+    async def download_media(self, message: Any, file: Any = None, **_: Any) -> str | None:
+        """Write the bytes registered for ``message`` to ``file`` and answer the path it took.
+
+        ``file`` is a path, never a directory: the extraction pass names its own temp file after
+        the media so the extractor can dispatch on the extension. A message with nothing
+        registered downloads as ``None``, which is what Telethon answers for media it cannot
+        write out.
+        """
+        key = (int(message.chat_id), int(message.id))
+        self.calls.append(("download_media", {"chat_id": key[0], "msg_id": key[1], "file": file}))
+        payload = self.downloads.get(key)
+        if isinstance(payload, BaseException):
+            raise payload
+        if payload is None:
+            return None
+        path = Path(file)
+        path.write_bytes(payload)
+        return str(path)
 
     def _attach_peers(self, message: types.Message) -> None:
         """Bind the sender and chat entities the way Telethon's ``_finish_init`` does.

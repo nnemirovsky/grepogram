@@ -502,30 +502,30 @@ Task 15's `sources add` guard, or the import protection silently evaporates.
 - Modify: `pyproject.toml`
 - Modify: `tests/fakes.py`
 
-- [ ] add a `media` optional extra (`pypdf`, `python-docx`,
+- [x] add a `media` optional extra (`pypdf`, `python-docx`,
       `pyobjc-framework-Vision; sys_platform == 'darwin'`) **and** add `pypdf` + `python-docx` to
       `[dependency-groups] dev` — CI installs no extras (ci.yml:36,50), so without this the tests
       cannot import them; then `uv lock` and commit the lockfile
-- [ ] add `ignore_missing_imports` overrides for `pypdf`, `docx`, `Vision`, `Quartz`, or strict
+- [x] add `ignore_missing_imports` overrides for `pypdf`, `docx`, `Vision`, `Quartz`, or strict
       mypy fails in both CI jobs
-- [ ] define `Extractor = Callable[[Path], str]` and build the registry through a
+- [x] define `Extractor = Callable[[Path], str]` and build the registry through a
       `_build_registry() -> dict[MediaKind, Extractor]` the tests can re-invoke under `monkeypatch`
       — an import-time constant cannot be re-derived, and Task 6 must prove the registry gains and
       loses `photo` with availability
-- [ ] make the `document` entry a **dispatcher**: `MediaKind` has one `document` member for both
+- [x] make the `document` entry a **dispatcher**: `MediaKind` has one `document` member for both
       formats (models.py:15-28, sync.py:250-275), so choose by `media_filename` extension and
       confirm with magic bytes; an unrecognised document is `ExtractError`
-- [ ] cap extracted text at `EXTRACT_MAX_CHARS = 4000` — after Task 2 an oversized single message
+- [x] cap extracted text at `EXTRACT_MAX_CHARS = 4000` — after Task 2 an oversized single message
       forms a window of its own, so this bounds that window at a few times `window_max_chars`
       (1500) rather than letting a 400-page PDF become one enormous unit
-- [ ] leave `voice` and `video_note` unmapped, with a comment naming v0.3.0
-- [ ] give `FakeClient` `get_messages(chat_id, ids=[...])` and `download_media(...)`, with a
+- [x] leave `voice` and `video_note` unmapped, with a comment naming v0.3.0
+- [x] give `FakeClient` `get_messages(chat_id, ids=[...])` and `download_media(...)`, with a
       deleted id coming back as `None` — Tasks 7 and 13 depend on this. `iter_messages` already
       implements `ids=` this way (tests/fakes.py:352-356), so `get_messages` is a thin wrapper
-- [ ] write tests: the PDF and DOCX fixtures round-trip; extension/magic dispatch picks the right
+- [x] write tests: the PDF and DOCX fixtures round-trip; extension/magic dispatch picks the right
       extractor and rejects a mismatch; a corrupt file raises `ExtractError`; an unmapped kind is
       absent; the length cap truncates; `FakeClient`'s two new methods behave as documented
-- [ ] run tests — must pass before task 6
+- [x] run tests — must pass before task 6
 
 ### Task 6: Add the macOS Vision OCR extractor behind a seam
 
