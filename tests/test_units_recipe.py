@@ -417,33 +417,6 @@ async def test_the_pass_writes_no_message_row(
 # --- when a re-cut is allowed to start -------------------------------------------------------
 
 
-async def test_a_budget_below_the_floor_does_not_start_one(
-    conn: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
-) -> None:
-    chat = _group(conn)
-    before = _unit_ids(conn, chat.id)
-    _bump(monkeypatch, NEXT)
-    with caplog.at_level(logging.INFO, logger="grepogram.sync"):
-        assert await sync.recut_pending_chats(conn, CFG, SyncBudget(1)) == 0
-    assert _unit_ids(conn, chat.id) == before
-    assert db.unit_recipe(conn) != NEXT
-    assert db.recut_markers(conn) == {}
-    assert "re-cut is pending" in caplog.text
-
-
-async def test_the_auto_sync_budget_never_starts_one(
-    conn: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """``search.auto_sync_budget_s`` defaults to 20 s, and a search must not empty an index."""
-    chat = _group(conn)
-    before = _unit_ids(conn, chat.id)
-    _bump(monkeypatch, NEXT)
-    seconds = float(Config().search.auto_sync_budget_s)
-    assert seconds < sync.RECUT_MIN_BUDGET_S
-    assert await sync.recut_pending_chats(conn, CFG, SyncBudget(seconds)) == 0
-    assert _unit_ids(conn, chat.id) == before
-
-
 async def test_an_unlimited_budget_starts_one(
     conn: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -454,12 +427,37 @@ async def test_an_unlimited_budget_starts_one(
     assert not set(before) & set(_unit_ids(conn, chat.id))
 
 
-async def test_a_generous_budget_starts_one(
+async def test_a_short_explicit_budget_still_makes_progress(
     conn: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    _group(conn)
+    """There is no budget floor: an explicit sync re-cuts what it can, however short its window.
+
+    The pass is bounded at ``RECUT_CHATS_PER_RUN`` and resumable through the per-chat markers,
+    so the cost of a short deliberate window is a few chats' work and no more. Who may start one
+    is the caller's ``recut`` flag, not the number of seconds left."""
+    _group(conn, GROUP)
+    _group(conn, GROUP - 1)
     _bump(monkeypatch, NEXT)
-    assert await sync.recut_pending_chats(conn, CFG, SyncBudget(sync.RECUT_MIN_BUDGET_S * 2)) == 1
+    seconds = float(Config().search.auto_sync_budget_s)
+    assert await sync.recut_pending_chats(conn, CFG, SyncBudget(seconds)) == 2
+    assert db.unit_recipe(conn) == NEXT
+
+
+async def test_a_budget_the_fetch_has_spent_recuts_nothing(
+    conn: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``recut_pending_chats`` runs after ``_sync_chats``, so a run whose fetch used the whole
+    budget arrives here expired: it re-cuts no chat, writes no marker and leaves the recipe as
+    it was for the next run to finish."""
+    chat = _group(conn)
+    before = _unit_ids(conn, chat.id)
+    _bump(monkeypatch, NEXT)
+    budget = SyncBudget(60)
+    budget.cancel()
+    assert await sync.recut_pending_chats(conn, CFG, budget) == 0
+    assert _unit_ids(conn, chat.id) == before
+    assert db.unit_recipe(conn) != NEXT
+    assert db.recut_markers(conn) == {}
 
 
 async def test_a_recut_without_an_embedder_warns_that_the_vectors_went(
@@ -492,8 +490,8 @@ async def test_no_such_warning_with_an_embedder(
 def test_search_warns_while_a_recut_is_pending(
     conn: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The short-budget path writes no flag, and an MCP-only user — whose syncs are the
-    20-second ones inside a ``search`` call — is exactly who never sees the log line."""
+    """Nothing flags a pending re-cut, and an MCP-only user — whose syncs are the automatic ones
+    inside a ``search`` call, which never start one — is exactly who never sees the log line."""
     _group(conn)
     _bump(monkeypatch, NEXT)
     result = search.search(conn, CFG, "message")

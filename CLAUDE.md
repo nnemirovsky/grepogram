@@ -128,14 +128,15 @@ never change the git identity.
   `index.index_units`, `repair_unit_index` and its `meta['unit_recut:<chat_id>']` marker are one
   transaction, so no chat is ever left flagged outside the transaction that rebuilds it and no
   later run — least of all a 20-second auto-sync — inherits a whole-index backlog for
-  `_sync_chats`'s unbudgeted deferred `index_pending` loop to drain. **A short-budget run never
-  starts one**: below `RECUT_MIN_BUDGET_S` the pass logs and returns (an unlimited budget,
-  `remaining is None`, always qualifies), writes no flag, and `search` re-derives the condition
-  into `search.RECUT_PENDING` so a user who has only ever searched is told to sync. The floor
-  sits between two numbers in other modules and `tests/test_mcp.py` pins both: below it
-  `search.auto_sync_budget_s = 20`, so no `search` ever starts a re-cut, and above it the MCP
-  `sync` tool's own `budget_s = 120` default, so an explicit `sync()` — as deliberate as
-  `grepogram sync`, and bounded and resumable either way — does. **The re-cut touches no
+  `_sync_chats`'s unbudgeted deferred `index_pending` loop to drain. **Who may start one is the
+  caller, not the budget**: `sync_all` takes `recut: bool = True` and `mcp._auto_sync` — the
+  refresh inside a `search` — is the one caller passing `False`. A budget floor was tried and
+  removed: `search.auto_sync_budget_s` is user-editable, so a floor made a search's own refresh
+  start whole-index re-cutting the moment the number was raised, while an explicit sync whose
+  fetch had eaten the budget never got to start one. An explicit sync makes whatever progress its
+  budget allows, bounded at `RECUT_CHATS_PER_RUN` and resumable through the markers. Nothing
+  flags a pending re-cut, so `search` re-derives the condition into `search.RECUT_PENDING` and a
+  user who has only ever searched is told to sync. **The re-cut touches no
   `messages` row**: unit boundaries change, message text does not, so no `indexed = 0` flagging
   and no `msg_fts` rewrite — flagging inside the transaction recovers nothing and flagging outside
   one is the backlog this design exists to prevent. The marker holds the version a chat was last

@@ -248,9 +248,12 @@ async def _run(
     seconds: float | None = None,
     *,
     clock: Callable[[], float] = time.monotonic,
+    recut: bool = True,
 ) -> SyncReport:
     async with tg.connected(client):
-        return await sync.sync_all(client, conn, cfg, paths, SyncBudget(seconds, clock=clock))
+        return await sync.sync_all(
+            client, conn, cfg, paths, SyncBudget(seconds, clock=clock), recut=recut
+        )
 
 
 # --- budget ----------------------------------------------------------------------------------
@@ -1902,10 +1905,27 @@ async def test_a_full_run_recuts_the_units_of_an_index_an_older_build_cut(
     assert db.chats_with_unindexed(conn) == []
 
 
-async def test_a_run_short_of_the_recut_floor_leaves_the_units_alone(
+async def test_a_run_that_opts_out_leaves_the_units_alone(
     conn: sqlite3.Connection, paths: Paths, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A 20-second auto-sync inside a ``search`` call must never empty a chat's units."""
+    """The auto-sync inside a ``search`` call passes ``recut=False`` and must never empty a
+    chat's units — whatever budget the user has given that refresh."""
+    client = _client(messages={ARG_ID: _arg_history()})
+    cfg = _cfg(ARG_SOURCE)
+    await _run(client, conn, paths, cfg)
+    before = [u.id for u in db.get_units(conn, ARG_ID)]
+    conn.execute("DELETE FROM meta WHERE key = ?", (db.META_UNIT_RECIPE,))
+    monkeypatch.setattr(units, "RECIPE_VERSION", units.RECIPE_VERSION + 1)
+    await _run(client, conn, paths, cfg, recut=False)
+    assert [u.id for u in db.get_units(conn, ARG_ID)] == before
+    assert db.unit_recipe(conn) is None
+
+
+async def test_a_short_explicit_run_still_recuts(
+    conn: sqlite3.Connection, paths: Paths, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The counterpart: an explicit sync makes what progress its budget allows, and a short
+    window is not a reason to leave an upgraded index behind."""
     client = _client(messages={ARG_ID: _arg_history()})
     cfg = _cfg(ARG_SOURCE)
     await _run(client, conn, paths, cfg)
@@ -1913,8 +1933,8 @@ async def test_a_run_short_of_the_recut_floor_leaves_the_units_alone(
     conn.execute("DELETE FROM meta WHERE key = ?", (db.META_UNIT_RECIPE,))
     monkeypatch.setattr(units, "RECIPE_VERSION", units.RECIPE_VERSION + 1)
     await _run(client, conn, paths, cfg, cfg.search.auto_sync_budget_s)
-    assert [u.id for u in db.get_units(conn, ARG_ID)] == before
-    assert db.unit_recipe(conn) is None
+    assert not set(before) & {u.id for u in db.get_units(conn, ARG_ID)}
+    assert db.unit_recipe(conn) == units.RECIPE_VERSION
 
 
 def _v011_index() -> sqlite3.Connection:
@@ -2005,10 +2025,10 @@ async def test_an_installed_v011_index_recuts_once_at_the_shipped_recipe(
     connection.close()
 
 
-async def test_the_auto_sync_budget_never_recuts_an_installed_v011_index(
+async def test_a_run_that_opts_out_never_recuts_an_installed_v011_index(
     paths: Paths, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The same index under the 20-second budget a ``search`` call syncs with: nothing starts."""
+    """The same index under the refresh a ``search`` call runs by itself: nothing starts."""
     connection = _v011_index()
     db.migrate(connection)
     before = [u.id for u in db.get_units(connection, ARG_ID)]
@@ -2021,7 +2041,7 @@ async def test_the_auto_sync_budget_never_recuts_an_installed_v011_index(
     monkeypatch.setattr(sync, "_recut_one", counted)
     cfg = _cfg(ARG_SOURCE)
     client = _client(messages={ARG_ID: _arg_history()})
-    await _run(client, connection, paths, cfg, cfg.search.auto_sync_budget_s)
+    await _run(client, connection, paths, cfg, recut=False)
     assert recut == []
     assert [u.id for u in db.get_units(connection, ARG_ID)] == before
     assert db.unit_recipe(connection) is None

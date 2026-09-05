@@ -90,20 +90,6 @@ A re-cut deletes and re-inserts every unit of a chat and drops their vectors, so
 re-embedded afterwards — the expensive half. Bounding it per run is what keeps a recipe bump
 from turning one sync into a full-index rebuild, and the per-chat markers are what let the next
 run carry on where this one stopped."""
-RECUT_MIN_BUDGET_S = 60.0
-"""Seconds a run must have left before it starts a re-cut at all.
-
-A re-cut is started deliberately, never incidentally. The floor sits above
-``search.auto_sync_budget_s`` (20 s by default) so the auto-sync inside an MCP ``search`` call
-never begins one, and below the MCP ``sync`` tool's own ``budget_s`` default
-(:mod:`grepogram.mcp`, 120 s) so an explicit tool call does — that call is as deliberate as
-``grepogram sync``, and the pass is bounded by :data:`RECUT_CHATS_PER_RUN` and resumable through
-the per-chat markers, so a short deliberate window costs a few chats' work and no more. An
-unlimited budget — ``SyncBudget.remaining is None``, what ``grepogram sync`` without ``--budget``
-gives — always qualifies. A run below the floor logs that a re-cut is pending and writes nothing;
-:func:`grepogram.search.search` re-derives the same condition and warns, which is how a user who
-has only ever searched learns to sync. Move either number and ``tests/test_mcp.py`` fails: the
-two live in different modules and the order between them is the whole contract."""
 SELF_NAME = "me"
 UNKNOWN_FORWARD = "unknown"
 _LOCATION_MEDIA = (types.MessageMediaGeo, types.MessageMediaGeoLive, types.MessageMediaVenue)
@@ -1253,16 +1239,15 @@ async def recut_pending_chats(
     Its own step after :func:`index_stranded`, so that sweep cannot rebuild a chat this pass has
     just finished, and never hooked into :func:`on_chat_synced`: nothing is left flagged outside
     the transaction that rebuilds it, so no later run — least of all a 20-second auto-sync inside
-    a ``search`` — inherits a whole-index backlog to drain.
+    a ``search`` — inherits a whole-index backlog to drain. Who may start one is decided by the
+    caller, not by how many seconds are left: :func:`sync_all` takes ``recut``, and the automatic
+    sync inside an MCP ``search`` is the one caller that passes ``False``.
 
     The procedure, in order:
 
     #. a recorded recipe equal to :data:`~grepogram.units.RECIPE_VERSION` means there is nothing
        to do. ``None`` — a v0.1.1 index — is a mismatch, not a fresh database:
        :func:`grepogram.db.migrate` stamps the ones built from empty;
-    #. a bounded budget below :data:`RECUT_MIN_BUDGET_S` does not start one. It logs that a
-       re-cut is pending and returns; an unlimited budget (``remaining is None``) always
-       qualifies;
     #. the candidates are **every** chat in the index, not the run's queue: a channel's
        discussion group known only through the link never appears in ``resolve_sources``' output,
        and its windows hold every comment the index has. At most :data:`RECUT_CHATS_PER_RUN` of
@@ -1280,16 +1265,6 @@ async def recut_pending_chats(
     """
     target = units.RECIPE_VERSION
     if db.unit_recipe(conn) == target:
-        return 0
-    remaining = budget.remaining
-    if remaining is not None and remaining < RECUT_MIN_BUDGET_S:
-        log.info(
-            "a unit re-cut is pending (recipe v%s) and this run has %.0fs left, below the %.0fs "
-            "it needs; run `grepogram sync` to let it start",
-            target,
-            remaining,
-            RECUT_MIN_BUDGET_S,
-        )
         return 0
     marker = str(target)
     markers = db.recut_markers(conn)
@@ -1367,6 +1342,7 @@ async def sync_all(
     paths: Paths,
     budget: SyncBudget,
     embedder: Embedder | None = None,
+    recut: bool = True,
 ) -> SyncReport:
     """Sync every configured source within ``budget``; the client must be connected.
 
@@ -1388,6 +1364,14 @@ async def sync_all(
     whether or not a chat completed, so a caller deciding whether the index is stale does not
     retry a run that has nothing to finish.
 
+    ``recut`` says whether this run may start the one-time unit re-cut
+    (:func:`recut_pending_chats`). It is a property of the caller, not of the budget: an
+    explicit sync — ``grepogram sync``, the MCP ``sync`` tool — is deliberate and makes whatever
+    progress its budget allows, bounded at :data:`RECUT_CHATS_PER_RUN` and resumable through the
+    per-chat markers; the automatic sync inside an MCP ``search`` passes ``False`` so a search
+    never rebuilds units incidentally, however large the user has set
+    ``search.auto_sync_budget_s``.
+
     With an ``embedder`` the run ends by embedding the dirty units under the same budget and
     lock (:func:`~grepogram.index.embed_dirty_units`); units the budget leaves unembedded and a
     changed embedding model become ``warnings`` — the messages are synced either way.
@@ -1395,7 +1379,8 @@ async def sync_all(
     with SyncLock(paths):
         current = cfg if isinstance(cfg, Config) else cfg()
         report = await _sync_chats(client, conn, current, budget)
-        await recut_pending_chats(conn, current, budget, embedder)
+        if recut:
+            await recut_pending_chats(conn, current, budget, embedder)
         db.set_last_sync_run(conn, int(time.time()))
         if embedder is None:
             return report

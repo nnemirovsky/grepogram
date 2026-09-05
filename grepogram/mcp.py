@@ -514,6 +514,9 @@ async def _auto_sync(state: AppState, cfg: Config) -> tuple[bool, list[str]]:
     ``sync`` is reported as a warning and the search runs on the index as it is. The sources
     are resolved from the config as it is once the sync lock is held (``state.config``), so a
     source removed while this call was loading its model or connecting stays removed.
+
+    This is the one caller that passes ``recut=False``: a search refreshes messages and never
+    starts the one-time unit re-cut, whatever ``search.auto_sync_budget_s`` is set to.
     """
     budget_s = cfg.search.auto_sync_budget_s
     try:
@@ -529,7 +532,13 @@ async def _auto_sync(state: AppState, cfg: Config) -> tuple[bool, list[str]]:
         embedder = await asyncio.to_thread(state.embedder)
         async with state.telegram() as client:
             report = await syncing.sync_all(
-                client, state.conn, state.config, state.paths, SyncBudget(budget_s), embedder
+                client,
+                state.conn,
+                state.config,
+                state.paths,
+                SyncBudget(budget_s),
+                embedder,
+                recut=False,
             )
     except AUTO_SYNC_ERRORS as exc:
         log.warning("auto-sync skipped: %s", exc)
@@ -623,20 +632,17 @@ def _messages_result(chat_id: int, msg_id: int, views: Sequence[MessageView]) ->
 
 
 @guarded_async
-async def sync(budget_s: int = 120) -> ToolResult:
+async def sync(budget_s: int = 45) -> ToolResult:
     """Fetch new messages from every configured source into the index (needs a signed-in
     session). Runs for at most `budget_s` seconds and stops cleanly: `chats_remaining` lists
     what is still behind — call again to continue. Returns `new` (messages stored),
     `chats_done`, `chats_remaining`, `unavailable` (chats Telegram refused), `warnings` and
     `index_age_min`. New units are embedded when the model is available.
 
-    The 120-second default is chosen, not arbitrary: it clears the 60-second floor
-    (`sync.RECUT_MIN_BUDGET_S`) a pending one-time unit re-cut needs before it starts, so calling
-    this tool — a deliberate act, like `grepogram sync` in a terminal — lets that re-cut begin,
-    while the 20-second automatic sync inside `search` stays below the floor and never starts one
-    incidentally. The re-cut is bounded (four chats a run) and resumable, so a short-but-explicit
-    window is safe. Pass a `budget_s` under 60 and this call does a plain fetch, leaving the
-    re-cut — and the warning `search` returns about it — for a later one.
+    This call is also what lets a pending one-time unit re-cut make progress: it is a deliberate
+    act, like `grepogram sync` in a terminal, so it re-cuts a few chats a run (bounded and
+    resumable) while the automatic sync inside `search` never starts one. Call it again until
+    the warning `search` returns about a pending re-cut is gone.
     """
     if budget_s <= 0:
         raise ValueError(f"budget_s must be a positive number of seconds, got {budget_s}")

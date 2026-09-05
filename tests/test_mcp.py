@@ -1,7 +1,6 @@
 import asyncio
 import dataclasses
 import fcntl
-import inspect
 import json
 import logging
 import os
@@ -22,7 +21,7 @@ from telethon import errors
 from telethon.tl import functions, types
 from telethon.tl.types import messages as tl_messages
 
-from grepogram import config, db, embed, filters, index
+from grepogram import config, db, embed, filters, index, units
 from grepogram import mcp as tools
 from grepogram import rerank as reranking
 from grepogram import search as retrieval
@@ -280,7 +279,7 @@ async def test_auto_sync_under_a_held_lock_is_a_warning(
 ) -> None:
     calls: list[tuple[object, ...]] = []
 
-    async def busy(*args: object) -> SyncReport:
+    async def busy(*args: object, **kwargs: object) -> SyncReport:
         calls.append(args)
         raise SyncInProgress("another sync is running (lock held)")
 
@@ -300,7 +299,7 @@ async def test_auto_sync_under_a_held_lock_is_a_warning(
 async def test_auto_sync_flood_wait_is_a_warning(
     stale: tools.AppState, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    async def flooded(*args: object) -> SyncReport:
+    async def flooded(*args: object, **kwargs: object) -> SyncReport:
         raise errors.FloodWaitError(request=None, capture=30)
 
     monkeypatch.setattr(syncing, "sync_all", flooded)
@@ -313,7 +312,7 @@ async def test_auto_sync_flood_wait_is_a_warning(
 async def test_auto_sync_reports_what_a_partial_run_left(
     stale: tools.AppState, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    async def partial(*args: object) -> SyncReport:
+    async def partial(*args: object, **kwargs: object) -> SyncReport:
         return SyncReport(
             new=3, chats_done=[GEO], chats_remaining=[ARG], unavailable=[7], warnings=["slow"]
         )
@@ -512,19 +511,37 @@ async def test_sync_rejects_a_non_positive_budget(state: tools.AppState) -> None
     assert (await tools.sync(budget_s=0))["error"].startswith("budget_s must be")
 
 
-def test_the_sync_tool_default_budget_clears_the_recut_floor() -> None:
-    """A ``sync()`` call with nothing passed must be able to start the one-time unit re-cut.
+async def test_the_auto_sync_inside_a_search_never_starts_a_recut(
+    stale: tools.AppState, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A search refreshes messages; it never rebuilds units.
 
-    The floor (`sync.RECUT_MIN_BUDGET_S`) exists so a re-cut is never started incidentally, and
-    the automatic sync inside ``search`` sits below it for that reason. An explicit tool call is
-    the deliberate act the floor was drawn for — as much as ``grepogram sync`` is — so its default
-    belongs above the floor, or an MCP-only user never opens the door at all. The two numbers live
-    in different modules, and this is the whole of what keeps them in that order: the default is
-    read off the signature so it tracks whatever ``mcp.sync`` declares.
+    Who may start the one-time re-cut is the caller's ``recut`` flag, not the budget: this is the
+    one caller that opts out, so raising ``search.auto_sync_budget_s`` — a user-editable number —
+    still cannot turn a search into a whole-index rebuild.
     """
-    default = inspect.signature(tools.sync).parameters["budget_s"].default
-    assert default >= syncing.RECUT_MIN_BUDGET_S
-    assert Config().search.auto_sync_budget_s < syncing.RECUT_MIN_BUDGET_S
+    conn = stale.conn
+    before = {unit.id for unit in db.get_units(conn, ARG)}
+    monkeypatch.setattr(units, "RECIPE_VERSION", units.RECIPE_VERSION + 1)
+    result = await tools.search("DNI", mode="lexical")
+    assert result["synced"] is True
+    assert {unit.id for unit in db.get_units(conn, ARG)} == before
+    assert db.unit_recipe(conn) != units.RECIPE_VERSION
+    assert db.recut_markers(conn) == {}
+
+
+async def test_an_explicit_sync_makes_recut_progress_on_its_own_budget(
+    state: tools.AppState, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The counterpart: an explicit ``sync()`` is deliberate, so it re-cuts what its budget
+    allows — bounded per run and resumable — however short the window it was given."""
+    conn = state.conn
+    before = {unit.id for unit in db.get_units(conn, ARG)}
+    monkeypatch.setattr(units, "RECIPE_VERSION", units.RECIPE_VERSION + 1)
+    report = await tools.sync(budget_s=5)
+    assert "error" not in report
+    assert {unit.id for unit in db.get_units(conn, ARG)} != before
+    assert db.unit_recipe(conn) == units.RECIPE_VERSION
 
 
 async def test_sync_under_a_held_lock_carries_the_lock_hint(
@@ -1162,7 +1179,7 @@ async def test_server_lists_the_eight_tools_over_a_session(state: tools.AppState
         assert properties["mode"]["enum"] == ["hybrid", "lexical", "dense"]
         assert properties["k"]["default"] == 10 and properties["rerank"]["default"] is True
         assert search_tool.inputSchema["required"] == ["query"]
-        assert by_name["sync"].inputSchema["properties"]["budget_s"]["default"] == 120
+        assert by_name["sync"].inputSchema["properties"]["budget_s"]["default"] == 45
         assert by_name["context"].inputSchema["properties"]["before"]["default"] == 15
         assert by_name["sources"].inputSchema["properties"] == {}
         for tool in listed.tools:
