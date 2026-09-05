@@ -409,6 +409,31 @@ def test_an_integer_unixtime_is_accepted(tmp_path: Path) -> None:
     assert _one(tmp_path, date_unixtime=1700000000).date == 1700000000
 
 
+@pytest.mark.parametrize("stamp", ["99999999999999", "-99999999999999", 253402300800000])
+def test_a_unixtime_no_date_can_hold_is_skipped_like_any_unreadable_field(
+    tmp_path: Path, stamp: str | int
+) -> None:
+    """The range of a plain integer is not the range of a date, and nothing else checks it.
+
+    Stored, such a value reaches ``datetime.fromtimestamp`` in ``units.render_line`` — after the
+    import committed the rows — and every later sync then fails on the chat again through
+    ``index_stranded``, taking the MCP ``sync`` tool and every auto-syncing ``search`` with it.
+    One unreadable field must cost its entry, exactly like a missing id or a malformed date.
+    """
+    path = _write(tmp_path, _account([_chat_entry([_message(date_unixtime=stamp)])]))
+    export = read_export(path)
+    assert export.chats[0].messages == []
+    assert export.skipped == 1
+    assert any("no readable date" in warning for warning in export.warnings)
+
+
+def test_an_unreadable_edit_stamp_costs_the_edit_and_not_the_message(tmp_path: Path) -> None:
+    """``edited_unixtime`` is nullable, so the same check leaves the message with no edit date
+    rather than dropping a message whose own date is perfectly good."""
+    row = _one(tmp_path, edited="2024-03-01T09:00:00", edited_unixtime="99999999999999")
+    assert row.date == 1709283600 and row.edit_date is None
+
+
 def test_a_date_with_no_offset_is_read_as_utc(tmp_path: Path) -> None:
     """An old export carries only ``date``, the exporting machine's local wall clock with no
     offset on it. UTC is the only reading available, and off by the exporter's offset at worst."""

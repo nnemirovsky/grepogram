@@ -548,11 +548,13 @@ def _epoch(unixtime: Any, iso: Any) -> int | None:
     the exporting machine's *local* wall clock with no offset on it, so an old export that
     carries only that is read as UTC — the only reading available, and off by the exporter's
     offset at worst.
+
+    An integer this build cannot turn back into a date is not a date (:func:`_renderable`).
     """
     if isinstance(unixtime, str) and unixtime.lstrip("-").isdigit():
-        return int(unixtime)
+        return _renderable(int(unixtime))
     if _is_int(unixtime):
-        return int(unixtime)
+        return _renderable(int(unixtime))
     if not isinstance(iso, str) or not iso:
         return None
     try:
@@ -561,7 +563,27 @@ def _epoch(unixtime: Any, iso: Any) -> int | None:
         return None
     if when.tzinfo is None:
         when = when.replace(tzinfo=dt.UTC)
-    return int(when.timestamp())
+    return _renderable(int(when.timestamp()))
+
+
+def _renderable(seconds: int) -> int | None:
+    """``seconds`` if a stored row carrying it can be rendered, ``None`` when it cannot.
+
+    ``date_unixtime`` is whatever the file says and this module's contract is that an unreadable
+    field costs the entry, not the import — but the range of a plain integer is not the range of
+    a date, and nothing else here checks it. Stored, such a value reaches
+    ``datetime.fromtimestamp`` in :func:`grepogram.units.render_line`, which raises
+    ``ValueError: year … is out of range`` — after the rows are committed, in the pass that cuts
+    their units. From then on every sync reaches the chat again through
+    :func:`grepogram.sync.index_stranded` and raises the same error, the MCP ``sync`` tool
+    answers ``error``, and a ``search`` old enough to auto-sync answers ``error`` instead of
+    hits: one unreadable field bricking the whole index. So the check is the render itself.
+    """
+    try:
+        dt.datetime.fromtimestamp(seconds, tz=dt.UTC)
+    except (OverflowError, OSError, ValueError):
+        return None
+    return seconds
 
 
 def _is_int(value: Any) -> TypeGuard[int]:
