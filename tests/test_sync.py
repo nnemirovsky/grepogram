@@ -23,6 +23,7 @@ from grepogram.models import (
     Config,
     Filters,
     MessageRow,
+    PruneReport,
     Source,
     SyncCfg,
     SyncReport,
@@ -757,6 +758,289 @@ async def test_a_deleted_comment_is_left_to_the_full_sweep(
     assert "g2" in thread.text
     window = next(u for u in db.get_units(conn, DISC_ID) if 2 in u.msg_ids)
     assert "g2" in window.text and "g5" not in window.text
+
+
+# --- the full sweep --------------------------------------------------------------------------
+
+
+async def _prune(
+    client: FakeClient,
+    conn: sqlite3.Connection,
+    paths: Paths,
+    cfg: Config,
+    budget: SyncBudget | None = None,
+    *,
+    chat_id: int | None = None,
+) -> PruneReport:
+    async with tg.connected(client):
+        return await sync.prune_deleted(
+            client, conn, cfg, paths, budget or SyncBudget(), chat_id=chat_id
+        )
+
+
+def _swept(client: FakeClient) -> list[int]:
+    """The chats the sweep asked Telegram about, first asked first."""
+    asked = [kw["chat_id"] for name, kw in client.calls if name == "get_messages"]
+    return list(dict.fromkeys(int(chat_id) for chat_id in asked))
+
+
+async def test_the_sweep_drops_exactly_the_ids_telegram_answers_nothing_for(
+    conn: sqlite3.Connection, paths: Paths
+) -> None:
+    """``get_messages(ids=[…])`` answers one slot per id and leaves the slot of a deleted message
+    empty, so here — unlike the edit-refetch pass — an empty slot *is* the deletion. The row, its
+    ``msg_fts`` entry and its line in the window all go, and the cursor is cleared once the sweep
+    has reached the end of the chat."""
+    client = _client(messages={ARG_ID: _talk(101, 102, 103)})
+    cfg = _cfg(ARG_SOURCE)
+    await _run(client, conn, paths, cfg)
+    gone = db.get_message(conn, ARG_ID, 102)
+    assert gone is not None and gone.id != gone.msg_id
+
+    client.messages[ARG_ID] = [m for m in client.messages[ARG_ID] if m.id != 102]
+    report = await _prune(client, conn, paths, cfg)
+
+    assert (report.removed, report.checked) == (1, 3)
+    assert report.chats_done == [ARG_ID]
+    assert report.chats_remaining == []
+    assert _texts(conn, ARG_ID) == {101: "m101", 103: "m103"}
+    assert _windows(conn, ARG_ID) == [[101, 103]]
+    assert "m102" not in db.get_units(conn, ARG_ID)[0].text
+    indexed = {int(row["rowid"]) for row in conn.execute("SELECT rowid FROM msg_fts")}
+    assert gone.id not in indexed
+    assert _unit_index(conn, ARG_ID) == {unit.id for unit in db.get_units(conn, ARG_ID)}
+    assert db.prune_cursor(conn, ARG_ID) == 0
+
+
+async def test_a_budget_stops_the_sweep_and_the_next_run_resumes_from_the_cursor(
+    conn: sqlite3.Connection, paths: Paths, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The cursor is a Telegram ``msg_id``: ``messages.id`` is an ``INTEGER PRIMARY KEY`` with no
+    ``AUTOINCREMENT``, so the rowids this very sweep frees are handed to the next insert."""
+    monkeypatch.setattr(sync, "PRUNE_BATCH", 2)
+    client = _client(messages={ARG_ID: _talk(101, 102, 103, 104, 105)})
+    cfg = _cfg(ARG_SOURCE)
+    await _run(client, conn, paths, cfg)
+    client.messages[ARG_ID] = [m for m in client.messages[ARG_ID] if m.id not in (102, 104)]
+    budget = SyncBudget()
+    answer = client.get_messages
+
+    async def stop_after_one_page(*args: Any, **kwargs: Any) -> Any:
+        page = await answer(*args, **kwargs)
+        budget.cancel()
+        return page
+
+    monkeypatch.setattr(client, "get_messages", stop_after_one_page)
+    first = await _prune(client, conn, paths, cfg, budget)
+
+    assert (first.removed, first.checked) == (1, 2)
+    assert first.chats_remaining == [ARG_ID]
+    assert db.prune_cursor(conn, ARG_ID) == 102
+    assert 104 in _texts(conn, ARG_ID)
+
+    monkeypatch.setattr(client, "get_messages", answer)
+    second = await _prune(client, conn, paths, cfg)
+
+    assert (second.removed, second.checked) == (1, 3)
+    assert second.chats_done == [ARG_ID]
+    assert sorted(_texts(conn, ARG_ID)) == [101, 103, 105]
+    assert db.prune_cursor(conn, ARG_ID) == 0
+
+
+async def test_a_flood_wait_keeps_what_the_sweep_earned(
+    conn: sqlite3.Connection, paths: Paths, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A flood wait is about the account, so the run ends — with the page it committed before it
+    and a cursor that starts the next run where this one stopped."""
+    monkeypatch.setattr(sync, "PRUNE_BATCH", 2)
+    client = _client(messages={ARG_ID: _talk(101, 102, 103, 104, 105)})
+    cfg = _cfg(ARG_SOURCE)
+    await _run(client, conn, paths, cfg)
+    client.messages[ARG_ID] = [m for m in client.messages[ARG_ID] if m.id not in (102, 104)]
+    answer = client.get_messages
+    pages = 0
+
+    async def flood_after_one_page(*args: Any, **kwargs: Any) -> Any:
+        nonlocal pages
+        pages += 1
+        if pages > 1:
+            raise errors.FloodWaitError(request=None, capture=30)
+        return await answer(*args, **kwargs)
+
+    monkeypatch.setattr(client, "get_messages", flood_after_one_page)
+    report = await _prune(client, conn, paths, cfg)
+
+    assert report.removed == 1
+    assert report.chats_remaining == [ARG_ID]
+    assert any("flood wait" in warning for warning in report.warnings)
+    assert db.prune_cursor(conn, ARG_ID) == 102
+    assert 102 not in _texts(conn, ARG_ID)
+    assert 104 in _texts(conn, ARG_ID)
+
+
+async def test_an_error_that_is_not_a_deletion_removes_nothing(
+    conn: sqlite3.Connection, paths: Paths
+) -> None:
+    """A chat that went private mid-sweep says nothing about what it holds; the sweep must not
+    read a refusal as a hundred deletions."""
+    client = _client(messages={ARG_ID: _talk(101, 102, 103)})
+    cfg = _cfg(ARG_SOURCE)
+    await _run(client, conn, paths, cfg)
+    before = _texts(conn, ARG_ID)
+
+    client.failures[ARG_ID] = errors.ChannelPrivateError(request=None)
+    report = await _prune(client, conn, paths, cfg)
+
+    assert (report.removed, report.checked) == (0, 0)
+    assert report.chats_remaining == [ARG_ID]
+    assert any(str(ARG_ID) in warning for warning in report.warnings)
+    assert _texts(conn, ARG_ID) == before
+    assert db.prune_cursor(conn, ARG_ID) == 0
+
+
+async def test_an_answer_that_does_not_line_up_with_the_page_removes_nothing(
+    conn: sqlite3.Connection, paths: Paths, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A short answer would make every id it left out look deleted at once, so an answer of
+    another shape than the question is read as no answer at all."""
+    client = _client(messages={ARG_ID: _talk(101, 102, 103)})
+    cfg = _cfg(ARG_SOURCE)
+    await _run(client, conn, paths, cfg)
+    answer = client.get_messages
+
+    async def truncated(*args: Any, **kwargs: Any) -> Any:
+        return (await answer(*args, **kwargs))[:1]
+
+    monkeypatch.setattr(client, "get_messages", truncated)
+    report = await _prune(client, conn, paths, cfg)
+
+    assert (report.removed, report.checked) == (0, 3)
+    assert report.chats_remaining == [ARG_ID]
+    assert any("did not line up" in warning for warning in report.warnings)
+    assert _texts(conn, ARG_ID) == {101: "m101", 102: "m102", 103: "m103"}
+    assert db.prune_cursor(conn, ARG_ID) == 0
+
+
+async def test_a_deleted_comment_invalidates_the_channels_post_thread(
+    conn: sqlite3.Connection, paths: Paths
+) -> None:
+    """The case Task 12 leaves here. A post thread lists the post alone in ``msg_ids``, so no
+    ``json_each`` over ``units.msg_ids`` reaches a comment id — the way from a deleted comment to
+    the thread quoting it is the ``comment_of_*`` pair on the comment's own row."""
+    client = _busy_discussion_client(DISC)
+    cfg = _cfg(Source(folder="News", comments=True))
+    await _run(client, conn, paths, cfg)
+    before = next(u for u in db.get_units(conn, NEWS_ID) if u.kind == "thread" and u.msg_ids == [1])
+    assert "g2" in before.text
+
+    client.messages[DISC_ID] = [m for m in client.messages[DISC_ID] if m.id != 2]
+    report = await _prune(client, conn, paths, cfg)
+
+    assert report.removed == 1
+    assert db.get_message(conn, DISC_ID, 2) is None
+    thread = next(u for u in db.get_units(conn, NEWS_ID) if u.kind == "thread" and u.msg_ids == [1])
+    assert "g1" in thread.text
+    assert "g2" not in thread.text
+    assert [v.text for v in search.thread(conn, NEWS_ID, 1)] == ["post 1", "g1"]
+    window = next(u for u in db.get_units(conn, DISC_ID) if 1 in u.msg_ids)
+    assert 2 not in window.msg_ids
+    assert "g20" in window.text
+    assert _unit_index(conn, NEWS_ID) == {unit.id for unit in db.get_units(conn, NEWS_ID)}
+
+
+async def test_the_sweep_of_one_chat_reaches_the_discussion_group_it_links(
+    conn: sqlite3.Connection, paths: Paths
+) -> None:
+    """``--chat <channel>`` covers the group as well, or the comments of the channel it was
+    pointed at would be the one thing it could not check."""
+    client = _busy_discussion_client(DISC)
+    cfg = _cfg(Source(folder="News", comments=True))
+    await _run(client, conn, paths, cfg)
+    client.calls.clear()
+
+    client.messages[DISC_ID] = [m for m in client.messages[DISC_ID] if m.id != 2]
+    report = await _prune(client, conn, paths, cfg, chat_id=NEWS_ID)
+
+    assert _swept(client) == [DISC_ID, NEWS_ID]
+    assert report.removed == 1
+    assert sorted(report.chats_done) == sorted([DISC_ID, NEWS_ID])
+
+
+async def test_an_imported_or_unavailable_chat_is_never_asked_about(
+    conn: sqlite3.Connection, paths: Paths
+) -> None:
+    """Neither can answer for its own history — an import never came from Telegram at all — and
+    an empty answer for such a chat would drop every message it holds."""
+    client = _client(messages={ARG_ID: _talk(101, 102)})
+    cfg = _cfg(ARG_SOURCE)
+    await _run(client, conn, paths, cfg)
+    db.upsert_chat(conn, ChatRow(id=ALICE_ID, type="user", source_id="import:alice"))
+    db.upsert_messages(conn, [MessageRow(chat_id=ALICE_ID, msg_id=7, date=1)])
+    db.upsert_chat(conn, ChatRow(id=GEORGIA_ID, type="supergroup", unavailable=True))
+    db.upsert_messages(conn, [MessageRow(chat_id=GEORGIA_ID, msg_id=8, date=1)])
+    client.calls.clear()
+
+    report = await _prune(client, conn, paths, cfg)
+
+    assert _swept(client) == [ARG_ID]
+    assert report.chats_done == [ARG_ID]
+    assert db.get_message(conn, ALICE_ID, 7) is not None
+    assert db.get_message(conn, GEORGIA_ID, 8) is not None
+
+
+async def test_a_comment_whose_post_is_gone_is_dropped_without_a_rebuild(
+    conn: sqlite3.Connection, paths: Paths
+) -> None:
+    """The pair names a channel and a post, and this index holds neither for ever: a channel it
+    never stored, or one whose post has gone since. The comment still goes."""
+    client = _client(messages={ARG_ID: _talk(101, 102, 103)})
+    cfg = _cfg(ARG_SOURCE)
+    await _run(client, conn, paths, cfg)
+    db.upsert_chat(conn, ChatRow(id=GEORGIA_ID, type="channel"))
+    with db.transaction(conn):
+        conn.execute(
+            "UPDATE messages SET comment_of_chat_id = ?, comment_of_msg_id = 5 "
+            "WHERE chat_id = ? AND msg_id = 102",
+            (GEORGIA_ID, ARG_ID),
+        )
+        conn.execute(
+            "UPDATE messages SET comment_of_chat_id = ?, comment_of_msg_id = 5 "
+            "WHERE chat_id = ? AND msg_id = 103",
+            (NEWS_ID, ARG_ID),
+        )
+
+    client.messages[ARG_ID] = [m for m in client.messages[ARG_ID] if m.id == 101]
+    report = await _prune(client, conn, paths, cfg)
+
+    assert report.removed == 2
+    assert _texts(conn, ARG_ID) == {101: "m101"}
+
+
+async def test_a_held_sync_lock_stops_the_sweep(conn: sqlite3.Connection, paths: Paths) -> None:
+    """The sweep deletes messages and writes index rows, so it holds the lock a sync holds —
+    ``db.Connection``'s own lock only serialises threads within one process."""
+    client = _client(messages={ARG_ID: _talk(101)})
+    cfg = _cfg(ARG_SOURCE)
+    await _run(client, conn, paths, cfg)
+    with SyncLock(paths), pytest.raises(SyncInProgress):
+        await _prune(client, conn, paths, cfg)
+
+
+async def test_a_sweep_with_no_budget_left_asks_about_nothing(
+    conn: sqlite3.Connection, paths: Paths
+) -> None:
+    client = _client(messages={ARG_ID: _talk(101, 102)})
+    cfg = _cfg(ARG_SOURCE)
+    await _run(client, conn, paths, cfg)
+    client.calls.clear()
+    budget = SyncBudget()
+    budget.cancel()
+
+    report = await _prune(client, conn, paths, cfg, budget)
+
+    assert _swept(client) == []
+    assert (report.removed, report.checked) == (0, 0)
+    assert report.chats_remaining == [ARG_ID]
 
 
 async def test_since_skips_older_history_on_the_first_run_only(conn: sqlite3.Connection) -> None:

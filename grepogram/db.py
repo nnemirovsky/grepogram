@@ -52,6 +52,8 @@ META_UNIT_RECIPE = "unit_recipe"
 """Recipe version the stored units were cut with (:data:`grepogram.units.RECIPE_VERSION`)."""
 META_RECUT_PREFIX = "unit_recut:"
 """Prefix of the per-chat marker a re-cut writes, ``unit_recut:<chat_id>``."""
+META_PRUNE_PREFIX = "prune_sweep:"
+"""Prefix of the deletion sweep's cursor, ``prune_sweep:<chat_id>`` (:func:`prune_cursor`)."""
 
 _V5: tuple[str, ...] = (
     "CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT)",
@@ -658,6 +660,38 @@ def set_recut_marker(conn: sqlite3.Connection, chat_id: int, version: int) -> No
     set_meta(conn, f"{META_RECUT_PREFIX}{chat_id}", str(version))
 
 
+def prune_cursor(conn: sqlite3.Connection, chat_id: int) -> int:
+    """How far the deletion sweep got in ``chat_id``; ``0`` before it has ever run there.
+
+    The value is a **Telegram** ``msg_id``, never a ``messages.id``. ``messages.id`` is an
+    ``INTEGER PRIMARY KEY`` without ``AUTOINCREMENT``, so SQLite hands the rowids a sweep frees
+    straight to the next insert: a rowid cursor would be unstable across exactly the operation
+    that writes it. (``units.id`` *is* ``AUTOINCREMENT``, which is why unit ids are safe; nothing
+    generalises from that.) A marker this build cannot read starts the chat again rather than
+    raising.
+    """
+    value = get_meta(conn, f"{META_PRUNE_PREFIX}{chat_id}")
+    if value is None:
+        return 0
+    try:
+        return int(value)
+    except ValueError:
+        return 0
+
+
+def set_prune_cursor(conn: sqlite3.Connection, chat_id: int, msg_id: int) -> None:
+    """Record that the sweep of ``chat_id`` has asked Telegram about every stored id up to
+    ``msg_id`` — written in the same transaction as the removals that id range earned."""
+    set_meta(conn, f"{META_PRUNE_PREFIX}{chat_id}", str(msg_id))
+
+
+def clear_prune_cursor(conn: sqlite3.Connection, chat_id: int) -> None:
+    """Forget where the sweep of ``chat_id`` got to, so the next one starts at its oldest
+    message; what a sweep that reached the end of a chat leaves behind."""
+    with transaction(conn):
+        conn.execute("DELETE FROM meta WHERE key = ?", (f"{META_PRUNE_PREFIX}{chat_id}",))
+
+
 def clear_recut_markers(conn: sqlite3.Connection) -> None:
     """Drop every per-chat re-cut marker; the tidy-up once the recipe itself is recorded."""
     with transaction(conn):
@@ -1045,6 +1079,23 @@ def delete_messages(conn: sqlite3.Connection, chat_id: int, msg_ids: Iterable[in
             )
             removed += max(cursor.rowcount, 0)
     return removed
+
+
+def message_ids_after(
+    conn: sqlite3.Connection, chat_id: int, after_msg_id: int, limit: int
+) -> list[int]:
+    """The next ``limit`` stored ``msg_id``s of ``chat_id`` above ``after_msg_id``, ascending.
+
+    One page of the deletion sweep, which walks a chat oldest first and asks Telegram about the
+    ids it reads here (:func:`grepogram.sync.prune_deleted`). The ``(chat_id, msg_id)`` unique
+    index answers it, so a page costs the same on a chat of ten messages and one of a hundred
+    thousand.
+    """
+    rows = conn.execute(
+        "SELECT msg_id FROM messages WHERE chat_id = ? AND msg_id > ? ORDER BY msg_id LIMIT ?",
+        (chat_id, after_msg_id, limit),
+    ).fetchall()
+    return [int(row["msg_id"]) for row in rows]
 
 
 # --- media extraction ------------------------------------------------------------------------

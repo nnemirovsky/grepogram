@@ -804,29 +804,33 @@ Task 15's `sources add` guard, or the import protection silently evaporates.
 - Modify: `grepogram/sync.py`
 - Modify: `grepogram/db.py`
 - Modify: `grepogram/cli.py`
+- Modify: `grepogram/models.py` (➕ `PruneReport` joins `SyncReport` and `MediaReport`, where every
+  report shape lives)
 - Modify: `tests/test_sync.py`
 - Modify: `tests/test_cli.py`
+- Modify: `tests/test_db.py` (➕ the cursor helpers and `message_ids_after` are `db.py` functions;
+  the "a Telegram id, not a rowid" guard is pinned where the other meta helpers are)
 
-- [ ] implement a resumable sweep: stored ids in batches of 100 through
+- [x] implement a resumable sweep: stored ids in batches of 100 through
       `client.get_messages(chat_id, ids=[...])`, oldest first
-- [ ] here an id that comes back `None` / `MessageEmpty` **is** the deletion signal — this is the
+- [x] here an id that comes back `None` / `MessageEmpty` **is** the deletion signal — this is the
       pass the empty-slot check belongs to, unlike Task 12
-- [ ] guard the false positive: anything Telegram declines for another reason must not be removed
-- [ ] store the cursor as a `meta` key `prune_sweep:<chat_id>` holding a **Telegram `msg_id`**, not
+- [x] guard the false positive: anything Telegram declines for another reason must not be removed
+- [x] store the cursor as a `meta` key `prune_sweep:<chat_id>` holding a **Telegram `msg_id`**, not
       a `messages.id`: `messages.id` is `INTEGER PRIMARY KEY` without `AUTOINCREMENT` (db.py:81), so
       rowids freed by a sweep are reused by the next insert and a rowid cursor is unstable across
       exactly the operation that writes it. No new schema — a v7 migration here was never planned
-- [ ] respect `--budget` (seconds) and the flood-wait threshold exactly as `sync` does
-- [ ] take the `SyncLock` for the whole sweep; `SyncInProgress` is a clean error
-- [ ] reach a channel's discussion group too, so a deleted **comment** is caught here — post threads
+- [x] respect `--budget` (seconds) and the flood-wait threshold exactly as `sync` does
+- [x] take the `SyncLock` for the whole sweep; `SyncInProgress` is a clean error
+- [x] reach a channel's discussion group too, so a deleted **comment** is caught here — post threads
       carry no comment ids in `msg_ids`, so invalidate the post thread through
       `comment_of_chat_id` / `comment_of_msg_id` (CLAUDE.md is explicit that nothing else finds it)
-- [ ] add `grepogram prune-deleted [--chat X] [--budget N]`, reporting removals and how far it got.
+- [x] add `grepogram prune-deleted [--chat X] [--budget N]`, reporting removals and how far it got.
       **No MCP tool** — like `sources prune`, deleting indexed history stays a deliberate CLI action
-- [ ] write tests: a sweep removes exactly the deleted ids; a budget stops it and the next run
+- [x] write tests: a sweep removes exactly the deleted ids; a budget stops it and the next run
       resumes from the cursor; a flood wait keeps what the run earned; a non-deletion error removes
       nothing; a deleted comment invalidates the channel's post thread; a held lock is a clean error
-- [ ] run tests — must pass before task 14
+- [x] run tests — must pass before task 14
 
 ### Task 14: Parse a Telegram Desktop export
 

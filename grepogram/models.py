@@ -308,6 +308,23 @@ class MediaReport:
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
+class PruneReport:
+    """What one deletion sweep did — :func:`grepogram.sync.prune_deleted`'s answer.
+
+    ``checked`` counts the stored ids the sweep asked Telegram about, ``removed`` the messages
+    that came back empty and were dropped. A chat is in ``chats_done`` once the sweep reached the
+    end of its history and in ``chats_remaining`` when a budget, a flood wait or an error stopped
+    it partway — its cursor stays where it got to, so the next run carries on from there.
+    """
+
+    removed: int = 0
+    checked: int = 0
+    chats_done: list[int] = field(default_factory=list)
+    chats_remaining: list[int] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
 class ChatStatus:
     id: int
     title: str | None

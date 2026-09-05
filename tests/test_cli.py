@@ -12,7 +12,7 @@ from typer.testing import CliRunner
 
 from grepogram import __version__, cli, config, db, index, media, search, sync, tg, units
 from grepogram.config import TEMPLATE
-from grepogram.models import ChatRow, Config, MediaReport, MessageRow, SearchMode
+from grepogram.models import ChatRow, Config, MediaReport, MessageRow, PruneReport, SearchMode
 from grepogram.paths import Paths
 from tests.conftest import file_mode
 from tests.fakes import FakeClient
@@ -609,6 +609,117 @@ def test_extract_reports_a_telegram_error_as_a_clean_error(
 
     monkeypatch.setattr(tg, "make_client", broken)
     result = runner.invoke(cli.app, ["extract"])
+    assert result.exit_code == 1
+    assert result.stdout == ""
+    assert "telegram error:" in result.stderr
+
+
+# --- prune-deleted ---------------------------------------------------------------------------
+
+
+PRUNE_ID = -1000000000901
+
+
+def _prune_chat(paths: Paths) -> FakeClient:
+    """One indexed chat of two messages, and a client that has lost the second of them."""
+    conn = db.connect(paths)
+    db.migrate(conn)
+    db.upsert_chat(conn, ChatRow(id=PRUNE_ID, type="supergroup", title="Chat", source_id="x"))
+    db.upsert_messages(
+        conn,
+        [
+            MessageRow(chat_id=PRUNE_ID, msg_id=101, date=1_700_000_000, text="kept"),
+            MessageRow(chat_id=PRUNE_ID, msg_id=102, date=1_700_000_060, text="deleted"),
+        ],
+    )
+    conn.close()
+    return FakeClient(messages={PRUNE_ID: [tl.message(PRUNE_ID, 101, "kept", sender=1)]})
+
+
+def test_prune_deleted_removes_what_telegram_no_longer_has(
+    tmp_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    paths = _signed_in(tmp_home)
+    client = _prune_chat(paths)
+    monkeypatch.setattr(tg, "make_client", lambda cfg, paths: client)
+    result = runner.invoke(cli.app, ["prune-deleted", "--budget", "30"])
+    assert result.exit_code == 0, result.output
+    lines = result.stdout.splitlines()
+    assert lines[0] == "messages removed: 1"
+    assert lines[1] == "messages checked: 2"
+    assert lines[2] == "chats swept: 1"
+    assert client.calls[-1] == ("disconnect", {})
+    conn = db.connect(paths)
+    stored = [row["msg_id"] for row in conn.execute("SELECT msg_id FROM messages")]
+    conn.close()
+    assert stored == [101]
+
+
+def test_prune_deleted_passes_the_chat_and_the_budget_through(
+    tmp_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    paths = _signed_in(tmp_home)
+    _prune_chat(paths)
+    seen: dict[str, object] = {}
+
+    async def record(
+        client: object, conn: object, cfg: object, paths: object, budget: Any, **kw: Any
+    ) -> PruneReport:
+        seen.update(kw)
+        seen["seconds"] = budget.seconds
+        return PruneReport(removed=0, checked=4, chats_remaining=[PRUNE_ID], warnings=["careful"])
+
+    monkeypatch.setattr(tg, "make_client", lambda cfg, paths: FakeClient())
+    monkeypatch.setattr(sync, "prune_deleted", record)
+    result = runner.invoke(cli.app, ["prune-deleted", "--chat", str(PRUNE_ID), "--budget", "7"])
+    assert result.exit_code == 0, result.output
+    assert seen == {"chat_id": PRUNE_ID, "seconds": 7}
+    assert f"chats not finished: 1 ({PRUNE_ID})" in result.stdout
+    assert "warning: careful" in result.stderr
+
+
+def test_prune_deleted_with_an_unknown_chat_is_a_clean_error(
+    tmp_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    paths = _signed_in(tmp_home)
+    _prune_chat(paths)
+    monkeypatch.setattr(tg, "make_client", lambda cfg, paths: FakeClient())
+    result = runner.invoke(cli.app, ["prune-deleted", "--chat", "@nowhere"])
+    assert result.exit_code == 1
+    assert result.stdout == ""
+    assert "@nowhere" in result.stderr
+
+
+def test_prune_deleted_without_api_keys_is_a_clean_error(tmp_home: Path) -> None:
+    result = runner.invoke(cli.app, ["prune-deleted"])
+    assert result.exit_code == 1
+    assert result.stdout == ""
+    assert "api_id and api_hash are not set" in result.stderr
+
+
+def test_prune_deleted_reports_a_held_sync_lock_as_a_clean_error(
+    tmp_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    paths = _signed_in(tmp_home)
+    _prune_chat(paths)
+    monkeypatch.setattr(tg, "make_client", lambda cfg, paths: FakeClient())
+    with sync.SyncLock(paths):
+        result = runner.invoke(cli.app, ["prune-deleted"])
+    assert result.exit_code == 1
+    assert result.stdout == ""
+    assert "another sync is running" in result.stderr
+
+
+def test_prune_deleted_reports_a_telegram_error_as_a_clean_error(
+    tmp_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _signed_in(tmp_home)
+
+    def broken(cfg: object, paths: object) -> FakeClient:
+        raise tg_errors.RPCError(request=None, message="nope")
+
+    monkeypatch.setattr(tg, "make_client", broken)
+    result = runner.invoke(cli.app, ["prune-deleted"])
     assert result.exit_code == 1
     assert result.stdout == ""
     assert "telegram error:" in result.stderr

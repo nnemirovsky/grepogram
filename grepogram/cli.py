@@ -53,6 +53,7 @@ from grepogram.models import (
     Config,
     MediaReport,
     MessageView,
+    PruneReport,
     SearchResult,
     SyncReport,
 )
@@ -334,6 +335,80 @@ def _print_media_report(report: MediaReport) -> None:
         typer.echo(f"media pending: {report.remaining}; run extract again")
     if report.extracted:
         typer.echo("next: grepogram sync (to re-cut and embed the units that changed)")
+    for warning in report.warnings:
+        typer.echo(f"warning: {warning}", err=True)
+
+
+@app.command("prune-deleted")
+def prune_deleted_cmd(
+    chat: Annotated[
+        str | None,
+        typer.Option(
+            "--chat",
+            help="Sweep only this chat and the discussion group it links; "
+            + _CHAT_HELP.removeprefix("The chat the message is in, "),
+        ),
+    ] = None,
+    budget: Annotated[
+        int | None,
+        typer.Option(
+            "--budget",
+            min=1,
+            help="Stop after this many seconds; the sweep resumes where it stopped.",
+        ),
+    ] = None,
+) -> None:
+    """Ask Telegram about every indexed message and drop the ones it no longer has; needs a
+    session.
+
+    The full sweep, about one request per hundred stored messages, so it is run by hand and never
+    by a sync — `sync` notices only the deletions among the newest messages of a chat. It is
+    resumable: a run stopped by `--budget` or by a flood wait keeps every batch it finished and
+    the next one carries on from there.
+    """
+    paths, cfg, conn = _load()
+    _require_api_keys(cfg, paths)
+    try:
+        chat_id = None if chat is None else filters.resolve_chat(conn, cfg, chat)
+        tg.ensure_session_mode(paths)
+        client = tg.make_client(cfg, paths)
+        report = asyncio.run(_run_prune(client, conn, cfg, paths, budget, chat_id))
+    except FilterError as exc:
+        fail(str(exc))
+    except (tg.AuthRequired, tg.SessionError, sync.SyncInProgress, ConfigError) as exc:
+        fail(str(exc), hint=getattr(exc, "hint", None))
+    except (tg_errors.RPCError, ConnectionError) as exc:
+        fail(f"telegram error: {exc}")
+    finally:
+        conn.close()
+    _print_prune_report(report)
+
+
+async def _run_prune(
+    client: TelegramClient,
+    conn: sqlite3.Connection,
+    cfg: Config,
+    paths: Paths,
+    budget: int | None,
+    chat_id: int | None,
+) -> PruneReport:
+    """Connect and run :func:`grepogram.sync.prune_deleted`, which takes the sync lock itself."""
+    async with tg.connected(client):
+        return await sync.prune_deleted(
+            client, conn, cfg, paths, sync.SyncBudget(budget), chat_id=chat_id
+        )
+
+
+def _print_prune_report(report: PruneReport) -> None:
+    typer.echo(f"messages removed: {report.removed}")
+    typer.echo(f"messages checked: {report.checked}")
+    typer.echo(f"chats swept: {len(report.chats_done)}")
+    if report.chats_remaining:
+        ids = ", ".join(str(chat_id) for chat_id in report.chats_remaining)
+        typer.echo(
+            f"chats not finished: {len(report.chats_remaining)} ({ids}); "
+            "run prune-deleted again to carry on"
+        )
     for warning in report.warnings:
         typer.echo(f"warning: {warning}", err=True)
 

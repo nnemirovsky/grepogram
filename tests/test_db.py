@@ -529,6 +529,34 @@ def test_meta_roundtrip(conn: sqlite3.Connection) -> None:
     assert not conn.in_transaction
 
 
+def test_the_prune_cursor_holds_a_telegram_id_and_starts_over_when_unreadable(
+    conn: sqlite3.Connection,
+) -> None:
+    """The sweep's memory: a Telegram ``msg_id``, never a ``messages.id`` — the rowids a sweep
+    frees are reused by the next insert. A hand-edited marker costs one sweep, not a traceback."""
+    assert db.prune_cursor(conn, 42) == 0
+    db.set_prune_cursor(conn, 42, 1234)
+    assert db.get_meta(conn, "prune_sweep:42") == "1234"
+    assert db.prune_cursor(conn, 42) == 1234
+    db.set_meta(conn, "prune_sweep:42", "halfway")
+    assert db.prune_cursor(conn, 42) == 0
+    db.set_prune_cursor(conn, 42, 1234)
+    db.clear_prune_cursor(conn, 42)
+    assert db.get_meta(conn, "prune_sweep:42") is None
+    assert not conn.in_transaction
+
+
+def test_message_ids_after_pages_one_chat_oldest_first(conn: sqlite3.Connection) -> None:
+    db.upsert_chat(conn, _chat(1))
+    db.upsert_chat(conn, _chat(2))
+    db.upsert_messages(conn, [_message(1, 101), _message(1, 102), _message(1, 103)])
+    db.upsert_messages(conn, [_message(2, 101)])
+    assert db.message_ids_after(conn, 1, 0, 2) == [101, 102]
+    assert db.message_ids_after(conn, 1, 102, 100) == [103]
+    assert db.message_ids_after(conn, 1, 103, 100) == []
+    assert db.message_ids_after(conn, 3, 0, 100) == []
+
+
 # --- transaction -----------------------------------------------------------------------------
 
 

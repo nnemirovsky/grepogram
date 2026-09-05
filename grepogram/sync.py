@@ -21,6 +21,11 @@ never reached and of a bounded number of chats nothing leads to any more (:func:
 The run then re-cuts a bounded number of chats whose units predate this build's unit recipe
 (:func:`recut_pending_chats`), which is how a change to what a unit *is* reaches history no
 incremental rebuild can touch.
+:func:`prune_deleted` is the pass beside all this: the full sweep that asks Telegram about every
+stored id and drops the messages it no longer has, driven by ``grepogram prune-deleted`` and never
+by a sync — it costs about one request per hundred stored messages, so it is resumable through a
+``meta`` cursor per chat and always deliberate.
+
 A run that dies between a commit and the rebuild therefore leaves nothing behind that the next run
 does not pick up (:func:`grepogram.db.unindexed_message_ids`). The rebuild, the
 indexing and the flag are one transaction, so the flag never clears over derived data that is not
@@ -46,7 +51,7 @@ import sqlite3
 import threading
 import time
 from collections import deque
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -62,13 +67,14 @@ from grepogram.models import (
     Config,
     MediaKind,
     MessageRow,
+    PruneReport,
     Source,
     SyncCfg,
     SyncReport,
     UserRow,
 )
 from grepogram.paths import FileLock, Paths
-from grepogram.sources import discussion_source_id, parse_since, resolve_sources
+from grepogram.sources import IMPORT_PREFIX, discussion_source_id, parse_since, resolve_sources
 from grepogram.units import UNKNOWN_SENDER
 
 log = logging.getLogger(__name__)
@@ -1568,3 +1574,267 @@ def _sync_order(chat: ChatRow) -> tuple[int, int, int]:
 def _self_row(me: Any) -> UserRow | None:
     users = collect_users([me])
     return next(iter(users.values()), None)
+
+
+# --- the deletion sweep ----------------------------------------------------------------------
+
+
+PRUNE_BATCH = 100
+"""Stored ids one request of the sweep asks about — the most ``messages.getMessages`` takes."""
+
+
+@dataclass(slots=True)
+class _PruneTally:
+    """What the sweep accumulates on its way to a :class:`PruneReport`."""
+
+    removed: int = 0
+    checked: int = 0
+    done: list[int] = field(default_factory=list)
+    remaining: list[int] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
+
+    def report(self) -> PruneReport:
+        log.info(
+            "prune-deleted: %d of %d checked messages were gone, %d chats swept, %d left",
+            self.removed,
+            self.checked,
+            len(self.done),
+            len(self.remaining),
+        )
+        return PruneReport(
+            removed=self.removed,
+            checked=self.checked,
+            chats_done=self.done,
+            chats_remaining=self.remaining,
+            warnings=self.warnings,
+        )
+
+
+async def prune_deleted(
+    client: Any,
+    conn: sqlite3.Connection,
+    cfg: Config,
+    paths: Paths,
+    budget: SyncBudget,
+    *,
+    chat_id: int | None = None,
+) -> PruneReport:
+    """Ask Telegram about every stored message and drop the ones it no longer has.
+
+    What :func:`_drop_deleted` cannot reach. That pass sees only the ``edit_refetch`` newest
+    messages of a chat and reads a deletion as a set difference, because ``iter_messages`` omits
+    a deleted message rather than yielding a hole for it. This one asks by
+    id — ``client.get_messages(chat_id, ids=[…])`` answers one slot per id and fills a deleted one
+    with ``MessageEmpty`` — so **here an empty slot is the deletion signal** (:func:`_empty_slots`
+    is where that is read, and where an answer that does not line up with the question is refused
+    instead). Nothing else counts as evidence: an ``RPCError``, a chat that went private
+    mid-sweep, a flood wait, all end the chat's turn with nothing removed.
+
+    It is a whole-index pass of about one request per hundred stored messages, so it is never
+    automatic and never an MCP tool: like ``sources prune``, deleting indexed history stays a
+    deliberate CLI action (``grepogram prune-deleted``). ``budget`` is in seconds like every
+    other pass, the client's ``flood_sleep_threshold`` is capped against what is left of it
+    (:func:`_cap_flood_sleep`), and the whole sweep runs under the :class:`SyncLock` — it deletes
+    messages, cuts units and writes index rows, and ``db.Connection``'s lock only serialises
+    threads within one process.
+
+    Progress is a ``meta`` cursor per chat (:func:`grepogram.db.prune_cursor`) written in the
+    same transaction as the removals it earned, so a run stopped by its budget or by a flood wait
+    keeps every batch it finished and the next one carries on from the id it reached rather than
+    from the top.
+
+    ``chat_id`` narrows the sweep to one chat **and the discussion group it links**, because a
+    deleted comment is only reachable from the group: a post thread lists the post alone in
+    ``msg_ids``, so no ``json_each`` over ``units.msg_ids`` finds a comment id, and the way back
+    to the thread is the ``comment_of_*`` pair on the comment's own row
+    (:func:`_invalidate_comment_posts`).
+    """
+    with SyncLock(paths):
+        targets = _sweep_targets(conn, chat_id)
+        tally = _PruneTally()
+        for position, chat in enumerate(targets):
+            if budget.expired:
+                tally.remaining.extend(rest.id for rest in targets[position:])
+                break
+            _cap_flood_sleep(client, cfg.sync, budget)
+            try:
+                complete = await _sweep_chat(client, conn, cfg, chat, budget, tally)
+            except errors.FloodWaitError as exc:
+                log.warning("flood wait of %ss on chat %s; stopping this run", exc.seconds, chat.id)
+                tally.warnings.append(
+                    f"flood wait: Telegram asks to wait {exc.seconds}s before more requests; "
+                    "run `grepogram prune-deleted` again later"
+                )
+                tally.remaining.extend(rest.id for rest in targets[position:])
+                break
+            except errors.RPCError as exc:
+                log.warning(
+                    "chat %s (%s): %s; nothing was removed from it", chat.id, chat.title, exc
+                )
+                tally.warnings.append(f"chat {chat.id} ({chat.title}): {exc}")
+                tally.remaining.append(chat.id)
+                continue
+            (tally.done if complete else tally.remaining).append(chat.id)
+        return tally.report()
+
+
+def _sweep_targets(conn: sqlite3.Connection, chat_id: int | None) -> list[ChatRow]:
+    """The chats one sweep walks, in id order; ``chat_id`` narrows it to one and its group.
+
+    Every indexed chat by default, discussion groups included — a group known only through a
+    channel's link is in ``db.list_chats`` like any other chat, which is what makes a deleted
+    comment this pass's to find without a special case.
+
+    Two kinds of chat are left out rather than asked about, because Telegram's answer for them
+    would say nothing about deletions: one whose history never came from Telegram at all (an
+    ``import:`` source, where every id would come back empty and the whole chat would be dropped)
+    and one already known to be unavailable, which would cost a refused request per batch.
+    """
+    if chat_id is None:
+        chats = db.list_chats(conn)
+    else:
+        found = (db.get_chat(conn, chat_id), db.get_discussion_chat(conn, chat_id))
+        chats = sorted((chat for chat in found if chat is not None), key=lambda chat: chat.id)
+    return [chat for chat in chats if _sweepable(chat)]
+
+
+def _sweepable(chat: ChatRow) -> bool:
+    if chat.unavailable:
+        log.debug("chat %s is unavailable; the sweep left it alone", chat.id)
+        return False
+    if (chat.source_id or "").startswith(IMPORT_PREFIX):
+        log.debug("chat %s was imported, not synced; the sweep left it alone", chat.id)
+        return False
+    return True
+
+
+async def _sweep_chat(
+    client: Any,
+    conn: sqlite3.Connection,
+    cfg: Config,
+    chat: ChatRow,
+    budget: SyncBudget,
+    tally: _PruneTally,
+) -> bool:
+    """One chat from its cursor on; ``True`` once the sweep has reached the end of its history.
+
+    A page of stored ids, one request, one transaction: the ids that came back empty are deleted,
+    the units holding them are cut again and the cursor moves to the last id of the page. The
+    write goes to a worker thread that is joined even under cancellation
+    (:func:`_joined_to_thread`), like every other write a sync makes.
+
+    An answer that does not line up with the page is not an answer: the chat's turn ends with its
+    cursor untouched, so the next run asks the same page again instead of taking the silence for
+    a hundred deletions.
+    """
+    cursor = db.prune_cursor(conn, chat.id)
+    while not budget.expired:
+        page = db.message_ids_after(conn, chat.id, cursor, PRUNE_BATCH)
+        if not page:
+            db.clear_prune_cursor(conn, chat.id)
+            return True
+        gone = _empty_slots(page, await client.get_messages(chat.id, ids=page))
+        tally.checked += len(page)
+        if gone is None:
+            log.warning(
+                "chat %s (%s): Telegram's answer did not line up with the %d ids asked about; "
+                "nothing was removed",
+                chat.id,
+                chat.title,
+                len(page),
+            )
+            tally.warnings.append(
+                f"chat {chat.id} ({chat.title}): Telegram's answer did not line up with the "
+                f"{len(page)} ids asked about; nothing was removed"
+            )
+            return False
+        cursor = page[-1]
+        tally.removed += await _joined_to_thread(
+            functools.partial(_prune_batch, conn, cfg, chat, gone, cursor), budget.cancel
+        )
+    return False
+
+
+def _empty_slots(page: Sequence[int], answer: Any) -> list[int] | None:
+    """The ids of ``page`` Telegram answered nothing for, or ``None`` when it did not answer.
+
+    ``messages.getMessages`` returns one slot per id asked about and fills the slot of a message
+    that is gone with ``MessageEmpty``, which Telethon hands over as ``None`` — so an empty slot
+    is a deletion, the one place in grepogram where that is true (:func:`_drop_deleted` reads a
+    set difference instead, because ``iter_messages`` yields no slot at all for a deleted
+    message).
+
+    That reading only holds while the answer lines up with the question. Anything else — a
+    shorter list, a single message where a list was asked for, ``None`` — is read as no answer
+    and removes nothing; the ids of a shortened answer would otherwise all look deleted at once.
+    """
+    if not isinstance(answer, list) or len(answer) != len(page):
+        return None
+    alive = {
+        int(msg.id) for msg in answer if msg is not None and not isinstance(msg, types.MessageEmpty)
+    }
+    return [msg_id for msg_id in page if msg_id not in alive]
+
+
+def _prune_batch(
+    conn: sqlite3.Connection,
+    cfg: Config,
+    chat: ChatRow,
+    gone: Sequence[int],
+    cursor: int,
+) -> int:
+    """Drop one page's deleted messages, re-cut what held them, move the cursor — one transaction.
+
+    The order is :func:`_drop_deleted`'s: read the rows, delete them, then invalidate. The rows
+    are read first because :func:`grepogram.units.invalidate_units_for` needs the topic a window
+    is scoped by, which lives on a row that no longer exists by then; it renders nothing from
+    them, so a deleted message that heads a reply thread does not come straight back in the unit
+    its removal rebuilds. The cursor is written here rather than after the commit, so a crash
+    never leaves a chat marked past ids whose deletions were rolled back.
+    """
+    with db.transaction(conn):
+        rows = [row for _, row in sorted(db.get_messages_by_msg_id(conn, chat.id, gone).items())]
+        if rows:
+            db.delete_messages(conn, chat.id, [row.msg_id for row in rows])
+            index.index_units(conn, units.invalidate_units_for(conn, chat, cfg, rows))
+            _invalidate_comment_posts(conn, cfg, rows)
+            log.info(
+                "chat %s (%s): %d messages were deleted in Telegram and dropped from the index",
+                chat.id,
+                chat.title,
+                len(rows),
+            )
+        db.set_prune_cursor(conn, chat.id, cursor)
+    return len(rows)
+
+
+def _invalidate_comment_posts(
+    conn: sqlite3.Connection, cfg: Config, rows: Sequence[MessageRow]
+) -> None:
+    """Re-cut the post threads of the channels whose comments these deleted rows were.
+
+    The only way from a deleted comment to the unit quoting it. A channel's post thread carries
+    the post followed by its comments while listing the post alone in ``msg_ids``, so no
+    ``json_each`` over ``units.msg_ids`` reaches a comment id and neither the group's own
+    invalidation nor any lookup by unit could find that thread; ``comment_of_chat_id`` /
+    ``comment_of_msg_id`` on the comment's row is what names it.
+
+    The posts are re-read from the channel's own rows and handed to the same primitive, which
+    rebuilds the thread from the comments still stored — this runs after the delete, so the one
+    that has just gone is not among them.
+    """
+    posts: dict[int, set[int]] = {}
+    for row in rows:
+        if row.comment_of_chat_id is not None and row.comment_of_msg_id is not None:
+            posts.setdefault(row.comment_of_chat_id, set()).add(row.comment_of_msg_id)
+    for channel_id, post_ids in posts.items():
+        channel = db.get_chat(conn, channel_id)
+        if channel is None:
+            continue
+        stored = db.get_messages_by_msg_id(conn, channel_id, sorted(post_ids))
+        if not stored:
+            continue
+        delta = units.invalidate_units_for(
+            conn, channel, cfg, [row for _, row in sorted(stored.items())]
+        )
+        index.index_units(conn, delta)
