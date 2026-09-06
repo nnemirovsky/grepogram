@@ -4,11 +4,12 @@ import logging
 import os
 import sqlite3
 import stat
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
 import pytest
-from telethon import errors
+from telethon import TelegramClient, errors
 from typer.testing import CliRunner
 
 from grepogram import cli, config, db, sources, sync, tg
@@ -23,6 +24,7 @@ from grepogram.sources import (
     UnknownSource,
     UnknownTarget,
 )
+from grepogram.tdesktop import ImportedChat
 from tests.fakes import (
     FakeClient,
     make_channel,
@@ -403,6 +405,63 @@ def test_remove_source_ambiguous_and_unknown(conn: sqlite3.Connection) -> None:
     assert len(db.list_chats(conn)) == 4
 
 
+def test_remove_source_of_an_import_by_a_short_slug(conn: sqlite3.Connection) -> None:
+    """``sources rm import:<slug>`` is the command every guard of an import points at.
+
+    It went through the fuzzy matcher, which scored the whole typed string — the seven-character
+    ``import:`` prefix included — against the bare slug, so nothing five characters or shorter
+    could reach ``FUZZY_MIN_RATIO``: a chat titled "Mama" or "Дом" could be removed by no
+    spelling at all, and could therefore never be converted to a live source either.
+    """
+    _store(conn, _chat(ARG_ID, "import:mama", title="Mama"), 2)
+    _store(conn, _chat(GEORGIA_ID, "import:дом", title="Дом"), 1)
+    cfg = _cfg()
+    for raw in ("import:mama", "import:MAMA", "Mama", str(ARG_ID)):
+        assert sources.find_source(cfg, conn, sources.parse_target(raw)) == "import:mama"
+    assert sources.find_source(cfg, conn, sources.parse_target("import:дом")) == "import:дом"
+
+    removed = sources.remove_source(cfg, conn, sources.parse_target("import:mama"))
+    assert (removed.source_id, removed.chat_ids, removed.source) == ("import:mama", [ARG_ID], None)
+    assert [c.id for c in db.list_chats(conn)] == [GEORGIA_ID]
+
+
+def test_remove_source_of_an_import_disambiguated_by_its_chat_id(
+    conn: sqlite3.Connection,
+) -> None:
+    """The shape ``import_source_ids`` derives for a slug collision: ``<slug>-<id>``.
+
+    An exact match has to win over the score, or the two ids a collision leaves behind would be
+    ambiguous against each other for good — ``import:x-123`` scores against ``x-123-123`` too.
+    """
+    _store(conn, _chat(ARG_ID, "import:x-123", title="x"), 1)
+    _store(conn, _chat(GEORGIA_ID, "import:x-123-123", title="x-123"), 1)
+    cfg = _cfg()
+    assert sources.find_source(cfg, conn, sources.parse_target("import:x-123")) == "import:x-123"
+    found = sources.find_source(cfg, conn, sources.parse_target("import:x-123-123"))
+    assert found == "import:x-123-123"
+    with pytest.raises(AmbiguousTarget) as excinfo:
+        sources.find_source(cfg, conn, sources.parse_target("import:x-12"))
+    assert excinfo.value.candidates == ["import:x-123", "import:x-123-123"]
+    with pytest.raises(UnknownSource, match="no imported source named 'import:zzz'"):
+        sources.find_source(cfg, conn, sources.parse_target("import:zzz"))
+
+
+def test_remove_source_of_an_import_named_by_its_title_or_id(conn: sqlite3.Connection) -> None:
+    """An ``import:`` tag covers exactly one chat, so naming that chat is not indirect.
+
+    ``import_source_ids`` gives every colliding chat a tag of its own, which makes the tag and
+    the chat one to one — unlike a folder source or a channel's discussion group, where the
+    refusal exists because removing the source would take other chats with it.
+    """
+    _store(conn, _chat(NEWS_ID, "import:news-chat", title="News chat", username="news_chat"), 2)
+    for raw in ("News chat", str(NEWS_ID), "@news_chat"):
+        found = sources.find_source(_cfg(), conn, sources.parse_target(raw))
+        assert found == "import:news-chat", raw
+    removed = sources.remove_source(_cfg(), conn, sources.parse_target("News chat"))
+    assert (removed.source_id, removed.chat_ids) == ("import:news-chat", [NEWS_ID])
+    assert db.list_chats(conn) == []
+
+
 def test_remove_source_handles_data_whose_entry_left_the_config(conn: sqlite3.Connection) -> None:
     _populate(conn)
     removed = sources.remove_source(_cfg(), conn, sources.parse_target("chat:@alice"))
@@ -509,6 +568,16 @@ def test_discussion_source_id_keeps_a_group_its_own_source_covers(spelling: str)
     )
     channel = _chat(NEWS_ID, "chat:@news", type="channel", title="News", username="news")
     assert sources.discussion_source_id(group, channel) == f"chat:{spelling}"
+
+
+def test_discussion_source_id_keeps_a_group_held_as_an_import() -> None:
+    """An ``import:`` tag is an ownership claim like a folder's or a ``chat:`` entry's, and the
+    one every writer of ``source_id`` has to honour: the channel's source must never replace it.
+    `sync.link_discussion_chat` refuses such a link outright before this is asked, so this is
+    the rule the refusal rests on rather than the guard itself."""
+    group = _chat(DISC_ID, "import:news-chat", title="News chat", unavailable=True)
+    channel = _chat(NEWS_ID, "folder:News", type="channel", title="News", username="news")
+    assert sources.discussion_source_id(group, channel) == "import:news-chat"
 
 
 @pytest.mark.parametrize("spelling", CHAT_SPELLINGS)
@@ -707,7 +776,7 @@ def _signed_in(tmp_home: Path, extra: str = "") -> Path:
 def test_cli_sources_help_lists_commands() -> None:
     result = runner.invoke(cli.app, ["sources", "--help"])
     assert result.exit_code == 0, result.output
-    for name in ("add", "ls", "rm"):
+    for name in ("add", "ls", "rm", "prune"):
         assert name in result.output
 
 
@@ -1084,3 +1153,679 @@ def test_remove_source_by_id_or_username_finds_the_other_spelling(
     by_username = sources.remove_source(by_id.config, conn, sources.parse_target("@xchat"))
     assert (by_username.source_id, by_username.chat_ids) == ("chat:555", [555])
     assert Source(chat=555) not in by_username.config.sources
+
+
+# --- prune -----------------------------------------------------------------------------------
+
+
+LEFT_ID = -1000000000555
+
+
+def _left(source_id: str = "folder:Argentina", **overrides: object) -> ChatRow:
+    """A chat indexed through a folder that no longer lists it."""
+    return _chat(LEFT_ID, source_id, title="Left chat", **overrides)
+
+
+def _membership(
+    listed: dict[str, set[int]] | None = None, failed: dict[str, str] | None = None
+) -> sources.FolderMembership:
+    return sources.FolderMembership(listed=listed or {}, failed=failed or {})
+
+
+async def test_folder_membership_lists_every_peer_a_folder_names() -> None:
+    cfg = _cfg(Source(folder="Argentina"), Source(chat="@alice"))
+    membership = await sources.folder_membership(cfg, _catalog())
+    # GHOST_ID has no entity to resolve, and is still listed by the folder: `folder_dialogs`
+    # drops such a peer, and reading that as "it left" is what would delete a live chat
+    assert membership.listed == {"folder:Argentina": {ARG_ID, NEWS_ID, OUTSIDE_ID, GHOST_ID}}
+    assert membership.failed == {}
+
+
+async def test_folder_membership_drops_a_peer_the_folder_also_excludes() -> None:
+    """A folder can name a peer in ``include``/``pinned`` and in ``exclude`` at once, and
+    ``exclude`` wins in Telegram. Reading the peer as listed would make ``sources prune`` keep a
+    chat the folder has actually dropped — and the explicit-peer union is exactly the half that
+    would keep it, because ``folder_dialogs`` already leaves it out."""
+    folder = make_folder(3, "Argentina", include=[ARG, GHOST_ID], pinned=[NEWS], exclude=[NEWS])
+    client = FakeClient(dialogs=[make_dialog(ARG), make_dialog(NEWS)], folders=[folder])
+    membership = await sources.folder_membership(
+        _cfg(Source(folder="Argentina")), DialogCatalog(client)
+    )
+    assert membership.listed == {"folder:Argentina": {ARG_ID, GHOST_ID}}
+
+
+async def test_folder_membership_records_an_unresolvable_source_instead_of_skipping_it() -> None:
+    cfg = _cfg(Source(folder="Xyz"), Source(folder="Argentina"))
+    membership = await sources.folder_membership(cfg, _catalog())
+    assert set(membership.listed) == {"folder:Argentina"}
+    assert "no folder named" in membership.failed["folder:Xyz"]
+
+
+async def test_folder_membership_records_a_transient_rpc_error() -> None:
+    flooded = _catalog(entity_errors={GHOST_ID: errors.FloodWaitError(request=None, capture=30)})
+    membership = await sources.folder_membership(_cfg(Source(folder="Argentina")), flooded)
+    assert membership.listed == {}
+    assert "wait" in membership.failed["folder:Argentina"].casefold()
+
+
+async def test_folder_membership_reraises_a_revoked_session() -> None:
+    """Every ``UnauthorizedError`` is an ``RPCError``, so a session revoked mid-scan was
+    recorded as "these sources could not be checked" and the user was told to try again once
+    Telegram answers — which it never will until ``grepogram auth`` is run. Raised, it reaches
+    ``tg.connected``'s ``wrap_auth_errors`` and says so, the way ``sync._sync_chats`` does.
+    """
+    client = _client(entity_errors={GHOST_ID: errors.AuthKeyUnregisteredError(request=None)})
+    cfg = _cfg(Source(folder="Argentina"))
+    with pytest.raises(tg.AuthRequired):
+        async with tg.connected(client):
+            await sources.folder_membership(cfg, DialogCatalog(client))
+
+
+def test_prunable_offers_a_chat_the_folder_no_longer_lists(conn: sqlite3.Connection) -> None:
+    _populate(conn)
+    _store(conn, _left(), 4)
+    scan = sources.prunable(CFG, conn, _membership({"folder:Argentina": {ARG_ID, NEWS_ID}}))
+    assert [(c.chat.id, c.messages) for c in scan.prunable] == [(LEFT_ID, 4)]
+    assert scan.prunable[0].reason == "folder:Argentina no longer lists it"
+    assert scan.kept == [] and scan.unresolved == []
+
+
+def test_prunable_keeps_the_chats_the_folder_still_lists(conn: sqlite3.Connection) -> None:
+    _populate(conn)
+    scan = sources.prunable(CFG, conn, _membership({"folder:Argentina": {ARG_ID, NEWS_ID}}))
+    assert scan.prunable == [] and scan.kept == []
+
+
+def test_prunable_prunes_nothing_when_the_source_fails_to_resolve(
+    conn: sqlite3.Connection,
+) -> None:
+    """The hazard this command exists around: `resolve_sources` logs and skips a source it
+    cannot resolve, so deriving "the folder no longer lists them" from a failed resolution
+    would offer a whole indexed history for deletion after one transient RPCError."""
+    _populate(conn)
+    _store(conn, _left(), 4)
+    scan = sources.prunable(
+        CFG, conn, _membership(failed={"folder:Argentina": "A wait of 30 seconds is required"})
+    )
+    assert scan.prunable == []
+    assert scan.unresolved == ["folder:Argentina: A wait of 30 seconds is required"]
+    # every chat of the source is held back, not only the one that looked gone
+    assert {c.chat.id for c in scan.kept} == {LEFT_ID, ARG_ID, NEWS_ID}
+    assert {c.reason for c in scan.kept} == {"folder:Argentina could not be checked"}
+
+
+def test_prunable_prunes_nothing_while_another_source_is_unchecked(
+    conn: sqlite3.Connection,
+) -> None:
+    """Coverage is a union over every source, so one folder that did not answer means no chat
+    can be proved uncovered — not even a chat of a folder that did answer."""
+    _populate(conn)
+    _store(conn, _left(), 4)
+    cfg = _cfg(*CFG.sources, Source(folder="Other"))
+    scan = sources.prunable(
+        cfg,
+        conn,
+        _membership({"folder:Argentina": {ARG_ID, NEWS_ID}}, {"folder:Other": "no folder named"}),
+    )
+    assert scan.prunable == [] and scan.unresolved == ["folder:Other: no folder named"]
+
+
+def test_prunable_keeps_a_chat_covered_by_another_source(conn: sqlite3.Connection) -> None:
+    """A chat two sources cover keeps the first source's id, so the stored tag says nothing
+    about who covers it now."""
+    _populate(conn)
+    _store(conn, _left(), 4)
+    by_folder = _cfg(*CFG.sources, Source(folder="Other"))
+    scan = sources.prunable(
+        by_folder,
+        conn,
+        _membership({"folder:Argentina": {ARG_ID, NEWS_ID}, "folder:Other": {LEFT_ID}}),
+    )
+    assert scan.prunable == [] and scan.kept == []
+
+
+def test_prunable_keeps_a_chat_a_chat_entry_names(conn: sqlite3.Connection) -> None:
+    _populate(conn)
+    _store(conn, _left(username="left_chat"), 4)
+    by_username = _cfg(*CFG.sources, Source(chat="https://t.me/left_chat"))
+    listed = _membership({"folder:Argentina": {ARG_ID, NEWS_ID}})
+    assert sources.prunable(by_username, conn, listed).prunable == []
+    by_id = _cfg(*CFG.sources, Source(chat=LEFT_ID))
+    assert sources.prunable(by_id, conn, listed).prunable == []
+
+
+def test_prunable_keeps_a_discussion_group_a_channel_still_links(
+    conn: sqlite3.Connection,
+) -> None:
+    _populate(conn)
+    _store(conn, _left(type="supergroup"), 4)
+    db.set_discussion_chat(conn, NEWS_ID, LEFT_ID)
+    scan = sources.prunable(CFG, conn, _membership({"folder:Argentina": {ARG_ID, NEWS_ID}}))
+    assert scan.prunable == []
+    assert [(c.chat.id, c.reason) for c in scan.kept] == [
+        (LEFT_ID, f"still the discussion group of channel {NEWS_ID}")
+    ]
+
+
+def test_prunable_offers_a_discussion_group_whose_channel_is_gone(
+    conn: sqlite3.Connection,
+) -> None:
+    _populate(conn)
+    _store(conn, _left(discussion_of=-1000000000777), 4)
+    scan = sources.prunable(CFG, conn, _membership({"folder:Argentina": {ARG_ID, NEWS_ID}}))
+    assert [c.chat.id for c in scan.prunable] == [LEFT_ID]
+
+
+def test_prunable_never_offers_an_imported_chat(conn: sqlite3.Connection) -> None:
+    _populate(conn)
+    _store(conn, _chat(LEFT_ID, "import:left-chat", title="Left chat"), 4)
+    scan = sources.prunable(CFG, conn, _membership({"folder:Argentina": {ARG_ID, NEWS_ID}}))
+    assert scan.prunable == [] and scan.kept == []
+
+
+def test_prunable_keeps_a_chat_whose_source_is_no_longer_configured(
+    conn: sqlite3.Connection,
+) -> None:
+    _populate(conn)
+    _store(conn, _left("folder:Gone"), 4)
+    scan = sources.prunable(CFG, conn, _membership({"folder:Argentina": {ARG_ID, NEWS_ID}}))
+    assert scan.prunable == []
+    assert [(c.chat.id, c.reason) for c in scan.kept] == [
+        (LEFT_ID, "folder:Gone is not a configured source; use sources rm")
+    ]
+
+
+def _offered(chat: ChatRow) -> sources.PruneCandidate:
+    """The candidate ``prunable`` would build for a chat it offers."""
+    return sources.PruneCandidate(
+        chat=chat, reason=f"{chat.source_id} no longer lists it", messages=0
+    )
+
+
+def test_prune_chats_deletes_the_rows_and_skips_ids_that_are_gone(
+    conn: sqlite3.Connection,
+) -> None:
+    _populate(conn)
+    news = _offered(_chat(NEWS_ID, "folder:Argentina", type="channel", title="News"))
+    ghost = _offered(_chat(GHOST_ID, "folder:Argentina"))
+    removed = sources.prune_chats(conn, [news, ghost, news])
+    assert removed == [NEWS_ID]
+    assert [c.id for c in db.list_chats(conn)] == sorted([ARG_ID, GEORGIA_ID, 1])
+    assert db.message_counts(conn) == {ARG_ID: 3, GEORGIA_ID: 4, 1: 1}
+
+
+def test_prune_chats_keeps_a_chat_imported_since_the_scan(conn: sqlite3.Connection) -> None:
+    """The race the scan cannot close: the offer predates the sync lock by a confirmation
+    prompt, and `sources rm` plus an import of the same chat fit inside one. An imported
+    history has no dialog behind it, so deleting it on a stale verdict loses it for good."""
+    _populate(conn)
+    offer = _offered(_chat(NEWS_ID, "folder:Argentina", type="channel", title="News"))
+    db.upsert_chat(conn, _chat(NEWS_ID, "import:news", type="channel", title="News"))
+    assert sources.prune_chats(conn, [offer]) == []
+    assert db.message_counts(conn)[NEWS_ID] == 2
+
+
+def test_prune_chats_keeps_a_chat_another_source_took_over(conn: sqlite3.Connection) -> None:
+    """A sync that resolved the chat under a different source between the scan and the lock:
+    the verdict was about the folder that no longer lists it, and it no longer describes
+    this row."""
+    _populate(conn)
+    offer = _offered(_chat(NEWS_ID, "folder:Argentina", type="channel", title="News"))
+    db.upsert_chat(conn, _chat(NEWS_ID, "folder:Other", type="channel", title="News"))
+    assert sources.prune_chats(conn, [offer]) == []
+    assert db.message_counts(conn)[NEWS_ID] == 2
+
+
+def test_prune_chats_keeps_a_chat_linked_as_a_discussion_group_since_the_scan(
+    conn: sqlite3.Connection,
+) -> None:
+    """`prunable` keeps a channel's discussion group; a sync can have made it one since."""
+    _populate(conn)
+    group = _chat(NEWS_ID, "folder:Argentina", type="supergroup", title="News chat")
+    _store(conn, group, 2)
+    db.set_discussion_chat(conn, ARG_ID, NEWS_ID)
+    assert sources.prune_chats(conn, [_offered(group)]) == []
+    assert db.get_chat(conn, NEWS_ID) is not None
+
+
+# --- prune, through the CLI ------------------------------------------------------------------
+
+
+def _prune_home(tmp_home: Path, monkeypatch: pytest.MonkeyPatch, extra: str = "") -> Paths:
+    """A signed-in home with the Argentina folder as its only source, holding one chat the
+    folder still lists and one it does not."""
+    _signed_in(tmp_home, '[[sources]]\nfolder = "Argentina"\n' + extra)
+    paths = Paths.from_env()
+    conn = db.connect(paths)
+    db.migrate(conn)
+    _store(conn, _chat(ARG_ID, "folder:Argentina", title="Argentina chat", username="arg_chat"), 3)
+    _store(conn, _left(), 4)
+    conn.close()
+    monkeypatch.setattr(tg, "make_client", lambda cfg, paths: _client())
+    return paths
+
+
+def _indexed(paths: Paths) -> list[int]:
+    conn = db.connect(paths)
+    try:
+        return [chat.id for chat in db.list_chats(conn)]
+    finally:
+        conn.close()
+
+
+def test_cli_sources_prune_deletes_after_a_confirmation(
+    tmp_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    paths = _prune_home(tmp_home, monkeypatch)
+    result = runner.invoke(cli.app, ["sources", "prune"], input="y\n")
+    assert result.exit_code == 0, result.output
+    assert f"{LEFT_ID}" in result.stdout and "folder:Argentina no longer lists it" in result.stdout
+    assert "removed 1 chats" in result.stdout
+    assert _indexed(paths) == [ARG_ID]
+    again = runner.invoke(cli.app, ["sources", "prune"])
+    assert again.exit_code == 0, again.output
+    assert again.stdout.strip() == "nothing to prune"
+
+
+def test_cli_sources_prune_dry_run_changes_nothing(
+    tmp_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    paths = _prune_home(tmp_home, monkeypatch)
+    result = runner.invoke(cli.app, ["sources", "prune", "--dry-run"])
+    assert result.exit_code == 0, result.output
+    assert "1 chats would go" in result.stdout
+    assert _indexed(paths) == sorted([ARG_ID, LEFT_ID])
+    assert config.load(paths).sources == [Source(folder="Argentina")]
+
+
+def test_cli_sources_prune_declined_removes_nothing(
+    tmp_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    paths = _prune_home(tmp_home, monkeypatch)
+    result = runner.invoke(cli.app, ["sources", "prune"], input="n\n")
+    assert result.exit_code == 0, result.output
+    assert "nothing removed" in result.stdout
+    assert _indexed(paths) == sorted([ARG_ID, LEFT_ID])
+
+
+def test_cli_sources_prune_refuses_when_a_source_cannot_be_resolved(
+    tmp_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    paths = _prune_home(tmp_home, monkeypatch, extra='\n[[sources]]\nfolder = "Xyz"\n')
+    result = runner.invoke(cli.app, ["sources", "prune"], input="y\n")
+    assert result.exit_code == 1
+    assert "nothing was pruned" in result.stderr and "folder:Xyz" in result.stderr
+    assert "does not resolve is not a source that lists nothing" in result.stderr
+    assert _indexed(paths) == sorted([ARG_ID, LEFT_ID])
+
+
+def test_cli_sources_prune_keeps_a_linked_discussion_group_and_says_why(
+    tmp_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    paths = _prune_home(tmp_home, monkeypatch)
+    conn = db.connect(paths)
+    _store(conn, _chat(NEWS_ID, "folder:Argentina", type="channel", title="News"))
+    db.set_discussion_chat(conn, NEWS_ID, LEFT_ID)
+    conn.close()
+    result = runner.invoke(cli.app, ["sources", "prune"], input="y\n")
+    assert result.exit_code == 0, result.output
+    assert f"kept Left chat (id {LEFT_ID}): still the discussion group" in result.stdout
+    assert "nothing to prune" in result.stdout
+    assert _indexed(paths) == sorted([ARG_ID, NEWS_ID, LEFT_ID])
+
+
+def test_cli_sources_prune_refuses_while_a_sync_runs(
+    tmp_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    paths = _prune_home(tmp_home, monkeypatch)
+    with sync.SyncLock(paths):
+        result = runner.invoke(cli.app, ["sources", "prune"], input="y\n")
+    assert result.exit_code == 1
+    assert "another sync is running" in result.stderr
+    assert _indexed(paths) == sorted([ARG_ID, LEFT_ID])
+    freed = runner.invoke(cli.app, ["sources", "prune"], input="y\n")
+    assert freed.exit_code == 0, freed.output
+    assert _indexed(paths) == [ARG_ID]
+
+
+def test_cli_sources_prune_resolves_before_it_takes_the_sync_lock(
+    tmp_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Telegram is read first and the lock is taken for the deletion alone: a round trip held
+    across the sync lock would block every sync for as long as Telegram takes to answer."""
+    paths = _prune_home(tmp_home, monkeypatch)
+    real_membership = cli._folder_membership
+    real_prune = sources.prune_chats
+    order: list[str] = []
+
+    async def membership_without_the_lock(
+        client: TelegramClient, cfg: Config
+    ) -> sources.FolderMembership:
+        with sync.SyncLock(paths):  # free while the network is being read
+            order.append("resolved")
+        return await real_membership(client, cfg)
+
+    def prune_under_the_lock(
+        conn: sqlite3.Connection, candidates: Sequence[sources.PruneCandidate]
+    ) -> list[int]:
+        with pytest.raises(sync.SyncInProgress), sync.SyncLock(paths):
+            pass
+        order.append("deleted")
+        return real_prune(conn, candidates)
+
+    monkeypatch.setattr(cli, "_folder_membership", membership_without_the_lock)
+    monkeypatch.setattr(sources, "prune_chats", prune_under_the_lock)
+    result = runner.invoke(cli.app, ["sources", "prune"], input="y\n")
+    assert result.exit_code == 0, result.output
+    assert order == ["resolved", "deleted"]
+    assert _indexed(paths) == [ARG_ID]
+
+
+def test_cli_sources_prune_needs_keys_a_session_and_sources(tmp_home: Path) -> None:
+    no_keys = runner.invoke(cli.app, ["sources", "prune"])
+    assert no_keys.exit_code == 1 and "my.telegram.org" in no_keys.stderr
+    (tmp_home / "config.toml").write_text(CONFIG_WITH_KEYS, encoding="utf-8")
+    no_sources = runner.invoke(cli.app, ["sources", "prune"])
+    assert no_sources.exit_code == 1 and "no sources configured" in no_sources.stderr
+    (tmp_home / "config.toml").write_text(
+        CONFIG_WITH_KEYS + '[[sources]]\nfolder = "Argentina"\n', encoding="utf-8"
+    )
+    no_session = runner.invoke(cli.app, ["sources", "prune"])
+    assert no_session.exit_code == 1 and "run: grepogram auth" in no_session.stderr
+
+
+def test_cli_sources_prune_maps_network_errors(
+    tmp_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _prune_home(tmp_home, monkeypatch)
+    broken = _client()
+
+    async def failing_connect() -> None:
+        raise ConnectionError("offline")
+
+    monkeypatch.setattr(broken, "connect", failing_connect)
+    monkeypatch.setattr(tg, "make_client", lambda cfg, paths: broken)
+    result = runner.invoke(cli.app, ["sources", "prune"])
+    assert result.exit_code == 1
+    assert "telegram error: offline" in result.stderr
+
+
+# --- import ----------------------------------------------------------------------------------
+
+
+def _export(*chats: ChatRow, messages: int = 1) -> list[ImportedChat]:
+    """A parsed export: what :func:`grepogram.tdesktop.read_export` hands the importer."""
+    return [
+        ImportedChat(
+            chat=chat,
+            messages=[
+                MessageRow(chat_id=chat.id, msg_id=i, date=1_700_000_000 + i, text=f"import {i}")
+                for i in range(1, messages + 1)
+            ],
+        )
+        for chat in chats
+    ]
+
+
+def _imported(chat_id: int, title: str | None) -> ChatRow:
+    """A chat as :func:`grepogram.tdesktop.read_export` builds it: no source, never fetched."""
+    return ChatRow(id=chat_id, type="supergroup", title=title, unavailable=True)
+
+
+@pytest.mark.parametrize(
+    ("title", "slug"),
+    [
+        ("Valencia Expats", "valencia-expats"),
+        ("Грузия | Georgia chat", "грузия-georgia-chat"),
+        ("  ...Trip 2019!  ", "trip-2019"),
+        ("a" * 60, "a" * 40),
+        ("🙂", ""),
+        (None, ""),
+    ],
+    ids=["ascii", "cyrillic", "punctuation", "truncated", "emoji-only", "unnamed"],
+)
+def test_import_slug_reads_a_title_as_the_readable_half_of_a_source_id(
+    title: str | None, slug: str
+) -> None:
+    assert sources.import_slug(title) == slug
+
+
+def test_import_source_ids_are_the_slugged_titles(conn: sqlite3.Connection) -> None:
+    chats = [_imported(LEFT_ID, "Left chat"), _imported(ARG_ID, "Argentina chat")]
+    assert sources.import_source_ids(conn, chats) == {
+        LEFT_ID: "import:left-chat",
+        ARG_ID: "import:argentina-chat",
+    }
+
+
+def test_import_source_ids_disambiguate_a_shared_title(conn: sqlite3.Connection) -> None:
+    """Two contacts of one name in a single export must not share a source id: ``sources rm``
+    on either would then delete both."""
+    chats = [_imported(LEFT_ID, "Anna"), _imported(ARG_ID, "Anna")]
+    assert sources.import_source_ids(conn, chats) == {
+        LEFT_ID: f"import:anna-{abs(LEFT_ID)}",
+        ARG_ID: f"import:anna-{abs(ARG_ID)}",
+    }
+
+
+def test_import_source_ids_avoid_a_slug_an_earlier_import_claimed(
+    conn: sqlite3.Connection,
+) -> None:
+    _store(conn, _chat(ARG_ID, "import:anna", title="Anna"))
+    assert sources.import_source_ids(conn, [_imported(LEFT_ID, "Anna")]) == {
+        LEFT_ID: f"import:anna-{abs(LEFT_ID)}"
+    }
+    # the chat that holds the plain slug keeps it, so re-importing it stays idempotent
+    assert sources.import_source_ids(conn, [_imported(ARG_ID, "Anna")]) == {ARG_ID: "import:anna"}
+
+
+def test_import_source_ids_disambiguate_again_when_the_first_fallback_collides(
+    conn: sqlite3.Connection,
+) -> None:
+    """The fallback is ``<slug>-<abs(chat_id)>``, which is itself a title someone can have.
+
+    Sharing an id would make ``sources rm`` on either delete both histories, so the chat id is
+    appended again until nothing else holds the result.
+    """
+    chats = [_imported(LEFT_ID, "Anna"), _imported(ARG_ID, "Anna"), _imported(NEWS_ID, "Anna")]
+    ids = sources.import_source_ids(conn, [*chats, _imported(GEORGIA_ID, f"Anna {abs(ARG_ID)}")])
+    assert len(set(ids.values())) == 4, "no two chats of one export share a source id"
+    assert {ids[ARG_ID], ids[GEORGIA_ID]} == {
+        f"import:anna-{abs(ARG_ID)}",
+        f"import:anna-{abs(ARG_ID)}-{abs(ARG_ID)}",
+    }
+
+
+def test_import_source_ids_do_not_depend_on_the_order_of_the_export(
+    conn: sqlite3.Connection,
+) -> None:
+    chats = [_imported(LEFT_ID, "Anna"), _imported(ARG_ID, "Anna"), _imported(NEWS_ID, "Anna")]
+    assert sources.import_source_ids(conn, chats) == sources.import_source_ids(
+        conn, list(reversed(chats))
+    )
+
+
+def test_import_source_ids_fall_back_to_the_chat_id_for_a_nameless_chat(
+    conn: sqlite3.Connection,
+) -> None:
+    assert sources.import_source_ids(conn, [_imported(LEFT_ID, None)]) == {
+        LEFT_ID: f"import:chat-{abs(LEFT_ID)}"
+    }
+
+
+def test_import_chats_stores_the_rows_under_an_import_tag(conn: sqlite3.Connection) -> None:
+    stored = sources.import_chats(conn, _export(_imported(LEFT_ID, "Left chat"), messages=3))
+    assert [(item.source_id, item.messages) for item in stored] == [("import:left-chat", 3)]
+    chat = db.get_chat(conn, LEFT_ID)
+    assert chat is not None
+    assert chat.source_id == "import:left-chat"
+    # nothing was fetched from Telegram, so no sync resumes from this chat
+    assert chat.unavailable and chat.last_msg_id == 0
+    assert db.message_counts(conn) == {LEFT_ID: 3}
+
+
+def test_import_chats_is_idempotent(conn: sqlite3.Connection) -> None:
+    entries = _export(_imported(LEFT_ID, "Left chat"), messages=3)
+    sources.import_chats(conn, entries)
+    again = sources.import_chats(conn, entries)
+    assert [item.source_id for item in again] == ["import:left-chat"]
+    assert db.message_counts(conn) == {LEFT_ID: 3}
+
+
+def test_import_chats_refuses_a_chat_already_synced_from_telegram(
+    conn: sqlite3.Connection,
+) -> None:
+    """`db.upsert_chat` overwrites `source_id`, so an import over a live chat would retag it and
+    hide it from the source that fetches it."""
+    _populate(conn)
+    with pytest.raises(sources.ImportConflict) as excinfo:
+        sources.import_chats(conn, _export(_imported(ARG_ID, "Argentina chat")))
+    assert "already indexed from Telegram through folder:Argentina" in str(excinfo.value)
+    assert "grepogram sources rm" in str(excinfo.value)
+
+
+def test_import_chats_refuses_a_stored_chat_that_carries_no_source(
+    conn: sqlite3.Connection,
+) -> None:
+    """An untagged row is still a row this index got from Telegram; refusing is the safe way to
+    be wrong about it."""
+    _store(conn, ChatRow(id=LEFT_ID, type="supergroup", title="Left chat"), 2)
+    with pytest.raises(sources.ImportConflict, match="with no source"):
+        sources.import_chats(conn, _export(_imported(LEFT_ID, "Left chat")))
+
+
+def test_import_chats_writes_nothing_when_one_chat_of_the_export_is_refused(
+    conn: sqlite3.Connection,
+) -> None:
+    """The refusal is checked for the whole export before the first row goes in, so a partial
+    import never leaves half a history under a tag the other half does not carry."""
+    _populate(conn)
+    entries = _export(_imported(LEFT_ID, "Left chat"), _imported(ARG_ID, "Argentina chat"))
+    with pytest.raises(sources.ImportConflict):
+        sources.import_chats(conn, entries)
+    assert db.get_chat(conn, LEFT_ID) is None
+    assert db.message_counts(conn) == {ARG_ID: 3, NEWS_ID: 2, GEORGIA_ID: 4, 1: 1}
+
+
+def test_refuse_imported_refuses_a_live_source_over_an_imported_chat(
+    conn: sqlite3.Connection,
+) -> None:
+    sources.import_chats(conn, _export(_imported(ARG_ID, "Argentina chat")))
+    covered = [DialogInfo(id=ARG_ID, type="supergroup", title="Argentina chat")]
+    with pytest.raises(sources.ImportConflict) as excinfo:
+        sources.refuse_imported(conn, covered)
+    assert "already in the index as import:argentina-chat" in str(excinfo.value)
+    assert "grepogram sources rm import:argentina-chat" in str(excinfo.value)
+
+
+def test_refuse_imported_passes_a_chat_that_is_not_an_import(conn: sqlite3.Connection) -> None:
+    _populate(conn)
+    sources.refuse_imported(
+        conn,
+        [
+            DialogInfo(id=ARG_ID, type="supergroup", title="Argentina chat"),
+            DialogInfo(id=GHOST_ID, type="channel", title="Never indexed"),
+        ],
+    )
+
+
+def test_refuse_imported_refuses_a_folder_holding_one_imported_chat(
+    conn: sqlite3.Connection,
+) -> None:
+    """Adding the folder would cover that chat on every sync from now on, so the whole folder is
+    refused rather than the one member silently taken over."""
+    sources.import_chats(conn, _export(_imported(NEWS_ID, "News")))
+    covered = [
+        DialogInfo(id=ARG_ID, type="supergroup", title="Argentina chat"),
+        DialogInfo(id=NEWS_ID, type="channel", title="News"),
+    ]
+    with pytest.raises(sources.ImportConflict, match="import:news"):
+        sources.refuse_imported(conn, covered)
+
+
+async def test_resolve_sources_leaves_an_imported_chat_under_its_import_tag(
+    conn: sqlite3.Connection, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The crossing `refuse_imported` does not cover: `sources add` is guarded, but the folder
+    gaining the chat on Telegram afterwards is not, and this runs on every sync.
+
+    `db.upsert_chat` writes `source_id` unconditionally, so a resolve would replace
+    `import:argentina-chat` with `folder:Argentina` — and `sources prune`, which keys on the
+    prefix, would then offer the whole imported history for deletion.
+    """
+    sources.import_chats(conn, _export(_imported(ARG_ID, "Argentina chat"), messages=3))
+    with caplog.at_level(logging.INFO, logger="grepogram.sources"):
+        rows = await sources.resolve_sources(_cfg(Source(folder="Argentina")), _client(), conn)
+    assert ARG_ID not in [row.id for row in rows], "an import is not a chat to sync"
+    chat = db.get_chat(conn, ARG_ID)
+    assert chat is not None and chat.source_id == "import:argentina-chat"
+    assert chat.unavailable and chat.last_msg_id == 0
+    assert "import:argentina-chat" in caplog.text and "sources rm" in caplog.text
+    held = [record for record in caplog.records if "import:argentina-chat" in record.getMessage()]
+    assert [record.levelname for record in held] == ["INFO"], (
+        "a standing state of the index, logged once per held chat on every sync — including "
+        "every automatic one inside an MCP search — is not a warning"
+    )
+    scan = sources.prunable(
+        _cfg(Source(folder="Argentina")), conn, _membership({"folder:Argentina": {NEWS_ID}})
+    )
+    assert ARG_ID not in [c.chat.id for c in scan.prunable], "never offered for pruning"
+    assert db.message_counts(conn)[ARG_ID] == 3
+
+
+def _import_home(tmp_home: Path, monkeypatch: pytest.MonkeyPatch, chat_id: int) -> Paths:
+    """A signed-in home whose index already holds ``chat_id`` as a Telegram Desktop import."""
+    _signed_in(tmp_home)
+    paths = Paths.from_env()
+    conn = db.connect(paths)
+    db.migrate(conn)
+    sources.import_chats(conn, _export(_imported(chat_id, "Argentina chat"), messages=2))
+    conn.close()
+    monkeypatch.setattr(tg, "make_client", lambda cfg, paths: _client())
+    return paths
+
+
+def test_cli_sources_add_refuses_an_imported_chat_and_leaves_its_tag(
+    tmp_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Without this guard `db.upsert_chat` would replace `import:argentina-chat` with
+    `chat:@arg_chat` on the next sync, and `sources prune` — which keys on the prefix — would
+    then offer the imported history for deletion."""
+    paths = _import_home(tmp_home, monkeypatch, ARG_ID)
+    result = runner.invoke(cli.app, ["sources", "add", "@arg_chat"])
+    assert result.exit_code == 1
+    assert result.stdout == ""
+    assert "already in the index as import:argentina-chat" in result.stderr
+    assert config.load(paths).sources == []
+    conn = db.connect(paths)
+    try:
+        chat = db.get_chat(conn, ARG_ID)
+        assert chat is not None and chat.source_id == "import:argentina-chat"
+        assert db.message_counts(conn) == {ARG_ID: 2}
+    finally:
+        conn.close()
+
+
+def test_cli_sources_add_refuses_a_folder_that_holds_an_imported_chat(
+    tmp_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    paths = _import_home(tmp_home, monkeypatch, ARG_ID)
+    result = runner.invoke(cli.app, ["sources", "add", "folder:Argentina"])
+    assert result.exit_code == 1
+    assert "already in the index as import:argentina-chat" in result.stderr
+    assert config.load(paths).sources == []
+
+
+def test_cli_sources_rm_removes_an_imported_chat_by_its_source_id(
+    tmp_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The refusal above tells the user to do exactly this, so it has to work."""
+    paths = _import_home(tmp_home, monkeypatch, ARG_ID)
+    result = runner.invoke(cli.app, ["sources", "rm", "import:argentina-chat"])
+    assert result.exit_code == 0, result.output
+    assert "removed import:argentina-chat (1 chats deleted)" in result.stdout
+    conn = db.connect(paths)
+    try:
+        assert db.list_chats(conn) == []
+    finally:
+        conn.close()

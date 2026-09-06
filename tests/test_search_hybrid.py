@@ -1,3 +1,4 @@
+import dataclasses
 import json
 import sqlite3
 from pathlib import Path
@@ -6,11 +7,20 @@ from typing import Any, NoReturn
 import pytest
 from typer.testing import CliRunner
 
-from grepogram import cli, db, embed, filters, index, search
+from grepogram import cli, db, embed, filters, index, search, units
 from grepogram import rerank as reranking
 from grepogram.embed import FAKE_DIM, FakeEmbedder, ModelUnavailable
 from grepogram.index import EmbeddingSpaceMismatch
-from grepogram.models import ChatRow, Config, Filters, Hit, SearchCfg, UnitRow
+from grepogram.models import (
+    ChatRow,
+    Config,
+    Filters,
+    Hit,
+    MessageRow,
+    SearchCfg,
+    SearchResult,
+    UnitRow,
+)
 from grepogram.paths import Paths
 from grepogram.rerank import FakeReranker
 from grepogram.search import DenseUnavailable, Match
@@ -655,3 +665,206 @@ def test_loader_hooks_replace_the_package_loaders(
         conn, CFG, "Recoleta", ALL, embedder=embedded, load_embedder=offline, rerank=False
     )
     assert handed.warnings == []
+
+
+# --- search: the reaction bonus --------------------------------------------------------------
+
+BONUS_ID = -1001000000300
+BONUS_CHAT = ChatRow(
+    id=BONUS_ID,
+    type="supergroup",
+    title="Reaction chat",
+    username="reaction_chat",
+    source_id=f"chat:{BONUS_ID}",
+)
+MARKERS = ("alfa", "bravo", "charlie", "delta")
+"""One marker word per message, each a day apart, so every message is a window of its own."""
+ONLY_BONUS = Filters(chat_ids={BONUS_ID})
+FLAT = {"alfa": 0.5, "bravo": 0.5, "charlie": 0.5, "delta": 0.5}
+"""Four candidates the reranker cannot tell apart at all."""
+NEAR_TIED: dict[str, dict[str, float]] = {
+    "fraction": {"alfa": 0.62, "bravo": 0.60, "charlie": 0.10, "delta": 0.00},
+    "logit": {"alfa": 8.7, "bravo": 8.4, "charlie": -3.2, "delta": -6.5},
+}
+"""The same shape on the two scales a reranker really answers on: ``FakeReranker`` returns a
+fraction in ``[0, 1]``, while ``BgeReranker`` passes raw logits through (``rerank.as_scores``)."""
+
+
+class MarkerReranker:
+    """Scores a unit by the marker word it carries, on whatever scale the test asked for."""
+
+    name = "marker"
+
+    def __init__(self, scores: dict[str, float]) -> None:
+        self.scores = scores
+        self.calls = 0
+
+    def score(self, query: str, texts: list[str]) -> list[float]:
+        self.calls += 1
+        return [next(v for word, v in self.scores.items() if word in text) for text in texts]
+
+
+def _bonus_rows(count: int = len(MARKERS)) -> list[MessageRow]:
+    start = chat_ru.SYNCED_AT - 90 * 24 * 3600
+    return [
+        MessageRow(
+            chat_id=BONUS_ID,
+            msg_id=i + 1,
+            date=start + i * 24 * 3600,
+            from_id=1,
+            from_name="Alice",
+            text=f"DNI turno {marker}",
+        )
+        for i, marker in enumerate(MARKERS[:count])
+    ]
+
+
+@pytest.fixture
+def bonus_chat(conn: sqlite3.Connection) -> ChatRow:
+    """A chat of four one-message windows, each named by a marker word, all matching one query."""
+    return _load_bonus(conn, _bonus_rows())
+
+
+def _load_bonus(conn: sqlite3.Connection, rows: list[MessageRow]) -> ChatRow:
+    chat = db.upsert_chat(conn, BONUS_CHAT)
+    ids = db.upsert_messages(conn, rows)
+    delta = units.rebuild_for_chat(conn, chat, CFG, ids)
+    index.index_chat(conn, chat, ids, delta)
+    db.set_chat_progress(conn, BONUS_ID, len(rows), chat_ru.SYNCED_AT)
+    return chat
+
+
+def _react(conn: sqlite3.Connection, **by_marker: int) -> None:
+    """Give the message carrying each marker that many reactions and refresh its units."""
+    msg_ids = [MARKERS.index(marker) + 1 for marker in by_marker]
+    with db.transaction(conn):
+        for marker, total in by_marker.items():
+            conn.execute(
+                "UPDATE messages SET reactions_total = ? WHERE chat_id = ? AND msg_id = ?",
+                (total, BONUS_ID, MARKERS.index(marker) + 1),
+            )
+    db.refresh_unit_reactions(conn, BONUS_ID, msg_ids)
+
+
+def _weighted(weight: float) -> Config:
+    """The dedup-free fixture config at one ``reaction_weight``."""
+    return dataclasses.replace(RAW, search=dataclasses.replace(RAW.search, reaction_weight=weight))
+
+
+def _markers(hits: list[Hit]) -> list[str]:
+    """The marker word of each hit, in the order the search returned them."""
+    return [next(m for m in MARKERS if m in hit.snippet) for hit in hits]
+
+
+def _bonus_search(
+    conn: sqlite3.Connection, cfg: Config, reranker: MarkerReranker, k: int = 40
+) -> SearchResult:
+    return search.search(conn, cfg, "DNI turno", ONLY_BONUS, k, mode="lexical", reranker=reranker)
+
+
+@pytest.mark.parametrize("scale", sorted(NEAR_TIED))
+def test_reactions_reorder_a_near_tie_on_either_rerank_scale(
+    conn: sqlite3.Connection, bonus_chat: ChatRow, scale: str
+) -> None:
+    """The bonus decides a near-tie — and does so identically on a raw-logit scale.
+
+    Its size is fixed against the *normalised* spread, which is the whole point: on the logit
+    scale the two leaders are 0.3 apart, far more than ``reaction_weight`` itself, so an
+    un-normalised bonus of that weight could never have moved them.
+    """
+    scores = NEAR_TIED[scale]
+    if scale == "logit":
+        assert scores["alfa"] - scores["bravo"] > RAW.search.reaction_weight
+    plain = _bonus_search(conn, _weighted(0.05), MarkerReranker(scores))
+    assert _markers(plain.hits) == ["alfa", "bravo", "charlie", "delta"]
+    _react(conn, bravo=20)
+    boosted = _bonus_search(conn, _weighted(0.05), MarkerReranker(scores))
+    assert _markers(boosted.hits) == ["bravo", "alfa", "charlie", "delta"]
+    assert boosted.hits[0].score > boosted.hits[1].score
+    assert (
+        search.search(
+            conn,
+            _weighted(0.05),
+            "DNI turno",
+            ONLY_BONUS,
+            1,
+            mode="lexical",
+            reranker=MarkerReranker(scores),
+        )
+        .hits[0]
+        .snippet
+        == boosted.hits[0].snippet
+    )
+
+
+@pytest.mark.parametrize("scale", sorted(NEAR_TIED))
+def test_a_far_behind_unit_never_overtakes_a_relevant_one(
+    conn: sqlite3.Connection, bonus_chat: ChatRow, scale: str
+) -> None:
+    """A thousand reactions buy less than ``reaction_weight`` of the normalised spread."""
+    _react(conn, charlie=1000, delta=100000)
+    hits = _bonus_search(conn, _weighted(0.05), MarkerReranker(NEAR_TIED[scale])).hits
+    assert _markers(hits)[:2] == ["alfa", "bravo"]
+    assert hits[0].score - hits[2].score > 0.5
+
+
+def test_zero_weight_reproduces_the_reranker_ordering_and_its_scores(
+    conn: sqlite3.Connection, bonus_chat: ChatRow
+) -> None:
+    """``reaction_weight = 0`` is off: no reordering, and no normalisation of the scores either."""
+    scores = NEAR_TIED["logit"]
+    before = _bonus_search(conn, _weighted(0.0), MarkerReranker(scores))
+    _react(conn, bravo=20, charlie=1000)
+    off = _bonus_search(conn, _weighted(0.0), MarkerReranker(scores))
+    assert off.hits == before.hits
+    assert _markers(off.hits) == ["alfa", "bravo", "charlie", "delta"]
+    assert [hit.score for hit in off.hits] == [scores[m] for m in _markers(off.hits)]
+    on = _bonus_search(conn, _weighted(0.05), MarkerReranker(scores))
+    assert _markers(on.hits) != _markers(off.hits)
+
+
+def test_no_bonus_when_the_reranker_did_not_run(
+    conn: sqlite3.Connection, bonus_chat: ChatRow, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The RRF fallback tops out near ``1 / (rrf_k + 1)``, where this bonus would decide alone."""
+    _react(conn, delta=100000)
+
+    def offline(cfg: Config) -> NoReturn:
+        raise ModelUnavailable("no torch")
+
+    monkeypatch.setattr(reranking, "load_reranker", offline)
+    degraded = search.search(conn, _weighted(0.05), "DNI turno", ONLY_BONUS, 40, mode="lexical")
+    assert degraded.warnings == ["reranking unavailable: no torch"]
+    assert all(0.0 < hit.score <= RRF_MAX for hit in degraded.hits)
+    skipped = search.search(
+        conn, _weighted(0.05), "DNI turno", ONLY_BONUS, 40, mode="lexical", rerank=False
+    )
+    assert _markers(skipped.hits) == _markers(degraded.hits)
+    assert [h.score for h in skipped.hits] == [h.score for h in degraded.hits]
+    assert _markers(skipped.hits)[0] != "delta"
+
+
+def test_a_single_candidate_is_left_alone(conn: sqlite3.Connection) -> None:
+    """One candidate has no range to normalise against, and dividing by it would raise."""
+    _load_bonus(conn, _bonus_rows(1))
+    alone = _bonus_search(conn, _weighted(0.05), MarkerReranker(NEAR_TIED["logit"]))
+    assert [hit.score for hit in alone.hits] == [NEAR_TIED["logit"]["alfa"]]
+
+
+def test_a_degenerate_spread_does_not_reorder_by_reactions_alone(
+    conn: sqlite3.Connection, bonus_chat: ChatRow
+) -> None:
+    """A hairline spread must be treated as no spread, or the bonus decides the whole order.
+
+    The reactions go on whichever unit the reranker put *last*, which is what an exact
+    ``hi == lo`` test would lift over the three above it once ``1e-9`` is stretched to ``1``.
+    """
+    hairline = dict(FLAT, alfa=0.5 + 1e-9)
+    order = _markers(_bonus_search(conn, _weighted(0.0), MarkerReranker(hairline)).hits)
+    _react(conn, **{order[-1]: 100000})
+    flat = _bonus_search(conn, _weighted(0.05), MarkerReranker(FLAT))
+    assert [hit.score for hit in flat.hits] == [0.5] * 4  # an exactly zero range never divides
+    assert _markers(flat.hits) == _markers(
+        _bonus_search(conn, _weighted(0.0), MarkerReranker(FLAT)).hits
+    )
+    assert _markers(_bonus_search(conn, _weighted(0.05), MarkerReranker(hairline)).hits) == order

@@ -46,10 +46,20 @@ class ModelsCfg:
 
 @dataclass(frozen=True, slots=True)
 class SearchCfg:
+    """How a search retrieves, fuses, reranks and orders its hits.
+
+    ``reaction_weight`` is the most a unit can gain for the reactions it collected, on the
+    normalised scale :func:`grepogram.search.search` puts the cross-encoder's scores on: the
+    bonus is ``reaction_weight * log1p(reactions) / (1 + log1p(reactions))``, so it rises fast
+    over the first few reactions and never reaches the weight itself. ``0`` switches it off and
+    leaves the reranker's own scores exactly as they were.
+    """
+
     k: int = 10
     rrf_k: int = 60
     rerank_top: int = 40
     dedup_overlap: float = 0.5
+    reaction_weight: float = 0.05
     vec_fanout_max: int = 8
     auto_sync_after_min: int = 60
     auto_sync_budget_s: int = 20
@@ -67,6 +77,22 @@ class UnitsCfg:
 class SyncCfg:
     edit_refetch: int = 200
     flood_sleep_threshold: int = 120
+
+
+@dataclass(frozen=True, slots=True)
+class MediaCfg:
+    """What the extraction pass reads out of media, and how much of it it will download.
+
+    ``enabled`` switches the whole pass off; ``ocr`` and ``documents`` switch one kind of
+    extractor off, which parks that media at ``db.MEDIA_DISABLED`` instead of re-reading it on
+    every pass. ``max_download_mb`` is checked against the size Telegram reports before anything
+    is fetched, so an oversized file costs no traffic at all.
+    """
+
+    enabled: bool = True
+    ocr: bool = True
+    documents: bool = True
+    max_download_mb: int = 20
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -99,6 +125,7 @@ class Config:
     search: SearchCfg = field(default_factory=SearchCfg)
     units: UnitsCfg = field(default_factory=UnitsCfg)
     sync: SyncCfg = field(default_factory=SyncCfg)
+    media: MediaCfg = field(default_factory=MediaCfg)
     sources: list[Source] = field(default_factory=list)
 
 
@@ -143,6 +170,12 @@ class MessageRow:
     discussion group holds and ``None`` on every other row, a forum topic message included. The
     two are independent because their ids are: a forum topic root and a channel post both start
     at 1 and a discussion group can be a forum, so one column could never carry both.
+
+    ``extracted_text`` is what an extractor read out of the attached media — OCR of a photo, the
+    text of a PDF or a DOCX — and ``media_state`` how far the extraction pass got with this row
+    (:data:`grepogram.db.MEDIA_PENDING` and the states beside it). Both are written by that pass
+    alone: :func:`grepogram.db.upsert_messages` never touches them, so a re-store of a message
+    Telegram re-read does not throw away what was extracted from its media.
     """
 
     id: int | None = None
@@ -161,6 +194,8 @@ class MessageRow:
     media_kind: MediaKind | None = None
     media_filename: str | None = None
     reactions_total: int = 0
+    extracted_text: str | None = None
+    media_state: int = 0
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -175,6 +210,8 @@ class UnitRow:
     date_start: int
     date_end: int
     text: str
+    reactions: int = 0
+    """Reactions on the messages this unit holds, summed when it is cut."""
     dirty: bool = True
     embedded_model: str | None = None
 
@@ -242,6 +279,52 @@ class SyncReport:
     chats_done: list[int] = field(default_factory=list)
     chats_remaining: list[int] = field(default_factory=list)
     unavailable: list[int] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class MediaReport:
+    """What one run of the extraction pass did — :func:`grepogram.media.run`'s answer.
+
+    The offline counters (``unsupported``, ``disabled``, ``requeued``) come from the bulk
+    updates that park media on what the stored ``media_kind`` alone says, before a single
+    Telegram request; the rest are messages the pass actually re-fetched. ``remaining`` is what
+    a budget or a flood wait left in the queue for the next run, and only the next run's own
+    work: media in a chat nothing may re-fetch is counted in ``unreachable`` instead.
+    """
+
+    extracted: int = 0
+    """Media that was read; ``extracted_text`` may still be empty — a photo holding no text."""
+    failed: int = 0
+    skipped: int = 0
+    """Larger than ``[media] max_download_mb``, so never downloaded."""
+    unsupported: int = 0
+    """Parked because this build has no extractor for the kind, offline or in the loop."""
+    disabled: int = 0
+    """Parked offline: the kind is switched off in ``[media]``."""
+    requeued: int = 0
+    """Put back in the queue: a kind switched back on, or ``--retry-failed``."""
+    remaining: int = 0
+    """Pending media a further run could still read — what "run extract again" is offered for."""
+    unreachable: int = 0
+    """Pending media in a chat no run may re-fetch: an imported or an unavailable one."""
+    warnings: list[str] = field(default_factory=list)
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class PruneReport:
+    """What one deletion sweep did — :func:`grepogram.sync.prune_deleted`'s answer.
+
+    ``checked`` counts the stored ids the sweep asked Telegram about, ``removed`` the messages
+    that came back empty and were dropped. A chat is in ``chats_done`` once the sweep reached the
+    end of its history and in ``chats_remaining`` when a budget, a flood wait or an error stopped
+    it partway — its cursor stays where it got to, so the next run carries on from there.
+    """
+
+    removed: int = 0
+    checked: int = 0
+    chats_done: list[int] = field(default_factory=list)
+    chats_remaining: list[int] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
 
 

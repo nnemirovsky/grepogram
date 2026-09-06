@@ -7,8 +7,18 @@ titles and folder names. :func:`add_source` resolves a target through a
 every configured source into ``chats`` rows tagged with ``source_id`` and runs before each sync
 because folder membership changes; :func:`remove_source` drops an entry together with its
 chats' data; :func:`sources_status` reports what is indexed per source.
+
+A chat can also arrive with no source to fetch it from: :func:`import_chats` stores a Telegram
+Desktop export and tags each of its chats ``import:<slug>``, a source id that names no
+``[[sources]]`` entry because there is nothing to sync. That prefix is what every protection of
+an imported history keys on — :func:`prunable` never offers such a chat and
+:func:`grepogram.sync.prune_deleted` never sweeps one — while
+:func:`grepogram.db.upsert_chat` overwrites ``source_id`` unconditionally, so both directions
+are refused by name: :func:`import_chats` will not import over a chat synced from Telegram, and
+:func:`refuse_imported` will not let a live source cover an imported chat.
 """
 
+import collections
 import dataclasses
 import datetime as dt
 import logging
@@ -24,12 +34,17 @@ from telethon.tl import types
 from grepogram import db, dialogs
 from grepogram.dialogs import DialogCatalog, DialogInfo, FolderInfo, Match
 from grepogram.models import ChatRow, ChatStatus, Config, Source, SourceStatus
+from grepogram.tdesktop import ImportedChat
 
 log = logging.getLogger(__name__)
 
 TargetKind = Literal["id", "username", "folder", "fuzzy"]
 FOLDER_PREFIX = "folder:"
 CHAT_PREFIX = "chat:"
+IMPORT_PREFIX = "import:"
+IMPORT_SLUG_MAX = 40
+"""How much of a chat title an ``import:`` source id carries; the rest is readability, not
+identity — :func:`import_source_ids` disambiguates a collision with the chat's own id."""
 ENTITY_ERRORS: tuple[type[Exception], ...] = (
     ValueError,
     TypeError,
@@ -78,6 +93,16 @@ class UnknownSource(SourceError):
     """No configured or indexed source matches the target."""
 
 
+class ImportConflict(SourceError):
+    """A Telegram Desktop import and a live source would claim the same chat.
+
+    Raised in both directions, because :func:`grepogram.db.upsert_chat` overwrites ``source_id``
+    unconditionally and whichever writes last would silently take the chat over: importing an
+    export of a chat this index already syncs, and adding a live source for a chat this index
+    holds as an import.
+    """
+
+
 @dataclass(frozen=True, slots=True, kw_only=True)
 class Target:
     """A parsed target; ``value`` is the marked id for ``kind="id"`` and text otherwise."""
@@ -112,6 +137,55 @@ class Removed:
     source_id: str
     source: Source | None
     chat_ids: list[int]
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class Imported:
+    """One chat :func:`import_chats` stored: the row as it now stands and what went into it.
+
+    ``chat`` is read back from the database, so it carries the sync state an earlier import or
+    an earlier life left on the row; ``source_id`` is the ``import:<slug>`` tag this import
+    wrote, and ``messages`` how many rows of the export it stored under it.
+    """
+
+    chat: ChatRow
+    source_id: str
+    messages: int
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class FolderMembership:
+    """What every folder source lists right now, read from Telegram by :func:`folder_membership`.
+
+    ``listed`` maps a folder source's id to the chat ids it covers *at this moment*; ``failed``
+    maps the id of a source that could not be resolved to the reason. A source is in exactly one
+    of the two, and one in neither was never looked at. The failures are data rather than a log
+    line on purpose: :func:`prunable` derives "the folder no longer lists this chat" from this
+    object, and a folder that answered with an error must never read as an empty one.
+    """
+
+    listed: dict[str, set[int]] = dataclasses.field(default_factory=dict)
+    failed: dict[str, str] = dataclasses.field(default_factory=dict)
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class PruneCandidate:
+    """One indexed chat the prune scan reached, with ``reason`` saying why it is offered or kept
+    and ``messages`` how many stored messages would go with it."""
+
+    chat: ChatRow
+    reason: str
+    messages: int
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class PruneScan:
+    """What ``sources prune`` would delete (:attr:`prunable`), what it deliberately keeps
+    (:attr:`kept`) and which configured sources it could not check (:attr:`unresolved`)."""
+
+    prunable: list[PruneCandidate]
+    kept: list[PruneCandidate]
+    unresolved: list[str]
 
 
 # --- targets ---------------------------------------------------------------------------------
@@ -438,7 +512,17 @@ def remove_source(cfg: Config, conn: sqlite3.Connection, target: Target) -> Remo
 
 
 def find_source(cfg: Config, conn: sqlite3.Connection, target: Target) -> str:
-    """The source id ``target`` refers to, among configured entries and ``chats.source_id``."""
+    """The source id ``target`` refers to, among configured entries and ``chats.source_id``.
+
+    An ``import:<slug>`` is matched exactly, like a ``folder:`` name and unlike everything else
+    here: it names no ``[[sources]]`` entry and there is nothing to resolve it through, and the
+    fuzzy fallback scores the *whole typed string* against the bare slug — with a seven-character
+    prefix in front of it, no slug of five characters or fewer could ever reach
+    :data:`grepogram.dialogs.FUZZY_MIN_RATIO`. An imported chat titled "Mama" or "Дом" could
+    therefore not be removed by any spelling, which is the one command every guard this feature
+    added tells the user to run (:func:`refuse_imported`, :func:`_refuse_live`,
+    :func:`grepogram.sync.link_discussion_chat` and :func:`resolve_sources`' log line).
+    """
     chats = db.list_chats(conn)
     known = [s.id for s in cfg.sources]
     known += sorted({c.source_id for c in chats if c.source_id and c.source_id not in known})
@@ -449,6 +533,8 @@ def find_source(cfg: Config, conn: sqlite3.Connection, target: Target) -> str:
         if named is not None:
             return named
         return _indexed_source(conn, chats, target)
+    if target.text.casefold().startswith(IMPORT_PREFIX):
+        return _import_source(target.text, known)
     return _fuzzy_source(target.text, known, chats)
 
 
@@ -494,6 +580,29 @@ def _folder_source(name: str, known: list[str]) -> str:
     raise UnknownSource(f"no folder source named {name!r} (sources: {', '.join(known) or 'none'})")
 
 
+def _import_source(text: str, known: list[str]) -> str:
+    """The ``import:`` id ``text`` names, matched the way :func:`_folder_source` matches a folder.
+
+    Exactly first, on the normalized slug, so ``import:x-123`` reaches the chat of that name and
+    not the ``import:x-123-123`` that :func:`import_source_ids` derived beside it; only then a
+    score over the other import ids, which is what answers a half-remembered slug with a single
+    candidate or with the list to choose from.
+    """
+    wanted = dialogs.normalize(text[len(IMPORT_PREFIX) :])
+    imports = [s for s in known if s.casefold().startswith(IMPORT_PREFIX)]
+    for source_id in imports:
+        if dialogs.normalize(source_id[len(IMPORT_PREFIX) :]) == wanted:
+            return source_id
+    hits = [s for s in imports if dialogs.score(wanted, s[len(IMPORT_PREFIX) :]) > 0]
+    if len(hits) == 1:
+        return hits[0]
+    if hits:
+        raise AmbiguousTarget(text, hits)
+    raise UnknownSource(
+        f"no imported source named {text!r} (sources: {', '.join(known) or 'none'})"
+    )
+
+
 def _chat_source(chat: ChatRow | None, label: str) -> str:
     if chat is None or not chat.source_id:
         raise UnknownSource(f"{label} is not an indexed chat")
@@ -505,7 +614,13 @@ def _refuse_indirect(chat: ChatRow, label: str) -> None:
     """Refuse a target that names a chat whose source covers more than that chat: a member of a
     folder source, or a channel's discussion group indexed through the channel's source — the
     group a channel was unlinked from included, which keeps that source until it is removed
-    (:func:`discussion_source_id` owns that rule)."""
+    (:func:`discussion_source_id` owns that rule).
+
+    An ``import:<slug>`` covers nothing but this chat and is therefore not indirect:
+    :func:`import_source_ids` gives every colliding chat a tag of its own, so the tag and the
+    chat are one to one and removing it removes exactly what was named. Refusing it sent the
+    user to ``sources rm import:<slug>`` for a chat they had just named a perfectly good way.
+    """
     if not chat.source_id:
         return
     if chat.source_id.startswith(FOLDER_PREFIX):
@@ -513,7 +628,7 @@ def _refuse_indirect(chat: ChatRow, label: str) -> None:
             f"{label} is indexed through {chat.source_id}; remove that folder source instead "
             "or take the chat out of the folder in Telegram"
         )
-    if _own_source(chat):
+    if chat.source_id.startswith(IMPORT_PREFIX) or _own_source(chat):
         return
     owner = (
         ""
@@ -581,6 +696,18 @@ async def resolve_sources(cfg: Config, client: Any, conn: sqlite3.Connection) ->
     and so is a stored ``discussion_of`` (:func:`grepogram.db.upsert_chat`): a channel's
     discussion group listed by a source is synced as a chat of its own and keeps holding the
     channel's comments.
+
+    **A chat held as an ``import:`` is left alone**, logged and not returned. ``upsert_chat``
+    writes ``source_id`` unconditionally, so without this a resolve would quietly replace
+    ``import:<slug>`` with the live source's id — and every protection keyed on that prefix would
+    go with it, :func:`prunable` offering the whole imported history for deletion the moment the
+    folder stopped listing the chat. :func:`refuse_imported` guards the two commands that *add* a
+    source, but nothing guards the folder gaining that chat on Telegram afterwards, and this runs
+    on every sync. Taking the chat over is a deliberate act: ``sources rm import:<slug>`` first.
+
+    That last one is logged at INFO rather than WARNING: it is a standing state of the index, not
+    an event, and it would otherwise be printed once per held chat on every sync — including
+    every automatic one inside an MCP ``search``.
     """
     catalog = DialogCatalog(client)
     rows: list[ChatRow] = []
@@ -596,6 +723,18 @@ async def resolve_sources(cfg: Config, client: Any, conn: sqlite3.Connection) ->
                 log.debug("chat %s already covered by another source, keeping the first", info.id)
                 continue
             seen.add(info.id)
+            held = imported_tag(conn, info.id)
+            if held is not None:
+                log.info(
+                    "chat %s (%s) is held as %s, a Telegram Desktop import; source %s does not "
+                    "take it over — run `grepogram sources rm %s` first to sync it from Telegram",
+                    info.id,
+                    info.title,
+                    held,
+                    source.id,
+                    held,
+                )
+                continue
             rows.append(
                 db.upsert_chat(
                     conn,
@@ -611,6 +750,20 @@ async def resolve_sources(cfg: Config, client: Any, conn: sqlite3.Connection) ->
             )
     log.info("resolved %d chats from %d sources", len(rows), len(cfg.sources))
     return rows
+
+
+def imported_tag(conn: sqlite3.Connection, chat_id: int) -> str | None:
+    """The ``import:<slug>`` this chat is held under, ``None`` when it is not an import.
+
+    The one question every writer of ``chats.source_id`` has to ask before it writes, because
+    :func:`grepogram.db.upsert_chat` overwrites the column: :func:`resolve_sources` on every
+    sync, :func:`refuse_imported` for the two commands that add a source, and
+    :func:`grepogram.sync.link_discussion_chat` for a channel whose discussion group turns out
+    to be one.
+    """
+    stored = db.get_chat(conn, chat_id)
+    source_id = "" if stored is None else (stored.source_id or "")
+    return source_id if source_id.startswith(IMPORT_PREFIX) else None
 
 
 async def source_dialogs(source: Source, catalog: DialogCatalog) -> list[DialogInfo]:
@@ -641,7 +794,11 @@ def discussion_source_id(group: ChatRow | None, channel: ChatRow) -> str | None:
       the link — removing X then leaves the group alone and removing Y takes it along, which is
       where its comments came from;
     * a group a channel was unlinked from keeps the source it came in through until that source
-      is removed: the comments stored under it were indexed through that source and go with it.
+      is removed: the comments stored under it were indexed through that source and go with it;
+    * a group held as an ``import:`` keeps that tag, like every other writer of ``source_id``
+      (:func:`imported_tag`). :func:`grepogram.sync.link_discussion_chat` refuses the link
+      before it ever gets here, so this is the invariant rather than the guard — but the rule
+      belongs with the rule it is part of, and a future caller inherits it.
 
     A channel with no source of its own (never resolved, only stored) changes nothing.
     :func:`_refuse_indirect` reads the same rule from the other end — only a group that is its
@@ -651,9 +808,338 @@ def discussion_source_id(group: ChatRow | None, channel: ChatRow) -> str | None:
     """
     if group is None or not group.source_id:
         return channel.source_id
-    if group.source_id.startswith(FOLDER_PREFIX) or _own_source(group):
+    if group.source_id.startswith((FOLDER_PREFIX, IMPORT_PREFIX)) or _own_source(group):
         return group.source_id
     return channel.source_id or group.source_id
+
+
+# --- prune -----------------------------------------------------------------------------------
+
+
+async def folder_membership(cfg: Config, catalog: DialogCatalog) -> FolderMembership:
+    """Read what every folder source lists right now; ``catalog``'s client must be connected.
+
+    The network half of ``sources prune``, and it differs from :func:`resolve_sources` in the
+    one way that matters here: a source that does not resolve is *recorded* as failed instead of
+    being logged and skipped. :func:`prunable` reads a chat's absence from its folder as "it
+    left", so a transient ``RPCError`` swallowed in silence would offer that source's whole
+    indexed history for deletion.
+
+    A folder's membership is the chats it shows plus the explicit peers it names, resolvable or
+    not: :func:`folder_dialogs` drops a peer whose entity Telegram will not hand over (a channel
+    gone private, say), and such a peer is still very much listed by the folder.
+
+    An ``UnauthorizedError`` is re-raised rather than recorded, the way
+    :func:`grepogram.sync._sync_chats` re-raises it: every ``UnauthorizedError`` is an
+    ``RPCError``, and a session revoked mid-scan is not a source Telegram would not answer for
+    but a session that answers for none. Raised, it reaches
+    :func:`grepogram.tg.wrap_auth_errors` and the user is told to run ``grepogram auth``
+    instead of to try again once Telegram comes back.
+    """
+    listed: dict[str, set[int]] = {}
+    failed: dict[str, str] = {}
+    for source in cfg.sources:
+        if source.folder is None:
+            continue
+        try:
+            folder = await find_folder(source.folder, catalog)
+            members = await folder_dialogs(folder, catalog)
+        except errors.UnauthorizedError:
+            raise
+        except (SourceError, errors.RPCError) as exc:
+            log.warning("cannot check source %s: %s", source.id, exc)
+            failed[source.id] = str(exc)
+            continue
+        named = (folder.include_ids | folder.pinned_ids) - folder.exclude_ids
+        listed[source.id] = {info.id for info in members} | set(named)
+    return FolderMembership(listed=listed, failed=failed)
+
+
+def prunable(cfg: Config, conn: sqlite3.Connection, folders: FolderMembership) -> PruneScan:
+    """The indexed chats whose folder source no longer lists them, with a reason for each.
+
+    ``folders`` is what :func:`folder_membership` just read from Telegram, and it is the only
+    evidence: a chat is offered when a folder source that *resolved* brought it in and no
+    resolved source covers it any more.
+
+    Four kinds of chat are kept instead, each with its reason:
+
+    * one an ``import:`` source holds — an import has no dialog by definition, so no folder
+      could ever list it;
+    * one a ``chat:`` entry names, whatever its stored ``source_id`` says: a chat two sources
+      cover keeps the first one's id (:func:`resolve_sources`), so the stored tag is no proof of
+      who covers it now;
+    * a channel's discussion group the channel still links — it is indexed through that link,
+      not through a folder listing (:func:`discussion_source_id`);
+    * one whose source is gone from the config; that is ``sources rm``'s business, and nothing
+      here can resolve a source the config does not hold.
+
+    A configured source that failed to resolve makes the whole scan inconclusive, and
+    :attr:`PruneScan.prunable` comes back empty while :attr:`PruneScan.unresolved` is not:
+    coverage is a union over every source, so one unchecked source means no chat can be *proved*
+    uncovered. The caller reports that instead of deleting anything.
+    """
+    covered: set[int] = set()
+    for ids in folders.listed.values():
+        covered |= ids
+    named = [
+        target
+        for target in (_target_of(str(s.chat)) for s in cfg.sources if s.chat is not None)
+        if target is not None
+    ]
+    counts = db.message_counts(conn)
+    unresolved = [f"{source_id}: {why}" for source_id, why in sorted(folders.failed.items())]
+    offered: list[PruneCandidate] = []
+    kept: list[PruneCandidate] = []
+
+    def record(into: list[PruneCandidate], chat: ChatRow, reason: str) -> None:
+        into.append(PruneCandidate(chat=chat, reason=reason, messages=counts.get(chat.id, 0)))
+
+    for chat in db.list_chats(conn):
+        source_id = chat.source_id or ""
+        if source_id.startswith(IMPORT_PREFIX) or not source_id.startswith(FOLDER_PREFIX):
+            continue  # an import and a chat entry name themselves; neither can leave a folder
+        if chat.id in covered or any(_names_chat(t, chat.id, chat.username) for t in named):
+            continue
+        if source_id in folders.failed:
+            record(kept, chat, f"{source_id} could not be checked")
+        elif source_id not in folders.listed:
+            record(kept, chat, f"{source_id} is not a configured source; use sources rm")
+        elif chat.discussion_of is not None and db.get_chat(conn, chat.discussion_of) is not None:
+            record(kept, chat, f"still the discussion group of channel {chat.discussion_of}")
+        else:
+            record(offered, chat, f"{source_id} no longer lists it")
+    if unresolved:
+        log.warning("prune scan is inconclusive: %s", "; ".join(unresolved))
+    return PruneScan(prunable=[] if unresolved else offered, kept=kept, unresolved=unresolved)
+
+
+def prune_chats(conn: sqlite3.Connection, candidates: Sequence[PruneCandidate]) -> list[int]:
+    """Delete the chats :func:`prunable` offered, with their messages, units and index rows.
+
+    One transaction for the lot, and every candidate is put to :func:`_still_prunable` again
+    inside it. The re-check is not belt and braces: the scan and the confirmation both happen
+    *before* the sync lock is taken, because a network round trip must never be held across it,
+    so the verdict this acts on can be seconds or minutes old and another process is free to
+    have changed the chat in between — to have taken it over, linked it as a discussion group,
+    or removed the live source and imported the same chat, which is the one that cannot be
+    undone. What the offer rested on is re-read here instead of assumed. Returns the ids
+    actually removed, which is how the caller notices that a candidate was dropped; each drop is
+    logged with the reason.
+
+    ``candidates`` and not ids for that reason: :attr:`PruneCandidate.chat` carries the
+    ``source_id`` the offer was made under, which is what "unchanged" is measured against.
+    """
+    removed: list[int] = []
+    with db.transaction(conn):
+        for candidate in candidates:
+            stored = db.get_chat(conn, candidate.chat.id)
+            if stored is None or not _still_prunable(conn, stored, candidate):
+                continue
+            db.delete_chat(conn, stored.id)
+            removed.append(stored.id)
+    log.info("pruned %d chats", len(removed))
+    return removed
+
+
+def _still_prunable(conn: sqlite3.Connection, stored: ChatRow, candidate: PruneCandidate) -> bool:
+    """Whether ``stored`` is still the chat :func:`prunable` offered, re-read under the lock.
+
+    Three questions, in the order of what they cost if missed:
+
+    * is it an import now? :func:`imported_tag` is the question every path that touches
+      ``chats.source_id`` has to ask, and this one deletes rows rather than writing the column,
+      which makes it the worst place to skip: an imported history has no dialog behind it and
+      Telegram cannot hand it back. ``sources rm folder:X`` followed by an import of the same
+      chat is all it takes, and neither command takes longer than a confirmation prompt;
+    * does it still carry the source id it was offered under? The whole verdict was "*this*
+      folder source brought it in and no resolved source covers it any more", so any other value
+      in the column — another source's id after a sync resolved it, a folder entry rewritten —
+      says the scan is describing a chat that no longer exists in that form;
+    * is it a channel's discussion group now? :func:`prunable` keeps one for the reason that it
+      is indexed through the link and not through a folder listing, and
+      :func:`grepogram.sync.link_discussion_chat` can have made it one since.
+
+    Everything here is a database read: this runs under the :class:`~grepogram.sync.SyncLock`,
+    where a Telegram round trip has no business. Re-resolving the folders is what the next
+    ``sources prune`` is for.
+    """
+    chat_id = stored.id
+    held = imported_tag(conn, chat_id)
+    if held is not None:
+        log.warning(
+            "chat %s (%s) is held as %s since the prune was scanned; it was not deleted — "
+            "an imported history cannot be fetched again",
+            chat_id,
+            stored.title,
+            held,
+        )
+        return False
+    if (stored.source_id or "") != (candidate.chat.source_id or ""):
+        log.warning(
+            "chat %s (%s) was offered under source %s and now carries %s; it was not deleted",
+            chat_id,
+            stored.title,
+            candidate.chat.source_id or "-",
+            stored.source_id or "-",
+        )
+        return False
+    if stored.discussion_of is not None and db.get_chat(conn, stored.discussion_of) is not None:
+        log.warning(
+            "chat %s (%s) is the discussion group of channel %s since the prune was scanned; "
+            "it was not deleted",
+            chat_id,
+            stored.title,
+            stored.discussion_of,
+        )
+        return False
+    return True
+
+
+# --- import ----------------------------------------------------------------------------------
+
+
+def import_chats(conn: sqlite3.Connection, entries: Sequence[ImportedChat]) -> list[Imported]:
+    """Store a parsed Telegram Desktop export, tagging each of its chats ``import:<slug>``.
+
+    The rows go in through :func:`grepogram.db.upsert_messages` like any other, so the caller
+    rebuilds units, indexes and embeds them exactly as a sync does; nothing here derives
+    anything. What is special is only the tag: an imported chat carries ``unavailable = 1`` and
+    ``last_msg_id = 0`` (:class:`grepogram.tdesktop.ImportedChat` sets both), so no sync ever
+    resumes from it, and its ``import:`` source id is what :func:`prunable` and
+    :func:`grepogram.sync.prune_deleted` recognise to leave the history alone — neither a folder
+    nor Telegram can be asked about a chat the account can no longer open.
+
+    Refused as a whole, before a single row is written, when any chat of the export is already
+    indexed from Telegram (:class:`ImportConflict`): :func:`grepogram.db.upsert_chat` overwrites
+    ``source_id``, so the import would retag a live chat and hide it from the source that fetches
+    it. A chat already stored as an import is not a conflict — re-running an import is how a
+    partial one is finished, and it is idempotent because the ids come from the export.
+    """
+    rows = [entry.chat for entry in entries]
+    _refuse_live(conn, rows)
+    source_ids = import_source_ids(conn, rows)
+    stored: list[Imported] = []
+    with db.transaction(conn):
+        for entry in entries:
+            source_id = source_ids[entry.chat.id]
+            chat = db.upsert_chat(conn, dataclasses.replace(entry.chat, source_id=source_id))
+            message_ids = db.upsert_messages(conn, entry.messages)
+            stored.append(Imported(chat=chat, source_id=source_id, messages=len(message_ids)))
+    log.info(
+        "imported %d chats and %d messages", len(stored), sum(item.messages for item in stored)
+    )
+    return stored
+
+
+def refuse_imported(conn: sqlite3.Connection, covered: Sequence[DialogInfo]) -> None:
+    """Refuse a live source that would cover a chat this index holds as an import.
+
+    :func:`grepogram.db.upsert_chat` writes ``source_id`` unconditionally, so the very next sync
+    would replace ``import:<slug>`` with the new source's id — and every protection keyed on that
+    prefix would go with it: :func:`prunable` would offer the imported history for deletion the
+    moment a folder stopped listing the chat, and :func:`grepogram.sync.prune_deleted` would ask
+    Telegram about ids it never had and delete the lot. Nothing below this point can tell an
+    imported chat from a fetched one afterwards, so the two commands that add a source — ``sources
+    add`` and the MCP tool of the same name — refuse by name here, before the config is saved.
+
+    ``covered`` is what the source resolved to: the one chat, or every member of a folder. One
+    imported chat in a folder refuses the whole folder, because adding it would cover that chat
+    on every sync from now on.
+    """
+    for dialog in covered:
+        source_id = imported_tag(conn, dialog.id)
+        if source_id is None:
+            continue
+        raise ImportConflict(
+            f"{dialog.title!r} (id {dialog.id}) is already in the index as {source_id}, a "
+            "Telegram Desktop import; a live source would take it over on the next sync and the "
+            f"imported history would become prunable — remove it with `grepogram sources rm "
+            f"{source_id}` first if you want this chat synced from Telegram instead"
+        )
+
+
+def import_source_ids(conn: sqlite3.Connection, chats: Sequence[ChatRow]) -> dict[int, str]:
+    """The ``import:<slug>`` source id of every chat of one export, keyed by chat id.
+
+    The slug is the title, so ``sources ls`` reads as something a human recognises and a second
+    import of the same export writes the same id — which is what makes re-running one idempotent
+    rather than a second copy under a fresh tag. A title that slugifies to nothing (an emoji-only
+    name, a chat the export left unnamed) falls back to the chat's own id.
+
+    Two chats can want the same slug — two contacts of one name in a single export, or a title
+    an earlier import already claimed — and sharing a source id would make ``sources rm`` on
+    either delete both, so every colliding chat carries its own id instead: the chat's own id is
+    appended, and appended again while the result is *still* taken. That last loop is not
+    theoretical — a chat titled ``x`` with id 123 and a chat titled ``x-123`` both land on
+    ``import:x-123`` at the first attempt.
+
+    The chats are walked in id order rather than the export's, so the answer depends only on the
+    export and the index and is stable across runs.
+    """
+    slugs = {chat.id: import_slug(chat.title) or f"chat-{abs(chat.id)}" for chat in chats}
+    shared = {slug for slug, count in collections.Counter(slugs.values()).items() if count > 1}
+    held = {
+        str(chat.source_id): chat.id
+        for chat in db.list_chats(conn)
+        if (chat.source_id or "").startswith(IMPORT_PREFIX)
+    }
+    ids: dict[int, str] = {}
+    taken: set[str] = set()
+
+    def claimed(source_id: str, chat_id: int) -> bool:
+        """Whether ``source_id`` belongs to some other chat — in this export or in the index."""
+        return source_id in taken or held.get(source_id, chat_id) != chat_id
+
+    for chat_id in sorted(slugs):
+        slug = slugs[chat_id]
+        source_id = f"{IMPORT_PREFIX}{slug}"
+        if slug in shared or claimed(source_id, chat_id):
+            source_id = f"{IMPORT_PREFIX}{slug}-{abs(chat_id)}"
+        while claimed(source_id, chat_id):
+            source_id = f"{source_id}-{abs(chat_id)}"
+        taken.add(source_id)
+        ids[chat_id] = source_id
+    return ids
+
+
+def import_slug(title: str | None) -> str:
+    """``title`` as the readable half of an ``import:`` source id, ``""`` when it yields none.
+
+    Letters and digits are kept as they are — a Cyrillic title stays Cyrillic, since the id is
+    read by people and never typed into a URL — everything else separates words, and the result
+    is one lowercase dash-joined run of at most :data:`IMPORT_SLUG_MAX` characters.
+    """
+    words: list[str] = []
+    word = ""
+    for char in (title or "").casefold():
+        if char.isalnum():
+            word += char
+        elif word:
+            words.append(word)
+            word = ""
+    if word:
+        words.append(word)
+    return "-".join(words)[:IMPORT_SLUG_MAX].strip("-")
+
+
+def _refuse_live(conn: sqlite3.Connection, chats: Sequence[ChatRow]) -> None:
+    """Refuse an import over a chat this index already syncs from Telegram, naming it.
+
+    Anything stored under a source that is not an ``import:`` one counts, an untagged row
+    included: the export is a snapshot of a history Telegram still serves, and importing it
+    would both retag the chat and leave two writers over the same ``(chat_id, msg_id)`` rows.
+    """
+    for chat in chats:
+        stored = db.get_chat(conn, chat.id)
+        if stored is None or (stored.source_id or "").startswith(IMPORT_PREFIX):
+            continue
+        through = f"through {stored.source_id}" if stored.source_id else "with no source"
+        raise ImportConflict(
+            f"{stored.title or stored.type} (id {stored.id}) is already indexed from Telegram "
+            f"{through}; remove that source with `grepogram sources rm` before importing an "
+            "export of the same chat, or the import would take the chat over"
+        )
 
 
 # --- status ----------------------------------------------------------------------------------

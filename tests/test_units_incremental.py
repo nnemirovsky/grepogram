@@ -209,6 +209,10 @@ def test_edit_inside_a_closed_window_is_not_recut_but_its_thread_is(
 def test_edit_that_leaves_unit_text_unchanged_keeps_every_row(
     conn: sqlite3.Connection, chat: ChatRow
 ) -> None:
+    """A reaction arriving is the case ``_content_key`` deliberately cannot see, and this is
+    what says so: with ``reactions`` in the key every reaction anyone adds would delete,
+    re-insert and re-embed the unit holding it — ``edit_refetch`` re-reads 200 messages per chat
+    per sync — while keeping the stored row is what preserves a refreshed total instead."""
     first = _sync(conn, chat, [_msg(1, 0), _msg(2, 1, reply_to=1)])
     ids = _ids_by_shape(conn)
     delta = _sync(conn, chat, [_msg(2, 1, reply_to=1, reactions_total=5)])
@@ -659,6 +663,236 @@ def test_edited_post_rebuilds_its_post_and_thread_only(conn: sqlite3.Connection)
     assert kept and all(after[shape] == unit_id for shape, unit_id in kept.items())
     assert all("post 10 (edited)" in str(shape[5]) for shape in after if shape[2] == (10,))
     assert _stored(conn, CHANNEL) == _expected(conn, channel)
+
+
+# --- invalidate_units_for --------------------------------------------------------------------
+
+
+def _photo(msg_id: int, minutes: int = 0, **overrides: Any) -> MessageRow:
+    """A caption-less photo — what the index holds as a bare ``[photo]`` until OCR runs."""
+    return _msg(msg_id, minutes, text="", media_kind="photo", **overrides)
+
+
+def _extracted(conn: sqlite3.Connection, chat_id: int, msg_id: int, text: str) -> MessageRow:
+    """Write extracted text onto a stored message the way ``db.set_media_text`` does."""
+    conn.execute(
+        "UPDATE messages SET extracted_text = ? WHERE chat_id = ? AND msg_id = ?",
+        (text, chat_id, msg_id),
+    )
+    row = db.get_message(conn, chat_id, msg_id)
+    assert row is not None
+    return row
+
+
+def test_extracted_text_reaches_an_already_closed_window(
+    conn: sqlite3.Connection, chat: ChatRow
+) -> None:
+    """The test the whole extraction feature stands on.
+
+    An incremental rebuild returns nothing for a message inside a closed window, and closed
+    windows are all but the last of a chat's history — so the ``indexed = 0`` flag would clear on
+    the next ``mark_indexed`` with the text still rendered nowhere.
+    """
+    _sync(conn, chat, [_photo(2, 2), *(_msg(i, i) for i in (1, 3, 4, 5, 6, 7))])
+    closed = _by_msg_ids(conn, "window")[(1, 2, 3, 4, 5)]
+    open_window = _by_msg_ids(conn, "window")[(6, 7)]
+    assert "[photo]" in closed.text
+
+    row = _extracted(conn, CHAT, 2, "ОТКРЫТО с 9:00")
+    assert row.id is not None
+    assert units.rebuild_for_chat(conn, chat, CFG, [row.id]) == UnitDelta()
+    assert _by_msg_ids(conn, "window")[(1, 2, 3, 4, 5)].text == closed.text, "a rebuild cannot"
+
+    delta = units.invalidate_units_for(conn, chat, CFG, [row])
+    recut = _by_msg_ids(conn, "window")[(1, 2, 3, 4, 5)]
+    assert "[photo] ОТКРЫТО с 9:00" in recut.text
+    assert delta.deleted_ids == [closed.id] and delta.inserted_ids == [recut.id]
+    assert _by_msg_ids(conn, "window")[(6, 7)].id == open_window.id, "unchanged, so still embedded"
+    assert _stored(conn) == _expected(conn, chat)
+    assert not conn.in_transaction
+
+
+def test_invalidation_windows_by_window_topic_not_the_raw_topic_id(
+    conn: sqlite3.Connection, chat: ChatRow
+) -> None:
+    """Telegram sets ``topic_id`` outside forums too, for a legacy message thread — 124 of
+    13,227 rows in a real supergroup. Windows there carry none, and ``topic_id IS ?`` would
+    match no window at all for such a message."""
+    _sync(conn, chat, [_photo(2, 2, topic_id=7), *(_msg(i, i) for i in (1, 3, 4, 5, 6, 7))])
+    assert _by_msg_ids(conn, "window")[(1, 2, 3, 4, 5)].topic_id is None
+    row = _extracted(conn, CHAT, 2, "read off the photo")
+    assert row.topic_id == 7
+    units.invalidate_units_for(conn, chat, CFG, [row])
+    assert "[photo] read off the photo" in _by_msg_ids(conn, "window")[(1, 2, 3, 4, 5)].text
+    assert _stored(conn) == _expected(conn, chat)
+
+
+def test_invalidation_rebuilds_the_thread_quoting_the_message(
+    conn: sqlite3.Connection, chat: ChatRow
+) -> None:
+    _sync(conn, chat, [_msg(1, 0), _photo(2, 1, reply_to=1), _msg(3, 2, reply_to=1)])
+    row = _extracted(conn, CHAT, 2, "прайс-лист")
+    units.invalidate_units_for(conn, chat, CFG, [row])
+    thread = _by_msg_ids(conn, "thread")[(1, 2, 3)]
+    assert "[photo] прайс-лист" in thread.text
+    assert "[photo] прайс-лист" in _by_msg_ids(conn, "window")[(1, 2, 3)].text
+    assert _stored(conn) == _expected(conn, chat)
+
+
+def test_a_photo_that_heads_a_thread_gets_its_text_into_the_thread_unit(
+    conn: sqlite3.Connection, chat: ChatRow
+) -> None:
+    """A thread's root is re-read, never taken from the row handed in — ``_chain_tops`` would
+    otherwise render the caller's copy at the head of the thread, stale placeholder and all."""
+    _sync(conn, chat, [_photo(1, 0), _msg(2, 1, reply_to=1), _msg(3, 2, reply_to=1)])
+    assert _by_msg_ids(conn, "thread")[(1, 2, 3)].text.splitlines()[0].endswith("[photo]")
+    stale = db.get_message(conn, CHAT, 1)
+    assert stale is not None
+    _extracted(conn, CHAT, 1, "объявление посольства")
+    units.invalidate_units_for(conn, chat, CFG, [stale])
+    head = _by_msg_ids(conn, "thread")[(1, 2, 3)].text.splitlines()[0]
+    assert head.endswith("[photo] объявление посольства")
+    assert _stored(conn) == _expected(conn, chat)
+
+
+def test_a_long_thread_is_rebuilt_in_every_chunk_it_spans(
+    conn: sqlite3.Connection, chat: ChatRow
+) -> None:
+    """``thread_max_msgs`` is 4 here, so the thread spans several units and only one of them
+    holds the changed message; the others must not linger beside the rebuilt ones."""
+    _sync(conn, chat, [_photo(1, 0), *(_msg(i, i, reply_to=1) for i in range(2, 9))])
+    assert sorted(_by_msg_ids(conn, "thread")) == [(1, 2, 3, 4), (1, 5, 6, 7), (1, 8)]
+    row = _extracted(conn, CHAT, 1, "read here")
+    units.invalidate_units_for(conn, chat, CFG, [row])
+    threads = _by_msg_ids(conn, "thread")
+    assert sorted(threads) == [(1, 2, 3, 4), (1, 5, 6, 7), (1, 8)]
+    assert all("[photo] read here" in unit.text for unit in threads.values())
+    assert _stored(conn) == _expected(conn, chat)
+
+
+def test_invalidation_renders_nothing_from_the_rows_it_is_given(
+    conn: sqlite3.Connection, chat: ChatRow
+) -> None:
+    """Task 12 hands this primitive rows it has just deleted. A row rendered as passed would be
+    written straight back into a fresh thread or window, undoing the deletion in the index."""
+    _sync(conn, chat, [_msg(1, 0), _msg(2, 1, reply_to=1), _msg(3, 2, reply_to=1)])
+    gone = db.get_message(conn, CHAT, 1)
+    assert gone is not None
+    conn.execute("DELETE FROM messages WHERE chat_id = ? AND msg_id = ?", (CHAT, 1))
+    units.invalidate_units_for(conn, chat, CFG, [gone])
+    stored = db.get_units(conn, CHAT)
+    assert "message 1" not in " ".join(unit.text for unit in stored)
+    assert [(u.kind, u.msg_ids) for u in stored] == [("window", [2, 3])]
+    assert _stored(conn) == _expected(conn, chat), "a thread whose root is gone is dropped"
+
+
+def test_a_batch_recuts_the_chats_tail_once_not_once_per_message(
+    conn: sqlite3.Connection, chat: ChatRow, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``windows_from`` replaces every window to the end of the chat, so a call per message
+    would re-cut and re-embed the same tail fifty times over."""
+    _sync(conn, chat, [_photo(i, i) for i in range(1, 51)])
+    before = len(_by_msg_ids(conn, "window"))
+    starts: list[int] = []
+    real = db.windows_from
+
+    def counted(
+        c: sqlite3.Connection, chat_id: int, topic_id: int | None, msg_id: int
+    ) -> list[UnitRow]:
+        starts.append(msg_id)
+        return real(c, chat_id, topic_id, msg_id)
+
+    monkeypatch.setattr(db, "windows_from", counted)
+    rows = [_extracted(conn, CHAT, i, f"read {i}") for i in range(1, 51)]
+    delta = units.invalidate_units_for(conn, chat, CFG, rows)
+    assert starts == [1]
+    assert len(delta.deleted_ids) == before and len(delta.inserted_ids) == before
+    assert _stored(conn) == _expected(conn, chat)
+
+
+def test_invalidation_recuts_a_channel_post_and_the_thread_quoting_it(
+    conn: sqlite3.Connection,
+) -> None:
+    """``db.containing_unit`` answers with the post unit alone; the post thread carries the
+    post's own line too and would keep the stale placeholder forever."""
+    channel = _channel(conn)
+    _discussion(conn)
+    db.upsert_messages(conn, [_comment(1, 10, 5)])
+    _sync(conn, channel, [_post(10, text="", media_kind="photo"), _post(11, 1)])
+    kept = _by_msg_ids(conn, "post", CHANNEL)[(11,)]
+    row = _extracted(conn, CHANNEL, 10, "объявление")
+    units.invalidate_units_for(conn, channel, CFG, [row])
+    assert "[photo] объявление" in _by_msg_ids(conn, "post", CHANNEL)[(10,)].text
+    thread = _by_msg_ids(conn, "thread", CHANNEL)[(10,)]
+    assert thread.text.splitlines()[0].endswith("[photo] объявление")
+    assert _by_msg_ids(conn, "post", CHANNEL)[(11,)].id == kept.id
+    assert _stored(conn, CHANNEL) == _expected(conn, channel)
+
+
+def test_invalidation_drops_the_units_of_a_post_that_is_gone(conn: sqlite3.Connection) -> None:
+    channel = _channel(conn)
+    _discussion(conn)
+    db.upsert_messages(conn, [_comment(1, 10, 5)])
+    _sync(conn, channel, [_post(10), _post(11, 1)])
+    gone = db.get_message(conn, CHANNEL, 10)
+    assert gone is not None
+    conn.execute("DELETE FROM messages WHERE chat_id = ? AND msg_id = ?", (CHANNEL, 10))
+    units.invalidate_units_for(conn, channel, CFG, [gone])
+    assert [(u.kind, u.msg_ids) for u in db.get_units(conn, CHANNEL)] == [("post", [11])]
+    assert "post 10" not in " ".join(u.text for u in db.get_units(conn, CHANNEL))
+
+
+def test_invalidation_reaches_a_message_no_window_holds_yet(
+    conn: sqlite3.Connection, chat: ChatRow
+) -> None:
+    """Messages do not always arrive in id order — a channel stores a comment in its group
+    before the group's own history gets there — so a row can be stored and windowed by nothing.
+    It takes the window before it, or its own id when none precedes it."""
+    _sync(conn, chat, [_msg(5, 5), _msg(6, 6)])
+    db.upsert_messages(conn, [_photo(1, 1), _photo(10, 10)])
+    ahead = db.get_message(conn, CHAT, 10)
+    behind = db.get_message(conn, CHAT, 1)
+    assert ahead is not None and behind is not None
+    assert db.containing_unit(conn, CHAT, 10, None) is None
+    _extracted(conn, CHAT, 1, "below every window")
+    _extracted(conn, CHAT, 10, "past the last window")
+    units.invalidate_units_for(conn, chat, CFG, [ahead, behind])
+    texts = " ".join(unit.text for unit in db.get_units(conn, CHAT))
+    assert "[photo] below every window" in texts
+    assert "[photo] past the last window" in texts
+    assert _stored(conn) == _expected(conn, chat)
+
+
+def test_invalidation_drops_a_thread_that_lost_every_reply(
+    conn: sqlite3.Connection, chat: ChatRow
+) -> None:
+    """A root with nothing under it is not a thread; the unit that was one goes."""
+    _sync(conn, chat, [_photo(1, 0), _msg(2, 1, reply_to=1)])
+    assert sorted(_by_msg_ids(conn, "thread")) == [(1, 2)]
+    conn.execute("DELETE FROM messages WHERE chat_id = ? AND msg_id = ?", (CHAT, 2))
+    row = _extracted(conn, CHAT, 1, "read here")
+    units.invalidate_units_for(conn, chat, CFG, [row])
+    assert _by_msg_ids(conn, "thread") == {}
+    assert "[photo] read here" in _by_msg_ids(conn, "window")[(1,)].text
+    assert _stored(conn) == _expected(conn, chat)
+
+
+def test_invalidation_with_no_rows_touches_nothing(conn: sqlite3.Connection, chat: ChatRow) -> None:
+    _sync(conn, chat, [_msg(1, 0), _msg(2, 1)])
+    before = _ids_by_shape(conn)
+    assert units.invalidate_units_for(conn, chat, CFG, []) == UnitDelta()
+    assert _ids_by_shape(conn) == before
+    assert not conn.in_transaction
+
+
+def test_invalidation_leaves_a_chat_with_no_windows_to_the_next_rebuild(
+    conn: sqlite3.Connection, chat: ChatRow
+) -> None:
+    """Nothing is stale, and cutting only from here would leave the messages before it homeless."""
+    ids = db.upsert_messages(conn, [_msg(1, 0), _msg(2, 1)])
+    rows = db.get_messages_by_ids(conn, ids)
+    assert units.invalidate_units_for(conn, chat, CFG, rows[1:]) == UnitDelta()
+    assert db.get_units(conn, CHAT) == []
 
 
 # --- atomicity -------------------------------------------------------------------------------

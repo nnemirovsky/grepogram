@@ -8,7 +8,9 @@ from grepogram.models import ChatRow, MessageRow, UnitRow, UnitsCfg
 
 BASE = 1_705_314_600  # 2024-01-15 10:30:00 UTC
 CHAT = -1000000000100
-CFG = UnitsCfg(window_gap_min=30, window_max_msgs=3, window_max_chars=80, thread_max_msgs=40)
+CFG = UnitsCfg(window_gap_min=30, window_max_msgs=3, window_max_chars=120, thread_max_msgs=40)
+"""Three ``message N`` lines come to 108 characters, so the message count is what binds here;
+the character ceiling has its own tests below."""
 GROUP = ChatRow(id=CHAT, type="supergroup")
 FORUM = ChatRow(id=CHAT, type="supergroup", is_forum=True)
 
@@ -84,6 +86,75 @@ def test_render_line_sender_fallbacks(
     assert line == f"[2024-01-15 10:30] {expected}: x"
 
 
+# --- render_line with extracted text ----------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("overrides", "expected"),
+    [
+        (
+            {"text": "", "media_kind": "photo", "extracted_text": "ОТКРЫТО с 9:00"},
+            "[photo] ОТКРЫТО с 9:00",
+        ),
+        (
+            {"text": "смотри", "media_kind": "photo", "extracted_text": "ОТКРЫТО с 9:00"},
+            "смотри [photo] ОТКРЫТО с 9:00",
+        ),
+        (
+            {
+                "text": "",
+                "media_kind": "document",
+                "media_filename": "cv.pdf",
+                "extracted_text": "Anna Petrova",
+            },
+            "[document: cv.pdf] Anna Petrova",
+        ),
+        ({"text": "", "media_kind": "photo", "extracted_text": ""}, "[photo]"),
+        ({"text": "", "media_kind": "photo", "extracted_text": "  \n "}, "[photo]"),
+        ({"text": "caption", "media_kind": "photo", "extracted_text": ""}, "caption"),
+        ({"text": "caption", "media_kind": "photo", "extracted_text": None}, "caption"),
+        ({"text": "", "media_kind": None, "extracted_text": "orphaned"}, "[empty]"),
+        ({"text": "typed", "media_kind": None, "extracted_text": "orphaned"}, "typed"),
+    ],
+)
+def test_render_line_carries_what_an_extractor_read(
+    overrides: dict[str, Any], expected: str
+) -> None:
+    """The marker never goes away: a reader has to see that a machine read those words."""
+    assert units.render_line(_msg(1, **overrides)) == f"[2024-01-15 10:30] Alice: {expected}"
+
+
+def test_extracted_text_folds_onto_one_line() -> None:
+    """A unit is one line per message and ``msg_ids`` maps back position by position, so a
+    PDF's own newlines — which ``extract._capped`` deliberately keeps — are folded here."""
+    msg = _msg(
+        1,
+        text="",
+        media_kind="document",
+        media_filename="prices.pdf",
+        extracted_text="Bread\t2.50\n\nMilk   1.20\n",
+    )
+    assert units.render_line(msg) == (
+        "[2024-01-15 10:30] Alice: [document: prices.pdf] Bread 2.50 Milk 1.20"
+    )
+    assert "\n" not in units.render_line(msg)
+
+
+def test_extracted_line_is_empty_when_nothing_was_read() -> None:
+    assert units.extracted_line(_msg(1, media_kind="photo")) == ""
+    assert units.extracted_line(_msg(1, media_kind="photo", extracted_text="  ")) == ""
+    assert units.extracted_line(_msg(1, media_kind="photo", extracted_text=" a  b ")) == "a b"
+
+
+def test_an_extracted_message_counts_against_the_window_ceiling() -> None:
+    """The rendered line is what the cap measures, so OCR text is part of the budget."""
+    cfg = UnitsCfg(window_gap_min=30, window_max_msgs=99, window_max_chars=120, thread_max_msgs=40)
+    long = _msg(1, text="", media_kind="photo", extracted_text="x" * 200)
+    windows = units.cut_windows([long, _msg(2, 1, text="after")], cfg, CHAT)
+    assert _ids(windows) == [[1], [2]]
+    assert len(windows[0].text) > cfg.window_max_chars
+
+
 # --- cut_windows -----------------------------------------------------------------------------
 
 
@@ -137,16 +208,33 @@ def test_cut_windows_count_cut() -> None:
 
 def test_cut_windows_char_cut() -> None:
     long_text = "x" * 50
-    cfg = UnitsCfg(window_gap_min=30, window_max_msgs=100, window_max_chars=120)
+    cfg = UnitsCfg(window_gap_min=30, window_max_msgs=100, window_max_chars=160)
     windows = _run([_msg(i, i, text=long_text) for i in range(1, 6)], cfg)
     assert _ids(windows) == [[1, 2], [3, 4], [5]]
-    for window in windows[:-1]:
-        assert len(window.text) >= 120
-        assert len(window.text.split("\n")[0]) < 120
+    for window in windows:
+        assert len(window.text) <= 160
+
+
+def test_cut_windows_never_exceeds_the_char_cap() -> None:
+    """The cap is a ceiling on the finished text, not the size at which a window closes: the
+    third line of each pair below would take it to 229, so the window closes before it."""
+    cfg = UnitsCfg(window_gap_min=30, window_max_msgs=100, window_max_chars=160)
+    windows = _run([_msg(i, i, text="x" * 50) for i in range(1, 20)], cfg)
+    assert all(len(window.text) <= cfg.window_max_chars for window in windows)
+
+
+def test_cut_windows_a_line_that_exactly_hits_the_cap_is_kept() -> None:
+    line = units.render_line(_msg(1, 0, text="ab"))
+    cfg = UnitsCfg(window_gap_min=30, window_max_msgs=100, window_max_chars=2 * len(line) + 1)
+    windows = _run([_msg(i, i, text="ab") for i in range(1, 3)], cfg)
+    assert _ids(windows) == [[1, 2]]
+    assert len(windows[0].text) == cfg.window_max_chars
 
 
 def test_cut_windows_oversized_message_is_its_own_window() -> None:
-    cfg = UnitsCfg(window_gap_min=30, window_max_msgs=100, window_max_chars=40)
+    """The empty-window guard: a message longer than the whole budget still becomes a window,
+    and it takes nothing else with it."""
+    cfg = UnitsCfg(window_gap_min=30, window_max_msgs=100, window_max_chars=70)
     messages = [
         _msg(1, 0, text="a" * 500),
         _msg(2, 1, text="b" * 500),
@@ -156,6 +244,7 @@ def test_cut_windows_oversized_message_is_its_own_window() -> None:
     windows = _run(messages, cfg)
     assert _ids(windows) == [[1], [2], [3, 4]]
     assert len(windows[0].text) > 500
+    assert len(windows[2].text) <= 70
 
 
 def test_cut_windows_char_budget_counts_rendered_lines_and_their_newlines() -> None:
@@ -165,6 +254,28 @@ def test_cut_windows_char_budget_counts_rendered_lines_and_their_newlines() -> N
     cfg = UnitsCfg(window_gap_min=30, window_max_msgs=100, window_max_chars=2 * len(line) + 1)
     windows = _run([_msg(i, i, text="ab") for i in range(1, 5)], cfg)
     assert _ids(windows) == [[1, 2], [3, 4]]
+    assert all(len(window.text) <= cfg.window_max_chars for window in windows)
+
+
+def test_cut_windows_default_cap_holds_over_a_real_sized_conversation() -> None:
+    """The overflow the v0.1.1 index measured: under the floor rule a window closed only *after*
+    passing ``window_max_chars``, so it held the cap plus whatever message carried it over —
+    median 1,274 characters against a 1,500 cap with a tail to 3,453, and 15.8% of a 400-window
+    sample past the embedder's 512-token limit. At the shipped defaults nothing passes the cap
+    now, and the character limit is what does most of the cutting.
+    """
+    cfg = UnitsCfg()
+    rng = random.Random(11)
+    messages = [_msg(i, i // 3, text="слово " * rng.randint(1, 90)) for i in range(1, 400)]
+    windows = _run(messages, cfg)
+    assert max(len(window.text) for window in windows) <= cfg.window_max_chars
+    # the cut is char-driven, not an artefact of the message-count limit
+    assert max(len(window.msg_ids) for window in windows) < cfg.window_max_msgs
+    # and it would have overflowed under the old rule: every closed window is one line short
+    by_id = {msg.msg_id: msg for msg in messages}
+    for window in windows[:-1]:
+        following = by_id[window.msg_id_end + 1]
+        assert len(window.text) + 1 + len(units.render_line(following)) > cfg.window_max_chars
 
 
 def test_cut_windows_text_is_rendered_lines() -> None:
@@ -208,7 +319,8 @@ def test_cut_windows_respects_every_limit() -> None:
         assert 1 <= len(window.msg_ids) <= CFG.window_max_msgs
         lines = [units.render_line(by_id[msg_id]) for msg_id in window.msg_ids]
         assert window.text == "\n".join(lines)
-        assert len("\n".join(lines[:-1])) < CFG.window_max_chars
+        # the cap is a ceiling; only a single message longer than the whole budget may pass it
+        assert len(window.text) <= CFG.window_max_chars or len(window.msg_ids) == 1
         dates = [by_id[msg_id].date for msg_id in window.msg_ids]
         assert all(b - a <= 30 * 60 for a, b in zip(dates, dates[1:], strict=False))
 
@@ -283,3 +395,30 @@ def test_build_unit_renders_in_given_order() -> None:
 def test_build_unit_rejects_empty() -> None:
     with pytest.raises(ValueError, match="at least one message"):
         units.build_unit("window", [], CHAT)
+
+
+def test_build_unit_sums_the_reactions_of_its_messages() -> None:
+    """A unit's ``reactions`` is a ranking signal, so it has to be the whole unit's, not one
+    message's — and it is summed over exactly the messages ``msg_ids`` lists, which is what lets
+    :func:`grepogram.db.refresh_unit_reactions` recompute the same number in place later."""
+    messages = [
+        _msg(1, 0, reactions_total=4),
+        _msg(2, 1),
+        _msg(3, 2, reactions_total=11),
+    ]
+    assert units.build_unit("window", messages, CHAT).reactions == 15
+
+
+def test_build_unit_reactions_are_zero_when_nobody_reacted() -> None:
+    assert units.build_unit("window", [_msg(1), _msg(2, 1)], CHAT).reactions == 0
+
+
+def test_cut_windows_carries_each_window_own_reaction_total() -> None:
+    """The totals follow the boundaries: a reaction counts for the window that holds it."""
+    messages = [
+        _msg(1, 0, reactions_total=2),
+        _msg(2, 1, reactions_total=3),
+        _msg(3, 2),
+        _msg(4, 90, reactions_total=7),
+    ]
+    assert [window.reactions for window in _run(messages)] == [5, 7]

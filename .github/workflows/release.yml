@@ -32,8 +32,56 @@ jobs:
 
       - run: uv build
 
-      # gh ships on the runner, so the release needs no third-party action
+      # the pypi job is a separate job and inherits none of this filesystem, so
+      # the sdist and the wheel travel to it as an artifact. Uploaded before the
+      # release step so a failed `gh release create` still leaves the build to
+      # look at
+      - name: keep the built distributions for the pypi job
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: dist
+          path: dist/
+          if-no-files-found: error
+
+      # gh ships on the runner, so the release needs no third-party action.
+      # Both ways of cutting a release reach here, so this handles both: a tag
+      # pushed on its own (the release does not exist yet, `create` makes it),
+      # and a release published from a workstation first (`create` would fail
+      # 422 already_exists, so the build is attached to what is already there).
+      # `gh release create` has no update mode — attaching is `gh release
+      # upload` — and the two must never both run, or the assets double up.
       - name: publish the release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "$GITHUB_REF_NAME" dist/* --generate-notes --verify-tag
+        run: |
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            echo "release $GITHUB_REF_NAME already exists; attaching the build to it"
+            gh release upload "$GITHUB_REF_NAME" dist/* --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" dist/* --generate-notes --verify-tag
+          fi
+
+  pypi:
+    # gated on the repository variable PYPI_PUBLISH: until the trusted publisher
+    # exists on PyPI this job skips, so a tag still cuts a GitHub release rather
+    # than failing the workflow on an upload that cannot authenticate. Set the
+    # variable to "true" once PyPI knows this workflow.
+    if: vars.PYPI_PUBLISH == 'true'
+    # the GitHub release is the gate, not the other way round: PyPI uploads are
+    # permanent, so nothing is pushed there until the release itself succeeded
+    needs: release
+    runs-on: ubuntu-latest
+    # the trusted publisher on PyPI is configured for this environment; it also
+    # keeps id-token off every other job
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - name: fetch the distributions the release job built
+        uses: actions/download-artifact@v8.0.1
+        with:
+          name: dist
+          path: dist
+
+      # trusted publishing: no API token, the OIDC id-token is the credential
+      - uses: pypa/gh-action-pypi-publish@v1.14.2

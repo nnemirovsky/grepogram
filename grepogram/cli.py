@@ -15,6 +15,7 @@ one, or with ``--json`` the same document those tools return.
 """
 
 import asyncio
+import dataclasses
 import datetime as dt
 import functools
 import json
@@ -23,6 +24,7 @@ import sqlite3
 from collections.abc import Sequence
 from dataclasses import asdict
 from enum import StrEnum
+from pathlib import Path
 from typing import Annotated, NoReturn
 
 import typer
@@ -37,9 +39,11 @@ from grepogram import (
     embed,
     filters,
     index,
+    media,
     search,
     sources,
     sync,
+    tdesktop,
     tg,
 )
 from grepogram.config import TEMPLATE, ConfigError
@@ -47,14 +51,22 @@ from grepogram.dialogs import Match
 from grepogram.embed import Embedder, ModelUnavailable
 from grepogram.filters import FilterError
 from grepogram.log import setup_logging
-from grepogram.models import Config, MessageView, SearchResult, SyncReport
+from grepogram.models import (
+    ChatRow,
+    Config,
+    MediaReport,
+    MessageView,
+    PruneReport,
+    SearchResult,
+    SyncReport,
+)
 from grepogram.paths import Paths
 from grepogram.search import UnknownMessage
 
 HELP = "Local hybrid search over opt-in Telegram chats, exposed to Claude Code through MCP."
 _CHAT_HELP = (
     "The chat the message is in, naming exactly one indexed chat: id, @username, t.me link, "
-    "folder:<name> or a title (put -- before a negative id)."
+    "folder:<name>, import:<slug> or a title (put -- before a negative id)."
 )
 
 app = typer.Typer(name="grepogram", help=HELP, no_args_is_help=True, add_completion=False)
@@ -256,6 +268,292 @@ def _print_report(report: SyncReport) -> None:
         typer.echo(f"warning: {warning}", err=True)
 
 
+@app.command("extract")
+def extract_cmd(
+    budget: Annotated[
+        int | None,
+        typer.Option(
+            "--budget",
+            min=1,
+            help="Stop after this many seconds; what is left resumes on the next run.",
+        ),
+    ] = None,
+    retry_failed: Annotated[
+        bool,
+        typer.Option(
+            "--retry-failed",
+            help="Queue the media an earlier run could not read again, and the media this "
+            "build had no extractor for (installing the 'media' extra is what fixes those).",
+        ),
+    ] = False,
+) -> None:
+    """Read text out of stored media — photos through OCR, PDFs and DOCX; needs a session.
+
+    A network pass, not an offline one: Telethon downloads from a message Telegram just
+    returned, so every pending message is re-fetched by id first. Run it after `grepogram sync`;
+    it never runs inside one, because a 400-page PDF must not eat a sync's budget.
+    """
+    paths, cfg, conn = _load()
+    _require_api_keys(cfg, paths)
+    try:
+        tg.ensure_session_mode(paths)
+        client = tg.make_client(cfg, paths)
+        with sync.SyncLock(paths):
+            report = asyncio.run(_run_extract(client, conn, cfg, budget, retry_failed))
+    except (tg.AuthRequired, tg.SessionError, sync.SyncInProgress, ConfigError) as exc:
+        fail(str(exc), hint=getattr(exc, "hint", None))
+    except (tg_errors.RPCError, ConnectionError) as exc:
+        fail(f"telegram error: {exc}")
+    finally:
+        conn.close()
+    _print_media_report(report)
+
+
+async def _run_extract(
+    client: TelegramClient,
+    conn: sqlite3.Connection,
+    cfg: Config,
+    budget: int | None,
+    retry_failed: bool,
+) -> MediaReport:
+    """Connect and run :func:`grepogram.media.run` under the sync lock the caller holds."""
+    async with tg.connected(client):
+        return await media.run(
+            conn, client, cfg, sync.SyncBudget(budget), retry_failed=retry_failed
+        )
+
+
+def _print_media_report(report: MediaReport) -> None:
+    typer.echo(f"media read: {report.extracted}")
+    for label, count in (
+        ("too large to download", report.skipped),
+        ("could not be read", report.failed),
+        ("no extractor here", report.unsupported),
+        ("switched off in [media]", report.disabled),
+        ("queued again", report.requeued),
+        ("in chats nothing can re-fetch", report.unreachable),
+    ):
+        if count:
+            typer.echo(f"{label}: {count}")
+    if report.remaining:
+        typer.echo(f"media pending: {report.remaining}; run extract again")
+    if report.extracted:
+        typer.echo("next: grepogram sync (to re-cut and embed the units that changed)")
+    for warning in report.warnings:
+        typer.echo(f"warning: {warning}", err=True)
+
+
+@app.command("prune-deleted")
+def prune_deleted_cmd(
+    chat: Annotated[
+        str | None,
+        typer.Option(
+            "--chat",
+            help="Sweep only this chat and the discussion group it links; "
+            + _CHAT_HELP.removeprefix("The chat the message is in, "),
+        ),
+    ] = None,
+    budget: Annotated[
+        int | None,
+        typer.Option(
+            "--budget",
+            min=1,
+            help="Stop after this many seconds; the sweep resumes where it stopped.",
+        ),
+    ] = None,
+) -> None:
+    """Ask Telegram about every indexed message and drop the ones it no longer has; needs a
+    session.
+
+    The full sweep, about one request per hundred stored messages, so it is run by hand and never
+    by a sync — `sync` notices only the deletions among the newest messages of a chat. It is
+    resumable: a run stopped by `--budget` or by a flood wait keeps every batch it finished and
+    the next one carries on from there.
+    """
+    paths, cfg, conn = _load()
+    _require_api_keys(cfg, paths)
+    try:
+        chat_id = None if chat is None else filters.resolve_chat(conn, cfg, chat)
+        tg.ensure_session_mode(paths)
+        client = tg.make_client(cfg, paths)
+        report = asyncio.run(_run_prune(client, conn, cfg, paths, budget, chat_id))
+    except FilterError as exc:
+        fail(str(exc))
+    except (tg.AuthRequired, tg.SessionError, sync.SyncInProgress, ConfigError) as exc:
+        fail(str(exc), hint=getattr(exc, "hint", None))
+    except (tg_errors.RPCError, ConnectionError) as exc:
+        fail(f"telegram error: {exc}")
+    finally:
+        conn.close()
+    _print_prune_report(report)
+
+
+async def _run_prune(
+    client: TelegramClient,
+    conn: sqlite3.Connection,
+    cfg: Config,
+    paths: Paths,
+    budget: int | None,
+    chat_id: int | None,
+) -> PruneReport:
+    """Connect and run :func:`grepogram.sync.prune_deleted`, which takes the sync lock itself."""
+    async with tg.connected(client):
+        return await sync.prune_deleted(
+            client, conn, cfg, paths, sync.SyncBudget(budget), chat_id=chat_id
+        )
+
+
+def _print_prune_report(report: PruneReport) -> None:
+    typer.echo(f"messages removed: {report.removed}")
+    typer.echo(f"messages checked: {report.checked}")
+    typer.echo(f"chats swept: {len(report.chats_done)}")
+    if report.chats_remaining:
+        ids = ", ".join(str(chat_id) for chat_id in report.chats_remaining)
+        typer.echo(
+            f"chats not finished: {len(report.chats_remaining)} ({ids}); "
+            "run prune-deleted again to carry on"
+        )
+    for warning in report.warnings:
+        typer.echo(f"warning: {warning}", err=True)
+
+
+@app.command("import")
+def import_cmd(
+    path: Annotated[
+        Path,
+        typer.Argument(
+            help="The export directory Telegram Desktop wrote, or the JSON file inside it.",
+            exists=True,
+            readable=True,
+        ),
+    ],
+    chat_title: Annotated[
+        str | None,
+        typer.Option(
+            "--chat-title",
+            help="Title for the chat this export holds; single-chat exports often carry none.",
+        ),
+    ] = None,
+) -> None:
+    """Index a Telegram Desktop export of a chat this account can no longer open (offline).
+
+    Export the chat from Telegram Desktop as JSON (Settings → Advanced → Export Telegram data,
+    machine-readable format), then point this at the directory it wrote. The messages are stored,
+    cut into units and indexed exactly as a sync's are, so `search` answers from them at once;
+    the chat is tagged `import:<slug>` and marked unavailable, so no sync ever fetches it and no
+    prune ever offers it. Running the same import again is safe: it updates what it already
+    stored rather than adding a second copy.
+    """
+    paths, cfg, conn = _load()
+    try:
+        export = tdesktop.read_export(path)
+        for warning in export.warnings:
+            typer.echo(f"warning: {warning}", err=True)
+        entries = _retitled(export.chats, chat_title)
+        embedder = _optional_embedder(cfg)
+        with sync.SyncLock(paths):
+            stored = _store_import(conn, cfg, entries)
+            embedded = _embed_imported(conn, embedder)
+    except tdesktop.ExportError as exc:
+        fail(str(exc))
+    except (sources.SourceError, sync.SyncInProgress) as exc:
+        fail(str(exc), hint=getattr(exc, "hint", None))
+    finally:
+        conn.close()
+    _print_import(export, stored, embedded)
+
+
+def _store_import(
+    conn: sqlite3.Connection, cfg: Config, entries: Sequence[tdesktop.ImportedChat]
+) -> list[sources.Imported]:
+    """Store an export and cut its units in **one** transaction: all of it or none of it.
+
+    `sources.import_chats` commits on its own and the rebuild that makes the rows searchable
+    comes after it, so anything the rebuild could not do left the chats committed with
+    ``indexed = 0`` and the command ending in a traceback. That state is not a failed import the
+    user can retry — it is a chat every later `sync` reaches again through
+    :func:`grepogram.sync.index_stranded` and fails on in the same way, which takes the MCP
+    ``sync`` tool and every ``search`` old enough to auto-sync down with it. The same atomicity
+    :func:`grepogram.sync.on_chat_synced` already gives its own three steps, one level up.
+
+    The embedding stays outside: it is a long model run that must not hold the write lock, and a
+    missing or mismatched model is a warning the import survives (:func:`_embed_imported`).
+    """
+    with db.transaction(conn):
+        stored = sources.import_chats(conn, entries)
+        for item in stored:
+            pending = db.unindexed_message_ids(conn, item.chat.id)
+            sync.on_chat_synced(conn, item.chat, cfg, pending)
+    return stored
+
+
+def _retitled(
+    entries: Sequence[tdesktop.ImportedChat], title: str | None
+) -> list[tdesktop.ImportedChat]:
+    """``entries`` with ``--chat-title`` applied, which only a single-chat export can take.
+
+    The title decides the ``import:<slug>`` tag as well as what ``sources ls`` shows, so an
+    account export holding many chats has no one place to put it and says so instead of
+    renaming an arbitrary one.
+    """
+    if not entries:
+        fail("the export holds no chat this version can read")
+    if title is None:
+        return list(entries)
+    if len(entries) > 1:
+        fail(
+            f"--chat-title names one chat and this export holds {len(entries)}; "
+            "import it without the option and the export's own names are used"
+        )
+    entry = entries[0]
+    return [dataclasses.replace(entry, chat=dataclasses.replace(entry.chat, title=title))]
+
+
+def _embed_imported(conn: sqlite3.Connection, embedder: Embedder | None) -> int | None:
+    """Embed the units the import just cut; ``None`` when no model was there to do it.
+
+    The import is offline and the messages are searchable lexically the moment they are indexed,
+    so a missing model is a warning and never a failure — `grepogram embed` finishes the job.
+    """
+    if embedder is None:
+        return None
+    try:
+        index.ensure_embedding_space(conn, embedder)
+        return index.embed_dirty_units(conn, embedder)
+    except index.EmbeddingSpaceMismatch as exc:
+        typer.echo(f"warning: dense index not updated: {exc}", err=True)
+        return None
+
+
+def _print_import(
+    export: tdesktop.Export, stored: Sequence[sources.Imported], embedded: int | None
+) -> None:
+    typer.echo(f"read {export.path}")
+    _print_table(
+        ("id", "type", "title", "messages", "source"),
+        [
+            (
+                str(item.chat.id),
+                item.chat.type,
+                item.chat.title or "-",
+                str(item.messages),
+                item.source_id,
+            )
+            for item in stored
+        ],
+    )
+    total = sum(item.messages for item in stored)
+    typer.echo(f"imported {total} messages into {len(stored)} chats")
+    if export.service:
+        typer.echo(f"service messages skipped: {export.service}")
+    if export.skipped:
+        typer.echo(f"entries that could not be read: {export.skipped}")
+    if embedded is None:
+        typer.echo("next: grepogram embed (to make the imported chats searchable by meaning)")
+    else:
+        typer.echo(f"embedded {embedded} units")
+
+
 @app.command("embed")
 def embed_cmd(
     reembed: Annotated[
@@ -299,7 +597,8 @@ def search_cmd(
         typer.Option(
             "--chat",
             "-c",
-            help="Search only these chats: id, @username, folder:<name> or a title (repeatable).",
+            help="Search only these chats: id, @username, folder:<name>, import:<slug> or a "
+            "title (repeatable).",
         ),
     ] = None,
     since: Annotated[
@@ -487,14 +786,17 @@ def sources_add(
     ] = False,
 ) -> None:
     """Add a folder or chat to the indexed sources and save the config; needs a session."""
-    paths = Paths.from_env()
-    cfg = _load_config(paths)
+    paths, cfg, conn = _load()
     _require_api_keys(cfg, paths)
     try:
         parsed = sources.parse_target(target)
         tg.ensure_session_mode(paths)
         client = tg.make_client(cfg, paths)
         added = asyncio.run(_add_source(client, cfg, parsed, since, comments))
+        # the index is opened for this one check: a chat held as a Telegram Desktop import must
+        # not gain a live source, because `db.upsert_chat` overwrites `source_id` and the next
+        # sync would drop the `import:` tag every protection of that history keys on
+        sources.refuse_imported(conn, added.dialogs)
         # the target was resolved over the network; the source is applied to the file as it is
         # by now, under the config lock, not to the snapshot read before the round trip — the
         # MCP server may have saved a change (a removed source) in the meantime
@@ -504,6 +806,8 @@ def sources_add(
         fail(str(exc), hint=getattr(exc, "hint", None))
     except (tg_errors.RPCError, ConnectionError) as exc:
         fail(f"telegram error: {exc}")
+    finally:
+        conn.close()
     if added.folder is not None:
         what = f"folder {added.title!r} with {len(added.dialogs)} chats"
     else:
@@ -588,6 +892,91 @@ def sources_rm(
     finally:
         conn.close()
     typer.echo(f"removed {removed.source_id} ({len(removed.chat_ids)} chats deleted)")
+
+
+@sources_app.command("prune")
+def sources_prune(
+    dry_run: Annotated[
+        bool, typer.Option("--dry-run", help="Show what would go and change nothing.")
+    ] = False,
+) -> None:
+    """Delete indexed chats their folder source no longer lists; needs a session.
+
+    What a folder holds right now is only knowable from Telegram, so the folders are read over
+    the network first and the sync lock is taken afterwards, for the deletion alone; there is no
+    config to save, because a chat that left a folder changes no source entry. Nothing goes
+    without a confirmation, and a source Telegram will not answer for stops the prune — a folder
+    that failed to resolve is not a folder that lists nothing.
+
+    The scan and the confirmation both predate the lock, so every chat is put to the offer's
+    terms again under it (:func:`grepogram.sources.prune_chats`) and one another process changed
+    meanwhile survives; that is why the count printed at the end can be lower than the table's.
+    """
+    paths, cfg, conn = _load()
+    _require_api_keys(cfg, paths)
+    if not cfg.sources:
+        conn.close()
+        fail("no sources configured; add one with: grepogram sources add <target>")
+    try:
+        tg.ensure_session_mode(paths)
+        client = tg.make_client(cfg, paths)
+        scan = sources.prunable(cfg, conn, asyncio.run(_folder_membership(client, cfg)))
+        for candidate in scan.kept:
+            typer.echo(f"kept {_chat_label(candidate.chat)}: {candidate.reason}")
+        if scan.unresolved:
+            fail(
+                "nothing was pruned, these sources could not be checked: "
+                + "; ".join(scan.unresolved),
+                hint="a source that does not resolve is not a source that lists nothing; "
+                "run `grepogram sources prune` again once Telegram answers for it",
+            )
+        if not scan.prunable:
+            typer.echo("nothing to prune")
+            return
+        _print_prune(scan.prunable)
+        if dry_run:
+            typer.echo(f"--dry-run: nothing removed ({len(scan.prunable)} chats would go)")
+            return
+        if not typer.confirm(
+            f"delete these {len(scan.prunable)} chats and everything indexed from them?"
+        ):
+            typer.echo("nothing removed")
+            return
+        with sync.SyncLock(paths):
+            removed = sources.prune_chats(conn, scan.prunable)
+        typer.echo(f"removed {len(removed)} chats")
+        if len(removed) < len(scan.prunable):
+            typer.echo(
+                f"{len(scan.prunable) - len(removed)} changed since the scan and were kept; "
+                "run `grepogram sources prune` again to see them",
+                err=True,
+            )
+    except (tg.AuthRequired, tg.SessionError, sync.SyncInProgress, ConfigError) as exc:
+        fail(str(exc), hint=getattr(exc, "hint", None))
+    except (tg_errors.RPCError, ConnectionError) as exc:
+        fail(f"telegram error: {exc}")
+    finally:
+        conn.close()
+
+
+async def _folder_membership(client: TelegramClient, cfg: Config) -> sources.FolderMembership:
+    """Connect and read what every folder source lists right now."""
+    async with tg.connected(client):
+        return await sources.folder_membership(cfg, dialogs.DialogCatalog(client))
+
+
+def _chat_label(chat: ChatRow) -> str:
+    return f"{chat.title or chat.type} (id {chat.id})"
+
+
+def _print_prune(candidates: Sequence[sources.PruneCandidate]) -> None:
+    _print_table(
+        ("id", "type", "title", "messages", "reason"),
+        [
+            (str(c.chat.id), c.chat.type, c.chat.title or "-", str(c.messages), c.reason)
+            for c in candidates
+        ],
+    )
 
 
 @config_app.command("path")

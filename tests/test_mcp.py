@@ -21,7 +21,7 @@ from telethon import errors
 from telethon.tl import functions, types
 from telethon.tl.types import messages as tl_messages
 
-from grepogram import config, db, embed, filters, index
+from grepogram import config, db, embed, filters, index, units
 from grepogram import mcp as tools
 from grepogram import rerank as reranking
 from grepogram import search as retrieval
@@ -279,7 +279,7 @@ async def test_auto_sync_under_a_held_lock_is_a_warning(
 ) -> None:
     calls: list[tuple[object, ...]] = []
 
-    async def busy(*args: object) -> SyncReport:
+    async def busy(*args: object, **kwargs: object) -> SyncReport:
         calls.append(args)
         raise SyncInProgress("another sync is running (lock held)")
 
@@ -299,7 +299,7 @@ async def test_auto_sync_under_a_held_lock_is_a_warning(
 async def test_auto_sync_flood_wait_is_a_warning(
     stale: tools.AppState, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    async def flooded(*args: object) -> SyncReport:
+    async def flooded(*args: object, **kwargs: object) -> SyncReport:
         raise errors.FloodWaitError(request=None, capture=30)
 
     monkeypatch.setattr(syncing, "sync_all", flooded)
@@ -312,7 +312,7 @@ async def test_auto_sync_flood_wait_is_a_warning(
 async def test_auto_sync_reports_what_a_partial_run_left(
     stale: tools.AppState, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    async def partial(*args: object) -> SyncReport:
+    async def partial(*args: object, **kwargs: object) -> SyncReport:
         return SyncReport(
             new=3, chats_done=[GEO], chats_remaining=[ARG], unavailable=[7], warnings=["slow"]
         )
@@ -509,6 +509,39 @@ async def test_sync_without_the_model_warns(
 
 async def test_sync_rejects_a_non_positive_budget(state: tools.AppState) -> None:
     assert (await tools.sync(budget_s=0))["error"].startswith("budget_s must be")
+
+
+async def test_the_auto_sync_inside_a_search_never_starts_a_recut(
+    stale: tools.AppState, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A search refreshes messages; it never rebuilds units.
+
+    Who may start the one-time re-cut is the caller's ``recut`` flag, not the budget: this is the
+    one caller that opts out, so raising ``search.auto_sync_budget_s`` — a user-editable number —
+    still cannot turn a search into a whole-index rebuild.
+    """
+    conn = stale.conn
+    before = {unit.id for unit in db.get_units(conn, ARG)}
+    monkeypatch.setattr(units, "RECIPE_VERSION", units.RECIPE_VERSION + 1)
+    result = await tools.search("DNI", mode="lexical")
+    assert result["synced"] is True
+    assert {unit.id for unit in db.get_units(conn, ARG)} == before
+    assert db.unit_recipe(conn) != units.RECIPE_VERSION
+    assert db.recut_markers(conn) == {}
+
+
+async def test_an_explicit_sync_makes_recut_progress_on_its_own_budget(
+    state: tools.AppState, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The counterpart: an explicit ``sync()`` is deliberate, so it re-cuts what its budget
+    allows — bounded per run and resumable — however short the window it was given."""
+    conn = state.conn
+    before = {unit.id for unit in db.get_units(conn, ARG)}
+    monkeypatch.setattr(units, "RECIPE_VERSION", units.RECIPE_VERSION + 1)
+    report = await tools.sync(budget_s=5)
+    assert "error" not in report
+    assert {unit.id for unit in db.get_units(conn, ARG)} != before
+    assert db.unit_recipe(conn) == units.RECIPE_VERSION
 
 
 async def test_sync_under_a_held_lock_carries_the_lock_hint(
@@ -810,6 +843,23 @@ async def test_sources_add_fuzzy_writes_config_and_reads_dialogs_afresh(
     assert "channels only" in (await tools.sources_add("@arg_chat", comments=True))["error"]
     assert "ISO date" in (await tools.sources_add("@news", since="jan"))["error"]
     assert config.load(paths).sources == expected
+
+
+async def test_sources_add_refuses_a_chat_already_held_as_an_import(
+    bind: Callable[..., tools.AppState], paths: Paths, conn: sqlite3.Connection
+) -> None:
+    """The tool is the second door to the same operation, so it carries the same guard: without
+    it ``db.upsert_chat`` would replace ``import:`` with ``chat:@arg_chat`` on the next sync and
+    the imported history would become prunable."""
+    bind(Config(telegram=KEYS))
+    db.upsert_chat(
+        conn, ChatRow(id=ARG, type="supergroup", title="Argentina chat", source_id="import:arg")
+    )
+    refused = await tools.sources_add("@arg_chat")
+    assert "already in the index as import:arg" in refused["error"]
+    assert config.load(paths).sources == []
+    stored = db.get_chat(conn, ARG)
+    assert stored is not None and stored.source_id == "import:arg"
 
 
 async def test_sources_remove_deletes_data_and_saves_the_config(

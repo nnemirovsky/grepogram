@@ -9,6 +9,7 @@ import asyncio
 import datetime as dt
 import inspect
 from collections.abc import AsyncIterator, Iterable, Mapping
+from pathlib import Path
 from typing import Any
 
 from telethon import errors, utils
@@ -188,9 +189,18 @@ class FakeClient:
     peer id — or ``(channel_id, post_id)`` for one comment thread — to an exception
     ``iter_messages`` raises for it, either at once or, as ``(after, exception)``, once ``after``
     messages were yielded; ``entity_errors`` maps a ``get_entity`` key to the exception it
-    raises; ``folders`` registers a ``GetDialogFiltersRequest`` response (the default "All
-    chats" entry first, like Telegram). Every method call is recorded in ``calls`` as
-    ``(name, kwargs)``.
+    raises; ``downloads`` maps ``(chat_id, msg_id)`` to the bytes ``download_media`` writes for
+    that message, or to an exception it raises; ``folders`` registers a
+    ``GetDialogFiltersRequest`` response (the default "All chats" entry first, like Telegram).
+    Every method call is recorded in ``calls`` as ``(name, kwargs)``.
+
+    ``entities`` is the *world*, not the client's cache: a peer this client could learn about,
+    the way Telegram knows one whether or not the session has its access hash. What the session
+    holds is :attr:`resolved`, which starts empty exactly as ``tg.load_session``'s does, and
+    ``strict_entities`` (the default) makes addressing an unlearned peer by bare id fail with
+    the plain ``ValueError`` Telethon raises for it — see :meth:`_require_resolved`. Pass
+    ``strict_entities=False`` only for a test whose subject is not peer resolution and that has
+    no realistic route to warm the cache.
     """
 
     def __init__(
@@ -203,10 +213,12 @@ class FakeClient:
         responses: Mapping[type, Any] | None = None,
         failures: Mapping[Any, Any] | None = None,
         entity_errors: Mapping[Any, BaseException] | None = None,
+        downloads: Mapping[tuple[int, int], bytes | BaseException] | None = None,
         folders: Iterable[Any] | None = None,
         authorized: bool = True,
         me: types.User | None = None,
         two_factor: bool = False,
+        strict_entities: bool = True,
     ) -> None:
         self.dialogs = list(dialogs)
         self.entities: dict[int, Any] = {}
@@ -224,9 +236,12 @@ class FakeClient:
             )
         self.failures: dict[Any, Any] = dict(failures or {})
         self.entity_errors: dict[Any, BaseException] = dict(entity_errors or {})
+        self.downloads: dict[tuple[int, int], bytes | BaseException] = dict(downloads or {})
         self.authorized = authorized
         self.me = me
         self.two_factor = two_factor
+        self.strict_entities = strict_entities
+        self.resolved: set[int] = set()
         self.connected = False
         self.flood_sleep_threshold = 120
         self.calls: list[tuple[str, dict[str, Any]]] = []
@@ -283,6 +298,7 @@ class FakeClient:
         concurrent callers interleave the way they do against Telegram."""
         self.calls.append(("get_dialogs", {}))
         await asyncio.sleep(0)
+        self._learn(dialog.entity for dialog in self.dialogs)
         return [
             dialog
             for dialog in self.dialogs
@@ -301,6 +317,7 @@ class FakeClient:
         entity = self._find_entity(key)
         if entity is None:
             raise ValueError(f"Could not find the input entity for {key!r}")
+        self._learn([entity])
         return entity
 
     # --- messages --------------------------------------------------------------------------
@@ -383,6 +400,50 @@ class FakeClient:
             self._attach_peers(message)
             yield message
 
+    async def get_messages(
+        self,
+        entity: Any,
+        limit: int | None = None,
+        *,
+        ids: int | list[int] | None = None,
+        **kwargs: Any,
+    ) -> Any:
+        """``iter_messages`` collected, with Telethon's return shapes.
+
+        A list of ``ids`` answers a list holding ``None`` where a message is deleted or was
+        never stored — the signal the extraction pass and ``prune-deleted`` read — and a single
+        int ``ids`` answers that one message or ``None``. Without ``ids`` Telethon defaults the
+        limit to one message, and so does this.
+        """
+        self.calls.append(
+            ("get_messages", {"chat_id": self._peer_id(entity), "limit": limit, "ids": ids})
+        )
+        if ids is None and limit is None:
+            limit = 1
+        got = [m async for m in self.iter_messages(entity, limit=limit, ids=ids, **kwargs)]
+        if isinstance(ids, int):
+            return got[0] if got else None
+        return got
+
+    async def download_media(self, message: Any, file: Any = None, **_: Any) -> str | None:
+        """Write the bytes registered for ``message`` to ``file`` and answer the path it took.
+
+        ``file`` is a path, never a directory: the extraction pass names its own temp file after
+        the media so the extractor can dispatch on the extension. A message with nothing
+        registered downloads as ``None``, which is what Telethon answers for media it cannot
+        write out.
+        """
+        key = (int(message.chat_id), int(message.id))
+        self.calls.append(("download_media", {"chat_id": key[0], "msg_id": key[1], "file": file}))
+        payload = self.downloads.get(key)
+        if isinstance(payload, BaseException):
+            raise payload
+        if payload is None:
+            return None
+        path = Path(file)
+        path.write_bytes(payload)
+        return str(path)
+
     def _attach_peers(self, message: types.Message) -> None:
         """Bind the sender and chat entities the way Telethon's ``_finish_init`` does.
 
@@ -402,13 +463,73 @@ class FakeClient:
             if isinstance(request, cls):
                 if isinstance(response, BaseException):
                     raise response
-                return response(request) if callable(response) else response
+                answer = response(request) if callable(response) else response
+                self._learn(
+                    [
+                        *(getattr(answer, "chats", None) or ()),
+                        *(getattr(answer, "users", None) or ()),
+                    ]
+                )
+                return answer
         raise NotImplementedError(f"FakeClient has no response for {type(request).__name__}")
+
+    # --- the session's entity cache ---------------------------------------------------------
+
+    def forget_entities(self) -> None:
+        """Start over with an empty entity cache, as every freshly built client does.
+
+        ``tg.make_client`` hands out a private in-memory copy of the session file holding the
+        data centre and the auth key alone, so a CLI command that runs after a sync — ``extract``
+        and ``prune-deleted`` are the two — begins knowing no peer at all. A test that fills an
+        index through one pass and then exercises another must call this in between, or it
+        measures a cache the second pass would never have.
+        """
+        self.resolved.clear()
+
+    def _learn(self, entities: Iterable[Any]) -> None:
+        """Cache the peers of an answer, as Telethon's ``session.process_entities`` does.
+
+        Every RPC result passes through it in the real client, which is why one ``get_dialogs()``
+        is enough to make every dialog addressable by bare id afterwards, and why a
+        ``GetFullChannelRequest`` makes the discussion group in its ``chats`` addressable even
+        when the account never joined it. A legacy group brings the supergroup it migrated to,
+        the way Telegram returns both in one ``chats`` list.
+        """
+        for entity in entities:
+            try:
+                self.resolved.add(int(utils.get_peer_id(entity)))
+            except (TypeError, AttributeError):
+                continue
+            target = getattr(entity, "migrated_to", None)
+            if target is not None:
+                self.resolved.add(utils.get_peer_id(types.PeerChannel(target.channel_id)))
+
+    def _require_resolved(self, marked_id: int) -> None:
+        """Refuse a peer this client never learned, the way Telethon 1.44 refuses one.
+
+        ``tg.load_session`` copies the data centre and the auth key out of the session file and
+        nothing else, so the entity cache of every client grepogram builds starts empty. With
+        it empty, ``get_input_entity`` finds no access hash and its network fallback
+        (``channels.getChannels`` / ``users.getUsers`` with ``access_hash = 0``) answers only
+        for a bot's private chats or a contact — for a user session on a private supergroup it
+        ends in ``ValueError: Could not find the input entity``. A legacy group is the one id
+        that needs no hash: Telethon turns a ``PeerChat`` straight into an ``InputPeerChat``.
+
+        This is what ``FakeClient`` used to be more permissive than the real client about, and
+        it is why nine review rounds passed over a ``grepogram extract`` that resolved no chat
+        at all on a real account.
+        """
+        if not self.strict_entities or marked_id in self.resolved:
+            return
+        if utils.resolve_id(marked_id)[1] is types.PeerChat:
+            return
+        raise ValueError(f"Could not find the input entity for {marked_id!r}")
 
     # --- helpers ---------------------------------------------------------------------------
 
     def _peer_id(self, entity: Any) -> int:
         if isinstance(entity, int):
+            self._require_resolved(entity)
             return entity
         if isinstance(entity, str):
             found = self._find_entity(entity)

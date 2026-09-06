@@ -28,13 +28,16 @@ dependencies = [
 
 [project.optional-dependencies]
 dense = ["sentence-transformers", "torch"]
+# Text out of media. pypdf and python-docx are pure Python and run everywhere; Vision is macOS
+# only, so OCR is simply absent elsewhere and its media is marked unsupported rather than failing.
+media = ["pypdf", "python-docx", "pyobjc-framework-Vision; sys_platform == 'darwin'"]
 
 [project.scripts]
 grepogram = "grepogram.cli:app"
 grepogram-mcp = "grepogram.mcp:main"
 
 [dependency-groups]
-dev = ["pytest", "pytest-asyncio", "pytest-cov", "ruff", "mypy"]
+dev = ["pytest", "pytest-asyncio", "pytest-cov", "ruff", "mypy", "pypdf", "python-docx"]
 
 [build-system]
 requires = ["hatchling"]
@@ -68,6 +71,12 @@ module = [
     "sentence_transformers.*",
     "torch",
     "torch.*",
+    "pypdf",
+    "pypdf.*",
+    "docx",
+    "docx.*",
+    "Vision",
+    "Quartz",
 ]
 ignore_missing_imports = true
 

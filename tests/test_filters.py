@@ -15,6 +15,8 @@ ARG_DISCUSSION = -1000000000102
 GEORGIA = -1000000000200
 BANK = -1000000000300
 ALICANTE = -1000000000400
+MAMA = -1000000000500
+DOM = -1000000000501
 ALICE = 777
 
 CHATS = [
@@ -359,6 +361,41 @@ def test_resolve_chats_untitled_chat_is_listed_by_id(empty_conn: sqlite3.Connect
         filters.resolve_chats(empty_conn, Config(), ["anything"])
     assert info.value.candidates == ["None (id 5)"]
     assert filters.resolve_chats(empty_conn, Config(), ["5"]) == {5}
+
+
+def test_resolve_chats_selects_an_import_by_its_short_slug(conn: sqlite3.Connection) -> None:
+    """``import:<slug>`` scopes a search the way ``folder:<name>`` does, and for the same reason
+    ``sources.find_source`` had to learn it (``sources._import_source``).
+
+    Both are ids read off ``chats.source_id``, and both are unreachable through the fuzzy
+    fallback: it scores the *whole typed string* — the seven-character ``import:`` prefix
+    included — against the bare slug, so no slug of five characters or fewer can reach
+    ``FUZZY_MIN_RATIO``. An import titled "Mama" or "Дом" could therefore not scope a search, a
+    reader or ``prune-deleted --chat`` by the very id ``sources ls``, the MCP ``sources`` tool
+    and every import refusal message print at the user.
+    """
+    db.upsert_chat(conn, ChatRow(id=MAMA, type="user", title="Mama", source_id="import:mama"))
+    db.upsert_chat(conn, ChatRow(id=DOM, type="supergroup", title="Дом", source_id="import:дом"))
+    for spec in ("import:mama", "import:MAMA", "import:mam", "import:Mam"):
+        assert filters.resolve_chats(conn, CFG, [spec]) == {MAMA}
+    assert filters.resolve_chats(conn, CFG, ["import:дом"]) == {DOM}
+    assert filters.resolve_chats(conn, CFG, ["import:mama", "folder:Spain"]) == {MAMA, ALICANTE}
+    assert filters.resolve_chat(conn, CFG, "import:дом") == DOM
+    with pytest.raises(UnknownChat, match="import:nowhere"):
+        filters.resolve_chats(conn, CFG, ["import:nowhere"])
+
+
+def test_resolve_chats_prefers_the_import_id_that_matches_exactly(
+    conn: sqlite3.Connection,
+) -> None:
+    """The shape ``sources.import_source_ids`` derives for a slug collision, ``<slug>-<id>``:
+    exact has to win over the score, or the two ids a collision leaves behind would select each
+    other for ever — ``x-123`` scores against ``x-123-123`` too."""
+    db.upsert_chat(conn, ChatRow(id=MAMA, type="user", title="x", source_id="import:x-123"))
+    db.upsert_chat(conn, ChatRow(id=DOM, type="user", title="x-123", source_id="import:x-123-123"))
+    assert filters.resolve_chats(conn, CFG, ["import:x-123"]) == {MAMA}
+    assert filters.resolve_chats(conn, CFG, ["import:x-123-123"]) == {DOM}
+    assert filters.resolve_chats(conn, CFG, ["import:x-12"]) == {MAMA, DOM}
 
 
 # --- resolve_chat ----------------------------------------------------------------------------

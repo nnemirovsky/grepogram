@@ -29,7 +29,7 @@ import sqlite3
 import sys
 import threading
 from collections import deque
-from collections.abc import Iterable, Iterator, Sequence
+from collections.abc import Collection, Iterable, Iterator, Sequence
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from typing import Any
 
@@ -48,6 +48,12 @@ are part of every window lookup."""
 META_SCHEMA_VERSION = "schema_version"
 META_EMBED_MODEL = "embed_model"
 META_LAST_SYNC_RUN = "last_sync_run"
+META_UNIT_RECIPE = "unit_recipe"
+"""Recipe version the stored units were cut with (:data:`grepogram.units.RECIPE_VERSION`)."""
+META_RECUT_PREFIX = "unit_recut:"
+"""Prefix of the per-chat marker a re-cut writes, ``unit_recut:<chat_id>``."""
+META_PRUNE_PREFIX = "prune_sweep:"
+"""Prefix of the deletion sweep's cursor, ``prune_sweep:<chat_id>`` (:func:`prune_cursor`)."""
 
 _V5: tuple[str, ...] = (
     "CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT)",
@@ -122,6 +128,35 @@ _V5: tuple[str, ...] = (
         raw, stemmed, chat_id UNINDEXED, date_start UNINDEXED, tokenize='{FTS_TOKENIZE}')""",
 )
 
+_V6: tuple[str, ...] = (
+    # what an extractor read out of a message's media, and how far the extraction pass got with
+    # that message (the MEDIA_* states below). Both are the pass's alone to write: the message
+    # upsert names neither column, so a re-store of a re-read message keeps what was extracted.
+    "ALTER TABLE messages ADD COLUMN extracted_text TEXT",
+    "ALTER TABLE messages ADD COLUMN media_state INTEGER NOT NULL DEFAULT 0",
+    # reactions on the messages a unit holds, summed when it is cut and refreshed in place
+    "ALTER TABLE units ADD COLUMN reactions INTEGER NOT NULL DEFAULT 0",
+    # the extraction pass's work queue. The predicate carries `media_kind IS NOT NULL` as well as
+    # the state: without it the index would cover every row of the table forever — text messages
+    # sit at MEDIA_PENDING and never leave it — and the pending query would stay a scan.
+    """CREATE INDEX messages_media_pending ON messages(chat_id, id)
+       WHERE media_state = 0 AND media_kind IS NOT NULL""",
+)
+
+MEDIA_PENDING = 0
+"""``messages.media_state``: media nothing has looked at yet — the extraction pass's queue."""
+MEDIA_EXTRACTED = 1
+"""Extraction ran; ``extracted_text`` may still be empty, an image holding no text."""
+MEDIA_UNSUPPORTED = 2
+"""No extractor is registered for this kind, so there is nothing to retry."""
+MEDIA_FAILED = 3
+"""Extraction was attempted and failed — a timeout, a corrupt file; retryable."""
+MEDIA_SKIPPED = 4
+"""Larger than ``media.max_download_mb``, so it was never downloaded."""
+MEDIA_DISABLED = 5
+"""The kind is switched off in config; re-queued to :data:`MEDIA_PENDING` when it comes back, so
+a disabled kind drains once instead of being re-read on every pass."""
+
 BASE_VERSION = 5
 """The version :data:`_V5` alone produces — the lowest number this build ever records.
 
@@ -133,7 +168,7 @@ rest of the code querying columns that are not there. Every version below this o
 belongs to that chain and is refused outright; :func:`migrate` upgrades only from a version this
 build itself wrote."""
 
-MIGRATIONS: dict[int, tuple[str, ...]] = {BASE_VERSION: _V5}
+MIGRATIONS: dict[int, tuple[str, ...]] = {BASE_VERSION: _V5, 6: _V6}
 """The schema, keyed by the version each step brings a database to.
 
 :data:`BASE_VERSION` builds it from nothing and only an empty file gets that step;
@@ -159,7 +194,16 @@ wrong Python exactly as it is. ``uv sync`` re-creates the ``.venv`` on its own."
 
 _VEC_DIM_RE = re.compile(r"FLOAT\[(\d+)\]")
 
-_MESSAGE_UPSERT = """
+_ATTACHMENT_REPLACED = (
+    "(excluded.media_kind IS NOT messages.media_kind "
+    "OR excluded.media_filename IS NOT messages.media_filename)"
+)
+"""Whether a re-stored message carries a *different* attachment from the one already stored.
+
+``IS NOT`` and not ``<>``: both columns are nullable, and a message that never had media has
+``NULL`` on both sides of every sync. See :data:`_MESSAGE_UPSERT` for what it decides."""
+
+_MESSAGE_UPSERT = f"""
     INSERT INTO messages(chat_id, msg_id, date, edit_date, from_id, from_name, reply_to_msg_id,
                          topic_id, comment_of_chat_id, comment_of_msg_id, fwd_from, text,
                          media_kind, media_filename, reactions_total)
@@ -178,13 +222,46 @@ _MESSAGE_UPSERT = """
         media_kind = excluded.media_kind,
         media_filename = excluded.media_filename,
         reactions_total = excluded.reactions_total,
+        extracted_text = CASE WHEN {_ATTACHMENT_REPLACED}
+            THEN NULL ELSE messages.extracted_text END,
+        media_state = CASE WHEN {_ATTACHMENT_REPLACED}
+            THEN {MEDIA_PENDING} ELSE messages.media_state END,
         indexed = 0
     RETURNING id"""
+"""Store a message, keeping what only the extraction pass knows — unless the attachment changed.
+
+``extracted_text`` and ``media_state`` are absent from the column list and are written by the
+SET clause **only** when the message no longer carries the attachment they were read off, so
+Telegram re-reading a message cannot undo the extraction and a message whose file was replaced
+cannot keep the previous file's text. The ``COALESCE`` idiom the topic and comment columns use
+cannot serve either half: it reads ``None`` as "not supplied", and ``media_state`` is ``NOT NULL
+DEFAULT 0`` — a freshly mapped row carries :data:`MEDIA_PENDING` and would reset every extracted
+message to pending on every sync.
+
+"Changed" is ``media_kind`` or ``media_filename`` differing (:data:`_ATTACHMENT_REPLACED`), the
+whole of what a stored row says about its attachment. Editing a **caption** changes neither, so
+an edit costs no re-download — which is the point: ``edit_refetch`` re-reads the newest messages
+of every chat on every sync, and keying this on ``edit_date`` or on ``text`` would re-queue and
+re-download every extracted photo in the index for a typo fix. The cost of reading so little is
+that a photo swapped for another photo is invisible here (neither column moves — Telegram names
+no file for a photo), as is a document replaced by one of the same name; ``extract
+--retry-failed`` does not reach those either, and re-syncing the chat from scratch is what
+clears them. Resetting to :data:`MEDIA_PENDING` rather than to the state the row held puts the
+row back at the top of the pass, where the offline half parks it again if the new kind has no
+extractor or is switched off.
+
+Clearing the column is only half of the reset: the units and ``unit_fts`` rows cut from that
+text still carry it, and ``indexed = 0`` alone never reaches them — a rebuild does not re-cut a
+closed window, which is where all but the newest handful of a chat's history lives, and
+:func:`grepogram.sync.on_chat_synced` clears the flag regardless. Invalidating them is the
+caller's job for the reason it is :func:`grepogram.media._recut`'s after an extraction: this
+module may not import :mod:`grepogram.units`. :func:`attachment_replaced` is the predicate the
+caller asks with, and :meth:`grepogram.sync._Run.store` is the caller."""
 
 _UNIT_INSERT = """
     INSERT INTO units(chat_id, topic_id, kind, msg_id_start, msg_id_end, msg_ids,
-                      date_start, date_end, text, dirty, embedded_model)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                      date_start, date_end, text, reactions, dirty, embedded_model)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     RETURNING id"""
 
 
@@ -457,9 +534,15 @@ def migrate(conn: sqlite3.Connection) -> int:
                 + f": MIGRATIONS has to run from v{BASE_VERSION} to v{SCHEMA_VERSION} without a "
                 "gap, and a mis-keyed step is a bug in grepogram, not in the database"
             )
-        return _apply(
-            conn, [MIGRATIONS[version] for version in range(BASE_VERSION, SCHEMA_VERSION + 1)]
-        )
+        # one transaction for the schema and the stamp: a crash between them would leave a
+        # fresh index with the full schema and no `unit_recipe`, which reads as a v0.1.1 index
+        # and costs the first sync a full re-cut and re-embed of the units it just cut correctly
+        with transaction(conn):
+            version = _apply(
+                conn, [MIGRATIONS[version] for version in range(BASE_VERSION, SCHEMA_VERSION + 1)]
+            )
+            _stamp_unit_recipe(conn)
+        return version
     if current > SCHEMA_VERSION:
         raise SchemaError(
             f"database schema v{current} is newer than this grepogram supports "
@@ -477,6 +560,24 @@ def migrate(conn: sqlite3.Connection) -> int:
             f"v{SCHEMA_VERSION}; {_REBUILD_HINT}"
         )
     return _apply(conn, [MIGRATIONS[version] for version in pending])
+
+
+def _stamp_unit_recipe(conn: sqlite3.Connection) -> None:
+    """Record the unit recipe a database built from empty already satisfies.
+
+    It holds no units, so nothing in it was cut by an older rule, and the decision cannot be
+    left to the sync-time pass: by the time that runs, :func:`grepogram.sync.index_pending` has
+    cut units for every chat the run fetched, so "the database holds no units" is never true and
+    a brand-new index would re-cut everything it has just cut correctly. Without the stamp the
+    first sync of a fresh install pays a full re-cut and re-embed of its own work. Its caller
+    runs it inside the transaction that writes the schema, for the same reason: a stamp that can
+    be lost on its own is a decision the code below can no longer make.
+
+    :mod:`grepogram.units` imports this module, so the version is read inside the function.
+    """
+    from grepogram.units import RECIPE_VERSION
+
+    set_unit_recipe(conn, RECIPE_VERSION)
 
 
 def has_vec_table(conn: sqlite3.Connection) -> bool:
@@ -544,6 +645,100 @@ def set_meta(conn: sqlite3.Connection, key: str, value: str) -> None:
             "INSERT INTO meta(key, value) VALUES (?, ?) "
             "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             (key, value),
+        )
+
+
+def unit_recipe(conn: sqlite3.Connection) -> int | None:
+    """The recipe the stored units were cut with, or ``None`` when none is recorded.
+
+    ``None`` names a v0.1.1 index — units cut before the recipe existed — and never a fresh one:
+    :func:`migrate` stamps a database it builds from empty, so "no recipe recorded" is a real
+    mismatch and the whole re-cut is not silently skipped. A value that is not a number is read
+    the same way, so a hand-edited marker costs one re-cut instead of a traceback.
+    """
+    value = get_meta(conn, META_UNIT_RECIPE)
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except ValueError:
+        return None
+
+
+def set_unit_recipe(conn: sqlite3.Connection, version: int) -> None:
+    """Record that every stored unit was cut with recipe ``version``."""
+    set_meta(conn, META_UNIT_RECIPE, str(version))
+
+
+def recut_markers(conn: sqlite3.Connection) -> dict[int, str]:
+    """Chat id → the recipe version that chat was last re-cut at, from ``meta.unit_recut:<id>``.
+
+    The marker holds a value rather than being a presence flag: a run that dies between the last
+    chat and the cleanup leaves markers behind, and a presence flag would then make the *next*
+    bump skip exactly the chats that are already done. The comparison is on the string, so a
+    marker this build cannot read means "not re-cut yet". A key whose suffix is not a chat id is
+    skipped rather than raised over.
+
+    The prefix match is ``substr``, not ``LIKE``: ``_`` is a single-character wildcard in
+    ``LIKE`` and the prefix carries two of them.
+    """
+    rows = conn.execute(
+        "SELECT key, value FROM meta WHERE substr(key, 1, ?) = ?",
+        (len(META_RECUT_PREFIX), META_RECUT_PREFIX),
+    ).fetchall()
+    markers: dict[int, str] = {}
+    for row in rows:
+        suffix = str(row["key"])[len(META_RECUT_PREFIX) :]
+        try:
+            markers[int(suffix)] = str(row["value"])
+        except ValueError:
+            continue
+    return markers
+
+
+def set_recut_marker(conn: sqlite3.Connection, chat_id: int, version: int) -> None:
+    """Mark ``chat_id`` as re-cut at recipe ``version``."""
+    set_meta(conn, f"{META_RECUT_PREFIX}{chat_id}", str(version))
+
+
+def prune_cursor(conn: sqlite3.Connection, chat_id: int) -> int:
+    """How far the deletion sweep got in ``chat_id``; ``0`` before it has ever run there.
+
+    The value is a **Telegram** ``msg_id``, never a ``messages.id``. ``messages.id`` is an
+    ``INTEGER PRIMARY KEY`` without ``AUTOINCREMENT``, so SQLite hands the rowids a sweep frees
+    straight to the next insert: a rowid cursor would be unstable across exactly the operation
+    that writes it. (``units.id`` *is* ``AUTOINCREMENT``, which is why unit ids are safe; nothing
+    generalises from that.) A marker this build cannot read starts the chat again rather than
+    raising.
+    """
+    value = get_meta(conn, f"{META_PRUNE_PREFIX}{chat_id}")
+    if value is None:
+        return 0
+    try:
+        return int(value)
+    except ValueError:
+        return 0
+
+
+def set_prune_cursor(conn: sqlite3.Connection, chat_id: int, msg_id: int) -> None:
+    """Record that the sweep of ``chat_id`` has asked Telegram about every stored id up to
+    ``msg_id`` — written in the same transaction as the removals that id range earned."""
+    set_meta(conn, f"{META_PRUNE_PREFIX}{chat_id}", str(msg_id))
+
+
+def clear_prune_cursor(conn: sqlite3.Connection, chat_id: int) -> None:
+    """Forget where the sweep of ``chat_id`` got to, so the next one starts at its oldest
+    message; what a sweep that reached the end of a chat leaves behind."""
+    with transaction(conn):
+        conn.execute("DELETE FROM meta WHERE key = ?", (f"{META_PRUNE_PREFIX}{chat_id}",))
+
+
+def clear_recut_markers(conn: sqlite3.Connection) -> None:
+    """Drop every per-chat re-cut marker; the tidy-up once the recipe itself is recorded."""
+    with transaction(conn):
+        conn.execute(
+            "DELETE FROM meta WHERE substr(key, 1, ?) = ?",
+            (len(META_RECUT_PREFIX), META_RECUT_PREFIX),
         )
 
 
@@ -699,6 +894,13 @@ def delete_chat(conn: sqlite3.Connection, chat_id: int) -> None:
     case is a channel deleted while its group lives on under a source of its own: the group keeps
     every message it holds, and only the link goes — with the comment mapping under it, which
     :func:`drop_comment_units` clears for the groups the delete unlinks.
+
+    The chat's two per-chat ``meta`` markers go too, because nothing else would ever remove them
+    and a chat id can come back — re-added after a ``sources rm``, or re-listed by a folder after
+    a ``sources prune``. A surviving ``prune_sweep:`` cursor would make
+    :func:`grepogram.sync.prune_deleted` resume the fresh history from the old chat's high-water
+    mark, report the chat done and never ask about anything below it; a surviving ``unit_recut:``
+    marker would make the next recipe bump skip the chat outright.
     """
     with transaction(conn):
         chat = get_chat(conn, chat_id)
@@ -720,6 +922,10 @@ def delete_chat(conn: sqlite3.Connection, chat_id: int) -> None:
                 f"DELETE FROM {VEC_TABLE} WHERE rowid IN (SELECT id FROM units WHERE chat_id = ?)",
                 (chat_id,),
             )
+        conn.execute(
+            "DELETE FROM meta WHERE key IN (?, ?)",
+            (f"{META_PRUNE_PREFIX}{chat_id}", f"{META_RECUT_PREFIX}{chat_id}"),
+        )
         conn.execute("DELETE FROM chats WHERE id = ?", (chat_id,))
 
 
@@ -821,9 +1027,10 @@ def upsert_messages(conn: sqlite3.Connection, batch: Iterable[MessageRow]) -> li
     rowid. A ``topic_id`` and a ``comment_of_*`` pair already stored survive a row without them:
     a channel's comment fetch stores a discussion group's message as a comment on one of its
     posts, and the group's own history sync stores the same message with no comment relation at
-    all — either may arrive first. Every row written, new or
-    updated, is flagged ``indexed = 0`` until a rebuild covers it (:func:`mark_indexed`). The
-    chat row must exist (foreign key).
+    all — either may arrive first. ``extracted_text`` and ``media_state`` are not written here at
+    all (see :data:`_MESSAGE_UPSERT`): they belong to the extraction pass, which owns them through
+    its own writers. Every row written, new or updated, is flagged ``indexed = 0`` until a rebuild
+    covers it (:func:`mark_indexed`). The chat row must exist (foreign key).
     """
     ids: list[int] = []
     with transaction(conn):
@@ -850,6 +1057,22 @@ def upsert_messages(conn: sqlite3.Connection, batch: Iterable[MessageRow]) -> li
             ).fetchone()
             ids.append(int(row["id"]))
     return ids
+
+
+def attachment_replaced(stored: MessageRow, fresh: MessageRow) -> bool:
+    """Whether storing ``fresh`` over ``stored`` would trip :data:`_ATTACHMENT_REPLACED`.
+
+    The Python half of that SQL predicate, kept beside it so "the attachment moved" is defined
+    once: ``!=`` is what the SQL's ``IS NOT`` means, both columns being nullable and ``None``
+    comparing equal to ``None`` on both sides.
+
+    A caller asks **before** the upsert, because the reset the predicate triggers clears
+    ``extracted_text`` — and the units cut from that text are the caller's to invalidate, which
+    an upsert cannot do for it (this module knows nothing of ``units``). The one caller is
+    :meth:`grepogram.sync._Run.store`; nothing else re-stores a message that may already carry
+    an extraction.
+    """
+    return stored.media_kind != fresh.media_kind or stored.media_filename != fresh.media_filename
 
 
 def unindexed_message_ids(conn: sqlite3.Connection, chat_id: int) -> list[int]:
@@ -893,6 +1116,198 @@ def mark_unindexed(conn: sqlite3.Connection, ids: Iterable[int]) -> None:
     with transaction(conn):
         for chunk in _chunks(ids):
             conn.execute(f"UPDATE messages SET indexed = 0 WHERE id IN ({_marks(chunk)})", chunk)
+
+
+def delete_messages(conn: sqlite3.Connection, chat_id: int, msg_ids: Iterable[int]) -> int:
+    """Remove these **Telegram message ids** of ``chat_id`` with their ``msg_fts`` rows.
+
+    What a message deleted in Telegram costs the index. The ids are the ``msg_id`` space, the one
+    a sync compares against what Telegram returned, not the ``messages.id`` rowids
+    :func:`mark_indexed` and friends take. The FTS rows go first, addressed by the rowid they are
+    keyed on (:func:`grepogram.index.index_messages` writes them under ``messages.id``), because
+    an ``fts5`` row is only reachable through that rowid and deleting the message would leave it
+    behind for the next insert to collide with.
+
+    The units these messages were part of are **not** touched here: they are cut again by
+    :func:`grepogram.units.invalidate_units_for`, which the caller runs in this same transaction
+    with the rows it read *before* the delete — the topic a window is scoped by lives on a row
+    that no longer exists once this has run. Returns how many message rows went.
+    """
+    removed = 0
+    with transaction(conn):
+        for chunk in _chunks(msg_ids):
+            conn.execute(
+                f"DELETE FROM msg_fts WHERE rowid IN (SELECT id FROM messages "
+                f"WHERE chat_id = ? AND msg_id IN ({_marks(chunk)}))",
+                [chat_id, *chunk],
+            )
+            cursor = conn.execute(
+                f"DELETE FROM messages WHERE chat_id = ? AND msg_id IN ({_marks(chunk)})",
+                [chat_id, *chunk],
+            )
+            removed += max(cursor.rowcount, 0)
+    return removed
+
+
+def message_ids_after(
+    conn: sqlite3.Connection, chat_id: int, after_msg_id: int, limit: int
+) -> list[int]:
+    """The next ``limit`` stored ``msg_id``s of ``chat_id`` above ``after_msg_id``, ascending.
+
+    One page of the deletion sweep, which walks a chat oldest first and asks Telegram about the
+    ids it reads here (:func:`grepogram.sync.prune_deleted`). The ``(chat_id, msg_id)`` unique
+    index answers it, so a page costs the same on a chat of ten messages and one of a hundred
+    thousand.
+    """
+    rows = conn.execute(
+        "SELECT msg_id FROM messages WHERE chat_id = ? AND msg_id > ? ORDER BY msg_id LIMIT ?",
+        (chat_id, after_msg_id, limit),
+    ).fetchall()
+    return [int(row["msg_id"]) for row in rows]
+
+
+# --- media extraction ------------------------------------------------------------------------
+
+
+def messages_pending_media(conn: sqlite3.Connection, limit: int, chat_id: int) -> list[MessageRow]:
+    """One chat's extraction queue: its rows whose media nothing has looked at yet, oldest first.
+
+    Always one chat, never the whole index: a batch is re-fetched through a single
+    ``client.get_messages(chat_id, ids=[…])`` and cannot mix chats, so a whole-index page would
+    be a queue no caller could use. :func:`chats_with_pending_media` is what says which chats to
+    ask for. The predicate is spelled the way ``count_pending_media`` is, :data:`MEDIA_PENDING`
+    inlined rather than bound, because SQLite only uses a partial index when the query's
+    ``WHERE`` provably implies the index's own — a parameter proves nothing at prepare time.
+    """
+    rows = conn.execute(
+        f"SELECT * FROM messages WHERE media_state = {MEDIA_PENDING} "
+        "AND media_kind IS NOT NULL AND chat_id = ? ORDER BY id LIMIT ?",
+        (chat_id, limit),
+    )
+    return [_message_row(row) for row in rows]
+
+
+def chats_with_pending_media(conn: sqlite3.Connection) -> list[int]:
+    """``chat_id`` of every chat still holding media the extraction pass has not looked at."""
+    rows = conn.execute(
+        f"SELECT DISTINCT chat_id FROM messages WHERE media_state = {MEDIA_PENDING} "
+        "AND media_kind IS NOT NULL ORDER BY chat_id"
+    ).fetchall()
+    return [int(row["chat_id"]) for row in rows]
+
+
+def count_pending_media(conn: sqlite3.Connection, chat_ids: Sequence[int] | None = None) -> int:
+    """How many rows are left in the extraction queue; ``chat_ids`` scopes it to those chats.
+
+    The scoped figure is what ``grepogram extract`` reports as ``remaining``, over the chats the
+    pass can actually re-fetch (:func:`grepogram.media._fetchable_chats`). A row in an imported
+    or unavailable chat never leaves :data:`MEDIA_PENDING`, so the index-wide count would tell
+    the user to "run extract again" for work no run can ever do, and a script looping until it
+    reaches zero would never stop. An empty ``chat_ids`` is an empty scope, not the whole index.
+    """
+    if chat_ids is None:
+        scope: str = ""
+        params: tuple[int, ...] = ()
+    elif chat_ids:
+        scope = f" AND chat_id IN ({','.join('?' * len(chat_ids))})"
+        params = tuple(chat_ids)
+    else:
+        return 0
+    row = conn.execute(
+        f"SELECT COUNT(*) AS n FROM messages WHERE media_state = {MEDIA_PENDING} "
+        f"AND media_kind IS NOT NULL{scope}",
+        params,
+    ).fetchone()
+    return int(row["n"])
+
+
+def set_media_text(conn: sqlite3.Connection, row_id: int, text: str) -> None:
+    """Store what an extractor read out of one message's media and flag the row for a rebuild.
+
+    The one writer here that touches ``indexed``: this text is rendered into the message's line
+    (``units.render_line``) and indexed in ``msg_fts``
+    (``index.message_index_text``), so both are behind until the row is rebuilt. Its twin
+    :func:`set_media_state` writes the state byte alone, because every other transition changes
+    no rendered text at all.
+
+    The flag is meant to be short-lived: ``media._recut`` does that rebuild and calls
+    :func:`mark_indexed` in the same transaction. What is left flagged afterwards is only what
+    that rebuild could not cover, which is what :func:`grepogram.sync.index_stranded` is for — a
+    flag carried across a whole extraction run would be a whole-index backlog for the
+    *unbudgeted* rebuild loops a later sync ends with.
+    """
+    with transaction(conn):
+        conn.execute(
+            "UPDATE messages SET extracted_text = ?, media_state = ?, indexed = 0 WHERE id = ?",
+            (text, MEDIA_EXTRACTED, row_id),
+        )
+
+
+def set_media_state(conn: sqlite3.Connection, ids: Iterable[int], state: int) -> None:
+    """Record how far the extraction pass got with these ``messages.id`` — and nothing else.
+
+    ``indexed`` is deliberately left alone. None of the states this writes (unsupported, failed,
+    skipped, disabled) changes a rendered line, and flagging would hand the deferred, unbudgeted
+    ``index_pending`` loop :func:`grepogram.sync._sync_chats` ends with a whole-index backlog to
+    rebuild and re-embed — the next 20-second auto-sync inside a ``search`` would drain it in
+    full. :func:`set_media_text` is the writer for the one transition that does change a line.
+    """
+    with transaction(conn):
+        for chunk in _chunks(ids):
+            conn.execute(
+                f"UPDATE messages SET media_state = ? WHERE id IN ({_marks(chunk)})",
+                [state, *chunk],
+            )
+
+
+def move_media_state(conn: sqlite3.Connection, kinds: Collection[str], *, frm: int, to: int) -> int:
+    """Move every message of these media kinds from one ``media_state`` to another; how many moved.
+
+    The offline half of the extraction pass, and the reason it is offline: which kinds have an
+    extractor and which are switched off in the config depends on the stored ``media_kind``
+    alone, so tens of thousands of rows are parked without a single Telegram request. Like
+    :func:`set_media_state` it never touches ``indexed``, for the same reason and more so — most
+    kinds (``video``, ``sticker``, ``audio``, ``webpage``, ``poll``, ``contact``, ``location``,
+    ``other`` and, until v0.3.0, ``voice`` and ``video_note``) have no extractor at all.
+    """
+    listed = list(dict.fromkeys(kinds))
+    if not listed:
+        return 0
+    with transaction(conn):
+        cursor = conn.execute(
+            f"UPDATE messages SET media_state = ? WHERE media_state = ? "
+            f"AND media_kind IN ({_marks(listed)})",
+            [to, frm, *listed],
+        )
+        return int(cursor.rowcount)
+
+
+def park_unreadable_documents(conn: sqlite3.Connection, suffixes: Collection[str]) -> int:
+    """Park pending ``document`` rows whose filename ends in none of ``suffixes``; how many moved.
+
+    ``document`` is ``sync.document_kind``'s fallback, so a ``.xlsx``, a ``.zip`` or an ``.apk``
+    carries the one kind that *does* have an extractor — and the dispatcher that would refuse it
+    only sees the file once it is downloaded. ``messages.media_filename`` decides the same thing
+    with no request at all, which is what the whole offline half is for
+    (:func:`move_media_state`), and the state is ``MEDIA_UNSUPPORTED`` rather than
+    ``MEDIA_FAILED`` because no retry can change it — only a build that reads more formats can,
+    and ``extract --retry-failed`` re-queues both.
+
+    A row with no filename is left where it is: nothing about it can be decided from here.
+    ``indexed`` is untouched, exactly as in :func:`move_media_state`.
+    """
+    listed = [suffix.lower() for suffix in dict.fromkeys(suffixes)]
+    if not listed:
+        return 0
+    clause = " AND ".join("lower(media_filename) NOT LIKE ?" for _ in listed)
+    with transaction(conn):
+        cursor = conn.execute(
+            f"UPDATE messages SET media_state = {MEDIA_UNSUPPORTED} "
+            f"WHERE media_state = {MEDIA_PENDING} AND media_kind = 'document' "
+            f"AND media_filename IS NOT NULL AND media_filename <> '' AND {clause}",
+            [f"%{suffix}" for suffix in listed],
+        )
+        return int(cursor.rowcount)
 
 
 def get_messages(
@@ -1160,12 +1575,48 @@ def insert_units(conn: sqlite3.Connection, units: Iterable[UnitRow]) -> list[int
                     unit.date_start,
                     unit.date_end,
                     unit.text,
+                    unit.reactions,
                     int(unit.dirty),
                     unit.embedded_model,
                 ),
             ).fetchone()
             ids.append(int(row["id"]))
     return ids
+
+
+_REFRESH_REACTIONS = """
+    UPDATE units SET reactions = COALESCE((
+        SELECT sum(messages.reactions_total) FROM json_each(units.msg_ids)
+        JOIN messages ON messages.chat_id = units.chat_id
+                     AND messages.msg_id = json_each.value), 0)
+    WHERE chat_id = ? AND EXISTS (
+        SELECT 1 FROM json_each(units.msg_ids) WHERE json_each.value IN ({marks}))"""
+
+
+def refresh_unit_reactions(conn: sqlite3.Connection, chat_id: int, msg_ids: Iterable[int]) -> int:
+    """Recompute ``units.reactions`` for the units of ``chat_id`` holding any of ``msg_ids``.
+
+    ``msg_ids`` are **Telegram message ids** — the space ``units.msg_ids`` stores
+    (:func:`grepogram.units._unit`). Every caller on the ``edit_refetch`` path carries
+    ``messages.id`` rowids instead (:meth:`grepogram.sync._Run.store` returns them), and in a
+    fixture chat both spaces start at 1 and coincide, so a caller that hands over rowids passes
+    its tests and refreshes nothing — or the wrong units — against real history. Convert first.
+
+    This is a direct ``UPDATE`` rather than anything the unit rebuild does, and it has to be:
+    reactions are not part of :func:`grepogram.units._content_key`, so a rebuild that re-cuts an
+    identical unit keeps the stored row, and a closed window is never re-cut at all
+    (:func:`grepogram.units._recut_start`). The total is summed over the messages the unit lists,
+    within the unit's own chat — a channel's post thread therefore reflects the post alone, its
+    comments' reactions being carried by the discussion group's own window units. Nothing here
+    touches ``text``, so no unit is flagged ``dirty``: a reaction changes the ranking, not the
+    embedding. Returns how many unit rows the update covered.
+    """
+    updated = 0
+    with transaction(conn):
+        for chunk in _chunks(msg_ids):
+            cursor = conn.execute(_REFRESH_REACTIONS.format(marks=_marks(chunk)), [chat_id, *chunk])
+            updated += max(cursor.rowcount, 0)
+    return updated
 
 
 def delete_units(conn: sqlite3.Connection, ids: Iterable[int]) -> None:
@@ -1383,6 +1834,8 @@ def _message_row(row: sqlite3.Row) -> MessageRow:
         media_kind=row["media_kind"],
         media_filename=row["media_filename"],
         reactions_total=row["reactions_total"],
+        extracted_text=row["extracted_text"],
+        media_state=row["media_state"],
     )
 
 
@@ -1398,6 +1851,7 @@ def _unit_row(row: sqlite3.Row) -> UnitRow:
         date_start=row["date_start"],
         date_end=row["date_end"],
         text=row["text"],
+        reactions=row["reactions"],
         dirty=bool(row["dirty"]),
         embedded_model=row["embedded_model"],
     )

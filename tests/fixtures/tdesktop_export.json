@@ -1,0 +1,138 @@
+{
+  "about": "Here is the data you requested. Remember: we cannot guarantee it is complete.",
+  "personal_information": {
+    "user_id": 777000,
+    "first_name": "Nina",
+    "last_name": "",
+    "phone_number": "+34600000000"
+  },
+  "chats": {
+    "about": "This page lists all chats from this export.",
+    "list": [
+      {
+        "name": "Valencia Expats",
+        "type": "public_supergroup",
+        "id": 1234567890,
+        "messages": [
+          {
+            "id": 1,
+            "type": "service",
+            "date": "2024-03-01T09:00:00",
+            "date_unixtime": "1709283600",
+            "actor": "Nina",
+            "actor_id": "user777000",
+            "action": "create_group",
+            "title": "Valencia Expats",
+            "text": "",
+            "text_entities": []
+          },
+          {
+            "id": 2,
+            "type": "message",
+            "date": "2024-03-01T09:05:00",
+            "date_unixtime": "1709283900",
+            "from": "Nina",
+            "from_id": "user777000",
+            "text": [
+              "Записаться на ВНЖ можно тут ",
+              { "type": "link", "text": "https://sede.example.es" },
+              " до пятницы"
+            ],
+            "text_entities": [
+              { "type": "plain", "text": "Записаться на ВНЖ можно тут " },
+              { "type": "link", "text": "https://sede.example.es" },
+              { "type": "plain", "text": " до пятницы" }
+            ],
+            "reactions": [
+              { "type": "emoji", "count": 3, "emoji": "👍" },
+              { "type": "emoji", "count": 2, "emoji": "🔥" }
+            ]
+          },
+          {
+            "id": 3,
+            "type": "message",
+            "date": "2024-03-01T09:07:00",
+            "date_unixtime": "1709284020",
+            "edited": "2024-03-01T09:09:00",
+            "edited_unixtime": "1709284140",
+            "from": "Pau",
+            "from_id": "user424242",
+            "reply_to_message_id": 2,
+            "photo": "photos/photo_1@01-03-2024_09-07-00.jpg",
+            "width": 1280,
+            "height": 720,
+            "text": "объявление у входа",
+            "text_entities": [{ "type": "plain", "text": "объявление у входа" }]
+          },
+          {
+            "id": 4,
+            "type": "message",
+            "date": "2024-03-01T09:20:00",
+            "date_unixtime": "1709284800",
+            "from": "Pau",
+            "from_id": "user424242",
+            "file": "files/tasa_790.pdf",
+            "file_name": "tasa_790.pdf",
+            "mime_type": "application/pdf",
+            "text": "",
+            "text_entities": []
+          },
+          {
+            "type": "message",
+            "date": "2024-03-01T09:30:00",
+            "date_unixtime": "1709285400",
+            "from": "Pau",
+            "from_id": "user424242",
+            "text": "an entry Telegram wrote without an id",
+            "text_entities": [
+              { "type": "plain", "text": "an entry Telegram wrote without an id" }
+            ]
+          }
+        ]
+      },
+      {
+        "name": "Двое в лодке",
+        "type": "private_group",
+        "id": 987654,
+        "messages": [
+          {
+            "id": 1,
+            "type": "message",
+            "date": "2022-06-04T18:00:00",
+            "from": "Nina",
+            "from_id": 777000,
+            "text": "старый экспорт без date_unixtime"
+          },
+          {
+            "id": 2,
+            "type": "message",
+            "date": "2022-06-04T18:02:00",
+            "from": "Kirill",
+            "from_id": 424242,
+            "forwarded_from": "Valencia Expats",
+            "file": "video_files/clip.mp4",
+            "media_type": "video_file",
+            "text": ""
+          },
+          {
+            "id": 3,
+            "type": "message",
+            "date": "2022-06-04T18:10:00",
+            "from": "Nina",
+            "from_id": 777000,
+            "poll": {
+              "question": "Идём в четверг?",
+              "closed": false,
+              "total_voters": 2,
+              "answers": [
+                { "text": "да", "voters": 2, "chosen": true },
+                { "text": "нет", "voters": 0, "chosen": false }
+              ]
+            },
+            "text": ""
+          }
+        ]
+      }
+    ]
+  }
+}

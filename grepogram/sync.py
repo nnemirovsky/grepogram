@@ -18,6 +18,14 @@ flagged until :func:`on_chat_synced` has rebuilt its units and ``msg_fts`` entry
 :func:`_sync_chats` indexes a chat's pending rows after its fetch whether that returned or raised
 (a flood wait, an RPC error, a cancellation) and, at the end of the run, those of the chats it
 never reached and of a bounded number of chats nothing leads to any more (:func:`index_stranded`).
+The run then re-cuts a bounded number of chats whose units predate this build's unit recipe
+(:func:`recut_pending_chats`), which is how a change to what a unit *is* reaches history no
+incremental rebuild can touch.
+:func:`prune_deleted` is the pass beside all this: the full sweep that asks Telegram about every
+stored id and drops the messages it no longer has, driven by ``grepogram prune-deleted`` and never
+by a sync — it costs about one request per hundred stored messages, so it is resumable through a
+``meta`` cursor per chat and always deliberate.
+
 A run that dies between a commit and the rebuild therefore leaves nothing behind that the next run
 does not pick up (:func:`grepogram.db.unindexed_message_ids`). The rebuild, the
 indexing and the flag are one transaction, so the flag never clears over derived data that is not
@@ -43,7 +51,7 @@ import sqlite3
 import threading
 import time
 from collections import deque
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -59,13 +67,20 @@ from grepogram.models import (
     Config,
     MediaKind,
     MessageRow,
+    PruneReport,
     Source,
     SyncCfg,
     SyncReport,
     UserRow,
 )
 from grepogram.paths import FileLock, Paths
-from grepogram.sources import discussion_source_id, parse_since, resolve_sources
+from grepogram.sources import (
+    IMPORT_PREFIX,
+    discussion_source_id,
+    imported_tag,
+    parse_since,
+    resolve_sources,
+)
 from grepogram.units import UNKNOWN_SENDER
 
 log = logging.getLogger(__name__)
@@ -74,6 +89,13 @@ BATCH_SIZE = 500
 JOIN_LOG_EVERY = 30.0
 STRANDED_CHATS = 4
 """Chats outside the run's own that :func:`index_stranded` repairs per run."""
+RECUT_CHATS_PER_RUN = 4
+"""Chats :func:`recut_pending_chats` re-cuts per run.
+
+A re-cut deletes and re-inserts every unit of a chat and drops their vectors, so the chat is
+re-embedded afterwards — the expensive half. Bounding it per run is what keeps a recipe bump
+from turning one sync into a full-index rebuild, and the per-chat markers are what let the next
+run carry on where this one stopped."""
 SELF_NAME = "me"
 UNKNOWN_FORWARD = "unknown"
 _LOCATION_MEDIA = (types.MessageMediaGeo, types.MessageMediaGeoLive, types.MessageMediaVenue)
@@ -365,6 +387,16 @@ class SyncBudget:
         self._cancelled = True
 
     @property
+    def cancelled(self) -> bool:
+        """Whether the run was cancelled, as opposed to having spent its allowance.
+
+        Both read as ``expired``, and a pass that keeps a slice of work for itself when the
+        clock runs out (:func:`recut_pending_chats`) must not keep one when the caller is being
+        torn down: there is nothing left to hold the :class:`SyncLock` open for.
+        """
+        return self._cancelled
+
+    @property
     def remaining(self) -> float | None:
         """Seconds left, ``None`` for an unlimited budget, never negative, ``0`` once cancelled."""
         if self._cancelled:
@@ -468,6 +500,9 @@ class _Run:
     Telegram refuses a thread mid-run, with the reason kept in ``warnings``. ``replies`` holds,
     per post the incremental pass mapped and has not stored yet, the reply count Telegram
     reported on it, so :func:`_store_batch` asks for the threads of posts that have one.
+
+    ``cfg`` is the whole config rather than its ``[sync]`` section because :meth:`store` may have
+    to cut units again, and those are cut to ``[units]``; a caller with none passes the defaults.
     """
 
     client: Any
@@ -475,6 +510,7 @@ class _Run:
     chat: ChatRow
     source: Source
     budget: SyncBudget
+    cfg: Config
     me: UserRow | None
     discussion: ChatRow | None = None
     peers: _PeerBook = field(default_factory=_PeerBook)
@@ -488,18 +524,72 @@ class _Run:
         self.peers.add(msg)
         return map_message(msg, chat, self.peers.names, me=self.me)
 
-    def store(self, rows: list[MessageRow]) -> list[int]:
-        """Upsert ``rows`` (all of one chat) with the users met so far; returns their row ids."""
+    async def store(self, rows: list[MessageRow]) -> list[int]:
+        """Upsert ``rows`` (all of one chat) with the users met so far; returns their row ids.
+
+        A row whose **attachment was replaced** loses its extracted text in the upsert
+        (:data:`grepogram.db._MESSAGE_UPSERT`), and the units cut from that text are this
+        method's to invalidate — the upsert cannot, :mod:`grepogram.db` knowing nothing of
+        :mod:`grepogram.units`, and the ``indexed = 0`` it raises reaches nothing on its own: a
+        rebuild never re-cuts a closed window and :func:`on_chat_synced` clears the flag anyway,
+        so the old file's text would stay in the unit and in ``unit_fts`` for good, with no row
+        left flagged and no media left pending to lead anything back to it. The same re-cut
+        :func:`grepogram.media._recut` does after an extraction, in the other direction.
+
+        Which rows those are has to be read *before* the upsert
+        (:func:`grepogram.db.attachment_replaced` over what is stored now), and only the ones
+        that actually carried text are worth a re-cut: a replaced attachment nothing was ever
+        read off renders exactly the same either way.
+        The rows handed to the invalidation are re-read *after* the upsert, so they carry the
+        ``topic_id`` and ``comment_of_*`` pair it just coalesced onto them — the second is what
+        :func:`_invalidate_comment_posts` follows to the channel post thread quoting a comment,
+        the one unit no ``json_each`` over ``units.msg_ids`` can reach.
+
+        The whole write is one transaction, and it goes to a worker thread
+        (:func:`_joined_to_thread`) only when there is something to cut — a re-cut runs to the
+        end of the chat, which is what :func:`_drop_deleted` is pushed off the event loop for,
+        while the ordinary batch is a plain upsert that has always run on it.
+        """
         if not rows:
             return []
         chat_id = rows[0].chat_id
-        with db.transaction(self.conn):
-            known = db.get_messages_by_msg_id(self.conn, chat_id, [row.msg_id for row in rows])
-            self.peers.flush(self.conn)
-            ids = db.upsert_messages(self.conn, rows)
+        known = db.get_messages_by_msg_id(self.conn, chat_id, [row.msg_id for row in rows])
+        stale = [
+            row.msg_id
+            for row in rows
+            if (was := known.get(row.msg_id)) is not None
+            and was.extracted_text
+            and db.attachment_replaced(was, row)
+        ]
+        write = functools.partial(self._write, chat_id, rows, stale)
+        ids = await _joined_to_thread(write, self.budget.cancel) if stale else write()
         fresh = sum(1 for row in rows if row.msg_id not in known)
         self.inserted[chat_id] = self.inserted.get(chat_id, 0) + fresh
         return ids
+
+    def _write(self, chat_id: int, rows: list[MessageRow], stale: Sequence[int]) -> list[int]:
+        """The upsert and, for the rows whose extraction it just dropped, the re-cut."""
+        with db.transaction(self.conn):
+            self.peers.flush(self.conn)
+            ids = db.upsert_messages(self.conn, rows)
+            if stale:
+                self._recut_replaced(chat_id, stale)
+        return ids
+
+    def _recut_replaced(self, chat_id: int, msg_ids: Sequence[int]) -> None:
+        """Cut the units of the messages whose extracted text the upsert just cleared."""
+        chat = db.get_chat(self.conn, chat_id)
+        assert chat is not None  # the upsert's foreign key would have refused the rows otherwise
+        reset = db.get_messages_by_msg_id(self.conn, chat_id, msg_ids)
+        rows = [row for _, row in sorted(reset.items())]
+        log.info(
+            "chat %s: %d messages were re-stored with a different attachment; "
+            "the text read off the old one was cut out of their units",
+            chat_id,
+            len(rows),
+        )
+        index.index_units(self.conn, units.invalidate_units_for(self.conn, chat, self.cfg, rows))
+        _invalidate_comment_posts(self.conn, self.cfg, rows)
 
     def drop_comments(self, exc: Exception) -> None:
         """Stop fetching comments for this run; the posts themselves go on."""
@@ -536,7 +626,7 @@ async def sync_chat(
     source: Source,
     budget: SyncBudget,
     *,
-    sync_cfg: SyncCfg | None = None,
+    cfg: Config | None = None,
     me: UserRow | None = None,
 ) -> SyncedChat:
     """Fetch one chat incrementally and store what changed; the client must be connected.
@@ -546,10 +636,15 @@ async def sync_chat(
     :data:`BATCH_SIZE`, advancing ``last_msg_id`` after every batch so an interrupted run resumes
     where it stopped. A run that finishes re-fetches the newest ``edit_refetch`` messages for
     edits and reactions (only rows that actually differ are written) and stamps
-    ``last_sync_at``. Channels whose source has ``comments`` also get the comment threads of each
-    new post, stored under the linked discussion chat as comments on that post, and the
-    re-fetch pass re-reads the thread of every re-fetched post Telegram reports more
+    ``last_sync_at``. That pass also drops the messages deleted in Telegram, which it costs no
+    request at all to notice: they are the stored ids inside the range it covered that it did not
+    return (:func:`_drop_deleted`). Channels whose source has ``comments`` also get the comment
+    threads of each new post, stored under the linked discussion chat as comments on that post,
+    and the re-fetch pass re-reads the thread of every re-fetched post Telegram reports more
     replies for than are stored, so comments that arrive after the post was indexed follow.
+
+    ``cfg`` is the whole config rather than its ``[sync]`` section because a deletion re-cuts the
+    units holding the message, which is cut to ``[units]``; without one the defaults are used.
 
     A chat Telegram refuses (:data:`UNAVAILABLE_ERRORS`) is marked ``unavailable`` and reported,
     not raised; the same errors on the discussion group alone (a private one, say) switch the
@@ -562,7 +657,15 @@ async def sync_chat(
     if chat.migrated_to is not None:
         log.debug("chat %s migrated to %s; its history is frozen", chat.id, chat.migrated_to)
         return SyncedChat(chat=chat, migrated_to=db.get_chat(conn, chat.migrated_to))
-    run = _Run(client=client, conn=conn, chat=chat, source=source, budget=budget, me=me)
+    run = _Run(
+        client=client,
+        conn=conn,
+        chat=chat,
+        source=source,
+        budget=budget,
+        cfg=cfg or Config(),
+        me=me,
+    )
     try:
         migrated = await _check_migration(client, conn, chat) if chat.type == "group" else None
         if source.comments and chat.type == "channel":
@@ -572,7 +675,7 @@ async def sync_chat(
                 run.drop_comments(exc)
         fetched = await _fetch_new(run)
         if fetched.complete and chat.last_sync_at is not None:
-            _track(run.changes, await _refetch_edits(run, sync_cfg or SyncCfg()))
+            _track(run.changes, await _refetch_edits(run, run.cfg))
     except UNAVAILABLE_ERRORS as exc:
         log.warning("chat %s (%s) is unavailable: %s", chat.id, chat.title, exc)
         db.set_chat_unavailable(conn, chat.id, True)
@@ -679,7 +782,7 @@ async def _store_batch(run: _Run, batch: list[MessageRow], progress: int, seen_u
     channel Telegram is already rate-limiting.
     """
     chat = run.chat
-    _track(run.changes, run.store(batch))
+    _track(run.changes, await run.store(batch))
     if run.discussion is None:
         run.replies.clear()
         db.set_chat_progress(run.conn, chat.id, seen_up_to, chat.last_sync_at)
@@ -738,51 +841,126 @@ async def _fetch_comments(run: _Run, post_id: int) -> list[int]:
                     )
                 )
             if len(rows) >= BATCH_SIZE:
-                stored += run.store(rows)
+                stored += await run.store(rows)
                 rows = []
     except errors.MsgIdInvalidError:
         log.debug("post %s in channel %s has no comment thread", post_id, run.chat.id)
     except UNAVAILABLE_ERRORS as exc:
         run.drop_comments(exc)
     finally:
-        stored += run.store(rows)
+        stored += await run.store(rows)
     return stored
 
 
-async def _refetch_edits(run: _Run, sync_cfg: SyncCfg) -> list[int]:
+async def _refetch_edits(run: _Run, cfg: Config) -> list[int]:
     """Re-read the newest ``edit_refetch`` messages and rewrite only stored rows that changed.
 
     Messages that are not stored — history before ``since``, or anything the incremental pass
-    has not reached — are left alone; this pass exists for edits and reactions only. For a
-    channel with comments it also refreshes the threads of the re-fetched posts that grew
+    has not reached — are left alone; this pass exists for edits, reactions and deletions only.
+    For a channel with comments it also refreshes the threads of the re-fetched posts that grew
     (:func:`_refresh_comments`); the ids of those posts are returned along with the edited rows
     so their post-thread units are rebuilt.
+
+    The stored units' reaction totals are brought up to date here as well
+    (:func:`grepogram.db.refresh_unit_reactions`) and not through the rebuild that follows: a
+    reaction is not part of a unit's content, so :func:`grepogram.units._apply` keeps the stored
+    row when it re-cuts an identical unit, and the closed window nearly every re-fetched message
+    sits in is never re-cut in the first place.
+
+    ``seen`` is every id the iteration yielded, service messages included — :meth:`_Run.map`
+    turns those into ``None`` and they are never stored, but they are still ids Telegram
+    answered with, and they bound the range this pass can say anything about
+    (:func:`_drop_deleted`).
     """
-    if sync_cfg.edit_refetch <= 0:
+    if cfg.sync.edit_refetch <= 0:
         return []
     chat = run.chat
     fresh: list[MessageRow] = []
     replies: dict[int, int] = {}
-    async for msg in run.client.iter_messages(chat.id, limit=sync_cfg.edit_refetch):
+    seen: set[int] = set()
+    async for msg in run.client.iter_messages(chat.id, limit=cfg.sync.edit_refetch):
+        seen.add(int(msg.id))
         row = run.map(msg, chat)
         if row is not None:
             fresh.append(row)
             replies[row.msg_id] = replies_count(msg)
-    if not fresh:
+    if not seen:
         return []
-    stored = {
-        row.msg_id: row
-        for row in db.get_messages(run.conn, chat.id, since_msg_id=min(r.msg_id for r in fresh))
-    }
+    stored = {row.msg_id: row for row in db.get_messages(run.conn, chat.id, since_msg_id=min(seen))}
     changed = [row for row in fresh if row.msg_id in stored and _differs(stored[row.msg_id], row)]
     if changed:
         log.debug(
             "chat %s: %d of %d re-fetched messages changed", chat.id, len(changed), len(fresh)
         )
-    ids = run.store(changed)
+    ids = await run.store(changed)
+    # Telegram msg ids, never the rowids `store` just returned: `units.msg_ids` is the other
+    # space, and the two coincide only in a chat whose history starts at 1 (see
+    # `db.refresh_unit_reactions`).
+    db.refresh_unit_reactions(run.conn, chat.id, [row.msg_id for row in changed])
+    await _drop_deleted(run, cfg, stored, seen)
     if run.discussion is not None:
         ids += await _refresh_comments(run, stored, replies)
     return ids
+
+
+async def _drop_deleted(
+    run: _Run, cfg: Config, stored: Mapping[int, MessageRow], seen: set[int]
+) -> list[int]:
+    """Remove the rows of the messages this re-fetch proves are gone, and re-cut their units.
+
+    A deletion is a **set difference**, never an empty slot: ``iter_messages`` simply omits a
+    deleted message rather than yielding a hole for it, so what says a stored message is gone is
+    that the iteration reached its id and did not return it. The comparison is bounded to
+    ``[min(seen), max(seen)]``, the range the iteration actually covered — a stored id below
+    where it stopped, or above where it started, was never asked about and is evidence of
+    nothing. Service messages cannot make a false positive: :func:`map_message` returns ``None``
+    for them so they are never stored, and their ids are in ``seen`` regardless.
+
+    Rows that are **comments** (``comment_of_chat_id`` set) are left alone even in a discussion
+    group a source lists directly, where this pass does run over them. Dropping one here would
+    re-cut the group's own window while the channel's post thread kept its text for good: a post
+    thread lists only the post in ``msg_ids``, so no ``json_each`` over ``units.msg_ids`` reaches
+    a comment id and nothing here could invalidate it. ``grepogram prune-deleted`` follows the
+    ``comment_of_*`` pair instead and is where a deleted comment belongs.
+
+    The order is read the rows, delete them, then re-cut — one transaction, and the rows are read
+    first because :func:`grepogram.units.invalidate_units_for` needs the topic a window is scoped
+    by, which lives on a row that no longer exists by then. It renders nothing from them, so a
+    message that heads a reply thread does not come back in the unit its removal rebuilds; a unit
+    left holding no messages is dropped instead of being rebuilt empty. Returns the ids removed.
+
+    That transaction goes to a worker thread joined even under cancellation
+    (:func:`_joined_to_thread`), like every other write a sync makes:
+    :func:`grepogram.units.invalidate_units_for` re-cuts every window from the deleted message to
+    the end of the chat, which is exactly the work :func:`on_chat_synced` is pushed off the event
+    loop for — the client's keepalives run on while it happens.
+    """
+    lo, hi = min(seen), max(seen)
+    gone = [
+        row
+        for msg_id, row in sorted(stored.items())
+        if lo <= msg_id <= hi and msg_id not in seen and row.comment_of_chat_id is None
+    ]
+    if not gone:
+        return []
+    msg_ids = [row.msg_id for row in gone]
+    await _joined_to_thread(
+        functools.partial(_apply_drop, run, cfg, gone, msg_ids), run.budget.cancel
+    )
+    log.info(
+        "chat %s (%s): %d messages were deleted in Telegram and dropped from the index",
+        run.chat.id,
+        run.chat.title,
+        len(gone),
+    )
+    return msg_ids
+
+
+def _apply_drop(run: _Run, cfg: Config, gone: Sequence[MessageRow], msg_ids: Sequence[int]) -> None:
+    """Delete one re-fetch's proven-gone rows and re-cut what held them — one transaction."""
+    with db.transaction(run.conn):
+        db.delete_messages(run.conn, run.chat.id, list(msg_ids))
+        index.index_units(run.conn, units.invalidate_units_for(run.conn, run.chat, cfg, gone))
 
 
 def _differs(stored: MessageRow, fresh: MessageRow) -> bool:
@@ -791,12 +969,32 @@ def _differs(stored: MessageRow, fresh: MessageRow) -> bool:
     Compared with the values the upsert would keep: a comment re-read as part of its discussion
     group's own history arrives with no comment relation — and, outside a forum, with no topic —
     and must not count as an edit for want of what the upsert would have preserved anyway.
+
+    ``extracted_text`` and ``media_state`` are normalised away on both sides instead, because a
+    mapped row never carries either: it has no extracted text and :data:`db.MEDIA_PENDING`, so
+    every extracted message inside the ``edit_refetch`` window would otherwise count as an edit
+    on every sync and be re-cut and re-embedded forever. The "kept" idiom above cannot do it —
+    it reads ``None`` as "not supplied", and a fresh row's ``media_state`` is ``0``.
+
+    Normalising them away hides nothing the upsert acts on. The upsert clears them only when the
+    attachment itself changed (:data:`db._ATTACHMENT_REPLACED`), and ``media_kind`` /
+    ``media_filename`` — the two columns that say so — are compared here in full, so a replaced
+    attachment reaches ``store`` as an edit and is cleared there while a caption edit is not and
+    keeps its text.
     """
     kept = {
         field: getattr(stored, field) if getattr(fresh, field) is None else getattr(fresh, field)
         for field in ("topic_id", "comment_of_chat_id", "comment_of_msg_id")
     }
-    return dataclasses.replace(stored, id=None) != dataclasses.replace(fresh, **kept)
+    return _comparable(dataclasses.replace(stored, id=None)) != _comparable(
+        dataclasses.replace(fresh, **kept)
+    )
+
+
+def _comparable(row: MessageRow) -> MessageRow:
+    """``row`` without the columns :func:`db.upsert_messages` writes from no value of its own —
+    see :func:`_differs`."""
+    return dataclasses.replace(row, extracted_text=None, media_state=db.MEDIA_PENDING)
 
 
 async def _refresh_comments(
@@ -820,14 +1018,17 @@ async def _refresh_comments(
     ]
     db.mark_unindexed(run.conn, [row_id for p in grown if (row_id := stored[p].id) is not None])
     touched: list[int] = []
+    reread: list[int] = []
     for post_id in grown:
         if run.budget.expired or run.discussion is None:
             break
         ids = await _fetch_comments(run, post_id)
         _track(run.comment_ids, ids)
+        reread += ids
         row_id = stored[post_id].id
         if ids and row_id is not None:
             touched.append(row_id)
+    _refresh_comment_reactions(run, reread)
     if grown:
         log.debug(
             "channel %s: %d of %d re-fetched posts had new comments; %d threads re-read",
@@ -837,6 +1038,24 @@ async def _refresh_comments(
             len(touched),
         )
     return touched
+
+
+def _refresh_comment_reactions(run: _Run, row_ids: Sequence[int]) -> None:
+    """Recompute the discussion group's unit reaction totals over the comments just re-read.
+
+    A closed window is never re-cut and reactions are not part of ``units._content_key``, so
+    ``refresh_unit_reactions`` is the only thing that moves a stored total
+    (:func:`_refetch_edits` runs it for the source chat). A discussion group known only through
+    a channel's link is never a source chat, so nothing else would ever run it there — the
+    comment rows would keep the totals they were first fetched with for good.
+
+    Telegram message ids, never the rowids ``_fetch_comments`` returns: ``units.msg_ids`` is the
+    other id space, and the two coincide only in a chat whose history starts at 1.
+    """
+    if run.discussion is None or not row_ids:
+        return
+    rows = db.get_messages_by_ids(run.conn, row_ids)
+    db.refresh_unit_reactions(run.conn, run.discussion.id, [row.msg_id for row in rows])
 
 
 async def _check_migration(client: Any, conn: sqlite3.Connection, chat: ChatRow) -> ChatRow | None:
@@ -889,6 +1108,19 @@ async def link_discussion_chat(
     still clears a link that points at a *different* group — that one is demonstrably not the
     channel's any more — while a link to the very group that failed to resolve is left untouched
     and retried next run.
+
+    **A group this index holds as a Telegram Desktop import is refused**, the same way and with
+    the same message :func:`~grepogram.sources.resolve_sources` uses
+    (:func:`~grepogram.sources.imported_tag`): this is the third writer of ``chats.source_id``,
+    and :func:`grepogram.db.upsert_chat` overwrites the column, so linking would replace
+    ``import:<slug>`` with the channel's source and hand the imported history to every rule
+    keyed on that prefix — ``sources rm`` of the channel's source would delete it,
+    :func:`~grepogram.sources.prunable` would offer it, and the ``import:`` handle the refusal
+    tells the user to remove would be gone. Refusing the link rather than only keeping the tag
+    is what also keeps live comments out of a chat marked ``unavailable``, whose rows came from
+    an export and which no sweep may re-fetch. It is reachable exactly where the import feature
+    is useful: a group the account was kicked from still comes back inside ``full.chats``, so
+    nothing else here would ever fail on it.
     """
     full = await client(functions.channels.GetFullChannelRequest(channel.id))
     linked = getattr(full.full_chat, "linked_chat_id", None)
@@ -899,6 +1131,13 @@ async def link_discussion_chat(
         )
         return None
     linked_id = dialogs.peer_id(types.PeerChannel(int(linked)))
+    held = imported_tag(conn, linked_id)
+    if held is not None:
+        _drop_stale_link(conn, channel, linked_id)
+        raise DiscussionUnavailable(
+            f"discussion group {linked_id} is held as {held}, a Telegram Desktop import; "
+            f"run `grepogram sources rm {held}` first to sync that group from Telegram"
+        )
     entity = next((c for c in full.chats if dialogs.peer_id(c) == linked_id), None)
     if entity is None:
         try:
@@ -1130,6 +1369,120 @@ async def index_stranded(
         await _joined_to_thread(functools.partial(on_chat_synced, conn, chat, cfg, pending))
 
 
+async def recut_pending_chats(
+    conn: sqlite3.Connection,
+    cfg: Config,
+    budget: SyncBudget,
+    embedder: Embedder | None = None,
+) -> int:
+    """Re-cut the chats whose units predate :data:`grepogram.units.RECIPE_VERSION`; how many moved.
+
+    Its own step after :func:`index_stranded`, so that sweep cannot rebuild a chat this pass has
+    just finished, and never hooked into :func:`on_chat_synced`: nothing is left flagged outside
+    the transaction that rebuilds it, so no later run — least of all a 20-second auto-sync inside
+    a ``search`` — inherits a whole-index backlog to drain. Who may start one is decided by the
+    caller, not by how many seconds are left: :func:`sync_all` takes ``recut``, and the automatic
+    sync inside an MCP ``search`` is the one caller that passes ``False``.
+
+    The procedure, in order:
+
+    #. a recorded recipe equal to :data:`~grepogram.units.RECIPE_VERSION` means there is nothing
+       to do. ``None`` — a v0.1.1 index — is a mismatch, not a fresh database:
+       :func:`grepogram.db.migrate` stamps the ones built from empty;
+    #. the candidates are **every** chat in the index, not the run's queue: a channel's
+       discussion group known only through the link never appears in ``resolve_sources``' output,
+       and its windows hold every comment the index has. At most :data:`RECUT_CHATS_PER_RUN` of
+       them move, while the budget lasts — but **the first one is taken whether or not the
+       fetch left anything of it**. This runs after :func:`_sync_chats` on the same budget, and
+       on a large index the edit-refetch tail alone can spend all of it with the index otherwise
+       up to date, so without that guarantee the MCP ``sync`` tool at its default budget would
+       re-cut zero chats every time and the pending re-cut would never end. One chat per run
+       still ends it, and the marker makes the next run continue. A budget that was *cancelled*
+       keeps nothing back: the caller is going away and the lock with it;
+    #. each chat is one transaction on a worker thread joined even under cancellation
+       (:func:`_joined_to_thread`, with :meth:`SyncBudget.cancel` as the abort): re-read the chat
+       row and skip it when it is gone, :func:`grepogram.units.recut_chat`, index the delta,
+       repair the unit index, write the marker. The indexing lives here rather than in
+       :mod:`grepogram.units`, which cannot import :mod:`grepogram.index`, and **no message ids
+       are passed**: a re-cut changes no message text, so rewriting an ``msg_fts`` row per id
+       would be the largest wasted cost available;
+    #. once every chat carries the marker, the recipe is recorded and the markers are dropped in
+       one transaction — tidy-up, not correctness. Until then a run cut short leaves the finished
+       chats marked and the next one picks up only the rest.
+    """
+    target = units.RECIPE_VERSION
+    if db.unit_recipe(conn) == target:
+        return 0
+    marker = str(target)
+    markers = db.recut_markers(conn)
+    pending = [chat for chat in db.list_chats(conn) if markers.get(chat.id) != marker]
+    recut = 0
+    for position, chat in enumerate(pending[:RECUT_CHATS_PER_RUN]):
+        if budget.expired and (position or budget.cancelled):
+            log.info(
+                "unit re-cut: %d chats are still cut by an older recipe and this run's budget "
+                "is spent; the next sync carries on from here",
+                len(pending) - position,
+            )
+            break
+        done = await _joined_to_thread(
+            functools.partial(_recut_one, conn, cfg, chat), budget.cancel
+        )
+        recut += int(done)
+    if recut and embedder is None:
+        log.warning(
+            "%d chats were re-cut and their old units' vectors went with them, and this run has "
+            "no embedding model; run `grepogram embed` to make them searchable by meaning again",
+            recut,
+        )
+    _finish_recut(conn, target)
+    return recut
+
+
+def _recut_one(conn: sqlite3.Connection, cfg: Config, chat: ChatRow) -> bool:
+    """Re-cut one chat, index the result and mark it done; ``False`` when the chat is gone.
+
+    The chat row is re-read the way :func:`index_pending` does it: a chat removed under the pass
+    would otherwise reach :func:`grepogram.db.insert_units` with no parent row and raise
+    ``IntegrityError`` outside the chat loop's guard, escaping :func:`sync_all` as a traceback.
+    """
+    with db.transaction(conn):
+        row = db.get_chat(conn, chat.id)
+        if row is None:
+            log.debug("chat %s was removed before its re-cut; skipped", chat.id)
+            return False
+        delta = units.recut_chat(conn, row, cfg)
+        index.index_units(conn, delta)
+        index.repair_unit_index(conn, row.id)
+        db.set_recut_marker(conn, row.id, units.RECIPE_VERSION)
+    log.info(
+        "chat %s (%s): re-cut %d units into %d for unit recipe v%s",
+        chat.id,
+        chat.title,
+        len(delta.deleted_ids),
+        len(delta.inserted_ids),
+        units.RECIPE_VERSION,
+    )
+    return True
+
+
+def _finish_recut(conn: sqlite3.Connection, target: int) -> None:
+    """Record the recipe and drop the markers once no chat is left unmarked.
+
+    Completion is "no chat is unmarked", so an index with no chats at all is complete on the
+    spot. The two writes are one transaction: a recorded recipe next to stale markers would make
+    the next bump skip the chats those markers name.
+    """
+    marker = str(target)
+    markers = db.recut_markers(conn)
+    if any(markers.get(chat.id) != marker for chat in db.list_chats(conn)):
+        return
+    with db.transaction(conn):
+        db.set_unit_recipe(conn, target)
+        db.clear_recut_markers(conn)
+    log.info("every chat is cut with unit recipe v%s", target)
+
+
 ConfigSource = Config | Callable[[], Config]
 """A config, or a loader called once the :class:`SyncLock` is held (see :func:`sync_all`)."""
 
@@ -1141,6 +1494,7 @@ async def sync_all(
     paths: Paths,
     budget: SyncBudget,
     embedder: Embedder | None = None,
+    recut: bool = True,
 ) -> SyncReport:
     """Sync every configured source within ``budget``; the client must be connected.
 
@@ -1162,6 +1516,15 @@ async def sync_all(
     whether or not a chat completed, so a caller deciding whether the index is stale does not
     retry a run that has nothing to finish.
 
+    ``recut`` says whether this run may start the one-time unit re-cut
+    (:func:`recut_pending_chats`). It is a property of the caller, not of the budget: an
+    explicit sync — ``grepogram sync``, the MCP ``sync`` tool — is deliberate and makes whatever
+    progress its budget allows, bounded at :data:`RECUT_CHATS_PER_RUN`, never less than one chat
+    even when the fetch spent the whole budget, and resumable through the per-chat markers; the
+    automatic sync inside an MCP ``search`` passes ``False`` so a search
+    never rebuilds units incidentally, however large the user has set
+    ``search.auto_sync_budget_s``.
+
     With an ``embedder`` the run ends by embedding the dirty units under the same budget and
     lock (:func:`~grepogram.index.embed_dirty_units`); units the budget leaves unembedded and a
     changed embedding model become ``warnings`` — the messages are synced either way.
@@ -1169,6 +1532,8 @@ async def sync_all(
     with SyncLock(paths):
         current = cfg if isinstance(cfg, Config) else cfg()
         report = await _sync_chats(client, conn, current, budget)
+        if recut:
+            await recut_pending_chats(conn, current, budget, embedder)
         db.set_last_sync_run(conn, int(time.time()))
         if embedder is None:
             return report
@@ -1306,9 +1671,7 @@ async def _sync_chats(
         _cap_flood_sleep(client, cfg.sync, budget)
         try:
             try:
-                synced = await sync_chat(
-                    client, conn, chat, source, budget, sync_cfg=cfg.sync, me=me
-                )
+                synced = await sync_chat(client, conn, chat, source, budget, cfg=cfg, me=me)
             finally:
                 await index_pending(conn, cfg, chat)
         except errors.UnauthorizedError:
@@ -1354,3 +1717,401 @@ def _sync_order(chat: ChatRow) -> tuple[int, int, int]:
 def _self_row(me: Any) -> UserRow | None:
     users = collect_users([me])
     return next(iter(users.values()), None)
+
+
+# --- the deletion sweep ----------------------------------------------------------------------
+
+
+PRUNE_BATCH = 100
+"""Stored ids one request of the sweep asks about — the most ``messages.getMessages`` takes."""
+
+
+@dataclass(slots=True)
+class _PruneTally:
+    """What the sweep accumulates on its way to a :class:`PruneReport`."""
+
+    removed: int = 0
+    checked: int = 0
+    done: list[int] = field(default_factory=list)
+    remaining: list[int] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
+
+    def report(self) -> PruneReport:
+        log.info(
+            "prune-deleted: %d of %d checked messages were gone, %d chats swept, %d left",
+            self.removed,
+            self.checked,
+            len(self.done),
+            len(self.remaining),
+        )
+        return PruneReport(
+            removed=self.removed,
+            checked=self.checked,
+            chats_done=self.done,
+            chats_remaining=self.remaining,
+            warnings=self.warnings,
+        )
+
+
+async def prune_deleted(
+    client: Any,
+    conn: sqlite3.Connection,
+    cfg: Config,
+    paths: Paths,
+    budget: SyncBudget,
+    *,
+    chat_id: int | None = None,
+) -> PruneReport:
+    """Ask Telegram about every stored message and drop the ones it no longer has.
+
+    What :func:`_drop_deleted` cannot reach. That pass sees only the ``edit_refetch`` newest
+    messages of a chat and reads a deletion as a set difference, because ``iter_messages`` omits
+    a deleted message rather than yielding a hole for it. This one asks by
+    id — ``client.get_messages(chat_id, ids=[…])`` answers one slot per id and fills a deleted one
+    with ``MessageEmpty`` — so **here an empty slot is the deletion signal** (:func:`_empty_slots`
+    is where that is read, and where an answer that does not line up with the question is refused
+    instead). Nothing else counts as evidence: an ``RPCError``, a chat that went private
+    mid-sweep, a flood wait, all end the chat's turn with nothing removed — and so does the
+    ``ValueError`` Telethon raises for a peer this account cannot resolve at all, which is a
+    plain exception rather than an ``RPCError`` and would otherwise end the whole sweep on the
+    first chat that hit it.
+
+    Addressing a chat by its stored id is only possible once the client knows that peer, and a
+    client grepogram builds knows none: :func:`warm_peer_cache` reads the dialog list first, for
+    the reasons written there. A sync gets that for free from
+    :func:`~grepogram.sources.resolve_sources`; this pass walks ``chats`` rows instead of a
+    source list, so it asks by hand.
+
+    It is a whole-index pass of about one request per hundred stored messages, so it is never
+    automatic and never an MCP tool: like ``sources prune``, deleting indexed history stays a
+    deliberate CLI action (``grepogram prune-deleted``). ``budget`` is in seconds like every
+    other pass, the client's ``flood_sleep_threshold`` is capped against what is left of it
+    (:func:`_cap_flood_sleep`) **before the warm-up rather than after it** — the warm-up is a
+    request like any other, and a client still carrying the default 120-second threshold would
+    sleep through a sub-threshold flood wait far longer than the whole budget before the sweep
+    had asked a single question — and the whole sweep runs under the :class:`SyncLock` — it deletes
+    messages, cuts units and writes index rows, and ``db.Connection``'s lock only serialises
+    threads within one process.
+
+    Progress is a ``meta`` cursor per chat (:func:`grepogram.db.prune_cursor`) written in the
+    same transaction as the removals it earned, so a run stopped by its budget or by a flood wait
+    keeps every batch it finished and the next one carries on from the id it reached rather than
+    from the top.
+
+    ``chat_id`` narrows the sweep to one chat **and the discussion group it links**, because a
+    deleted comment is only reachable from the group: a post thread lists the post alone in
+    ``msg_ids``, so no ``json_each`` over ``units.msg_ids`` finds a comment id, and the way back
+    to the thread is the ``comment_of_*`` pair on the comment's own row
+    (:func:`_invalidate_comment_posts`).
+    """
+    with SyncLock(paths):
+        targets = _sweep_targets(conn, chat_id)
+        tally = _PruneTally()
+        _cap_flood_sleep(client, cfg.sync, budget)
+        await warm_peer_cache(client, targets)
+        for position, chat in enumerate(targets):
+            if budget.expired:
+                tally.remaining.extend(rest.id for rest in targets[position:])
+                break
+            _cap_flood_sleep(client, cfg.sync, budget)
+            try:
+                complete = await _sweep_chat(client, conn, cfg, chat, budget, tally)
+            except errors.FloodWaitError as exc:
+                log.warning("flood wait of %ss on chat %s; stopping this run", exc.seconds, chat.id)
+                tally.warnings.append(
+                    f"flood wait: Telegram asks to wait {exc.seconds}s before more requests; "
+                    "run `grepogram prune-deleted` again later"
+                )
+                tally.remaining.extend(rest.id for rest in targets[position:])
+                break
+            except errors.UnauthorizedError:
+                raise
+            except (errors.RPCError, ValueError) as exc:
+                log.warning(
+                    "chat %s (%s): %s; nothing was removed from it", chat.id, chat.title, exc
+                )
+                tally.warnings.append(f"chat {chat.id} ({chat.title}): {exc}")
+                tally.remaining.append(chat.id)
+                continue
+            (tally.done if complete else tally.remaining).append(chat.id)
+        return tally.report()
+
+
+def _sweep_targets(conn: sqlite3.Connection, chat_id: int | None) -> list[ChatRow]:
+    """The chats one sweep walks, in id order; ``chat_id`` narrows it to one and its group.
+
+    Every indexed chat by default, discussion groups included — a group known only through a
+    channel's link is in ``db.list_chats`` like any other chat, which is what makes a deleted
+    comment this pass's to find without a special case.
+
+    Two kinds of chat are left out rather than asked about, because Telegram's answer for them
+    would say nothing about deletions: an ``import:`` source, where every id would come back
+    empty and the whole chat would be dropped, and one already known to be unavailable
+    (:func:`refetchable`).
+    """
+    if chat_id is None:
+        chats = db.list_chats(conn)
+    else:
+        found = (db.get_chat(conn, chat_id), db.get_discussion_chat(conn, chat_id))
+        chats = sorted((chat for chat in found if chat is not None), key=lambda chat: chat.id)
+    return [chat for chat in chats if refetchable(chat)]
+
+
+def refetchable(chat: ChatRow) -> bool:
+    """Whether a pass may ask Telegram about this chat's stored messages again.
+
+    Two kinds of chat are left alone rather than asked about. One whose history never came from
+    Telegram at all (an ``import:`` source) has no ids Telegram knows: the sweep would read every
+    empty slot as a deletion and drop the whole chat, and the extraction pass would re-fetch a
+    peer the account cannot even resolve — for which Telethon raises a plain ``ValueError``. One
+    already known to be unavailable would cost a refused request per batch.
+
+    Shared by :func:`_sweep_targets` and :func:`grepogram.media.run`, the two passes that
+    re-fetch stored rows by id rather than following a chat's history forward.
+    """
+    if chat.unavailable:
+        log.debug("chat %s is unavailable; it was left alone", chat.id)
+        return False
+    if (chat.source_id or "").startswith(IMPORT_PREFIX):
+        log.debug("chat %s was imported, not synced; it was left alone", chat.id)
+        return False
+    return True
+
+
+async def warm_peer_cache(client: Any, chats: Sequence[ChatRow]) -> None:
+    """Teach ``client`` the peers of ``chats`` before anything addresses them by bare id.
+
+    :func:`grepogram.tg.load_session` copies the data centre and the auth key out of the session
+    file and nothing else, so **the entity cache of every client grepogram builds starts empty**
+    — the docstring there states the rule and every Telegram-facing pass has to honour it. A
+    request that names a chat by its stored id and nothing else, which is what
+    ``client.get_messages(chat.id, ids=[…])`` is, has no access hash to build an ``InputPeer``
+    from: Telethon 1.44 asks the session, gets nothing, and its network fallback
+    (``channels.getChannels`` / ``users.getUsers`` with ``access_hash = 0``) is documented to
+    answer only for a bot's private chats or a contact. For a user session on a private
+    supergroup it ends in a plain ``ValueError: Could not find the input entity``, which is not
+    an ``RPCError`` and reaches a caller as a skipped chat or a traceback.
+
+    One ``get_dialogs()`` is the whole fix: Telethon writes the peers of every answer into the
+    session (``session.process_entities``), so the dialog list makes every chat the account has
+    a dialog with addressable for the rest of the client's life. It is the same warm-up a sync
+    gets for free from :func:`~grepogram.sources.resolve_sources` and the reason no path that
+    goes through a :class:`~grepogram.dialogs.DialogCatalog` ever had to think about this; the
+    two passes that walk stored rows instead of a source list — :func:`prune_deleted` and
+    :func:`grepogram.media.run` — are the ones that must ask for it by hand. The client's own
+    call rather than that catalog, because neither pass has any use for the folder list the
+    catalog reads beside it.
+
+    The dialog list is not the whole account, though, and the two chats it misses are exactly
+    the ones a source list reaches by a **stored handle** rather than by id:
+
+    * A public channel or group the account follows without joining has no dialog at all. A sync
+      never notices, because its source is a ``chat = "@name"`` and
+      :func:`~grepogram.sources.resolve_sources` resolves the handle — and that handle is stored
+      on the row as ``chats.username``, so this can walk the same route with
+      ``client.get_entity(chat.username)``. Skipping it left ``extract`` and ``prune-deleted``
+      failing every by-id request for precisely the chats the warm-up was added for.
+    * A channel's discussion group is indexed through the channel's link
+      (:func:`link_discussion_chat`) and may have neither a dialog nor a username of its own.
+      ``GetFullChannelRequest`` on the channel answers with the group among ``full.chats``,
+      which caches it exactly as the dialog list caches a dialog.
+
+    Both in that order, and the order matters: the *channel* a link-only group hangs off may
+    itself be outside the dialog list, and naming it by bare id in ``GetFullChannelRequest``
+    would fail for the same reason everything else here does. The username pass runs over the
+    whole list first, so a channel with a handle is resolved before its group is asked for.
+
+    ``resolved`` is what the session is known to hold, keyed by what actually came back
+    (``utils.get_peer_id``) rather than by what was asked for: a handle that has moved to another
+    peer resolves *that* one, and the chat it was stored on still needs its second route.
+
+    Nothing here is worth failing a pass for: a chat no route resolves is left to the caller's
+    per-chat handler, which costs that chat its turn and reports it, and a Telegram error during
+    the warm-up (a flood wait included) resurfaces on the very next request the pass makes, where
+    it is handled properly. An ``UnauthorizedError`` is the exception every handler makes, for
+    the reason :func:`_sync_chats` makes it: a session revoked mid-run is not a chat that would
+    not resolve, and only re-raising lets :func:`grepogram.tg.wrap_auth_errors` turn it into an
+    :class:`~grepogram.tg.AuthRequired` with the ``grepogram auth`` hint instead of a wall of
+    per-chat warnings and an exit code of zero.
+    """
+    if not chats:
+        return
+    try:
+        listed = {int(dialog.id) for dialog in await client.get_dialogs(ignore_migrated=True)}
+    except errors.UnauthorizedError:
+        raise
+    except (errors.RPCError, ValueError) as exc:
+        log.warning("could not read the dialog list to resolve %d chats: %s", len(chats), exc)
+        return
+    log.debug("warmed the entity cache with %d dialogs", len(listed))
+    resolved = set(listed)
+    for chat in chats:
+        if chat.id in resolved or not chat.username:
+            continue
+        try:
+            entity = await client.get_entity(chat.username)
+        except errors.UnauthorizedError:
+            raise
+        except (errors.RPCError, ValueError) as exc:
+            log.warning(
+                "chat %s (%s): @%s, the handle it is stored under, could not be resolved, "
+                "so the chat may not resolve: %s",
+                chat.id,
+                chat.title,
+                chat.username,
+                exc,
+            )
+            continue
+        resolved.add(int(utils.get_peer_id(entity)))
+    for chat in chats:
+        if chat.id in resolved or chat.discussion_of is None:
+            continue
+        try:
+            await client(functions.channels.GetFullChannelRequest(chat.discussion_of))
+        except errors.UnauthorizedError:
+            raise
+        except (errors.RPCError, ValueError) as exc:
+            log.warning(
+                "chat %s (%s): channel %s, which it holds the comments of, could not be read, "
+                "so the group may not resolve: %s",
+                chat.id,
+                chat.title,
+                chat.discussion_of,
+                exc,
+            )
+
+
+async def _sweep_chat(
+    client: Any,
+    conn: sqlite3.Connection,
+    cfg: Config,
+    chat: ChatRow,
+    budget: SyncBudget,
+    tally: _PruneTally,
+) -> bool:
+    """One chat from its cursor on; ``True`` once the sweep has reached the end of its history.
+
+    A page of stored ids, one request, one transaction: the ids that came back empty are deleted,
+    the units holding them are cut again and the cursor moves to the last id of the page. The
+    write goes to a worker thread that is joined even under cancellation
+    (:func:`_joined_to_thread`), like every other write a sync makes.
+
+    An answer that does not line up with the page is not an answer: the chat's turn ends with its
+    cursor untouched, so the next run asks the same page again instead of taking the silence for
+    a hundred deletions. ``checked`` counts the pages that *were* answered, for the same reason —
+    a refused page has told the report nothing, and the next run asks about it again.
+    """
+    cursor = db.prune_cursor(conn, chat.id)
+    while not budget.expired:
+        page = db.message_ids_after(conn, chat.id, cursor, PRUNE_BATCH)
+        if not page:
+            db.clear_prune_cursor(conn, chat.id)
+            return True
+        gone = _empty_slots(page, await client.get_messages(chat.id, ids=page))
+        if gone is None:
+            log.warning(
+                "chat %s (%s): Telegram's answer did not line up with the %d ids asked about; "
+                "nothing was removed",
+                chat.id,
+                chat.title,
+                len(page),
+            )
+            tally.warnings.append(
+                f"chat {chat.id} ({chat.title}): Telegram's answer did not line up with the "
+                f"{len(page)} ids asked about; nothing was removed"
+            )
+            return False
+        tally.checked += len(page)
+        cursor = page[-1]
+        tally.removed += await _joined_to_thread(
+            functools.partial(_prune_batch, conn, cfg, chat, gone, cursor), budget.cancel
+        )
+    return False
+
+
+def _empty_slots(page: Sequence[int], answer: Any) -> list[int] | None:
+    """The ids of ``page`` Telegram answered nothing for, or ``None`` when it did not answer.
+
+    ``messages.getMessages`` returns one slot per id asked about and fills the slot of a message
+    that is gone with ``MessageEmpty``, which Telethon hands over as ``None`` — so an empty slot
+    is a deletion, the one place in grepogram where that is true (:func:`_drop_deleted` reads a
+    set difference instead, because ``iter_messages`` yields no slot at all for a deleted
+    message).
+
+    That reading only holds while the answer lines up with the question. Anything else — a
+    shorter list, a single message where a list was asked for, ``None`` — is read as no answer
+    and removes nothing; the ids of a shortened answer would otherwise all look deleted at once.
+    """
+    if not isinstance(answer, list) or len(answer) != len(page):
+        return None
+    alive = {
+        int(msg.id) for msg in answer if msg is not None and not isinstance(msg, types.MessageEmpty)
+    }
+    return [msg_id for msg_id in page if msg_id not in alive]
+
+
+def _prune_batch(
+    conn: sqlite3.Connection,
+    cfg: Config,
+    chat: ChatRow,
+    gone: Sequence[int],
+    cursor: int,
+) -> int:
+    """Drop one page's deleted messages, re-cut what held them, move the cursor — one transaction.
+
+    The order is :func:`_drop_deleted`'s: read the rows, delete them, then invalidate. The rows
+    are read first because :func:`grepogram.units.invalidate_units_for` needs the topic a window
+    is scoped by, which lives on a row that no longer exists by then; it renders nothing from
+    them, so a deleted message that heads a reply thread does not come straight back in the unit
+    its removal rebuilds. The cursor is written here rather than after the commit, so a crash
+    never leaves a chat marked past ids whose deletions were rolled back.
+    """
+    with db.transaction(conn):
+        rows = [row for _, row in sorted(db.get_messages_by_msg_id(conn, chat.id, gone).items())]
+        if rows:
+            db.delete_messages(conn, chat.id, [row.msg_id for row in rows])
+            index.index_units(conn, units.invalidate_units_for(conn, chat, cfg, rows))
+            _invalidate_comment_posts(conn, cfg, rows)
+            log.info(
+                "chat %s (%s): %d messages were deleted in Telegram and dropped from the index",
+                chat.id,
+                chat.title,
+                len(rows),
+            )
+        db.set_prune_cursor(conn, chat.id, cursor)
+    return len(rows)
+
+
+def _invalidate_comment_posts(
+    conn: sqlite3.Connection, cfg: Config, rows: Sequence[MessageRow]
+) -> None:
+    """Re-cut the post threads of the channels whose comments ``rows`` are.
+
+    The only way from a comment to the unit quoting it, and therefore the follow-through every
+    pass that changes a comment outside its own chat owes: :func:`_prune_batch` after a deletion
+    and :func:`grepogram.media._recut` after an extraction. A channel's post thread carries the
+    post followed by its comments while listing the post alone in ``msg_ids``, so no
+    ``json_each`` over ``units.msg_ids`` reaches a comment id and neither the group's own
+    invalidation nor any lookup by unit could find that thread; ``comment_of_chat_id`` /
+    ``comment_of_msg_id`` on the comment's row is what names it.
+
+    ``rows`` name the comments and nothing else: the posts are re-read from the channel's own
+    rows and the threads rebuilt from the comments **stored now**, so a deleted comment is
+    already gone from them (this runs after the delete) and an extracted one is already carrying
+    its text. Rows that are not comments cost nothing — they name no post.
+    """
+    posts: dict[int, set[int]] = {}
+    for row in rows:
+        if row.comment_of_chat_id is not None and row.comment_of_msg_id is not None:
+            posts.setdefault(row.comment_of_chat_id, set()).add(row.comment_of_msg_id)
+    for channel_id, post_ids in posts.items():
+        channel = db.get_chat(conn, channel_id)
+        if channel is None:
+            continue
+        stored = db.get_messages_by_msg_id(conn, channel_id, sorted(post_ids))
+        if not stored:
+            continue
+        delta = units.invalidate_units_for(
+            conn, channel, cfg, [row for _, row in sorted(stored.items())]
+        )
+        index.index_units(conn, delta)

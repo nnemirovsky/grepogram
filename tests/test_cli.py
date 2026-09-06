@@ -3,20 +3,38 @@ import logging
 import sys
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
-from typing import get_args
+from typing import Any, get_args
 
 import pytest
 import typer
+from telethon import errors as tg_errors
 from typer.testing import CliRunner
 
-from grepogram import __version__, cli, config, db, index, search, units
+from grepogram import (
+    __version__,
+    cli,
+    config,
+    db,
+    embed,
+    index,
+    media,
+    search,
+    sync,
+    tg,
+    units,
+)
 from grepogram.config import TEMPLATE
-from grepogram.models import ChatRow, Config, MessageRow, SearchMode
+from grepogram.embed import ModelUnavailable
+from grepogram.models import ChatRow, Config, MediaReport, MessageRow, PruneReport, SearchMode
 from grepogram.paths import Paths
 from tests.conftest import file_mode
-from tests.fixtures import chat_ru
+from tests.fakes import FakeClient, make_channel, make_dialog
+from tests.fixtures import chat_ru, tl
 
 runner = CliRunner()
+
+SAMPLE_PDF = Path(__file__).resolve().parent / "fixtures" / "sample.pdf"
+EXTRACT_ID = -1000000000900
 
 
 # --- app -------------------------------------------------------------------------------------
@@ -485,3 +503,478 @@ def test_readers_exit_1_on_an_unknown_message(tmp_home: Path, command: str) -> N
     assert result.exit_code == 1
     assert result.stdout == ""
     assert result.stderr.strip() == (f"error: message 9999 of chat {chat_ru.ARG_ID} is not indexed")
+
+
+# --- extract ---------------------------------------------------------------------------------
+
+
+EXTRACT_KEYS = '[telegram]\napi_id = 12345\napi_hash = "fakehash"\n'
+
+
+def _signed_in(tmp_home: Path, extra: str = "") -> Paths:
+    (tmp_home / "config.toml").write_text(EXTRACT_KEYS + extra, encoding="utf-8")
+    paths = Paths.from_env()
+    paths.session_file.touch()
+    return paths
+
+
+def _extract_chat(paths: Paths) -> FakeClient:
+    """One indexed chat holding one pending PDF, and the client that answers for it.
+
+    Through ``on_chat_synced``, so the chat carries units: a chat whose rows were stored and
+    never cut is what ``media._recut`` keeps the ``indexed`` flag raised for.
+    """
+    conn = db.connect(paths)
+    db.migrate(conn)
+    chat = db.upsert_chat(
+        conn, ChatRow(id=EXTRACT_ID, type="supergroup", title="Chat", source_id="x")
+    )
+    ids = db.upsert_messages(
+        conn,
+        [
+            MessageRow(
+                chat_id=EXTRACT_ID,
+                msg_id=1,
+                date=1_700_000_000,
+                media_kind="document",
+                media_filename="note.pdf",
+            )
+        ],
+    )
+    sync.on_chat_synced(conn, chat, Config(), ids)
+    conn.close()
+    return FakeClient(
+        dialogs=[make_dialog(make_channel(900, "Chat", megagroup=True))],
+        messages={EXTRACT_ID: [tl.document_message(EXTRACT_ID, 1, "note.pdf")]},
+        downloads={(EXTRACT_ID, 1): SAMPLE_PDF.read_bytes()},
+    )
+
+
+def test_extract_reads_the_media_and_reports_what_it_did(
+    tmp_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    paths = _signed_in(tmp_home)
+    client = _extract_chat(paths)
+    monkeypatch.setattr(tg, "make_client", lambda cfg, paths: client)
+    result = runner.invoke(cli.app, ["extract", "--budget", "30"])
+    assert result.exit_code == 0, result.output
+    lines = result.stdout.splitlines()
+    assert lines[0] == "media read: 1"
+    assert any("grepogram sync" in line for line in lines)
+    assert client.calls[-1] == ("disconnect", {})
+    conn = db.connect(paths)
+    row = conn.execute("SELECT extracted_text, media_state, indexed FROM messages").fetchone()
+    conn.close()
+    assert row["media_state"] == db.MEDIA_EXTRACTED
+    assert row["indexed"] == 1, "the pass rebuilds the row it flagged, in the same transaction"
+    assert "sample pdf" in str(row["extracted_text"]).lower()
+
+
+def test_extract_passes_retry_failed_through(
+    tmp_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _signed_in(tmp_home)
+    seen: dict[str, object] = {}
+
+    async def record(
+        conn: object, client: object, cfg: object, budget: object, **kw: object
+    ) -> Any:
+        seen.update(kw)
+        seen["seconds"] = budget.seconds  # type: ignore[attr-defined]
+        return MediaReport(unsupported=3, remaining=2, warnings=["careful"])
+
+    monkeypatch.setattr(tg, "make_client", lambda cfg, paths: FakeClient())
+    monkeypatch.setattr(media, "run", record)
+    result = runner.invoke(cli.app, ["extract", "--retry-failed", "--budget", "7"])
+    assert result.exit_code == 0, result.output
+    assert seen == {"retry_failed": True, "seconds": 7}
+    assert "no extractor here: 3" in result.stdout
+    assert "media pending: 2; run extract again" in result.stdout
+    assert "warning: careful" in result.stderr
+
+
+def test_extract_reports_unreachable_media_apart_from_the_queue(
+    tmp_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Media in an imported or unavailable chat sits at pending for good, so it is never what
+    "run extract again" is offered for: that line is the pass's only completion signal, and a
+    script looping until it stops appearing would never stop."""
+    _signed_in(tmp_home)
+
+    async def parked(
+        conn: object, client: object, cfg: object, budget: object, **kw: object
+    ) -> Any:
+        return MediaReport(unreachable=4)
+
+    monkeypatch.setattr(tg, "make_client", lambda cfg, paths: FakeClient())
+    monkeypatch.setattr(media, "run", parked)
+    result = runner.invoke(cli.app, ["extract"])
+    assert result.exit_code == 0, result.output
+    assert "in chats nothing can re-fetch: 4" in result.stdout
+    assert "run extract again" not in result.stdout
+
+
+def test_extract_without_api_keys_is_a_clean_error(tmp_home: Path) -> None:
+    result = runner.invoke(cli.app, ["extract"])
+    assert result.exit_code == 1
+    assert result.stdout == ""
+    assert "api_id and api_hash are not set" in result.stderr
+
+
+def test_extract_without_a_session_is_a_clean_error(tmp_home: Path) -> None:
+    (tmp_home / "config.toml").write_text(EXTRACT_KEYS, encoding="utf-8")
+    result = runner.invoke(cli.app, ["extract"])
+    assert result.exit_code == 1
+    assert result.stdout == ""
+    assert "grepogram auth" in result.stderr
+
+
+def test_extract_reports_a_held_sync_lock_as_a_clean_error(
+    tmp_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    paths = _signed_in(tmp_home)
+    monkeypatch.setattr(tg, "make_client", lambda cfg, paths: FakeClient())
+    with sync.SyncLock(paths):
+        result = runner.invoke(cli.app, ["extract"])
+    assert result.exit_code == 1
+    assert result.stdout == ""
+    assert "another sync is running" in result.stderr
+
+
+def test_extract_reports_a_telegram_error_as_a_clean_error(
+    tmp_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _signed_in(tmp_home)
+
+    def broken(cfg: object, paths: object) -> FakeClient:
+        raise tg_errors.RPCError(request=None, message="nope")
+
+    monkeypatch.setattr(tg, "make_client", broken)
+    result = runner.invoke(cli.app, ["extract"])
+    assert result.exit_code == 1
+    assert result.stdout == ""
+    assert "telegram error:" in result.stderr
+
+
+# --- prune-deleted ---------------------------------------------------------------------------
+
+
+PRUNE_ID = -1000000000901
+
+
+def _prune_chat(paths: Paths) -> FakeClient:
+    """One indexed chat of two messages, and a client that has lost the second of them."""
+    conn = db.connect(paths)
+    db.migrate(conn)
+    db.upsert_chat(conn, ChatRow(id=PRUNE_ID, type="supergroup", title="Chat", source_id="x"))
+    db.upsert_messages(
+        conn,
+        [
+            MessageRow(chat_id=PRUNE_ID, msg_id=101, date=1_700_000_000, text="kept"),
+            MessageRow(chat_id=PRUNE_ID, msg_id=102, date=1_700_000_060, text="deleted"),
+        ],
+    )
+    conn.close()
+    return FakeClient(
+        dialogs=[make_dialog(make_channel(901, "Chat", megagroup=True))],
+        messages={PRUNE_ID: [tl.message(PRUNE_ID, 101, "kept", sender=1)]},
+    )
+
+
+def test_prune_deleted_removes_what_telegram_no_longer_has(
+    tmp_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    paths = _signed_in(tmp_home)
+    client = _prune_chat(paths)
+    monkeypatch.setattr(tg, "make_client", lambda cfg, paths: client)
+    result = runner.invoke(cli.app, ["prune-deleted", "--budget", "30"])
+    assert result.exit_code == 0, result.output
+    lines = result.stdout.splitlines()
+    assert lines[0] == "messages removed: 1"
+    assert lines[1] == "messages checked: 2"
+    assert lines[2] == "chats swept: 1"
+    assert client.calls[-1] == ("disconnect", {})
+    conn = db.connect(paths)
+    stored = [row["msg_id"] for row in conn.execute("SELECT msg_id FROM messages")]
+    conn.close()
+    assert stored == [101]
+
+
+def test_prune_deleted_passes_the_chat_and_the_budget_through(
+    tmp_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    paths = _signed_in(tmp_home)
+    _prune_chat(paths)
+    seen: dict[str, object] = {}
+
+    async def record(
+        client: object, conn: object, cfg: object, paths: object, budget: Any, **kw: Any
+    ) -> PruneReport:
+        seen.update(kw)
+        seen["seconds"] = budget.seconds
+        return PruneReport(removed=0, checked=4, chats_remaining=[PRUNE_ID], warnings=["careful"])
+
+    monkeypatch.setattr(tg, "make_client", lambda cfg, paths: FakeClient())
+    monkeypatch.setattr(sync, "prune_deleted", record)
+    result = runner.invoke(cli.app, ["prune-deleted", "--chat", str(PRUNE_ID), "--budget", "7"])
+    assert result.exit_code == 0, result.output
+    assert seen == {"chat_id": PRUNE_ID, "seconds": 7}
+    assert f"chats not finished: 1 ({PRUNE_ID})" in result.stdout
+    assert "warning: careful" in result.stderr
+
+
+def test_prune_deleted_with_an_unknown_chat_is_a_clean_error(
+    tmp_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    paths = _signed_in(tmp_home)
+    _prune_chat(paths)
+    monkeypatch.setattr(tg, "make_client", lambda cfg, paths: FakeClient())
+    result = runner.invoke(cli.app, ["prune-deleted", "--chat", "@nowhere"])
+    assert result.exit_code == 1
+    assert result.stdout == ""
+    assert "@nowhere" in result.stderr
+
+
+def test_prune_deleted_without_api_keys_is_a_clean_error(tmp_home: Path) -> None:
+    result = runner.invoke(cli.app, ["prune-deleted"])
+    assert result.exit_code == 1
+    assert result.stdout == ""
+    assert "api_id and api_hash are not set" in result.stderr
+
+
+def test_prune_deleted_reports_a_held_sync_lock_as_a_clean_error(
+    tmp_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    paths = _signed_in(tmp_home)
+    _prune_chat(paths)
+    monkeypatch.setattr(tg, "make_client", lambda cfg, paths: FakeClient())
+    with sync.SyncLock(paths):
+        result = runner.invoke(cli.app, ["prune-deleted"])
+    assert result.exit_code == 1
+    assert result.stdout == ""
+    assert "another sync is running" in result.stderr
+
+
+def test_prune_deleted_reports_a_telegram_error_as_a_clean_error(
+    tmp_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _signed_in(tmp_home)
+
+    def broken(cfg: object, paths: object) -> FakeClient:
+        raise tg_errors.RPCError(request=None, message="nope")
+
+    monkeypatch.setattr(tg, "make_client", broken)
+    result = runner.invoke(cli.app, ["prune-deleted"])
+    assert result.exit_code == 1
+    assert result.stdout == ""
+    assert "telegram error:" in result.stderr
+
+
+# --- import ----------------------------------------------------------------------------------
+
+
+EXPORT = Path(__file__).resolve().parent / "fixtures" / "tdesktop_export.json"
+EXPATS_ID = -1001234567890
+BOAT_ID = -987654
+
+
+def _single_chat_export(tmp_path: Path, **over: Any) -> Path:
+    """A one-chat ``messages.json``, the shape Telegram Desktop writes for a single export."""
+    entry: dict[str, Any] = {
+        "name": "Old group",
+        "type": "private_group",
+        "id": 555,
+        "messages": [
+            {
+                "id": 1,
+                "type": "message",
+                "date": "2024-03-01T09:00:00",
+                "date_unixtime": "1709283600",
+                "from": "Nina",
+                "from_id": "user777000",
+                "text": "cita previa extranjeria",
+            }
+        ],
+    }
+    entry.update(over)
+    directory = tmp_path / "export"
+    directory.mkdir(exist_ok=True)
+    (directory / "messages.json").write_text(json.dumps(entry, ensure_ascii=False), "utf-8")
+    return directory
+
+
+def _chats(paths: Paths) -> dict[int, ChatRow]:
+    conn = db.connect(paths)
+    try:
+        return {chat.id: chat for chat in db.list_chats(conn)}
+    finally:
+        conn.close()
+
+
+def test_import_stores_a_searchable_chat_tagged_as_an_import(tmp_home: Path) -> None:
+    """The whole point: an export the account can no longer open answers `search` at once, and
+    the chat carries the `import:` tag every protection of that history keys on."""
+    result = runner.invoke(cli.app, ["import", str(EXPORT)])
+    assert result.exit_code == 0, result.output
+    assert "imported 6 messages into 2 chats" in result.stdout
+    assert "service messages skipped: 1" in result.stdout
+    assert "entries that could not be read: 1" in result.stdout
+    assert "embedded 3 units" in result.stdout
+    chats = _chats(Paths.from_env())
+    assert chats[EXPATS_ID].source_id == "import:valencia-expats"
+    assert chats[BOAT_ID].source_id == "import:двое-в-лодке"
+    # nothing was fetched from Telegram, so no sync may ever resume from these rows
+    assert all(chat.unavailable and chat.last_msg_id == 0 for chat in chats.values())
+    found = runner.invoke(cli.app, ["search", "ВНЖ", "--mode", "lexical", "--no-rerank"])
+    assert found.exit_code == 0, found.output
+    assert "Valencia Expats" in found.stdout
+    assert f"https://t.me/c/{abs(EXPATS_ID) - 1000000000000}/2" in found.stdout
+
+
+def test_import_is_idempotent(tmp_home: Path) -> None:
+    """Re-running an import is how a partial one is finished: the ids come from the export, so
+    the second run updates the same rows instead of storing a second copy."""
+    first = runner.invoke(cli.app, ["import", str(EXPORT)])
+    assert first.exit_code == 0, first.output
+    second = runner.invoke(cli.app, ["import", str(EXPORT)])
+    assert second.exit_code == 0, second.output
+    assert "imported 6 messages into 2 chats" in second.stdout
+    # the units were already embedded, so the second run has nothing left to embed
+    assert "embedded 0 units" in second.stdout
+    conn = db.connect(Paths.from_env())
+    try:
+        assert db.message_counts(conn) == {EXPATS_ID: 3, BOAT_ID: 3}
+        assert [chat.source_id for chat in db.list_chats(conn)] == [
+            "import:valencia-expats",
+            "import:двое-в-лодке",
+        ]
+    finally:
+        conn.close()
+
+
+def test_import_over_a_chat_synced_from_telegram_is_refused_by_name(tmp_home: Path) -> None:
+    """`db.upsert_chat` overwrites `source_id`, so an import over a live chat would retag it and
+    hide it from the source that fetches it."""
+    paths = Paths.from_env()
+    conn = db.connect(paths)
+    db.migrate(conn)
+    db.upsert_chat(
+        conn, ChatRow(id=EXPATS_ID, type="supergroup", title="Live", source_id="folder:Spain")
+    )
+    conn.close()
+    result = runner.invoke(cli.app, ["import", str(EXPORT)])
+    assert result.exit_code == 1
+    assert "already indexed from Telegram through folder:Spain" in result.stderr
+    # refused as a whole, before a row of any chat of the export was written
+    assert _chats(paths)[EXPATS_ID].source_id == "folder:Spain"
+    conn = db.connect(paths)
+    try:
+        assert db.message_counts(conn) == {}
+    finally:
+        conn.close()
+
+
+def test_import_applies_chat_title_to_a_single_chat_export(tmp_home: Path) -> None:
+    directory = _single_chat_export(tmp_path=tmp_home, name=None)
+    result = runner.invoke(cli.app, ["import", str(directory), "--chat-title", "Пикник 2019"])
+    assert result.exit_code == 0, result.output
+    stored = _chats(Paths.from_env())[-555]
+    assert stored.title == "Пикник 2019"
+    assert stored.source_id == "import:пикник-2019"
+
+
+def test_import_refuses_chat_title_for_a_multi_chat_export(tmp_home: Path) -> None:
+    result = runner.invoke(cli.app, ["import", str(EXPORT), "--chat-title", "One"])
+    assert result.exit_code == 1
+    assert result.stdout == ""
+    assert "--chat-title names one chat and this export holds 2" in result.stderr
+    assert _chats(Paths.from_env()) == {}
+
+
+def test_import_of_a_directory_without_an_export_is_a_clean_error(tmp_home: Path) -> None:
+    empty = tmp_home / "elsewhere"
+    empty.mkdir()
+    result = runner.invoke(cli.app, ["import", str(empty)])
+    assert result.exit_code == 1
+    assert result.stdout == ""
+    assert "holds no result.json or messages.json" in result.stderr
+
+
+def test_import_of_an_export_with_no_readable_chat_is_a_clean_error(tmp_home: Path) -> None:
+    directory = _single_chat_export(tmp_path=tmp_home, type="channel_of_the_future")
+    result = runner.invoke(cli.app, ["import", str(directory)])
+    assert result.exit_code == 1
+    assert "unknown export type" in result.stderr
+    assert "the export holds no chat this version can read" in result.stderr
+
+
+def test_import_reports_a_held_sync_lock_as_a_clean_error(tmp_home: Path) -> None:
+    paths = Paths.from_env()
+    with sync.SyncLock(paths):
+        result = runner.invoke(cli.app, ["import", str(EXPORT)])
+    assert result.exit_code == 1
+    assert "another sync is running" in result.stderr
+    assert _chats(paths) == {}
+
+
+def test_import_that_fails_to_index_leaves_nothing_behind(
+    tmp_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The rows and the units they are cut into are one transaction, all of it or none.
+
+    ``import_chats`` used to commit on its own with the rebuild coming after, so anything the
+    rebuild could not do left the chats stored with ``indexed = 0`` and the command ending in a
+    traceback — and that is not a failed import a user can retry: every later `sync` reaches the
+    chat again through ``index_stranded`` and fails the same way, which takes the MCP `sync`
+    tool and every `search` old enough to auto-sync down with it.
+    """
+    paths = Paths.from_env()
+
+    def refuse(*_: object, **__: object) -> None:
+        raise ValueError("year 3170843 is out of range")
+
+    monkeypatch.setattr(sync, "on_chat_synced", refuse)
+    with pytest.raises(ValueError, match="out of range"):
+        runner.invoke(cli.app, ["import", str(EXPORT)], catch_exceptions=False)
+
+    assert _chats(paths) == {}
+    conn = db.connect(paths)
+    try:
+        assert db.chats_with_unindexed(conn) == []
+        assert conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0] == 0
+    finally:
+        conn.close()
+
+
+def test_import_keeps_the_messages_when_the_dense_index_was_built_elsewhere(
+    tmp_home: Path,
+) -> None:
+    """A model change is the embedding step's problem, never the import's: the export is stored
+    and searchable lexically, and the mismatch is a warning naming the way out."""
+    conn = db.connect(Paths.from_env())
+    db.migrate(conn)
+    db.set_meta(conn, db.META_EMBED_MODEL, "some-other-model")
+    conn.close()
+    result = runner.invoke(cli.app, ["import", str(EXPORT)])
+    assert result.exit_code == 0, result.output
+    assert "warning: dense index not updated:" in result.stderr
+    assert "embed --reembed" in result.stderr
+    assert "next: grepogram embed" in result.stdout
+    assert _chats(Paths.from_env())[EXPATS_ID].source_id == "import:valencia-expats"
+
+
+def test_import_without_an_embedding_model_says_what_finishes_the_job(
+    tmp_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An import is offline and its messages are searchable lexically the moment they land, so a
+    missing model is a warning and the chat is still imported."""
+
+    def unavailable(cfg: object) -> Any:
+        raise ModelUnavailable("no torch here")
+
+    monkeypatch.setattr(embed, "load_embedder", unavailable)
+    result = runner.invoke(cli.app, ["import", str(EXPORT)])
+    assert result.exit_code == 0, result.output
+    assert "warning: dense index not updated: no torch here" in result.stderr
+    assert "next: grepogram embed" in result.stdout
+    assert _chats(Paths.from_env())[EXPATS_ID].source_id == "import:valencia-expats"

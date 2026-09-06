@@ -5,8 +5,9 @@ Python 3.12 pinned, `uv` only (no pip, no global installs), developed on macOS.
 
 ## Commands
 
-- `uv sync --managed-python --all-extras --all-groups` — full environment (the `dense` extra
-  brings torch and sentence-transformers). `--managed-python` is not decoration: sqlite-vec is a
+- `uv sync --managed-python --all-extras --all-groups` — full environment. The `dense` extra
+  brings torch and sentence-transformers; the `media` extra brings pypdf, python-docx and
+  pyobjc-framework-Vision. `--managed-python` is not decoration: sqlite-vec is a
   loadable extension, and uv would otherwise build the venv on whichever `python3.12` it finds
   first — python.org's macOS build and Apple's system Python are compiled without
   `--enable-loadable-sqlite-extensions`, so `db.connect` refuses them (`ExtensionsUnsupported`).
@@ -21,10 +22,41 @@ Python 3.12 pinned, `uv` only (no pip, no global installs), developed on macOS.
 - `uv run grepogram --help`, `uv run grepogram-mcp` — the CLI and the MCP server
 - all checks pass before every commit; CI (`.github/workflows/ci.yml`) runs them with
   `--group dev` only, `GREPOGRAM_FAKE_MODELS=1` and `HF_HUB_OFFLINE=1`
+- **CI installs no extras**, so the pure-Python half of an extra that the tests import must be
+  mirrored into the `dev` group — pypdf and python-docx are there for that reason (CONTRIBUTING.md
+  states the rule). What cannot be mirrored (torch, pyobjc) is what the tests must monkeypatch
+  around: a module-level `import docx` in a test file makes the whole module uncollectable on CI
 - `uv.lock` is committed and CI installs with `--locked`: after touching dependencies run
   `uv lock` and commit the lockfile
 - the version lives in `grepogram/__init__.py` only (`__version__`, read by hatch and
   `grepogram --version`)
+
+## Releasing
+
+`.github/workflows/release.yml` runs on a `v*` tag. In order:
+
+1. bump `__version__` in `grepogram/__init__.py`, commit, and push to `main`;
+2. tag it `vX.Y.Z` and push the tag — the workflow refuses a tag whose name does not match
+   `__version__`, so the two can never drift;
+3. it runs `uv build`, uploads `dist/` as an artifact (before the release step, so a failed
+   release still leaves the build to look at), and then publishes. **Either order of tag and
+   release works**: the step asks `gh release view` first, and creates the release
+   (`gh release create … --generate-notes --verify-tag`, so the tag must already be on the
+   remote) when there is none, or attaches the build to the release a workstation already
+   published (`gh release upload … --clobber`). `gh release create` has no update mode and
+   answers 422 `already_exists` for a tag that already has a release, so running both would
+   fail the job and, through `needs: release`, skip the PyPI upload entirely;
+4. the `pypi` job is gated on the repository variable `PYPI_PUBLISH == 'true'` and `needs:
+   release`, downloads that artifact and uploads through trusted publishing (the `pypi`
+   environment, `id-token: write`, no API token). Until the variable is set the job skips, so a
+   tag pushed before the PyPI publisher exists still cuts a GitHub release instead of failing the
+   workflow.
+
+`ci.yml` is the per-push suite and is separate from this.
+
+`CONTRIBUTING.md` covers the same gates for an outside contributor, plus the PR flow; when the
+two disagree, this file is what the repository's own work follows and the other should be
+corrected to match.
 
 ## Commit convention
 
@@ -48,7 +80,25 @@ never change the git identity.
   `tg.connected(client)`. Only `grepogram auth` opens the session file for writing
   (`tg.make_login_client`); every other client works on an in-memory copy (`tg.make_client` →
   `tg.load_session`), because two Telethon clients on one session database block each other and
-  fail with `database is locked`. The MCP server builds a fresh client per Telegram-using tool
+  fail with `database is locked`. **That copy carries the data centre and the auth key and
+  nothing else, so its entity cache starts empty and no chat is addressable by its stored id
+  until something warms it.** A pass that walks a source list gets that for free
+  (`sources.resolve_sources` → `DialogCatalog` → `get_dialogs`, whose peers Telethon writes into
+  the session); a pass that walks `chats` rows instead — `sync.prune_deleted` and `media.run`,
+  the two that re-fetch by id — must call `sync.warm_peer_cache` first, or every
+  `client.get_messages(chat.id, ids=…)` raises a plain `ValueError` that is not an `RPCError`.
+  The dialog list is not the whole account, and `warm_peer_cache` walks the two stored handles a
+  `chats` row can carry for what it misses, **in this order**: `chats.username` through
+  `client.get_entity`, for a public chat the account follows without joining (a sync only ever
+  reaches such a chat through the `@name` its source names, and that handle is on the row —
+  skipping it left `extract` and `prune-deleted` failing by-id requests for exactly the chats the
+  warm-up was added for), and then `GetFullChannelRequest(chat.discussion_of)` for a link-only
+  discussion group. The order is load-bearing: that request *names* the channel, so a channel
+  outside the dialog list has to be resolved by its own handle before its group can be asked for.
+  Those two are the whole of it — `source_id` is a source id and not a peer, `title` is fuzzy
+  text matched against the dialog list this already read, and a legacy `PeerChat` id needs no
+  access hash at all. What no route resolves costs that chat its turn with a warning, and only an
+  `UnauthorizedError` is re-raised, ahead of every handler. The MCP server builds a fresh client per Telegram-using tool
   call (`AppState.telegram()`): Telethon caches the authorization check per instance and
   concurrent calls must never share a connection one of them will close. Syncs in the server go
   through `AppState.sync_lock`, config writes through `AppState.editing_config()`, and
@@ -91,9 +141,15 @@ never change the git identity.
   not a schema this code can classify. `MIGRATIONS` has to run from `BASE_VERSION` to
   `SCHEMA_VERSION` without a gap and `db._missing_steps` is where both paths check it: a
   mis-keyed step is a bug in grepogram, and stamping an empty database at a version every
-  existing one is refused at would hide it. Nothing has shipped, so no step transforms rows: an
-  index is derived from Telegram and a rebuild costs one sync. Change the schema by editing `_V5`
-  until the first release; after it, append a step above `BASE_VERSION` and leave `_V5` alone.
+  existing one is refused at would hide it. No step transforms rows: an index is derived from
+  Telegram and a rebuild costs one sync. **The schema is append-only now that v0.1.0 is tagged** —
+  append a step above `BASE_VERSION` and leave `_V5` alone. `migrate()` applies every step from
+  `BASE_VERSION` for a database with no schema objects, so a column added to `_V5` *and* to a step
+  above it raises `duplicate column name` and fails `tests/conftest.py`'s shared fixture, which is
+  the whole suite. v0.2.0's step `6` (`messages.extracted_text`, `messages.media_state`,
+  `units.reactions`, the `messages_media_pending` partial index) is the model. That index's
+  predicate carries `media_kind IS NOT NULL` as well as `media_state = 0`, or it would cover every
+  row in the table forever and the pending query would stay a scan.
 - `messages.indexed` is 0 for a row whose units and `msg_fts` entry are behind: every
   `upsert_messages` sets it, `db.mark_unindexed` raises it for a post whose thread grew, and
   `sync.on_chat_synced` clears it after the rebuild. `sync._sync_chats` runs `index_pending` for
@@ -108,6 +164,117 @@ never change the git identity.
   rows only repairs because `index.index_chat` ends with `index.repair_unit_index`, which compares
   `units` with `unit_fts` in both directions — a rebuild that re-cuts identical units reports an
   empty delta and would index nothing.
+- `units.RECIPE_VERSION` names how this build cuts and renders a unit, and it is the whole of the
+  contract between a stored index and the code reading it. Bump it in the same commit as any
+  change to what a unit's text or boundaries are — v0.2.0 bumped three times (the window cap
+  becoming a ceiling, extracted text reaching `render_line`, reactions landing on `UnitRow`) and
+  an upgrader pays for the highest number once. `db.migrate` stamps `meta['unit_recipe']` on the
+  branch that builds a schema from empty, because by the time any sync-time pass could ask, a
+  brand-new index has already cut units for every chat it fetched — "fresh" is *the database
+  holds no units*, never "no recipe recorded", which is exactly what a v0.1.1 index also looks
+  like. `sync.recut_pending_chats` is the only thing that acts on a mismatch, and three
+  properties of it are load-bearing. **Units are never dropped globally**: a re-cut takes at most
+  `RECUT_CHATS_PER_RUN` whole chats and each one's delete-all, `units.recut_chat`,
+  `index.index_units`, `repair_unit_index` and its `meta['unit_recut:<chat_id>']` marker are one
+  transaction, so no chat is ever left flagged outside the transaction that rebuilds it and no
+  later run — least of all a 20-second auto-sync — inherits a whole-index backlog for
+  `_sync_chats`'s unbudgeted deferred `index_pending` loop to drain. **Who may start one is the
+  caller, not the budget**: `sync_all` takes `recut: bool = True` and `mcp._auto_sync` — the
+  refresh inside a `search` — is the one caller passing `False`. A budget floor was tried and
+  removed: `search.auto_sync_budget_s` is user-editable, so a floor made a search's own refresh
+  start whole-index re-cutting the moment the number was raised, while an explicit sync whose
+  fetch had eaten the budget never got to start one. An explicit sync makes whatever progress its
+  budget allows, bounded at `RECUT_CHATS_PER_RUN` and resumable through the markers — **and never
+  fewer than one chat**: `recut_pending_chats` runs after `_sync_chats` on the *same* budget, and
+  the `edit_refetch` tail of a large index can spend all of it with nothing left to fetch, so a
+  gate on `budget.expired` alone left the MCP `sync` tool at its default budget re-cutting nothing,
+  ever. The first chat is taken whatever the clock says, the rest wait for the next run, and a
+  *cancelled* budget (`SyncBudget.cancelled`) keeps nothing back — the caller and its lock are
+  going away. Nothing
+  flags a pending re-cut, so `search` re-derives the condition into `search.RECUT_PENDING` and a
+  user who has only ever searched is told to sync. **The re-cut touches no
+  `messages` row**: unit boundaries change, message text does not, so no `indexed = 0` flagging
+  and no `msg_fts` rewrite — flagging inside the transaction recovers nothing and flagging outside
+  one is the backlog this design exists to prevent. The marker holds the version a chat was last
+  re-cut at, never a bare presence flag, so a crash between the last chat and the cleanup cannot
+  make the *next* bump skip the chats already done. Go through `units.units_for_chat`, not
+  `rebuild_for_chat`: after a delete-all every stale lookup inside the latter is empty by
+  construction and its `_apply` would report `deleted_ids = []`, so the delta would not even be
+  honest.
+- `units.py` must never import `grepogram.index` — `index.py` imports `UnitDelta` from `units`,
+  so the reverse is a cycle. `units.recut_chat` and `units.invalidate_units_for` therefore return
+  a `UnitDelta` and the **caller** hands it to `index.index_units`: `sync.recut_pending_chats`,
+  `sync._drop_deleted`, `sync.prune_deleted` and `media.run` all do. A primitive that indexed its
+  own delta would be the thing that could not be written here.
+- Extraction is a **network pass that never blocks a sync**. Telethon downloads from a `Message`
+  object and never from a stored row, so `media.run` re-fetches every pending message by id
+  before downloading it — that is also where the size comes from, there being no size column. It
+  runs from `grepogram extract` after a sync, never inside one, because a 400-page PDF or a slow
+  OCR must not eat a sync's budget; `messages.media_state` is the whole of its memory, so it is
+  resumable by construction. The offline half comes first and touches no network at all: which
+  kinds have an extractor and which are switched off in `[media]` follows from the stored
+  `media_kind` alone, so three bulk `UPDATE`s park them — and **none of them flags `indexed`**,
+  which is why `db.set_media_text` (text plus `indexed = 0`) and `db.set_media_state` (the state
+  byte alone) are two writers. Most kinds have no extractor at all, so flagging there would mark
+  tens of thousands of rows across every chat and hand `_sync_chats`'s deferred loop the very
+  backlog the recipe contract forbids. A batch that read something ends by calling
+  `units.invalidate_units_for` once per chat per batch and indexing the delta: `_recut_start`
+  returns `None` for a message in a closed window, where all but the newest handful of a chat's
+  history lives, and `on_chat_synced` clears `indexed` whether or not anything was rebuilt — so
+  without that step the text this pass reads would be written to a column nothing ever renders.
+  That re-cut is a chat's own units and no more, so `media._recut` owes the same two follow-ups
+  every such pass owes: `sync._invalidate_comment_posts` for an extracted **comment**, whose
+  channel post thread quotes it and is reachable only through `comment_of_*`, and keeping
+  `indexed = 0` raised for the rows `units.uncut_rows` names — a `(chat, topic)` with no window
+  at all, where `_invalidation_start` answers `None` and clearing the flag would hide the rows
+  from `index_stranded`, the one pass that would ever cut their first windows. An *empty delta*
+  is not that case and must still clear: an OCR that read nothing leaves every unit identical,
+  and keeping those flagged is the whole-index backlog again.
+- **A message re-stored with a different attachment loses its extraction.**
+  `db._MESSAGE_UPSERT` leaves `extracted_text` and `media_state` alone so a routine re-store
+  cannot clobber the pass's work, *except* when `media_kind` or `media_filename` moved
+  (`db._ATTACHMENT_REPLACED`) — then the text is dropped and the state goes back to
+  `MEDIA_PENDING`, because `MEDIA_EXTRACTED` is terminal and the row would otherwise carry the
+  previous file's text for good, unreachable even to `extract --retry-failed`. Those two columns
+  and nothing else: a caption edit moves neither, and keying this on `edit_date` or `text` would
+  re-download every extracted photo in the index for a typo fix, `edit_refetch` messages per
+  chat per sync. `sync._differs` compares both columns in full, so a replaced attachment always
+  reaches the upsert as an edit. **Clearing the column is only half of the reset**: the units and
+  `unit_fts` rows cut from that text still hold it, and `indexed = 0` reaches none of it — a
+  rebuild does not re-cut a closed window and `on_chat_synced` clears the flag anyway, so with no
+  row left flagged and no media left pending nothing would ever lead back to it. Invalidating is
+  the caller's job, `db` knowing nothing of `units`: `sync._Run.store` asks
+  `db.attachment_replaced` over the row as it is stored *before* the upsert, and for the rows
+  that actually carried text runs `units.invalidate_units_for` + `index.index_units` and
+  `sync._invalidate_comment_posts` in the upsert's own transaction — the same pairing
+  `media._recut` runs in the other direction, off the event loop (`_joined_to_thread`) because a
+  re-cut runs to the end of the chat. Rows that carried no text are deliberately left alone: a
+  changed rendered line inside a closed window is the documented v1 limitation
+  (`units.rebuild_for_chat`), and widening this to every attachment change would re-cut a chat's
+  tail for edits the design accepts.
+- An extractor **degrades rather than fails**. `extract.registry()` is re-derived on every call,
+  never frozen at import, because what a kind maps to is a property of the environment: `pypdf`
+  and `python-docx` come with the `media` extra, and OCR needs macOS and
+  `pyobjc-framework-Vision` (Vision learned Russian only in macOS 15, and a
+  `VNRecognizeTextRequest` given a language the build does not know fails outright, so
+  `_requested_languages` narrows `OCR_LANGUAGES` to `supportedRecognitionLanguages` instead). An
+  installation without them registers less and the pass parks that media at
+  `db.MEDIA_UNSUPPORTED` — this build cannot read it, rather than a failure to retry — and
+  nothing raises, nothing is lost, and `--retry-failed` queues it again once the extra is there.
+  Every module must keep importing with no extra installed; the Vision call sits behind one
+  module-level indirection so the suite never needs a Mac.
+- Unit reactions are refreshed by a **direct `UPDATE`**, never through the rebuild.
+  `units._content_key` is `(kind, topic_id, msg_ids, date_start, date_end, text)` and reactions
+  are deliberately not in it — adding them would invalidate, delete, re-insert and re-embed a
+  unit on every reaction change, `edit_refetch = 200` messages per chat per sync, forever — so
+  `units._apply` keeps the stored row when it re-cuts an identical unit, and that is what
+  preserves a refreshed total. A rebuild-driven refresh is inert twice over: `_apply` keeps the
+  row, and the closed window nearly every re-fetched message sits in is never re-cut at all. The
+  refresh is `db.refresh_unit_reactions`, called from the `edit_refetch` path independently of
+  the rebuild, recomputing totals over `json_each(units.msg_ids)`. Those are Telegram `msg_id`s,
+  the space `units.msg_ids` stores, while everything on the `edit_refetch` path carries
+  `messages.id` rowids — the caller converts. In a fixture chat the two coincide from 1, which is
+  exactly how this ships broken.
 - Work a sync hands to a worker thread goes through `sync._joined_to_thread`, never bare
   `asyncio.to_thread`: an `anyio` cancel scope (how the MCP server cancels a tool call) abandons
   the future rather than the job, and the `SyncLock` must not be released while a detached thread
@@ -149,6 +316,25 @@ never change the git identity.
   *now*, so it moves along when another channel takes it over — removing the old channel then
   leaves it and removing the new one takes its comments along; a group a channel was unlinked
   from keeps the source it came in through until that source is removed.
+- **Every writer of `chats.source_id` asks `sources.imported_tag` first**, because
+  `db.upsert_chat` overwrites the column and an `import:<slug>` is the whole of what protects a
+  history Telegram cannot serve again: `resolve_sources` skips such a chat on every sync,
+  `refuse_imported` refuses the two commands that add a source, and
+  `sync.link_discussion_chat` refuses the link outright when a channel's discussion group turns
+  out to be one — `DiscussionUnavailable`, so the posts sync without comments and the run says
+  why. Refusing the link rather than only keeping the tag is deliberate: pointing `discussion_of`
+  at that group would store live comments into a chat marked `unavailable` whose rows came from
+  an export. `_check_migration` is the fourth writer and needs no guard — it copies the chat's
+  own `source_id` onto the supergroup it migrated to, and only when that supergroup is not
+  already stored. Lose the tag and `sources rm` of the live source deletes the import,
+  `prunable` offers it, and the `import:` handle every refusal tells the user to remove is gone.
+  `sources.prune_chats` asks the same question a fourth time, on the *delete* side: the scan and
+  the confirmation both predate the `SyncLock` — a Telegram round trip must never be held across
+  it — so every candidate is put to `_still_prunable` again inside the deletion transaction, and
+  one that gained an `import:` tag, changed `source_id`, or became a channel's discussion group
+  in between is dropped. It takes `PruneCandidate`s and not ids for exactly that: the offer's
+  `source_id` is what "unchanged" is measured against. Re-ordering the resolve and the lock is
+  not the fix and never will be.
 - Never decide what a `chat:` source covers by comparing `source_id` strings. `chat =` takes an
   id, an `@username`, `https://t.me/<name>` and `t.me/c/<id>`, and all four are one chat:
   `sources.parse_target` folds them into a `Target`, and `sources._names_chat` / `_same_target`
@@ -259,11 +445,27 @@ never change the git identity.
   (both autouse), `tmp_home`, `conn` (an in-memory index, migrated) and the `file_mode` helper.
   A module that needs more overrides `conn` by requesting it (`tests/test_filters.py`).
 - `tests/fakes.py` — `FakeClient` (async `get_dialogs`, `iter_messages` with Telethon's offset
-  semantics, `get_entity`, raw requests such as `GetDialogFiltersRequest`) driven by in-memory
-  fixtures, plus `make_*` builders for TL entities and dialogs.
+  semantics, `get_messages(entity, ids=…)`, `get_entity`, `download_media(message, file)`, raw
+  requests such as `GetDialogFiltersRequest`) driven by in-memory fixtures, plus `make_*` builders
+  for TL entities and dialogs. Two of those answers are signals the product reads, not
+  conveniences: a list `ids` answers one slot per id and `None` where a message is gone, which is
+  what `sync.prune_deleted` and `media.run` both key on, and the `downloads=` mapping keyed by
+  `(chat_id, msg_id)` is what a download writes (bytes, or an exception to raise).
+  **`FakeClient` refuses a peer it has not learned**, like the real one: `entities=` is the world
+  and `resolved` is the session cache, which starts empty and is filled by `get_dialogs()`, by a
+  successful `get_entity`, and by the `chats` / `users` of any raw answer — Telethon's
+  `session.process_entities`. Addressing an unlearned id raises `ValueError: Could not find the
+  input entity` (a legacy `PeerChat` id needs no access hash and is allowed, as in Telethon).
+  `forget_entities()` models the fresh client `extract` and `prune-deleted` each build after a
+  sync, and `strict_entities=False` is for a test with no realistic route to warm up. A fake more
+  permissive than production is a fake that hides bugs: this one hid a `grepogram extract` that
+  resolved no chat at all on a real account through nine review rounds.
 - `tests/fixtures/tl.py` — real Telethon `types.Message` objects built without a client (text,
   caption with photo, voice, document with filename, reply, forum topic, forward, service message,
   reactions, channel post).
+- `tests/fixtures/sample.pdf`, `tests/fixtures/sample.docx` — tiny hand-built documents the
+  extraction tests round-trip; `tests/fixtures/tdesktop_export.json` — a Telegram Desktop export
+  the import tests parse.
 - `tests/fixtures/chat_ru.py` — a 62-message bilingual corpus over two chats, loaded through the
   real pipeline (`upsert_messages` → `rebuild_for_chat` → `index_chat`); `PARAPHRASE` names the
   pair only the dense side can connect.
@@ -283,12 +485,17 @@ never change the git identity.
 (dataclasses and the shared `Literal`s: `ChatType`, `UnitKind`, `MediaKind`, `SearchMode`),
 `db` (schema, migrations, accessors), `tg` (client, session, auth errors), `dialogs` (folders,
 fuzzy matching), `sources` (targets, resolution, status), `sync` (fetch, mapping, lock, budget),
-`units` (windows, threads, posts, incremental rebuild), `stem` (tokenizer, Snowball, FTS query),
-`index` (FTS and vec maintenance, KNN), `embed` and `rerank` (protocols, fakes, bge models),
+`units` (windows, threads, posts, incremental rebuild, `RECIPE_VERSION`), `stem` (tokenizer,
+Snowball, FTS query), `index` (FTS and vec maintenance, KNN), `embed` and `rerank` (protocols,
+fakes, bge models), `extract` (the extractor registry: PDF, DOCX, macOS Vision OCR), `media` (the
+bounded extraction pass), `tdesktop` (Telegram Desktop export parsing),
 `links` (deep links), `filters` (chat specs, dates, `resolve_chat` for the one-chat
 readers), `search` (retrieval, fusion, dedup, readers), `cli` (typer app: `search` and the
-`thread` / `context` readers beside `sources`, `sync`, `embed`, `config`), `mcp` (FastMCP server
-with eight tools). The CLI and the MCP server offer the same readers, and `--json` prints the
-document the matching tool returns.
+`thread` / `context` readers beside `sources`, `sync`, `extract`, `embed`, `import`,
+`prune-deleted`, `config`), `mcp` (FastMCP server with eight tools). The CLI and the MCP server
+offer the same readers, and `--json` prints the document the matching tool returns. Four commands
+are **CLI-only by design** and have no MCP tool: `sources prune` and `prune-deleted` delete
+indexed history, `extract` is a long flood-exposed network pass, and `import` reads a directory
+the server cannot see.
 
 Plans live in `docs/plans/`, finished ones in `docs/plans/completed/`.

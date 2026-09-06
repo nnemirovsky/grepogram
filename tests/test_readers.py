@@ -285,6 +285,28 @@ def test_view_of_a_media_message_shows_a_placeholder(
     assert captioned.text.startswith("Вот скрин")
 
 
+def test_view_of_a_media_message_shows_what_was_read_off_it(conn: sqlite3.Connection) -> None:
+    """The tools tell the caller to open ``thread`` or ``context`` rather than conclude from a
+    snippet, so text a search found through OCR must not vanish on the way there.
+
+    Rendered exactly as a unit's own line renders it (``units.message_body``), marker kept, so a
+    reader can still tell a machine read those words off an image.
+    """
+    db.upsert_chat(conn, _chat(PLAIN))
+    ids = db.upsert_messages(
+        conn,
+        [
+            _msg(PLAIN, 1, 0, text="", media_kind="photo"),
+            _msg(PLAIN, 2, 1, text="Вот скрин", media_kind="photo"),
+        ],
+    )
+    for row_id, read in zip(ids, ("ОТКРЫТО с 9:00", "цена 500"), strict=True):
+        db.set_media_text(conn, row_id, read)
+    first, second = search.context(conn, PLAIN, 1)
+    assert first.text == "[photo] ОТКРЫТО с 9:00"
+    assert second.text == "Вот скрин [photo] цена 500"
+
+
 def test_view_keeps_the_stored_sender_even_when_unknown(conn: sqlite3.Connection) -> None:
     _store(conn, _chat(PLAIN), [_msg(PLAIN, 1, 0, from_id=None, from_name=None, text="  hi  ")])
     (view,) = search.thread(conn, PLAIN, 1)

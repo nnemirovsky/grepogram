@@ -470,13 +470,14 @@ async def search(
     Hits are conversation units — time windows, reply threads, channel posts — with `chat`,
     `kind`, `date_start`/`date_end` (unix seconds, UTC), `anchor_msg_id` (the message the link
     opens), `url`, `snippet` and `msg_ids`; `full=true` adds the whole unit `text`. `chats`
-    restricts the search: each entry is a chat id, `@username`, t.me link, `folder:<name>` or
-    a chat / folder title (fuzzy). `since` / `until` take an ISO date (2025-06-01), month
-    (2025-06), datetime (2025-06-01T14:30) or an age such as 7d, 3w, 6m, 1y; `until` is
-    inclusive. `mode`: `hybrid` fuses stemmed BM25 with dense embeddings (default), `lexical` is
-    BM25 only (exact tokens, names, numbers), `dense` is embeddings only (paraphrase); without
-    vectors or the model every mode falls back to lexical and says so in `warnings`. `rerank`
-    re-scores the top candidates with a cross-encoder. A stale index is refreshed briefly first
+    restricts the search: each entry is a chat id, `@username`, t.me link, `folder:<name>`,
+    `import:<slug>` (a source id `sources` reports) or a chat / folder title (fuzzy). `since` /
+    `until` take an ISO date (2025-06-01), month (2025-06), datetime (2025-06-01T14:30) or an
+    age such as 7d, 3w, 6m, 1y; `until` is inclusive. `mode`: `hybrid` fuses stemmed BM25 with
+    dense embeddings (default), `lexical` is BM25 only (exact tokens, names, numbers), `dense`
+    is embeddings only (paraphrase); without vectors or the model every mode falls back to
+    lexical and says so in `warnings`. `rerank` re-scores the top candidates with a
+    cross-encoder. A stale index is refreshed briefly first
     (`synced=true`); problems with that refresh are `warnings`, the hits are still valid.
     `index_age_min` is the age of the index. A bad filter comes back as `error` with `hint` and
     `candidates`.
@@ -514,6 +515,9 @@ async def _auto_sync(state: AppState, cfg: Config) -> tuple[bool, list[str]]:
     ``sync`` is reported as a warning and the search runs on the index as it is. The sources
     are resolved from the config as it is once the sync lock is held (``state.config``), so a
     source removed while this call was loading its model or connecting stays removed.
+
+    This is the one caller that passes ``recut=False``: a search refreshes messages and never
+    starts the one-time unit re-cut, whatever ``search.auto_sync_budget_s`` is set to.
     """
     budget_s = cfg.search.auto_sync_budget_s
     try:
@@ -529,7 +533,13 @@ async def _auto_sync(state: AppState, cfg: Config) -> tuple[bool, list[str]]:
         embedder = await asyncio.to_thread(state.embedder)
         async with state.telegram() as client:
             report = await syncing.sync_all(
-                client, state.conn, state.config, state.paths, SyncBudget(budget_s), embedder
+                client,
+                state.conn,
+                state.config,
+                state.paths,
+                SyncBudget(budget_s),
+                embedder,
+                recut=False,
             )
     except AUTO_SYNC_ERRORS as exc:
         log.warning("auto-sync skipped: %s", exc)
@@ -629,6 +639,11 @@ async def sync(budget_s: int = 45) -> ToolResult:
     what is still behind — call again to continue. Returns `new` (messages stored),
     `chats_done`, `chats_remaining`, `unavailable` (chats Telegram refused), `warnings` and
     `index_age_min`. New units are embedded when the model is available.
+
+    This call is also what lets a pending one-time unit re-cut make progress: it is a deliberate
+    act, like `grepogram sync` in a terminal, so it re-cuts a few chats a run (bounded and
+    resumable) while the automatic sync inside `search` never starts one. Call it again until
+    the warning `search` returns about a pending re-cut is gone.
     """
     if budget_s <= 0:
         raise ValueError(f"budget_s must be a positive number of seconds, got {budget_s}")
@@ -653,10 +668,14 @@ async def sync(budget_s: int = 45) -> ToolResult:
 
 @guarded
 def sources() -> ToolResult:
-    """List the configured sources with the chats indexed through each: `id`, `title`, `type`,
-    `username`, `message_count`, `last_sync_at` (unix seconds, null before the first sync) and
-    `unavailable`. A source with no chats has not been synced yet. `index_age_min` is minutes
-    since the last completed sync (null before the first).
+    """List every source the index holds chats under, with the chats indexed through each: `id`,
+    `title`, `type`, `username`, `message_count`, `last_sync_at` (unix seconds, null before the
+    first sync) and `unavailable`. A source with no chats has not been synced yet.
+    `index_age_min` is minutes since the last completed sync (null before the first).
+
+    The configured sources come first, then any other `source_id` still in the database. An
+    `import:<slug>` is a Telegram Desktop export the user indexed from a file: those chats are
+    `unavailable` and no sync ever fetches them, but they are searched like any other.
     """
     state = _app()
     statuses = sourcing.sources_status(state.config(), state.conn)
@@ -714,7 +733,9 @@ async def sources_add(target: str, since: str | None = None, comments: bool = Fa
     t.me link, `folder:<name>`, or a chat / folder title (fuzzy; an ambiguous one comes back as
     `error` with `candidates`). `since` (YYYY-MM-DD) skips older history on the first sync;
     `comments=true` (channels only) also indexes the linked discussion threads. Returns the
-    stored `source` and the `chats` it covers; call `sync` afterwards.
+    stored `source` and the `chats` it covers; call `sync` afterwards. A chat already in the
+    index as a Telegram Desktop import comes back as `error`: a live source would take it over
+    on the next sync and the imported history would be lost.
     """
     state = _app()
     parsed = sourcing.parse_target(target)
@@ -723,6 +744,9 @@ async def sources_add(target: str, since: str | None = None, comments: bool = Fa
         added = await sourcing.add_source(
             state.config(), parsed, catalog, since=since, comments=comments
         )
+    # `db.upsert_chat` overwrites `source_id`, so a live source over an imported chat would drop
+    # the `import:` tag every protection of that history keys on; the CLI refuses the same way
+    sourcing.refuse_imported(state.conn, added.dialogs)
     dialog = None if added.folder is not None else added.dialogs[0]
     with state.editing_config() as current:
         state.save_config(sourcing.with_source(current, added.source, dialog))

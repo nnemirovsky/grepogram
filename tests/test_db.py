@@ -21,6 +21,7 @@ INDEXES = {
     "messages_unindexed",
     "chats_discussion_of",
     "messages_comments",
+    "messages_media_pending",
 }
 
 
@@ -161,11 +162,11 @@ def test_connection_usable_from_second_thread(conn: sqlite3.Connection) -> None:
 def test_fresh_migrate_creates_schema() -> None:
     connection = db.connect(":memory:")
     assert db.schema_version(connection) == 0
-    assert db.migrate(connection) == db.SCHEMA_VERSION == 5
+    assert db.migrate(connection) == db.SCHEMA_VERSION == 6
     assert TABLES <= _names(connection, "table")
     assert INDEXES <= _names(connection, "index")
-    assert db.schema_version(connection) == 5
-    assert db.get_meta(connection, "schema_version") == "5"
+    assert db.schema_version(connection) == 6
+    assert db.get_meta(connection, "schema_version") == "6"
     assert not db.has_vec_table(connection)
     assert not connection.in_transaction
     messages_sql = connection.execute(
@@ -176,6 +177,8 @@ def test_fresh_migrate_creates_schema() -> None:
     assert "indexed INTEGER NOT NULL DEFAULT 0" in messages_sql
     assert "comment_of_chat_id INTEGER" in messages_sql
     assert "comment_of_msg_id INTEGER" in messages_sql
+    assert _columns(connection, "messages") >= {"extracted_text", "media_state"}
+    assert "reactions" in _columns(connection, "units")
     units_sql = connection.execute("SELECT sql FROM sqlite_master WHERE name = 'units'").fetchone()
     assert "AUTOINCREMENT" in units_sql[0]
     for fts in ("msg_fts", "unit_fts"):
@@ -188,6 +191,56 @@ def test_migrate_twice_is_noop(conn: sqlite3.Connection) -> None:
     assert db.migrate(conn) == db.SCHEMA_VERSION
     assert _schema(conn) == before
     assert db.get_meta(conn, "schema_version") == str(db.SCHEMA_VERSION)
+
+
+def test_migrate_upgrades_a_v5_database_and_keeps_its_rows() -> None:
+    """The first step above the base: an index in the field gains the columns without losing a
+    row, and still owes the re-cut its units were not cut for."""
+    connection = db.connect(":memory:")
+    for statement in db.MIGRATIONS[db.BASE_VERSION]:
+        connection.execute(statement)
+    connection.execute("INSERT INTO meta(key, value) VALUES ('schema_version', '5')")
+    connection.execute("INSERT INTO chats(id, type, title) VALUES (1, 'supergroup', 'c')")
+    connection.execute(
+        "INSERT INTO messages(chat_id, msg_id, date, text, media_kind, reactions_total) "
+        "VALUES (1, 7, 100, 'hello', 'photo', 3)"
+    )
+    connection.execute(
+        "INSERT INTO units(chat_id, kind, msg_id_start, msg_id_end, msg_ids, date_start, "
+        "date_end, text) VALUES (1, 'window', 7, 7, '[7]', 100, 100, 'hello')"
+    )
+    assert db.migrate(connection) == db.SCHEMA_VERSION == 6
+    stored = db.get_message(connection, 1, 7)
+    assert stored is not None
+    assert (stored.text, stored.media_kind, stored.reactions_total) == ("hello", "photo", 3)
+    assert stored.extracted_text is None
+    assert stored.media_state == db.MEDIA_PENDING
+    (unit,) = db.get_units(connection, 1)
+    assert unit.text == "hello"
+    assert unit.reactions == 0
+    assert "messages_media_pending" in _names(connection, "index")
+    assert db.unit_recipe(connection) is None
+    connection.close()
+
+
+def test_fresh_migrate_adds_the_v6_columns_exactly_once() -> None:
+    """A database with no schema objects runs every step from the base, so a column named in
+    both ``_V5`` and step 6 would raise ``duplicate column name`` — and take the shared ``conn``
+    fixture, i.e. the whole suite, down with it. ``_V5`` names none of them."""
+    base = " ".join(db.MIGRATIONS[db.BASE_VERSION])
+    assert "extracted_text" not in base
+    assert "media_state" not in base
+    assert "reactions INTEGER" not in base
+    connection = db.connect(":memory:")
+    assert db.migrate(connection) == 6
+    for table, column in (
+        ("messages", "extracted_text"),
+        ("messages", "media_state"),
+        ("units", "reactions"),
+    ):
+        names = [row["name"] for row in connection.execute(f"PRAGMA table_info({table})")]
+        assert names.count(column) == 1
+    connection.close()
 
 
 def test_migrate_refuses_a_version_no_chain_of_steps_reaches(
@@ -303,8 +356,8 @@ def test_migrate_walks_up_a_version_it_holds_every_step_for(
 
 def test_migrate_rolls_back_on_failure(monkeypatch: pytest.MonkeyPatch) -> None:
     connection = db.connect(":memory:")
-    broken = (*db.MIGRATIONS[db.SCHEMA_VERSION][:3], "CREATE TABLE ?")
-    monkeypatch.setattr(db, "MIGRATIONS", {db.SCHEMA_VERSION: broken})
+    broken = (*db.MIGRATIONS[db.BASE_VERSION][:3], "CREATE TABLE ?")
+    monkeypatch.setattr(db, "MIGRATIONS", {**db.MIGRATIONS, db.BASE_VERSION: broken})
     with pytest.raises(sqlite3.OperationalError):
         db.migrate(connection)
     assert _names(connection, "table") == set()
@@ -474,6 +527,34 @@ def test_meta_roundtrip(conn: sqlite3.Connection) -> None:
     db.set_meta(conn, "embed_model", "other/model")
     assert db.get_meta(conn, "embed_model") == "other/model"
     assert not conn.in_transaction
+
+
+def test_the_prune_cursor_holds_a_telegram_id_and_starts_over_when_unreadable(
+    conn: sqlite3.Connection,
+) -> None:
+    """The sweep's memory: a Telegram ``msg_id``, never a ``messages.id`` — the rowids a sweep
+    frees are reused by the next insert. A hand-edited marker costs one sweep, not a traceback."""
+    assert db.prune_cursor(conn, 42) == 0
+    db.set_prune_cursor(conn, 42, 1234)
+    assert db.get_meta(conn, "prune_sweep:42") == "1234"
+    assert db.prune_cursor(conn, 42) == 1234
+    db.set_meta(conn, "prune_sweep:42", "halfway")
+    assert db.prune_cursor(conn, 42) == 0
+    db.set_prune_cursor(conn, 42, 1234)
+    db.clear_prune_cursor(conn, 42)
+    assert db.get_meta(conn, "prune_sweep:42") is None
+    assert not conn.in_transaction
+
+
+def test_message_ids_after_pages_one_chat_oldest_first(conn: sqlite3.Connection) -> None:
+    db.upsert_chat(conn, _chat(1))
+    db.upsert_chat(conn, _chat(2))
+    db.upsert_messages(conn, [_message(1, 101), _message(1, 102), _message(1, 103)])
+    db.upsert_messages(conn, [_message(2, 101)])
+    assert db.message_ids_after(conn, 1, 0, 2) == [101, 102]
+    assert db.message_ids_after(conn, 1, 102, 100) == [103]
+    assert db.message_ids_after(conn, 1, 103, 100) == []
+    assert db.message_ids_after(conn, 3, 0, 100) == []
 
 
 # --- transaction -----------------------------------------------------------------------------
@@ -898,6 +979,111 @@ def test_upsert_messages_returns_ids_and_stores_all_columns(conn: sqlite3.Connec
     assert db.upsert_messages(conn, []) == []
 
 
+def _extracted(conn: sqlite3.Connection, row_id: int, text: str = "visa office notice") -> None:
+    """What the extraction pass leaves on a row, written directly."""
+    conn.execute(
+        "UPDATE messages SET extracted_text = ?, media_state = ? WHERE id = ?",
+        (text, db.MEDIA_EXTRACTED, row_id),
+    )
+
+
+def test_upsert_messages_takes_extracted_text_and_media_state_from_no_value_of_its_own(
+    conn: sqlite3.Connection,
+) -> None:
+    """The two columns the extraction pass owns are in neither the column list nor a plain
+    assignment, so a message Telegram re-reads keeps what was read out of its media. A
+    ``COALESCE`` would not do it: ``media_state`` is ``NOT NULL DEFAULT 0``, so a freshly mapped
+    row carries :data:`db.MEDIA_PENDING` and would reset every extracted message on every sync."""
+    db.upsert_chat(conn, _chat(1))
+    (row_id,) = db.upsert_messages(
+        conn,
+        [_message(1, 5, media_kind="photo", extracted_text="mapped", media_state=db.MEDIA_FAILED)],
+    )
+    fresh = db.get_message(conn, 1, 5)
+    assert fresh is not None
+    assert fresh.extracted_text is None
+    assert fresh.media_state == db.MEDIA_PENDING
+    _extracted(conn, row_id)
+    assert db.upsert_messages(
+        conn, [_message(1, 5, text="caption edited", media_kind="photo")]
+    ) == [row_id]
+    stored = db.get_message(conn, 1, 5)
+    assert stored is not None
+    assert stored.text == "caption edited"
+    assert stored.extracted_text == "visa office notice"
+    assert stored.media_state == db.MEDIA_EXTRACTED
+
+
+@pytest.mark.parametrize(
+    ("before", "after", "kept"),
+    [
+        (("photo", None), ("photo", None), True),  # a caption edit moves neither column
+        (("document", "note.pdf"), ("document", "note.pdf"), True),
+        (("photo", None), ("document", "contract.pdf"), False),  # the file itself was replaced
+        (("document", "note.pdf"), ("document", "other.pdf"), False),
+        (("document", "note.pdf"), ("photo", None), False),
+        (("photo", None), (None, None), False),  # the media was taken off the message
+    ],
+)
+def test_upsert_messages_drops_the_extraction_only_when_the_attachment_changed(
+    conn: sqlite3.Connection,
+    before: tuple[str | None, str | None],
+    after: tuple[str | None, str | None],
+    kept: bool,
+) -> None:
+    """Preserving the extraction is right for an edit and wrong for a replaced attachment: the
+    text would be attributed to a file the message no longer carries, and ``MEDIA_EXTRACTED`` is
+    terminal, so nothing — not even ``extract --retry-failed`` — would ever read the new one.
+    ``media_kind`` and ``media_filename`` are the whole of what a row says about its attachment,
+    and a caption edit moves neither, so an edit still costs no re-download."""
+    db.upsert_chat(conn, _chat(1))
+    (row_id,) = db.upsert_messages(
+        conn, [_message(1, 5, media_kind=before[0], media_filename=before[1])]
+    )
+    _extracted(conn, row_id)
+    assert db.upsert_messages(
+        conn, [_message(1, 5, text="edited", media_kind=after[0], media_filename=after[1])]
+    ) == [row_id]
+    stored = db.get_message(conn, 1, 5)
+    assert stored is not None
+    assert stored.extracted_text == ("visa office notice" if kept else None)
+    assert stored.media_state == (db.MEDIA_EXTRACTED if kept else db.MEDIA_PENDING)
+
+
+def test_media_pending_index_answers_the_queue_and_excludes_media_less_rows(
+    conn: sqlite3.Connection,
+) -> None:
+    """The partial index is the extraction pass's work queue. Its predicate carries
+    ``media_kind IS NOT NULL`` as well as the state: without that it would cover every row in the
+    table — text messages sit at :data:`db.MEDIA_PENDING` for ever — and the query it exists for
+    would still be a scan."""
+    db.upsert_chat(conn, _chat(1))
+    db.upsert_messages(
+        conn,
+        [
+            _message(1, 1, media_kind="photo"),
+            _message(1, 2),
+            _message(1, 3, media_kind="document", media_filename="rules.pdf"),
+        ],
+    )
+    conn.execute("UPDATE messages SET media_state = ? WHERE msg_id = 3", (db.MEDIA_EXTRACTED,))
+    pending = (
+        "SELECT msg_id FROM messages WHERE chat_id = ? AND media_state = 0 "
+        "AND media_kind IS NOT NULL ORDER BY id"
+    )
+    plan = " ".join(
+        str(row["detail"]) for row in conn.execute(f"EXPLAIN QUERY PLAN {pending}", (1,))
+    )
+    assert "messages_media_pending" in plan
+    assert [row["msg_id"] for row in conn.execute(pending, (1,))] == [1]
+    # a query that does not name the predicate has no solution in this index — which is the
+    # index saying, in SQLite's own words, that it holds no row without media
+    with pytest.raises(sqlite3.OperationalError, match="no query solution"):
+        conn.execute(
+            "SELECT msg_id FROM messages INDEXED BY messages_media_pending WHERE chat_id = ?", (1,)
+        )
+
+
 def test_upsert_flags_rows_until_they_are_marked_indexed(conn: sqlite3.Connection) -> None:
     """Every row written — inserted or updated, changed or not — waits for a rebuild; the
     flag is cleared per row, in chunks larger than one ``IN`` list, and can be raised again for
@@ -919,6 +1105,32 @@ def test_upsert_flags_rows_until_they_are_marked_indexed(conn: sqlite3.Connectio
     db.mark_indexed(conn, [])
     db.mark_unindexed(conn, [])
     assert db.unindexed_message_ids(conn, 1) == ids[:2]
+    assert not conn.in_transaction
+
+
+def test_delete_messages_removes_the_rows_of_one_chat_with_their_fts_entries(
+    conn: sqlite3.Connection,
+) -> None:
+    """The ids are the ``msg_id`` space a sync compares against Telegram, and the chat is part of
+    the key: every chat numbers its messages from 1, so an unscoped delete would take another
+    chat's rows of the same number. The ``msg_fts`` rows go by the ``messages.id`` rowid they are
+    keyed on, or an fts5 row nothing can reach any more would be left for the next insert."""
+    db.upsert_chat(conn, _chat(1))
+    db.upsert_chat(conn, _chat(2))
+    ids = db.upsert_messages(conn, [_message(1, i) for i in range(1, db.IN_BATCH + 3)])
+    other = db.upsert_messages(conn, [_message(2, 1)])
+    for row_id in [*ids, *other]:
+        conn.execute(
+            "INSERT INTO msg_fts(rowid, raw, stemmed, chat_id, date) VALUES (?, 'a', 'a', 1, 1)",
+            (row_id,),
+        )
+
+    assert db.delete_messages(conn, 1, range(1, db.IN_BATCH + 3)) == len(ids)
+
+    assert db.get_messages(conn, 1) == []
+    assert [row.msg_id for row in db.get_messages(conn, 2)] == [1]
+    assert [r["rowid"] for r in conn.execute("SELECT rowid FROM msg_fts")] == other
+    assert db.delete_messages(conn, 1, []) == 0
     assert not conn.in_transaction
 
 
@@ -1189,6 +1401,73 @@ def test_insert_and_get_units_roundtrip(conn: sqlite3.Connection) -> None:
     assert [u.id for u in db.get_units(conn, 1) if u.kind == "thread"] == [2]
     assert db.get_units(conn, 3) == []
     assert db.insert_units(conn, []) == []
+
+
+def test_units_roundtrip_a_reaction_total(conn: sqlite3.Connection) -> None:
+    """``units.reactions`` is written by the insert and read back by the mapping, so the column
+    is whole from the schema step that adds it — no later task inherits half of it."""
+    db.upsert_chat(conn, _chat(1))
+    ids = db.insert_units(conn, [_unit(1, [1], reactions=17), _unit(1, [2])])
+    stored = db.get_units(conn, 1)
+    assert [(u.id, u.reactions) for u in stored] == [(ids[0], 17), (ids[1], 0)]
+    assert db.get_units_by_ids(conn, [ids[0]])[0].reactions == 17
+
+
+def test_refresh_unit_reactions_recomputes_over_telegram_msg_ids(
+    conn: sqlite3.Connection,
+) -> None:
+    """The refresh reads ``units.msg_ids``, which holds Telegram ids, so the chat here starts its
+    history above its rowids — the two coincide from 1 in a naive fixture and hide the mistake.
+
+    Reactions arrive long after a unit was cut and no rebuild reaches a closed window, so this is
+    a direct ``UPDATE``: it rewrites the total and nothing else, leaving the text and the
+    ``dirty`` flag alone, because a reaction changes the ranking and not the embedding.
+    """
+    db.upsert_chat(conn, _chat(1))
+    db.upsert_chat(conn, _chat(2))
+    rowids = db.upsert_messages(
+        conn,
+        [
+            _message(1, 101, reactions_total=3),
+            _message(1, 102),
+            _message(1, 103, reactions_total=7),
+            _message(2, 101, reactions_total=99),
+        ],
+    )
+    assert set(rowids).isdisjoint({101, 102, 103})
+    held, apart, other = db.insert_units(
+        conn, [_unit(1, [101, 102]), _unit(1, [103]), _unit(2, [101])]
+    )
+    assert db.refresh_unit_reactions(conn, 1, [101, 103]) == 2
+    assert {u.id: u.reactions for u in db.get_units(conn, 1)} == {held: 3, apart: 7}
+    assert db.get_units_by_ids(conn, [other])[0].reactions == 0
+    conn.execute("UPDATE messages SET reactions_total = 5 WHERE chat_id = 1 AND msg_id = 102")
+    assert db.refresh_unit_reactions(conn, 1, [102]) == 1
+    stored = db.get_units_by_ids(conn, [held])[0]
+    assert (stored.reactions, stored.text, stored.dirty) == (8, "unit text", True)
+
+
+def test_refresh_unit_reactions_ignores_rowids_and_empty_input(conn: sqlite3.Connection) -> None:
+    """Handed ``messages.id`` values instead, the refresh matches no unit at all — which is what
+    the caller's conversion buys, and what a fixture chat numbered from 1 would never show."""
+    db.upsert_chat(conn, _chat(1))
+    rowids = db.upsert_messages(conn, [_message(1, 101, reactions_total=4)])
+    unit = db.insert_units(conn, [_unit(1, [101])])[0]
+    assert db.refresh_unit_reactions(conn, 1, rowids) == 0
+    assert db.get_units_by_ids(conn, [unit])[0].reactions == 0
+    assert db.refresh_unit_reactions(conn, 1, []) == 0
+    assert db.refresh_unit_reactions(conn, 1, [101]) == 1
+    assert db.get_units_by_ids(conn, [unit])[0].reactions == 4
+
+
+def test_refresh_unit_reactions_zeroes_a_unit_nobody_reacted_to(conn: sqlite3.Connection) -> None:
+    """A reaction that is taken back is as real as one that is added."""
+    db.upsert_chat(conn, _chat(1))
+    db.upsert_messages(conn, [_message(1, 101, reactions_total=2)])
+    unit = db.insert_units(conn, [_unit(1, [101], reactions=2)])[0]
+    conn.execute("UPDATE messages SET reactions_total = 0 WHERE chat_id = 1 AND msg_id = 101")
+    assert db.refresh_unit_reactions(conn, 1, [101]) == 1
+    assert db.get_units_by_ids(conn, [unit])[0].reactions == 0
 
 
 def test_delete_units_by_id(conn: sqlite3.Connection) -> None:
