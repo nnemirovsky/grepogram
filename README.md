@@ -193,47 +193,6 @@ index older than an hour on its own (see below). A `launchd` job or a cron entry
 `grepogram sync --budget 300` works fine next to a running MCP server: only one sync runs at a
 time, and the two never contend for the session file.
 
-## Upgrading from v0.1.x
-
-**An index built by v0.1.x is re-cut and re-embedded once, and that takes a while.** Three of
-v0.2.0's changes alter what a *unit* is — `window_max_chars` became a real ceiling, text read out
-of media is rendered into the line that used to be a bare `[photo]`, and a unit now carries the
-reactions its messages collected — so every stored unit predates the code reading it. Nothing is
-re-fetched from Telegram: the messages you already have are cut into units again and the new units
-embedded. On a 47,000-unit index that is roughly an hour of local model time.
-
-It happens on its own, and it never takes the index down:
-
-- The re-cut runs at the end of a sync, **four whole chats per run at most**. One
-  chat's delete, re-cut, index and progress marker are a single transaction, so search keeps
-  answering throughout — from the chats that are through and the chats that are not alike.
-- An interrupted run loses nothing. Each finished chat is marked with the recipe it was cut at,
-  and the next run picks up only the chats that are behind.
-- Until every chat is through, `search` returns a warning saying so. The hits next to it are
-  valid; they are just cut the old way in the chats that have not moved yet.
-
-**The automatic sync inside a `search` never starts one.** A one-time re-cut has no business
-being attempted inside a refresh nobody asked for, so that one refreshes messages and stops
-there — which is what the warning on every search is there to tell you. **A sync you ask for is a
-different matter**: `grepogram sync`, and the MCP `sync` tool, both move the re-cut along, four
-chats at a time, making whatever progress their budget allows — and never fewer than one chat,
-even when fetching messages used the whole of it, so a `--budget` short enough to be spent on the
-fetch still finishes the re-cut eventually instead of never starting it. From a terminal:
-
-```sh
-grepogram sync                 # no --budget means unlimited
-```
-
-as many times as it takes for the warning to go. Either door works; the terminal is the one with
-no budget at all, so it is the quickest way through a big index.
-
-Nothing else about the upgrade needs doing. The schema migrates itself when the index is first
-opened, the config and the session carry over untouched, and the new `[media]` settings take their
-defaults whether or not the file mentions them (`grepogram config init` refuses to overwrite an
-existing config — copy the block from [Configuration](#configuration) to spell them out). The
-media you already have is *not* read by the upgrade: that backlog waits for a
-[`grepogram extract`](#reading-text-out-of-media) run whenever you want it.
-
 ## CLI Reference
 
 Global options: `--version`, `--verbose` / `-v` (DEBUG logging). Command output goes to stdout,
@@ -427,10 +386,9 @@ back to `context` alongside its `msg_id`.
 Four CLI commands have **no tool here, deliberately**: `sources prune` and `prune-deleted` delete
 indexed history, `extract` is a long flood-exposed network pass, and `import` reads a directory
 the server has no reason to be looking at. They stay in the terminal, and an agent that needs one
-should say so rather than find it. The `sync` tool is also the door to the one-time unit re-cut:
-an explicit `sync()` moves an upgraded index along, four chats a run, while the automatic refresh
-inside `search` never starts one however long its budget — see
-[Upgrading from v0.1.x](#upgrading-from-v01x).
+should say so rather than find it. The `sync` tool is also the door to a pending unit re-cut: an
+explicit `sync()` moves one along, four chats a run, while the automatic refresh inside `search`
+never starts one however long its budget.
 
 The server's `instructions` tell the agent how to use the tools: run two or three query variants
 (Russian and English, the specific term and the concept, synonyms), prefer `lexical` for exact
@@ -596,10 +554,9 @@ expect of a byte-hungry alphabet: bge-m3's SentencePiece vocabulary encodes Russ
 compactly as English — 1500 characters of pure Cyrillic message text comes to a median 399 tokens
 against 418 for pure Latin — so what reached the cap was unit *length*, in any language.
 
-Making the cap real changes where windows are cut, so an index built before v0.2.0 re-cuts and
-re-embeds every unit once, chat by chat, over the syncs that follow the upgrade — together with
-the two other v0.2.0 changes to what a unit is, in one pass rather than three. See
-[Upgrading from v0.1.x](#upgrading-from-v01x) for what that costs and how to make sure it runs.
+Making the cap real changes where windows are cut, so an index cut by an older build re-cuts and
+re-embeds every unit once, chat by chat, over the syncs that follow — four whole chats a run, each
+in one transaction, so search keeps answering throughout and `search` says so until it is through.
 
 A truncated unit is not a lost unit. Its whole text is in the FTS tables, so lexical retrieval
 matches on every word of it and the hit comes back complete — a query whose terms sit in the tail
@@ -872,10 +829,6 @@ connections are held open rather than refused — a firewall prompt nobody answe
   uncommitted write open on the session file (a sync in another Telethon-based tool, say) can
   fail with `database is locked`; grepogram's own clients only read it.
 - `sources add` / `rm` and the MCP tools rewrite `config.toml` without its comments.
-- An index built with a development version from before the first release is not upgraded: the
-  schema changed while there was nothing in the field to carry over, so grepogram refuses such a
-  file instead of transforming rows it cannot interpret. Delete `index.db` and run
-  `grepogram sync` to build it again.
 - The MCP contract targets the `mcp` 1.x SDK (`FastMCP`); 2.x renamed the API and is excluded by
   the dependency pin.
 
