@@ -4,6 +4,7 @@ import datetime as dt
 import logging
 import sqlite3
 import stat
+import threading
 import time
 from collections.abc import AsyncIterator, Callable
 from pathlib import Path
@@ -3631,9 +3632,15 @@ async def test_a_cancelled_index_step_waits_for_its_worker_however_long_it_takes
     """
     monkeypatch.setattr(sync, "JOIN_LOG_EVERY", 0.01)
     landed: list[str] = []
+    # the job holds until the test releases it, so how long the join waits is decided here and
+    # not by the clock: timing this with sleeps made the cancel land after the job had already
+    # finished on a loaded runner, and the join then logged once instead of repeatedly
+    running = threading.Event()
+    release = threading.Event()
 
     def job() -> str:
-        time.sleep(0.2)
+        running.set()
+        release.wait(10)
         landed.append("job")
         return "done"
 
@@ -3643,15 +3650,28 @@ async def test_a_cancelled_index_step_waits_for_its_worker_however_long_it_takes
         finally:
             landed.append("unwound")
 
+    def waited() -> list[logging.LogRecord]:
+        stalled = "still running after the run was cancelled"
+        return [r for r in list(caplog.records) if stalled in r.message]
+
+    def release_once_it_has_logged_twice() -> None:
+        # on its own thread on purpose: once cancelled, the join waits on a plain
+        # threading.Event and so blocks the event loop, and nothing scheduled on the loop
+        # could ever let the job finish
+        while len(waited()) < 2:
+            time.sleep(0.005)
+        release.set()
+
     with caplog.at_level("WARNING", logger="grepogram.sync"):
         task = asyncio.create_task(call())
-        await asyncio.sleep(0.05)
+        while not running.is_set():  # the loop must stay free to start the worker
+            await asyncio.sleep(0.005)
+        threading.Thread(target=release_once_it_has_logged_twice, daemon=True).start()
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task
     assert landed == ["job", "unwound"]
-    waited = [r for r in caplog.records if "still running after the run was cancelled" in r.message]
-    assert len(waited) > 1
+    assert len(waited()) > 1
 
 
 async def test_a_cancelled_job_that_can_be_aborted_is_asked_to_stop() -> None:
