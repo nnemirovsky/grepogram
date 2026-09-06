@@ -334,7 +334,7 @@ class _FakeVision:
         self,
         *,
         lines: tuple[str, ...] = (),
-        supported: tuple[str, ...] = ("ru-RU", "en-US"),
+        supported: tuple[str, ...] = ("ru-RU", "en-US", "tr-TR"),
         languages_error: object = None,
         done: bool = True,
         perform_error: object = None,
@@ -391,7 +391,7 @@ def test_ocr_requests_the_languages_this_build_supports(
     vision = _fake_vision(monkeypatch, _FakeVision(lines=("text",)))
     extract.ocr_image(_photo(tmp_path))
     assert vision.request is not None
-    assert vision.request.languages == ["ru-RU", "en-US"]
+    assert vision.request.languages == ["ru-RU", "en-US", "tr-TR"]
 
 
 def test_ocr_drops_a_language_the_build_does_not_offer(

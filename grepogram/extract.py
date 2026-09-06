@@ -41,13 +41,18 @@ sees the end of. Extractors stop reading once they are past it rather than parsi
 Extractor = Callable[[Path], str]
 """What every extractor is: a downloaded file in, its text out, :class:`ExtractError` on failure."""
 
-OCR_LANGUAGES = ("ru-RU", "en-US")
-"""What OCR asks Vision for, best first — these are Russian and English chats.
+OCR_LANGUAGES = ("ru-RU", "en-US", "tr-TR")
+"""What OCR asks Vision for, best first.
+
+Russian and English are what these chats are written in; Turkish is here because a chat about
+living in a country photographs that country's paperwork, and Latin script alone reads its
+diacritics wrong — ``BAŞKANLIGI`` for ``BAŞKANLIĞI``, which no search for the correct spelling
+finds.
 
 Never handed to Vision as it is. A ``VNRecognizeTextRequest`` given a language the build does not
-recognise fails outright rather than ignoring it, and Vision only learned Russian in macOS 15, so
-the request carries this narrowed to ``supportedRecognitionLanguages`` by
-:func:`_requested_languages`.
+recognise fails outright rather than ignoring it, and the accurate level's list is both longer and
+newer than the fast one's (Russian arrived in macOS 15), so the request carries this narrowed to
+``supportedRecognitionLanguages`` by :func:`_requested_languages`.
 """
 
 _PDF_MAGIC = b"%PDF-"
