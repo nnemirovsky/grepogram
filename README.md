@@ -2,6 +2,7 @@
 
 [![ci](https://github.com/nnemirovsky/grepogram/actions/workflows/ci.yml/badge.svg)](https://github.com/nnemirovsky/grepogram/actions/workflows/ci.yml)
 [![release](https://img.shields.io/github/v/release/nnemirovsky/grepogram)](https://github.com/nnemirovsky/grepogram/releases/latest)
+[![pypi](https://img.shields.io/pypi/v/grepogram)](https://pypi.org/project/grepogram/)
 [![python](https://img.shields.io/badge/python-3.12-blue)](pyproject.toml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
@@ -91,17 +92,23 @@ Everything lives in one SQLite file.
 
 1. Create an application at https://my.telegram.org/apps and note the `api_id` and `api_hash`.
 
-2. Install as a tool, straight from GitHub — no checkout needed:
+2. Install as a tool — no checkout needed:
+
+   ```sh
+   uv tool install --managed-python --python 3.12 'grepogram[dense]'
+   ```
+
+   which puts `grepogram` and `grepogram-mcp` into `$(uv tool dir --bin)`. Drop `[dense]` for a
+   lexical-only install, or ask for `[dense,media]` to get OCR and document text as well (see
+   [Reading Text Out of Media](#reading-text-out-of-media)).
+
+   To run an unreleased change, install from the repository instead — any tag, branch or commit
+   after the `@`, and the tip of `main` without one:
 
    ```sh
    uv tool install --managed-python --python 3.12 \
        'grepogram[dense] @ git+https://github.com/nnemirovsky/grepogram'
    ```
-
-   which puts `grepogram` and `grepogram-mcp` into `$(uv tool dir --bin)`. Drop `[dense]` for a
-   lexical-only install, or ask for `[dense,media]` to get OCR and document text as well (see
-   [Reading Text Out of Media](#reading-text-out-of-media)). Append `@v0.2.0` — any tag, branch or
-   commit — to the URL to pin a version; without one you get the tip of `main`.
 
    From a checkout instead, to run it in place or to work on it:
 
@@ -326,8 +333,7 @@ screenshotted — before v0.2.0 the index held `[photo]` and `[document: contrac
 of what they said. `grepogram extract` reads that text and puts it where search can find it.
 
 ```sh
-uv tool install --managed-python --python 3.12 \
-    'grepogram[dense,media] @ git+https://github.com/nnemirovsky/grepogram'
+uv tool install --managed-python --python 3.12 'grepogram[dense,media]'
 # from a checkout instead: uv sync --managed-python --extra dense --extra media
 
 grepogram sync                  # first, so there is something to extract
