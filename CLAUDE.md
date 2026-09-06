@@ -39,9 +39,13 @@ Python 3.12 pinned, `uv` only (no pip, no global installs), developed on macOS.
 2. tag it `vX.Y.Z` and push the tag — the workflow refuses a tag whose name does not match
    `__version__`, so the two can never drift;
 3. it runs `uv build`, uploads `dist/` as an artifact (before the release step, so a failed
-   release still leaves the build to look at), and publishes with
-   `gh release create "$GITHUB_REF_NAME" dist/* --generate-notes --verify-tag` — `--verify-tag`
-   means the tag must already be on the remote;
+   release still leaves the build to look at), and then publishes. **Either order of tag and
+   release works**: the step asks `gh release view` first, and creates the release
+   (`gh release create … --generate-notes --verify-tag`, so the tag must already be on the
+   remote) when there is none, or attaches the build to the release a workstation already
+   published (`gh release upload … --clobber`). `gh release create` has no update mode and
+   answers 422 `already_exists` for a tag that already has a release, so running both would
+   fail the job and, through `needs: release`, skip the PyPI upload entirely;
 4. the `pypi` job is gated on the repository variable `PYPI_PUBLISH == 'true'` and `needs:
    release`, downloads that artifact and uploads through trusted publishing (the `pypi`
    environment, `id-token: write`, no API token). Until the variable is set the job skips, so a

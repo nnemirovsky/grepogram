@@ -43,11 +43,23 @@ jobs:
           path: dist/
           if-no-files-found: error
 
-      # gh ships on the runner, so the release needs no third-party action
+      # gh ships on the runner, so the release needs no third-party action.
+      # Both ways of cutting a release reach here, so this handles both: a tag
+      # pushed on its own (the release does not exist yet, `create` makes it),
+      # and a release published from a workstation first (`create` would fail
+      # 422 already_exists, so the build is attached to what is already there).
+      # `gh release create` has no update mode — attaching is `gh release
+      # upload` — and the two must never both run, or the assets double up.
       - name: publish the release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "$GITHUB_REF_NAME" dist/* --generate-notes --verify-tag
+        run: |
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            echo "release $GITHUB_REF_NAME already exists; attaching the build to it"
+            gh release upload "$GITHUB_REF_NAME" dist/* --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" dist/* --generate-notes --verify-tag
+          fi
 
   pypi:
     # gated on the repository variable PYPI_PUBLISH: until the trusted publisher
