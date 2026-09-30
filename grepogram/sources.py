@@ -31,7 +31,7 @@ from typing import Any, Literal
 from telethon import errors, utils
 from telethon.tl import types
 
-from grepogram import db, dialogs, leads, tg
+from grepogram import config, db, dialogs, leads, research_db, tg
 from grepogram.dialogs import DialogCatalog, DialogInfo, FolderInfo, Match
 from grepogram.models import (
     ACCOUNT_NAME,
@@ -1717,3 +1717,73 @@ def accounts_status(cfg: Config, paths: Paths, conn: sqlite3.Connection) -> list
             )
         )
     return listed
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class RemovedAccount:
+    """What :func:`remove_account` did: the chats deleted, those kept under another account's
+    source, and the research sessions it stopped."""
+
+    chat_ids: list[int]
+    kept_chat_ids: list[int]
+    stopped_sessions: list[int]
+
+
+def remove_account(conn: sqlite3.Connection, paths: Paths, name: str) -> RemovedAccount:
+    """Remove account ``name``: stop its research sessions (:func:`_stop_research_of`), remove
+    its sources, forget its access and its ``[[accounts]]`` entry (:func:`_drop_account`), then
+    delete its session file. Nothing is changed on Telegram.
+
+    The caller holds the :class:`~grepogram.sync.SyncLock` and then the
+    :class:`~grepogram.config.ConfigLock`: the config is read, edited and saved under the same
+    locks as the deletion, so a sync that starts once they are free reads a config without
+    these sources and cannot re-create their chats, and an MCP edit saved in between is not
+    overwritten."""
+    stopped = _stop_research_of(paths, name)
+    deleted, kept = _drop_account(config.load(paths), conn, paths, name)
+    paths.session_file_for(name).unlink(missing_ok=True)
+    return RemovedAccount(chat_ids=deleted, kept_chat_ids=kept, stopped_sessions=stopped)
+
+
+def _stop_research_of(paths: Paths, name: str) -> list[int]:
+    """Stop every active research session of account ``name``, voiding the grants it has not
+    used; returns their ids. Whether ``[research]`` is enabled does not matter — an approval must
+    not outlive the account it was given to, and a later sign-in under the same name may be
+    someone else. A ``research.db`` that does not exist holds nothing to stop."""
+    if not paths.research_db_file.exists():
+        return []
+    rdb = research_db.open_store(paths)
+    try:
+        active = [s.id for s in research_db.list_sessions(rdb, "active") if s.account == name]
+        for session_id in active:
+            research_db.stop_session(rdb, session_id)
+    finally:
+        rdb.close()
+    return active
+
+
+def _drop_account(
+    current: Config, conn: sqlite3.Connection, paths: Paths, name: str
+) -> tuple[list[int], list[int]]:
+    """Remove every source of ``name`` from ``current`` through the ordinary source-removal
+    rules, forget its access, drop its ``[[accounts]]`` entry and save the config. Returns the
+    chats deleted and those kept under another source. The caller holds both locks.
+
+    One transaction: every removal joins it (:func:`grepogram.db.transaction`), and the config
+    is saved inside it, last. A failure anywhere — the save included — rolls every deletion
+    back with the config untouched, so no chat is ever deleted while the source that fetched it
+    stays configured and a sync fetches it all over again.
+    """
+    deleted: list[int] = []
+    kept: list[int] = []
+    with db.transaction(conn):
+        for source in [s for s in current.sources if s.account == name]:
+            removed = remove_source_id(current, conn, source.id)
+            current = removed.config
+            deleted += removed.chat_ids
+            kept += removed.kept_chat_ids
+        db.forget_account(conn, name)
+        accounts = [entry for entry in current.accounts if entry.name != name]
+        config.save(dataclasses.replace(current, accounts=accounts), paths)
+    gone = set(deleted)
+    return sorted(gone), sorted({chat_id for chat_id in kept if chat_id not in gone})

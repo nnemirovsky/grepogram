@@ -181,7 +181,8 @@ never change the git identity.
   covering source in config order — for a link-only discussion group to its channel's
   (`discussion_source_id`), which is why channels are decided before groups — and never onto an
   `import:` tag, and `Removed.kept_chat_ids` names what stayed. `accounts rm` removes an
-  account's sources through the same rule (`sources.remove_source_id`), `db.forget_account`
+  account (`sources.remove_account`, under the `SyncLock` and `ConfigLock` the CLI takes after
+  its confirmation) — its sources through the same rule (`sources.remove_source_id`), `db.forget_account`
   drops its `chat_access`, `peer_cache` and `accounts` rows and the config is saved, all inside one `db.transaction`, so a
   failure deletes nothing; it first stops the account's active research sessions, voiding their
   unused grants. **Removing a source or an account never
