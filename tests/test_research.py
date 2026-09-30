@@ -1287,6 +1287,33 @@ def test_grant_records_the_channel_and_the_text_the_human_saw(
     assert not research.authorized(rdb, stored, "request")
 
 
+def test_one_approval_grants_each_named_target_and_nothing_else(
+    rdb: sqlite3.Connection, conn: sqlite3.Connection
+) -> None:
+    """A batch is one summary and one answer for several named targets: each gets its own grant
+    for exactly its own actions, and a candidate the batch did not name stays unauthorized."""
+    session = _start(rdb, conn)
+    flats = _flats(rdb, session)
+    rooms = _probed(rdb, session, "@tb_rooms", title="Rooms", type="channel", member=True)
+    unnamed = _probed(rdb, session, "@tb_other", title="Other", type="channel", member=False)
+    items = [_item(flats, "join", "fetch", "add_source"), _item(rooms, "add_source")]
+    summary = research.approval_summary(rdb, conn, CFG, session.id, items)
+    assert f"Candidate {flats.id}:" in summary and f"Candidate {rooms.id}:" in summary
+    assert f"Candidate {unnamed.id}:" not in summary
+
+    granted = research.grant(rdb, conn, CFG, session.id, items, via="cli", summary=summary)
+
+    assert [(g.candidate_id, g.actions, g.summary) for g in granted] == [
+        (flats.id, ("join", "fetch", "add_source"), summary),
+        (rooms.id, ("add_source",), summary),
+    ]
+    stored = {c.id: c for c in research_db.list_candidates(rdb, session.id)}
+    assert research.authorized_actions(rdb, stored[flats.id]) == ["join", "fetch", "add_source"]
+    assert research.authorized_actions(rdb, stored[rooms.id]) == ["add_source"]
+    assert research.authorized_actions(rdb, stored[unnamed.id]) == []
+    assert stored[unnamed.id].status == "proposed"
+
+
 def test_a_summary_that_no_longer_matches_grants_nothing(
     rdb: sqlite3.Connection, conn: sqlite3.Connection
 ) -> None:
