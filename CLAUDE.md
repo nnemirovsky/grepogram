@@ -253,17 +253,20 @@ never change the git identity.
   "delete index.db and sync again" is no upgrade path a released schema may ask for. Step `7`
   fills `chats.peer_id = id`, `chats.scope` from `type`, `chat_sources` from `source_id` and
   `chat_access` for `default` (imports excepted: they reach no account); step `8` records
-  `meta['links_captured_from']`, the first row id whose links are captured, so research knows
-  which rows only `leads.text_leads` can speak for (`db.links_captured_from`). On an empty
-  database those fills run over no rows. **The schema is append-only now that v0.1.0 is tagged** —
+  `meta['links_captured_from']`, the first row id whose links are captured; step `9` turns that
+  mark into the per-row `messages.links_read` (a row with links or a forward origin is read, an
+  import's rows are not) and starts the lead clock. On an empty database those fills run over no
+  rows. Step 9 also gives the index a random `meta['index_id']` — meta naming the file, not data
+  — so a cursor kept outside the index can tell a rebuilt index from this one. **The schema is append-only now that v0.1.0 is tagged** —
   append a step above `BASE_VERSION` and leave `_V5` alone. `migrate()` applies every step from
   `BASE_VERSION` for a database with no schema objects, so a column added to `_V5` *and* to a step
   above it raises `duplicate column name` and fails `tests/conftest.py`'s shared fixture, which is
   the whole suite. v0.2.0's step `6` (`messages.extracted_text`, `messages.media_state`,
   `units.reactions`, the `messages_media_pending` partial index) is the model, and steps `7`
   (accounts: `accounts`, `chats.peer_id` / `scope` unique together, `chat_access`,
-  `chat_sources`) and `8` (`messages.fwd_peer_id` / `fwd_msg_id` / `fwd_date`, `message_links`)
-  followed it; `RECIPE_VERSION` did not move for either, unit text being unchanged. The media
+  `chat_sources`), `8` (`messages.fwd_peer_id` / `fwd_msg_id` / `fwd_date`, `message_links`)
+  and `9` (`messages.links_read` / `lead_seq`, `peer_cache`) followed it; `RECIPE_VERSION` did
+  not move for any of them, unit text being unchanged. The media
   index's predicate carries `media_kind IS NOT NULL` as well as `media_state = 0`, or it would
   cover every row in the table forever and the pending query would stay a scan.
 - `messages.indexed` is 0 for a row whose units and `msg_fts` entry are behind: every
@@ -560,6 +563,47 @@ never change the git identity.
   candidates and evidence in `research.db`, never `messages` rows, so no sync cursor moves. Every
   research entry point refuses before opening the file while `[research] enabled` is false
   (`research.require_enabled`), and ordinary `search` never widens what it reads.
+- **`research.db` never names a chat by an index row id.** Seeds (`session_seeds`), scan cursors
+  (`chat_scans`) and evidence carry `models.ChatKey` — `(scope, peer_id)`, the identity
+  `db.upsert_chat` finds a row by — and are resolved to the row the index holds *now*
+  (`research.chat_of`) at use: a rebuilt index numbers rows afresh, and a private chat's
+  synthetic id goes to whichever account's row is stored second. `db._next_synthetic_id` keeps a
+  high-water mark (`meta['synthetic_next']`) so a deleted scoped row's id is never handed to
+  another conversation. The JSON documents show evidence as `scope` / `peer_id` plus `chat_id`,
+  the row resolved at read time (`research.evidence_document`, `None` when the index does not
+  hold the chat), and seeds as `{scope, peer_id}`.
+- Discovery reads a chat from a cursor on the **lead clock**, never a `msg_id`: every
+  `upsert_messages` call stamps its rows with one tick (`messages.lead_seq`, inserts always,
+  re-stores only when they read the links again) and `db.set_captured_links` does the same, so a
+  comment stored below the newest `msg_id`, an edit that gained a link and a recaptured row are
+  all read. A cursor counts only on the index `chat_scans.index_id` names (`db.index_id`);
+  another index's reads the chat from the start, which duplicates nothing (`add_evidence` keeps
+  one row per path). A channel's discussion group is read beside its channel, seed or fetched
+  (`research.scan_targets`). Whether a row falls back to `leads.text_leads` is `links_read`, a
+  per-row fact, never an id threshold — an import stored after capture began has none either
+  (`tdesktop.export_links` reads the runs an export does spell).
+- Research also reads the **pinned posts** of the chats a session reads — seeds (the user's own
+  sources) and chats a run fetched under a grant, never anything else — once each
+  (`chat_scans.pins_read_at`), whatever their age, through `iter_messages(filter=
+  InputMessagesFilterPinned)` (`research.read_pins`: from `discover` for what it has not read,
+  from a run for the chats it just fetched). Their leads are evidence (`via = pinned`) only:
+  **never `messages` rows, and no cursor moves** — a sparse read must never pass for the history
+  before it. Another account's private chat is never asked about. A chat whose links name
+  `research.DIRECTORY_MIN_CHATS` distinct chats is a directory (`chat_scans.directory`, sticky)
+  and every lead found in it gets a `directory` path with the lead's own origin key, so it adds
+  no corroboration and approving the directory still approves nothing it lists.
+- A forward names its origin by id alone, so `sync.forward_peers` records what the fetching
+  account was handed with the message — `msg.forward.chat`'s username and non-`min` access hash
+  — in `peer_cache` (index.db, per account), and `research._probe_peer` looks a `peer:`
+  candidate up with the access hash of the index's chat row, else `peer_cache`'s, else resolves
+  the cached username and takes the answer only when it is that very peer
+  (`_probe_named_peer`). The cached username is a probe hint and never a candidate's identity:
+  a stale one would fold two chats into one candidate.
+- `grepogram recapture-links` (`sync.recapture_links`) is the backfill for rows whose links were
+  never read: by id through `StoredPass`, a hundred per request, under the `SyncLock`, resumable
+  on a `meta['links_recapture:<chat>']` cursor. It writes `message_links`, `fwd_*`, `links_read`
+  and a lead-clock tick and nothing else — no text, no `indexed`, no unit, no sync cursor — and
+  leaves a message Telegram no longer has to `prune-deleted`; imports are never re-read.
 - **No parameter stands in for consent.** A grant comes from exactly two places: `grepogram
   research approve`, which writes `research.approval_summary` to the controlling terminal and
   reads the typed-back code there, and the MCP `research_approve`, which shows the same summary
@@ -577,8 +621,12 @@ never change the git identity.
   `research.authorized(target, action)` is the one check before every outward step of a run:
   only a grant naming that very target counts, so approving a chat approves nothing discovered
   inside it, and a shared folder is approved chat by chat, never whole. Probes read metadata,
-  never history; a `peer:` candidate is looked up only with an access hash the index stored for
-  the session's account and is `unresolvable` otherwise, never guessed. Global search needs the
+  never history; a `peer:` candidate is looked up only with an access hash stored for the
+  session's account or by the username a sync saw it under (see `peer_cache` above) and is
+  `unresolvable` otherwise, never guessed. `max_candidates` bounds one call and
+  `max_session_candidates` the whole session (`research.room`); what the session ceiling cuts
+  moves the cursor on, since no later call could propose it. An admission request no admin
+  answered within `admission_timeout_days` (`candidates.requested_at`) is `failed` with a note. Global search needs the
   `[research]` switch *and* a `global_search` grant; paying needs `paid_stars_max > 0`, a price
   within it and a `paid_search` grant, consumed before the request is sent. A run adds its
   sources in one `config.update` under `SyncLock` → `ConfigLock` with no Telegram request under
@@ -643,7 +691,10 @@ never change the git identity.
   for TL entities and dialogs. Two of those answers are signals the product reads, not
   conveniences: a list `ids` answers one slot per id and `None` where a message is gone, which is
   what `sync.prune_deleted` and `media.run` both key on, and the `downloads=` mapping keyed by
-  `(chat_id, msg_id)` is what a download writes (bytes, or an exception to raise).
+  `(chat_id, msg_id)` is what a download writes (bytes, or an exception to raise). Messages it
+  yields carry `msg.forward` bound to the origin entity this account sees (its access hash, and
+  the origin learned, as Telethon learns an answer's `chats`), and `iter_messages(filter=
+  InputMessagesFilterPinned)` answers only the `pinned` ones — any other filter is refused.
   **`FakeClient` refuses a peer it has not learned**, like the real one: `entities=` is the world
   and `resolved` is the session cache, which starts empty and is filled by `get_dialogs()`, by a
   successful `get_entity`, and by the `chats` / `users` of any raw answer — Telethon's
@@ -698,17 +749,19 @@ Snowball, FTS query), `index` (FTS and vec maintenance, KNN), `embed` and `reran
 fakes, bge models), `extract` (the extractor registry: PDF, DOCX, macOS Vision OCR), `media` (the
 bounded extraction pass), `tdesktop` (Telegram Desktop export parsing),
 `links` (deep links), `leads` (normalizing a Telegram link or mention to a target, and the
-text fallback for rows stored before links were captured), `filters` (chat specs, dates,
+text fallback for rows whose links were never read), `filters` (chat specs, dates,
 `account:` scopes, `resolve_chat` for the one-chat readers), `search` (retrieval, fusion,
 dedup, readers), `research_db` (`research.db`: schema and accessors), `research` (discovery,
 probing, global search, approval grammar and summaries, grants, runs, the JSON documents the
 CLI and the tools share), `cli` (typer app: `search` and the `thread` / `context` readers beside
-`sources`, `accounts`, `auth`, `sync`, `extract`, `embed`, `import`, `prune-deleted`, `leave`,
+`sources`, `accounts`, `auth`, `sync`, `extract`, `embed`, `import`, `prune-deleted`,
+`recapture-links`, `leave`,
 `research`, `config`), `mcp` (FastMCP server with eighteen tools: the readers, `sync`, the
 source tools, a read-only `accounts` and nine `research_*`). The CLI and the MCP server offer
 the same readers, and `--json` prints the document the matching tool returns. Some commands are
 **CLI-only by design** and have no MCP tool: `sources prune` and `prune-deleted` delete indexed
-history, `extract` is a long flood-exposed network pass, `import` reads a directory the server
+history, `extract` and `recapture-links` are long flood-exposed network passes, `import` reads a
+directory the server
 cannot see, `auth` and `accounts rm` sign accounts in and out, `leave` is the one command that
 changes an account on Telegram, and `research unexclude` lifts the user's own decision.
 
