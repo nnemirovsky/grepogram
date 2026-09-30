@@ -1,18 +1,19 @@
 """Command-line interface: ``grepogram <command>``.
 
 Commands print plain text to stdout and diagnostics to stderr; logging goes to stderr and the log
-file. ``config`` and ``sources`` are sub-apps; ``search --json`` prints the
-:class:`~grepogram.models.SearchResult` and nothing else on stdout. ``search`` fuses lexical and
-dense retrieval by default (``--mode``) and reranks unless ``--no-rerank``; when the dense index
-or a model is unavailable it falls back to lexical and prints a warning on stderr. ``sync`` embeds
-new units when the embedding model loads and only warns when it does not; ``embed`` insists on
-the model.
+file. ``config``, ``sources``, ``accounts`` and ``research`` are sub-apps; ``search --json``
+prints the :class:`~grepogram.models.SearchResult` and nothing else on stdout. ``search`` fuses
+lexical and dense retrieval by default (``--mode``) and reranks unless ``--no-rerank``; when the
+dense index or a model is unavailable it falls back to lexical and prints a warning on stderr.
+``sync`` embeds new units when the embedding model loads and only warns when it does not;
+``embed`` insists on the model.
 
 Every command that talks to Telegram does it as an account: ``auth``, ``dialogs``, ``sources
-add`` and ``leave`` take ``--account`` (``default`` when omitted, the account a config without
-``[[accounts]]`` has always had), while ``sync``, ``extract``, ``prune-deleted``,
-``recapture-links`` and ``sources prune`` use every signed-in account at once. ``accounts rm``
-and ``leave`` change things a config edit cannot undo, so they ask on the controlling terminal
+add``, ``leave`` and ``research start`` take ``--account`` (``default`` when omitted, the account
+a config without ``[[accounts]]`` has always had), while ``sync``, ``extract``,
+``prune-deleted``, ``recapture-links`` and ``sources prune`` use every signed-in account at
+once; the offline ``import --account`` names the account an export was made from. ``accounts
+rm`` and ``leave`` change things a config edit cannot undo, so they ask on the controlling terminal
 (:func:`_terminal`) and refuse without one; the human confirms by typing back a random code the
 question shows (:func:`_ask`), and no option answers for them.
 ``research`` drives :mod:`grepogram.research` over ``research.db`` and refuses every command while
@@ -1161,9 +1162,10 @@ def sources_rm(
         ),
     ],
 ) -> None:
-    """Remove a source and delete its chats' messages and index data (offline; refuses while a
+    """Remove a source and delete the messages and index data of the chats no other source
+    covers; a chat another source still covers is kept and reported (offline; refuses while a
     sync is running, and refuses a chat indexed through a folder or as a channel's discussion
-    group)."""
+    group). Never leaves a chat on Telegram."""
     paths, _, conn = _load()
     try:
         # the config is read and saved under the same lock as the delete, so a sync that starts
@@ -2022,7 +2024,9 @@ def config_path() -> None:
     rows = (
         ("config", paths.config_file),
         ("session", paths.session_file),
+        ("sessions", paths.sessions_dir),
         ("index", paths.db_file),
+        ("research", paths.research_db_file),
         ("lock", paths.lock_file),
         ("log", paths.log_file),
     )

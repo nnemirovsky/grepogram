@@ -133,12 +133,14 @@ def test_config_path_respects_grepogram_home(tmp_home: Path) -> None:
     result = runner.invoke(cli.app, ["config", "path"])
     assert result.exit_code == 0, result.output
     lines = result.output.splitlines()
-    assert len(lines) == 5
+    assert len(lines) == 7
     listed = {line.split(maxsplit=1)[0]: Path(line.split(maxsplit=1)[1]) for line in lines}
     assert listed == {
         "config": tmp_home / "config.toml",
         "session": tmp_home / "session.session",
+        "sessions": tmp_home / "sessions",
         "index": tmp_home / "index.db",
+        "research": tmp_home / "research.db",
         "lock": tmp_home / "sync.lock",
         "log": tmp_home / "logs" / "grepogram.log",
     }
