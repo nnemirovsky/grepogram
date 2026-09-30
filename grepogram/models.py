@@ -883,9 +883,10 @@ class ProbeReport:
     """One bounded probing pass (:func:`grepogram.research.probe_candidates`).
 
     ``probed``, ``unavailable`` and ``unresolvable`` split the candidates asked about by
-    :data:`ProbeResult`; ``children`` are the candidates shared folders led to; ``remaining``
-    how many unprobed candidates wait for the next call; ``flood_wait_s`` is set when Telegram
-    asked to wait and probing stopped there.
+    :data:`ProbeResult`; ``children`` are the candidates shared folders led to, and ``people``,
+    ``excluded``, ``in_session`` and ``over_cap`` count the chats those folders listed that did
+    not become one; ``remaining`` how many unprobed candidates wait for the next call;
+    ``flood_wait_s`` is set when Telegram asked to wait and probing stopped there.
     """
 
     session_id: int
@@ -893,6 +894,10 @@ class ProbeReport:
     unavailable: list[int] = field(default_factory=list)
     unresolvable: list[int] = field(default_factory=list)
     children: list[int] = field(default_factory=list)
+    people: int = 0
+    excluded: int = 0
+    in_session: int = 0
+    over_cap: int = 0
     remaining: int = 0
     flood_wait_s: int | None = None
     warnings: list[str] = field(default_factory=list)

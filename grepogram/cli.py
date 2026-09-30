@@ -1669,6 +1669,13 @@ def _print_discover(report: DiscoverReport) -> None:
             f"{len(probe.unresolvable)} unresolvable, {len(probe.children)} found in shared "
             f"folders; {probe.remaining} left to probe"
         )
+        folder_left_out = probe.people + probe.excluded + probe.in_session + probe.over_cap
+        if folder_left_out:
+            typer.echo(
+                f"left out of shared folders: {probe.people} people, {probe.excluded} excluded, "
+                f"{probe.in_session} the session already reads, {probe.over_cap} over the "
+                "candidate cap"
+            )
         for warning in probe.warnings:
             typer.echo(f"warning: {warning}", err=True)
     typer.echo(f"next: grepogram research candidates {report.session_id}")

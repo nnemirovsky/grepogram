@@ -384,7 +384,9 @@ def migrate(conn: sqlite3.Connection) -> int:
 # --- helpers ---------------------------------------------------------------------------------
 
 
-def _now(now: int | None) -> int:
+def clock(now: int | None = None) -> int:
+    """``now``, or the current unix time when it is ``None``: the one clock ``research.db`` and
+    :mod:`grepogram.research` write by, so a test passes the time it wants."""
     return int(time.time()) if now is None else now
 
 
@@ -448,7 +450,7 @@ def create_session(
         row = conn.execute(
             "INSERT INTO sessions(question, account, limits, created_at) "
             "VALUES (?, ?, ?, ?) RETURNING *",
-            (question.strip(), account, json.dumps(dataclasses.asdict(limits)), _now(now)),
+            (question.strip(), account, json.dumps(dataclasses.asdict(limits)), clock(now)),
         ).fetchone()
         conn.executemany(
             "INSERT INTO session_seeds(session_id, position, scope, peer_id) VALUES (?, ?, ?, ?)",
@@ -495,7 +497,7 @@ def stop_session(conn: sqlite3.Connection, session_id: int, now: int | None = No
     Returns how many grants were voided. Stopping twice keeps the first ``stopped_at``. Nothing
     else changes: candidates keep their status and every source a run added stays configured.
     """
-    stamp = _now(now)
+    stamp = clock(now)
     with db.transaction(conn):
         if get_session(conn, session_id) is None:
             raise KeyError(f"no research session {session_id}")
@@ -610,7 +612,7 @@ def add_candidate(
                 invite_hash,
                 addlist_slug,
                 parent_id,
-                _now(now),
+                clock(now),
             ),
         ).fetchone()
     return _candidate(row)
@@ -857,7 +859,7 @@ def add_evidence(
             """INSERT INTO evidence(candidate_id, via, scope, peer_id, msg_id, origin_key,
                    snippet, found_at)
                VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT DO NOTHING""",
-            (candidate_id, via, scope, peer, msg_id, origin_key, snippet, _now(now)),
+            (candidate_id, via, scope, peer, msg_id, origin_key, snippet, clock(now)),
         )
     return cursor.rowcount > 0
 
@@ -930,8 +932,9 @@ def add_grant(
     one cannot be written, here or by the ``CHECK`` behind it. ``summary`` is the text the human
     saw. ``candidate_id`` names the candidate the actions apply to (:data:`CandidateAction`
     only); ``None`` makes a session-wide grant (:data:`SessionAction` only). The session must be
-    active and the candidate one of its own. Whether the actions suit the candidate's state is
-    the caller's to decide; this checks only that they are real actions of the right kind.
+    active, ``account`` its own, and the candidate one of its own. Whether the actions suit the
+    candidate's state is the caller's to decide; this checks only that they are real actions of
+    the right kind.
     """
     _check(via, _CHANNELS, "grant channel")
     if not summary.strip():
@@ -951,6 +954,11 @@ def add_grant(
             raise KeyError(f"no research session {session_id}")
         if session.state != "active":
             raise ValueError(f"research session {session_id} is stopped and takes no grants")
+        if account != session.account:
+            raise ValueError(
+                f"research session {session_id} acts as {session.account}; a grant for "
+                f"{account} would authorize nothing it does"
+            )
         if candidate_id is not None:
             candidate = get_candidate(conn, candidate_id)
             if candidate is None or candidate.session_id != session_id:
@@ -959,7 +967,7 @@ def add_grant(
             """INSERT INTO grants(session_id, candidate_id, account, actions, via, summary,
                    granted_at)
                VALUES (?, ?, ?, ?, ?, ?, ?) RETURNING *""",
-            (session_id, candidate_id, account, json.dumps(wanted), via, summary, _now(now)),
+            (session_id, candidate_id, account, json.dumps(wanted), via, summary, clock(now)),
         ).fetchone()
     return _grant(row)
 
@@ -996,7 +1004,7 @@ def consume_grant(conn: sqlite3.Connection, grant_id: int, now: int | None = Non
         cursor = conn.execute(
             "UPDATE grants SET consumed_at = ? "
             "WHERE id = ? AND consumed_at IS NULL AND voided_at IS NULL",
-            (_now(now), grant_id),
+            (clock(now), grant_id),
         )
     return cursor.rowcount > 0
 
@@ -1010,7 +1018,7 @@ def void_grants(
 ) -> int:
     """Void the live grants of a session — all of them, or those of ``candidate_ids`` — and
     return how many."""
-    stamp = _now(now)
+    stamp = clock(now)
     with db.transaction(conn):
         if candidate_ids is None:
             cursor = conn.execute(
@@ -1158,7 +1166,7 @@ def add_exclusion(
     """
     if not identity:
         raise ValueError("an exclusion needs an identity")
-    stamp = _now(now)
+    stamp = clock(now)
     with db.transaction(conn):
         conn.execute(
             "INSERT INTO exclusions(identity, reason, created_at) VALUES (?, ?, ?) "
@@ -1223,7 +1231,7 @@ def record_search(
         row = conn.execute(
             "INSERT INTO searches(session_id, kind, query, ran_at, results, note) "
             "VALUES (?, ?, ?, ?, ?, ?) RETURNING *",
-            (session_id, kind, query, _now(now), results, note),
+            (session_id, kind, query, clock(now), results, note),
         ).fetchone()
     return _search(row)
 
@@ -1296,7 +1304,7 @@ def set_scan_cursor(
                    index_id = excluded.index_id,
                    scanned_at = excluded.scanned_at
                RETURNING *""",
-            (session_id, chat.scope, chat.peer_id, depth, index_id, lead_seq, _now(now)),
+            (session_id, chat.scope, chat.peer_id, depth, index_id, lead_seq, clock(now)),
         ).fetchone()
     return _scan(row)
 
@@ -1306,7 +1314,7 @@ def mark_pins_read(
 ) -> ScanCursor:
     """Record that ``chat``'s pinned posts were read for the session (at ``depth``, when the
     session did not read the chat yet); its cursor is left where it is."""
-    stamp = _now(now)
+    stamp = clock(now)
     with db.transaction(conn):
         row = conn.execute(
             """INSERT INTO chat_scans(session_id, scope, peer_id, depth, pins_read_at, scanned_at)
@@ -1324,7 +1332,7 @@ def mark_directory(
     conn: sqlite3.Connection, session_id: int, chat: ChatKey, *, depth: int, now: int | None = None
 ) -> ScanCursor:
     """Record that ``chat`` is a directory — its messages name many chats — for the session."""
-    stamp = _now(now)
+    stamp = clock(now)
     with db.transaction(conn):
         row = conn.execute(
             """INSERT INTO chat_scans(session_id, scope, peer_id, depth, directory, scanned_at)

@@ -123,13 +123,12 @@ import functools
 import json
 import logging
 import sqlite3
-import time
 import unicodedata
 from collections import Counter
 from collections.abc import Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta
-from typing import Any, NoReturn, get_args
+from typing import Any, Literal, NoReturn, get_args
 
 from telethon import errors, utils
 from telethon.tl import functions, types
@@ -188,14 +187,6 @@ SNIPPET_CHARS = 240
 """The most of a message's text one piece of evidence keeps."""
 _MIN_TERM = 3
 """Question tokens shorter than this ("a", "in", "из") say nothing about relevance."""
-
-_VIA_OF_LINK: dict[LinkKind, EvidenceVia] = {
-    "link": "link",
-    "text_url": "text_url",
-    "mention": "mention",
-    "button": "button",
-    "webpage": "webpage",
-}
 
 
 class ResearchError(Exception):
@@ -366,23 +357,31 @@ def chat_of(conn: sqlite3.Connection, key: ChatKey) -> ChatRow | None:
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class Lead:
-    """One path from a stored message to a chat: the candidate ``identity`` it names (chat-level,
-    a :mod:`grepogram.leads` target), how (``via``), where (``found_in`` — the chat as Telegram
+    """One path from a stored message to a chat: the chat it names (``chat``, whose target is
+    the candidate :attr:`identity`), how (``via``), where (``found_in`` — the chat as Telegram
     names it — ``row_id``, its index row now, and Telegram ``msg_id``), the ``origin_key``
     corroboration counts, and a snippet of the text."""
 
-    identity: str
-    kind: CandidateKind
     target: LeadTarget
     """What the message named exactly, a post included."""
     chat: LeadTarget
-    """The chat ``target`` is in: ``target`` itself unless it names a post."""
+    """The chat ``target`` is in (:func:`chat_level`): ``target`` itself unless it names a
+    post."""
     via: EvidenceVia
     found_in: ChatKey
     row_id: int
     msg_id: int
     origin_key: str
     snippet: str | None = None
+
+    @property
+    def identity(self) -> str:
+        """The candidate identity the lead names: its chat's target."""
+        return self.chat.target
+
+    @property
+    def kind(self) -> CandidateKind:
+        return candidate_kind(self.chat)
 
 
 @dataclass(slots=True, kw_only=True)
@@ -399,26 +398,26 @@ class LeadScan:
     """Leads naming a person (a user id) rather than a chat, left out."""
 
 
-def chat_level(target: LeadTarget) -> tuple[CandidateKind, str, LeadTarget] | None:
-    """The chat a lead names, as ``(kind, identity, chat target)``; ``None`` for a person.
+def chat_level(target: LeadTarget) -> LeadTarget | None:
+    """The chat a lead names — a username, a peer, an invite or a shared folder, whose target is
+    its candidate identity — or ``None`` for a person.
 
     A post leads to its chat; a peer named by a positive (user) id is a person, not a chat.
     """
-    if target.kind == "username":
-        return "username", target.target, target
+    if target.kind in ("username", "invite", "addlist"):
+        return target
     if target.kind == "post" and target.username is not None:
-        chat = leads.username(target.username)
-        return None if chat is None else ("username", chat.target, chat)
+        return leads.username(target.username)
     if target.kind in ("peer", "private_post") and target.peer_id is not None:
-        if target.peer_id > 0:
-            return None
-        chat = leads.peer(target.peer_id)
-        return None if chat is None else ("peer", chat.target, chat)
-    if target.kind == "invite":
-        return "invite", target.target, target
-    if target.kind == "addlist":
-        return "addlist", target.target, target
+        return None if target.peer_id > 0 else leads.peer(target.peer_id)
     return None
+
+
+def candidate_kind(chat: LeadTarget) -> CandidateKind:
+    """The candidate kind of a chat :func:`chat_level` answered with: its own lead kind."""
+    kind = chat.kind
+    assert kind in ("username", "peer", "invite", "addlist"), kind
+    return kind
 
 
 def origin_key(message: MessageRow, chat: ChatRow) -> str:
@@ -510,22 +509,19 @@ def message_leads(
     for link_kind, value in links or ():
         target = leads.normalize(value)
         if target is not None:
-            named.append((via or _VIA_OF_LINK[link_kind], target))
+            named.append((via or link_kind, target))
     if message.fwd_peer_id is not None:
         origin = leads.peer(message.fwd_peer_id)
         if origin is not None:
             named.append((via or "forward", origin))
     found: list[Lead] = []
     for path, target in named:
-        level = chat_level(target)
-        if level is None:
+        chat_target = chat_level(target)
+        if chat_target is None:
             scan.people += 1
             continue
-        kind, identity, chat_target = level
         found.append(
             Lead(
-                identity=identity,
-                kind=kind,
                 target=target,
                 chat=chat_target,
                 via=path,
@@ -550,24 +546,22 @@ def cached_in(conn: sqlite3.Connection, candidate: Candidate) -> tuple[list[int]
     a probe learns the chat behind it. A chat held only through a Telegram Desktop import is
     cached with no account.
     """
-    rows: dict[int, ChatRow] = {}
-    if candidate.peer_id is not None:
-        rows.update((chat.id, chat) for chat in db.chats_for_peer(conn, candidate.peer_id))
-    if candidate.username:
-        rows.update((chat.id, chat) for chat in db.chats_for_username(conn, candidate.username))
+    rows = held_rows(conn, candidate.peer_id, candidate.username)
     accounts: dict[str, None] = {}
-    for chat_id in sorted(rows):
+    for chat_id in rows:
         accounts.update(dict.fromkeys(db.chat_reach(conn, chat_id)))
-    return sorted(rows), list(accounts)
+    return rows, list(accounts)
 
 
-def _cached_ids(conn: sqlite3.Connection, chat: LeadTarget) -> set[int]:
+def held_rows(conn: sqlite3.Connection, peer_id: int | None, username: str | None) -> list[int]:
+    """The index rows holding the chat ``peer_id`` / ``username`` name, in id order — every
+    account's row of a private peer, and the row of whatever chat goes by that username."""
     found: set[int] = set()
-    if chat.peer_id is not None:
-        found.update(row.id for row in db.chats_for_peer(conn, chat.peer_id))
-    if chat.username:
-        found.update(row.id for row in db.chats_for_username(conn, chat.username))
-    return found
+    if peer_id is not None:
+        found.update(row.id for row in db.chats_for_peer(conn, peer_id))
+    if username:
+        found.update(row.id for row in db.chats_for_username(conn, username))
+    return sorted(found)
 
 
 # --- ranking ---------------------------------------------------------------------------------
@@ -635,9 +629,12 @@ pinned posts' leads; the flag is kept for the session once it is set."""
 class _Found:
     """Every lead to one identity in this call, and the shallowest depth any of them gives."""
 
-    first: Lead
     depth: int
     leads: list[Lead] = field(default_factory=list)
+
+    @property
+    def first(self) -> Lead:
+        return self.leads[0]
 
     def rank(self, terms: frozenset[str]) -> tuple[int, int, int]:
         return (
@@ -740,11 +737,11 @@ def _propose(
     proposal = _Proposal()
     found: dict[str, _Found] = {}
     for lead in found_leads:
-        if _cached_ids(conn, lead.chat) & targets.keys():
+        if targets.keys() & set(held_rows(conn, lead.chat.peer_id, lead.chat.username)):
             proposal.in_session += 1
             continue
         depth = targets[lead.row_id].depth + 1
-        entry = found.setdefault(lead.identity, _Found(first=lead, depth=depth))
+        entry = found.setdefault(lead.identity, _Found(depth=depth))
         entry.depth = min(entry.depth, depth)
         entry.leads.append(lead)
     terms = question_terms(session.question)
@@ -841,9 +838,9 @@ def _directories(
             named = set(extra.get(chat_id, ()))
             for value in db.chat_link_targets(conn, chat_id):
                 parsed = leads.normalize(value)
-                level = None if parsed is None else chat_level(parsed)
-                if level is not None:
-                    named.add(level[1])
+                chat = None if parsed is None else chat_level(parsed)
+                if chat is not None:
+                    named.add(chat.target)
             named -= _own(target.chat)
             if len(named) < DIRECTORY_MIN_CHATS:
                 continue
@@ -883,7 +880,7 @@ def discover_offline(
     """
     require_enabled(cfg)
     session = active_session(rdb, session_id)
-    stamp = int(time.time()) if now is None else now
+    stamp = research_db.clock(now)
     index = db.index_id(conn)
     targets = scan_targets(rdb, conn, session)
     scan = collect_leads(conn, {chat_id: target.after for chat_id, target in targets.items()})
@@ -976,7 +973,7 @@ async def read_pins(
     """
     require_enabled(cfg)
     session = active_session(rdb, session_id)
-    stamp = _stamp(now)
+    stamp = research_db.clock(now)
     report = PinReport(session_id=session.id)
     targets = scan_targets(rdb, conn, session)
     pending = [
@@ -1004,9 +1001,8 @@ async def read_pins(
             ]
         except errors.FloodError as exc:
             report.flood_wait_s = _flood_seconds(exc)
-            wait = f"{report.flood_wait_s}s" if report.flood_wait_s is not None else "a while"
             report.warnings.append(
-                f"Telegram asks to wait {wait} before reading more pinned posts; stopped"
+                sync.flood_warning(report.flood_wait_s, "reading more pinned posts", "stopped")
             )
             break
         except errors.UnauthorizedError as exc:
@@ -1078,10 +1074,6 @@ UNRESOLVABLE_NOTE = (
 )
 
 
-def _stamp(now: int | None) -> int:
-    return int(time.time()) if now is None else now
-
-
 def _flood_seconds(exc: errors.FloodError) -> int | None:
     seconds = getattr(exc, "seconds", None)
     return int(seconds) if isinstance(seconds, int) else None
@@ -1144,18 +1136,6 @@ def _stored_hash(conn: sqlite3.Connection, peer_id: int, account: str) -> int | 
         if stored is not None:
             return stored
     return None
-
-
-def _session_holds(
-    conn: sqlite3.Connection, reads: Iterable[int], peer_id: int | None, username: str | None
-) -> bool:
-    """Whether the chat named by ``peer_id`` / ``username`` is one the session already reads."""
-    rows: set[int] = set()
-    if peer_id is not None:
-        rows.update(chat.id for chat in db.chats_for_peer(conn, peer_id))
-    if username:
-        rows.update(chat.id for chat in db.chats_for_username(conn, username))
-    return bool(rows & set(reads))
 
 
 def _settle(
@@ -1232,7 +1212,7 @@ async def probe(
     session = research_db.get_session(rdb, candidate.session_id)
     if session is None:
         raise UnknownSession(candidate.session_id)
-    stamp = _stamp(now)
+    stamp = research_db.clock(now)
     try:
         if candidate.kind == "username":
             return await _probe_username(client, rdb, candidate, stamp)
@@ -1400,58 +1380,34 @@ async def _probe_addlist(
     targets = scan_targets(rdb, conn, session)
     allowance = room(rdb, session)
     children: list[int] = []
-    people = excluded = in_session = over_cap = 0
+    left_out: Counter[str] = Counter()
     with db.transaction(rdb):
         for peer in peers:
             marked = int(utils.get_peer_id(peer))
             entity = entities.get(marked)
             if entity is None:
                 continue
-            if isinstance(entity, types.User):
-                people += 1
-                continue
-            facts = entity_facts(entity)
-            if marked in joined:
-                facts["member"] = joined[marked]
-            if _session_holds(conn, targets, marked, facts.get("username")):
-                in_session += 1
-                continue
-            target = entity_target(entity)
-            if target is None:
-                continue
-            existing = research_db.candidate_for(
-                rdb, session.id, target.target, peer_id=marked, username=facts.get("username")
-            )
-            if existing is None and len(children) >= allowance:
-                over_cap += 1
-                continue
-            child = research_db.add_candidate(
+            recorded = _record_entity(
                 rdb,
-                session.id,
-                target.target,
-                "username" if target.kind == "username" else "peer",
-                candidate.depth,
-                peer_id=marked,
-                username=facts.get("username"),
+                conn,
+                session,
+                targets.keys(),
+                entity,
+                depth=candidate.depth,
                 parent_id=candidate.id,
-                now=stamp,
-            )
-            if child is None:
-                excluded += 1
-                continue
-            child = research_db.update_candidate(rdb, child.id, probed_at=stamp, **facts)
-            child = _reconcile(rdb, child)
-            research_db.add_evidence(
-                rdb,
-                child.id,
-                "shared_folder",
-                f"addlist:{slug}",
-                chat=None,
+                room_left=allowance - len(children),
+                facts={"member": joined[marked]} if marked in joined else {},
+                via="shared_folder",
+                origin_key=f"addlist:{slug}",
+                in_itself=False,
                 msg_id=None,
                 snippet=title,
-                now=stamp,
+                stamp=stamp,
             )
-            children.append(child.id)
+            if recorded.candidate is None:
+                left_out[recorded.outcome] += 1
+            else:
+                children.append(recorded.candidate.id)
         note = f"shared folder of {len(peers)} chat(s)"
         folder_facts: dict[str, Any] = {"member": member}
         if title:
@@ -1461,10 +1417,10 @@ async def _probe_addlist(
         candidate=stored,
         result="probed",
         children=tuple(children),
-        people=people,
-        excluded=excluded,
-        in_session=in_session,
-        over_cap=over_cap,
+        people=left_out["person"],
+        excluded=left_out["excluded"],
+        in_session=left_out["in_session"],
+        over_cap=left_out["over_cap"],
     )
 
 
@@ -1475,32 +1431,38 @@ async def probe_candidates(
     cfg: Config,
     session_id: int,
     *,
-    limit: int | None = None,
     now: int | None = None,
 ) -> ProbeReport:
-    """Probe the session's candidates no probe has answered yet, best ranked first, at most
-    ``limit`` (the session's ``probe_limit`` by default) of them.
+    """Probe the session's candidates no probe has answered yet, best ranked first, at most the
+    session's ``probe_limit`` of them.
 
     A flood wait stops the pass: the report carries a warning and ``flood_wait_s``, and the
     candidates not reached wait for the next call.
     """
     require_enabled(cfg)
-    session = active_session(rdb, session_id)
+    return await _probe_pass(client, rdb, conn, active_session(rdb, session_id), now)
+
+
+async def _probe_pass(
+    client: Any,
+    rdb: sqlite3.Connection,
+    conn: sqlite3.Connection,
+    session: ResearchSession,
+    now: int | None,
+) -> ProbeReport:
     report = ProbeReport(session_id=session.id)
     pending = [
         view.candidate
         for view in candidate_views(rdb, conn, session, _PROBED)
         if view.candidate.probed_at is None
     ]
-    allowance = session.limits.probe_limit if limit is None else limit
-    for candidate in pending[: max(allowance, 0)]:
+    for candidate in pending[: session.limits.probe_limit]:
         try:
             outcome = await probe(client, rdb, conn, candidate, now=now)
         except errors.FloodError as exc:
             report.flood_wait_s = _flood_seconds(exc)
-            wait = f"{report.flood_wait_s}s" if report.flood_wait_s is not None else "a while"
             report.warnings.append(
-                f"Telegram asks to wait {wait} before probing again; probing stopped"
+                sync.flood_warning(report.flood_wait_s, "probing again", "probing stopped")
             )
             break
         {
@@ -1509,6 +1471,10 @@ async def probe_candidates(
             "unresolvable": report.unresolvable,
         }[outcome.result].append(outcome.candidate.id)
         report.children.extend(outcome.children)
+        report.people += outcome.people
+        report.excluded += outcome.excluded
+        report.in_session += outcome.in_session
+        report.over_cap += outcome.over_cap
     report.remaining = sum(
         1 for c in research_db.list_candidates(rdb, session.id, _PROBED) if c.probed_at is None
     )
@@ -1573,7 +1539,7 @@ async def global_search(
     require_enabled(cfg)
     session = active_session(rdb, session_id)
     enabled = search_kinds(cfg)
-    wanted = list(dict.fromkeys(kinds)) if kinds is not None else enabled
+    wanted: list[SearchKind] = list(dict.fromkeys(kinds)) if kinds is not None else enabled
     off = [kind for kind in wanted if kind not in enabled]
     if not enabled or off:
         raise ResearchError(
@@ -1590,7 +1556,22 @@ async def global_search(
             "named",
             "start a session with this question to search for it",
         )
-    stamp = _stamp(now)
+    return await _search_telegram(client, rdb, conn, cfg, session, text, wanted, now)
+
+
+async def _search_telegram(
+    client: Any,
+    rdb: sqlite3.Connection,
+    conn: sqlite3.Connection,
+    cfg: Config,
+    session: ResearchSession,
+    text: str,
+    wanted: Sequence[SearchKind],
+    now: int | None,
+) -> list[GlobalSearchReport]:
+    """Run the searches ``wanted`` for ``text`` — whose switches, grant and query the caller
+    checked — one report each; a flood wait ends the rest."""
+    stamp = research_db.clock(now)
     reports: list[GlobalSearchReport] = []
     for kind in wanted:
         report = GlobalSearchReport(session_id=session.id, kind=kind, query=text)
@@ -1601,9 +1582,10 @@ async def global_search(
             else:
                 await _post_search(client, rdb, conn, cfg, session, report, stamp)
         except errors.FloodError as exc:
-            report.flood_wait_s = seconds = _flood_seconds(exc)
-            wait = f"{seconds}s" if seconds is not None else "a while"
-            report.warnings.append(f"{kind}: Telegram asks to wait {wait}; search stopped")
+            report.flood_wait_s = _flood_seconds(exc)
+            report.warnings.append(
+                f"{kind}: {sync.flood_warning(report.flood_wait_s, 'searching', 'search stopped')}"
+            )
             _record_search(rdb, report, stamp)
             break
         except errors.UnauthorizedError as exc:
@@ -1637,11 +1619,97 @@ def _search_limit(session: ResearchSession) -> int:
     return max(1, min(SEARCH_LIMIT, session.limits.max_candidates))
 
 
+EntityOutcome = Literal["person", "in_session", "unnamed", "over_cap", "excluded", "new", "known"]
+"""What :func:`_record_entity` did with one chat Telegram answered with: left it out — a person,
+a chat the session already reads, one nothing names, one over the candidate cap, an excluded
+one — or recorded it as a ``new`` candidate or evidence of a ``known`` one."""
+
+
+@dataclass(frozen=True, slots=True)
+class _Recorded:
+    outcome: EntityOutcome
+    candidate: Candidate | None = None
+    added: bool = False
+    """Whether the evidence was a path not recorded before."""
+
+
+def _record_entity(
+    rdb: sqlite3.Connection,
+    conn: sqlite3.Connection,
+    session: ResearchSession,
+    reads: Collection[int],
+    entity: Any,
+    *,
+    depth: int,
+    parent_id: int | None,
+    room_left: int,
+    facts: Mapping[str, Any],
+    via: EvidenceVia,
+    origin_key: str,
+    in_itself: bool,
+    msg_id: int | None,
+    snippet: str | None,
+    stamp: int,
+) -> _Recorded:
+    """Record one chat Telegram answered with — a chat of a shared folder, a global search's
+    result — as a candidate probed on the spot, with its evidence, inside the caller's
+    ``research.db`` transaction.
+
+    A person (a user or bot), a chat the session already reads (``reads``, index rows) and an
+    excluded chat are left out, and so is a new one once ``room_left`` is spent. What Telegram
+    said about the chat is stored as probed facts, ``facts`` on top (a folder knows whether the
+    account joined it); the candidate is named by its ``@username`` or else its marked id
+    (:func:`entity_target`), ``depth`` hops from the question and inside ``parent_id``. The
+    evidence was found ``in_itself`` — in the chat, for a search result — or nowhere indexed.
+    """
+    if isinstance(entity, types.User):
+        return _Recorded("person")
+    known = {**entity_facts(entity), **facts}
+    marked = known["peer_id"]
+    if set(reads) & set(held_rows(conn, marked, known.get("username"))):
+        return _Recorded("in_session")
+    target = entity_target(entity)
+    if target is None:
+        return _Recorded("unnamed")
+    existing = research_db.candidate_for(
+        rdb, session.id, target.target, peer_id=marked, username=known.get("username")
+    )
+    if existing is None and room_left <= 0:
+        return _Recorded("over_cap")
+    candidate = research_db.add_candidate(
+        rdb,
+        session.id,
+        target.target,
+        candidate_kind(target),
+        depth,
+        peer_id=marked,
+        username=known.get("username"),
+        parent_id=parent_id,
+        now=stamp,
+    )
+    if candidate is None:
+        return _Recorded("excluded")
+    candidate = _reconcile(
+        rdb, research_db.update_candidate(rdb, candidate.id, probed_at=stamp, **known)
+    )
+    added = research_db.add_evidence(
+        rdb,
+        candidate.id,
+        via,
+        origin_key,
+        chat=ChatKey(chat_scope(known["type"], session.account), marked) if in_itself else None,
+        msg_id=msg_id,
+        snippet=snippet,
+        now=stamp,
+    )
+    return _Recorded("new" if existing is None else "known", candidate, added)
+
+
 def _found_chat(
     rdb: sqlite3.Connection,
     conn: sqlite3.Connection,
     session: ResearchSession,
-    reads: Iterable[int],
+    reads: Collection[int],
     report: GlobalSearchReport,
     entity: Any,
     *,
@@ -1650,53 +1718,36 @@ def _found_chat(
     snippet_text: str | None,
     stamp: int,
 ) -> None:
-    """Record one chat a global search answered with as a candidate and its evidence."""
-    if isinstance(entity, types.User):
-        report.people += 1
-        return
-    facts = entity_facts(entity)
-    marked = facts["peer_id"]
-    if _session_holds(conn, reads, marked, facts.get("username")):
-        report.in_session += 1
-        return
-    target = entity_target(entity)
-    if target is None:
-        return
-    existing = research_db.candidate_for(
-        rdb, session.id, target.target, peer_id=marked, username=facts.get("username")
-    )
-    if existing is None and room(rdb, session) <= 0:
-        report.over_cap += 1
-        return
-    candidate = research_db.add_candidate(
+    """Record one chat a global search answered with (:func:`_record_entity`) in ``report``."""
+    recorded = _record_entity(
         rdb,
-        session.id,
-        target.target,
-        "username" if target.kind == "username" else "peer",
-        1,
-        peer_id=marked,
-        username=facts.get("username"),
-        now=stamp,
-    )
-    if candidate is None:
-        report.excluded += 1
-        return
-    candidate = _reconcile(
-        rdb, research_db.update_candidate(rdb, candidate.id, probed_at=stamp, **facts)
-    )
-    added = research_db.add_evidence(
-        rdb,
-        candidate.id,
-        report.kind,
-        origin_key,
-        chat=ChatKey(chat_scope(facts["type"], session.account), marked),
+        conn,
+        session,
+        reads,
+        entity,
+        depth=1,
+        parent_id=None,
+        room_left=room(rdb, session),
+        facts={},
+        via=report.kind,
+        origin_key=origin_key,
+        in_itself=True,
         msg_id=msg_id,
         snippet=snippet_text,
-        now=stamp,
+        stamp=stamp,
     )
-    if existing is None:
+    candidate = recorded.candidate
+    if recorded.outcome == "person":
+        report.people += 1
+    elif recorded.outcome == "in_session":
+        report.in_session += 1
+    elif recorded.outcome == "over_cap":
+        report.over_cap += 1
+    elif recorded.outcome == "excluded":
+        report.excluded += 1
+    elif candidate is not None and recorded.outcome == "new":
         report.new_candidates.append(candidate.id)
-    elif added and candidate.id not in report.updated_candidates:
+    elif candidate is not None and recorded.added and candidate.id not in report.updated_candidates:
         report.updated_candidates.append(candidate.id)
 
 
@@ -1725,7 +1776,7 @@ async def _chat_search(
                 rdb,
                 conn,
                 session,
-                reads,
+                reads.keys(),
                 report,
                 entity,
                 origin_key=f"chat_search:{marked}",
@@ -1796,7 +1847,7 @@ async def _post_search(
                 rdb,
                 conn,
                 session,
-                reads,
+                reads.keys(),
                 report,
                 entity,
                 origin_key=f"post:{marked}/{post.id}",
@@ -1872,13 +1923,9 @@ async def discover(
         question = " ".join(session.question.split())
         kinds = [kind for kind in search_kinds(cfg) if (kind, question) not in done]
         if kinds:
-            searches = await global_search(
-                client, rdb, conn, cfg, session.id, question, kinds=kinds, now=now
-            )
+            searches = await _search_telegram(client, rdb, conn, cfg, session, question, kinds, now)
     flooded = any(search.flood_wait_s is not None for search in searches)
-    probed = (
-        None if flooded else await probe_candidates(client, rdb, conn, cfg, session.id, now=now)
-    )
+    probed = None if flooded else await _probe_pass(client, rdb, conn, session, now)
     return dataclasses.replace(report, pins=pins, probe=probed, searches=tuple(searches))
 
 
@@ -1937,9 +1984,10 @@ def authorized(
     one check everything that acts on a candidate, or searches for a session, goes through.
 
     Only a grant naming ``target`` itself counts: approving a folder or a chat authorizes
-    nothing found inside it. The session must be active (stopping voids its grants), the grant
-    must be the session's own account's, and a candidate skipped since, or a chat an exclusion
-    covers under any of its spellings, is not authorized whatever its grants say.
+    nothing found inside it. The session must be active (stopping voids its grants) — every
+    grant of a session is given to its one account (:func:`grant`) — and a candidate skipped
+    since, or a chat an exclusion covers under any of its spellings, is not authorized whatever
+    its grants say.
     """
     if isinstance(target, Candidate):
         session = research_db.get_session(rdb, target.session_id)
@@ -1955,8 +2003,7 @@ def authorized(
     if session is None or session.state != "active":
         return False
     return any(
-        action in grant.actions and grant.account == session.account
-        for grant in research_db.live_grants(rdb, session.id, candidate_id)
+        action in grant.actions for grant in research_db.live_grants(rdb, session.id, candidate_id)
     )
 
 
@@ -1983,7 +2030,6 @@ def _live_actions(
     return {
         action
         for grant in research_db.live_grants(rdb, session.id, candidate_id)
-        if grant.account == session.account
         for action in grant.actions
     }
 
@@ -2358,7 +2404,7 @@ def grant(
     and one per session action; a ``proposed``, ``skipped`` or ``failed`` candidate becomes
     ``approved``. The validation and the writing are one ``research.db`` transaction.
     """
-    stamp = _stamp(now)
+    stamp = research_db.clock(now)
     granted: list[Grant] = []
     with db.transaction(rdb):
         # validated inside the writing transaction: a skip or an exclusion landing between the
@@ -2451,13 +2497,13 @@ def target_identities(
         target = leads.normalize(text)
         if target is None and text.lstrip("-").isdigit():
             target = leads.peer(int(text))
-        level = None if target is None else chat_level(target)
-        if level is None:
+        chat = None if target is None else chat_level(target)
+        if chat is None:
             raise ResearchError(
                 f"{ref!r} names no chat",
                 "give a candidate id, an @username, a t.me link or a marked chat id",
             )
-        identities.append(level[1])
+        identities.append(chat.target)
     return list(dict.fromkeys(identities))
 
 
@@ -2534,9 +2580,7 @@ def _is_member(candidate: Candidate) -> bool:
 
 
 def _flood_note(report: RunReport, exc: errors.FloodError, what: str) -> None:
-    seconds = _flood_seconds(exc)
-    wait = f"{seconds}s" if seconds is not None else "a while"
-    report.warnings.append(f"Telegram asks to wait {wait} before {what}; the run stopped there")
+    report.warnings.append(sync.flood_warning(_flood_seconds(exc), what, "the run stopped there"))
     report.stopped_by = "flood"
 
 
@@ -2747,14 +2791,13 @@ async def _join_one(
     report: RunReport,
     stamp: int,
 ) -> None:
-    """Take ``route`` — ``join`` or ``request``, both authorized just before — into one chat.
+    """Take ``route`` — ``join`` or ``request``, authorized by :func:`_way_in` just before — into
+    one chat.
 
     An invite goes through ``messages.importChatInvite``, anything else through
     ``channels.joinChannel``; for a chat whose admins approve joins either one sends the
     admission request, which is what a ``request`` grant approved.
     """
-    if not authorized(rdb, candidate, route):  # pragma: no cover - _way_in just asked
-        return
     account = session.account
     try:
         if candidate.kind == "invite" and candidate.invite_hash:
@@ -2854,8 +2897,6 @@ async def _join_folder(
         offered = {int(utils.get_peer_id(p)) for p in answer.peers}
     to_join: list[tuple[Candidate, Any]] = []
     for child in children:
-        if not authorized(rdb, child, "join"):  # pragma: no cover - _way_in just asked
-            continue
         entity = None if child.peer_id is None else entities.get(child.peer_id)
         if child.peer_id in already:
             _mark_joined(rdb, session, child, entity, report, "the account was already a member")
@@ -3180,27 +3221,22 @@ def _consume_done(
 def _record_progress(
     rdb: sqlite3.Connection, session: ResearchSession, report: RunReport, stamp: int
 ) -> None:
-    progress = dict(research_db.get_session(rdb, session.id).progress)  # type: ignore[union-attr]
-    runs = progress.get("runs", 0)
-    total = progress.get("messages", 0)
+    """Count the run on the session — ``runs``, ``messages`` — and keep what it did as
+    ``last_run``: the report without its session id and the pinned-post and discovery passes,
+    whose new candidates it keeps."""
+    stored = research_db.get_session(rdb, session.id)
+    progress: dict[str, Any] = dict((stored or session).progress)
+    last_run = {
+        name: value
+        for name, value in dataclasses.asdict(report).items()
+        if name not in ("session_id", "pins", "discovery")
+    }
+    last_run["new_candidates"] = [] if report.discovery is None else report.discovery.new_candidates
     progress.update(
-        runs=(runs if isinstance(runs, int) else 0) + 1,
-        messages=(total if isinstance(total, int) else 0) + report.messages,
+        runs=progress.get("runs", 0) + 1,
+        messages=progress.get("messages", 0) + report.messages,
         last_run_at=stamp,
-        last_run={
-            "admitted": report.admitted,
-            "joined": report.joined,
-            "pending_admission": report.pending_admission,
-            "sources_added": report.sources_added,
-            "fetched": report.fetched,
-            "partial": report.partial,
-            "unavailable": report.unavailable,
-            "failed": report.failed,
-            "messages": report.messages,
-            "new_candidates": [] if report.discovery is None else report.discovery.new_candidates,
-            "stopped_by": report.stopped_by,
-            "warnings": report.warnings,
-        },
+        last_run=last_run,
     )
     research_db.set_session_progress(rdb, session.id, progress)
 
@@ -3253,7 +3289,7 @@ async def run(
     limits = session.limits
     if budget is None:
         budget = sync.SyncBudget(limits.run_budget_s, messages=limits.max_messages_per_run)
-    stamp = _stamp(now)
+    stamp = research_db.clock(now)
     spent_before = budget.spent
     report = RunReport(session_id=session.id)
     flooded = await _recheck_admissions(client, rdb, conn, session, report, stamp)

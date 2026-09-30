@@ -708,6 +708,8 @@ async def test_a_shared_folder_s_chats_become_candidates_of_their_own(
     private = found[f"peer:{_marked(FOLDER_PRIVATE)}"]
     assert set(found) == {"addlist/Tbilisi1", "@folder_chan", f"peer:{_marked(FOLDER_PRIVATE)}"}
     assert sorted(report.children) == sorted([public.id, private.id])
+    # the folder's person, the seed it lists and the excluded chat are counted, not proposed
+    assert (report.people, report.in_session, report.excluded, report.over_cap) == (1, 1, 1, 0)
     for child in (public, private):
         assert child.parent_id == folder.id and child.depth == folder.depth
         assert child.status == "proposed" and child.probed_at == 4 and child.member is False
@@ -1535,22 +1537,26 @@ def test_a_stopped_session_has_no_live_grants(
         research.stop(rdb, CFG, 999)
 
 
-def test_a_grant_for_another_account_authorizes_nothing(
+def test_a_grant_for_another_account_is_never_written(
     rdb: sqlite3.Connection, conn: sqlite3.Connection
 ) -> None:
+    """A session acts as its one account, so a grant naming another could authorize nothing;
+    the store refuses it rather than every check filtering it out."""
     session = _start(rdb, conn)
     flats = _flats(rdb, session)
-    research_db.add_grant(
-        rdb,
-        session_id=session.id,
-        candidate_id=flats.id,
-        account="work",
-        actions=["join"],
-        via="cli",
-        summary="join as work",
-    )
+    with pytest.raises(ValueError, match="acts as default"):
+        research_db.add_grant(
+            rdb,
+            session_id=session.id,
+            candidate_id=flats.id,
+            account="work",
+            actions=["join"],
+            via="cli",
+            summary="join as work",
+        )
 
     assert not research.authorized(rdb, flats, "join")
+    assert research_db.list_grants(rdb, session.id) == []
 
 
 def test_skip_and_exclude_narrow_without_consent_and_void_grants(
