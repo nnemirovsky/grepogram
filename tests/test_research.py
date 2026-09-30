@@ -2339,6 +2339,140 @@ async def test_an_unmoved_public_chat_read_without_joining_is_added_by_its_usern
     assert source.chat == "@tb_flats" and _marked(FLATS) not in client.members
 
 
+def _moved_folder(client: FakeClient, world: FakeWorld) -> None:
+    """A shared folder listing the chat that took ``@tb_flats`` over."""
+    world.chatlists["Moved"] = FakeChatlist("Moved housing", [client.entities[_marked(IMPOSTOR)]])
+
+
+def _set_aside(rdb: sqlite3.Connection, flats: Candidate, status: str) -> None:
+    """``flats`` still names the chat it was probed as, and nothing is approved for it."""
+    stored = _status(rdb, flats)
+    assert stored.peer_id == _marked(FLATS)
+    assert stored.access_hash == FakeWorld.access_hash("default", _marked(FLATS))
+    assert stored.title == "Tbilisi flats"
+    assert stored.status == status and "now leads to a different chat" in (stored.note or "")
+    assert _live(rdb, flats) == []
+
+
+async def test_a_folder_listing_the_chat_a_username_moved_to_never_repoints_the_approval(
+    rdb: sqlite3.Connection, conn: sqlite3.Connection, paths: Paths
+) -> None:
+    world = _impostor_world()
+    client = _run_client(world)
+    session, found = await _discovered(rdb, conn, client, "@tb_flats")
+    flats = found["@tb_flats"]
+    _approve(rdb, conn, session, _item(flats, "join", "fetch", "add_source"))
+    _hand_over_username(client)
+    _moved_folder(client, world)
+    _store(conn, SEED, 2, "see t.me/addlist/Moved", links=(("link", "addlist/Moved"),))
+
+    await research.discover(rdb, conn, CFG, session.id, client, now=6)
+
+    _set_aside(rdb, flats, "failed")
+    other = research_db.candidate_by_identity(rdb, session.id, f"peer:{_marked(IMPOSTOR)}")
+    assert other is not None and other.id != flats.id
+    assert (other.status, other.username, other.peer_id) == (
+        "proposed",
+        "tb_flats",
+        _marked(IMPOSTOR),
+    )
+    assert _live(rdb, other) == []
+
+    report = await _run(rdb, conn, paths, client, session)
+
+    assert report.joined == report.fetched == report.sources_added == []
+    assert not [r for r in client.requests if isinstance(r, functions.channels.JoinChannelRequest)]
+    assert client.members.isdisjoint({_marked(FLATS), _marked(IMPOSTOR)})
+    assert config.load(paths).sources == [] and _read(client) == set()
+
+
+async def test_a_search_result_under_a_moved_username_never_repoints_the_approval(
+    rdb: sqlite3.Connection, conn: sqlite3.Connection, paths: Paths
+) -> None:
+    client = _run_client(_impostor_world())
+    _links(conn, "@tb_flats")
+    session = _asking(rdb, conn, "impostor")
+    await research.discover(rdb, conn, SEARCH_CFG, session.id, client, now=3)
+    flats = research_db.candidate_by_identity(rdb, session.id, "@tb_flats")
+    assert flats is not None and flats.peer_id == _marked(FLATS)
+    _approve(rdb, conn, session, _item(flats, "fetch", "add_source"))
+    _hand_over_username(client)
+    _grant(rdb, session, "global_search")
+
+    (report,) = await research.global_search(
+        client, rdb, conn, SEARCH_CFG, session.id, "impostor", kinds=["chat_search"], now=6
+    )
+
+    _set_aside(rdb, flats, "failed")
+    other = research_db.candidate_by_identity(rdb, session.id, f"peer:{_marked(IMPOSTOR)}")
+    assert other is not None and report.new_candidates == [other.id]
+    run = await _run(rdb, conn, paths, client, session)
+    assert run.fetched == run.sources_added == [] and config.load(paths).sources == []
+    assert _read(client) == set()
+
+
+async def test_an_undecided_candidate_whose_name_moved_is_unavailable_not_repointed(
+    rdb: sqlite3.Connection, conn: sqlite3.Connection
+) -> None:
+    world = _impostor_world()
+    client = _run_client(world)
+    session, found = await _discovered(rdb, conn, client, "@tb_flats")
+    _hand_over_username(client)
+    _moved_folder(client, world)
+    _store(conn, SEED, 2, "see t.me/addlist/Moved", links=(("link", "addlist/Moved"),))
+
+    await research.discover(rdb, conn, CFG, session.id, client, now=6)
+
+    flats = found["@tb_flats"]
+    _set_aside(rdb, flats, "unavailable")
+    views = research.candidate_views(rdb, conn, session)
+    assert sorted(v.candidate.peer_id or 0 for v in views if v.candidate.kind != "addlist") == (
+        sorted([_marked(FLATS), _marked(IMPOSTOR)])
+    ), "two chats stay two candidates, never merged through the shared name"
+
+
+async def test_an_admission_recheck_never_takes_the_chat_a_username_moved_to(
+    rdb: sqlite3.Connection, conn: sqlite3.Connection, paths: Paths
+) -> None:
+    world = _impostor_world()
+    gated = copy.copy(world.entities[_marked(FLATS)])
+    gated.join_request = True
+    world.entities[_marked(FLATS)] = gated
+    client = _run_client(world)
+    session, found = await _discovered(rdb, conn, client, "@tb_flats")
+    flats = found["@tb_flats"]
+    assert flats.request_needed is True
+    _approve(rdb, conn, session, _item(flats, "request", "fetch", "add_source"))
+    first = await _run(rdb, conn, paths, client, session)
+    assert first.pending_admission == [flats.id]
+    _hand_over_username(client)
+    client.members.add(_marked(IMPOSTOR))  # the account happens to be in the other chat
+
+    second = await _run(rdb, conn, paths, client, session)
+
+    assert second.admitted == [] and second.failed == [flats.id]
+    _set_aside(rdb, flats, "failed")
+    assert second.fetched == second.sources_added == [] and config.load(paths).sources == []
+    assert _read(client) == set()
+
+
+def test_a_candidate_s_peer_id_is_never_rewritten(
+    rdb: sqlite3.Connection, conn: sqlite3.Connection
+) -> None:
+    session = _start(rdb, conn)
+    first = research_db.add_candidate(rdb, session.id, "@name", "username", 1, peer_id=-1001)
+    assert first is not None
+    with pytest.raises(ValueError, match="cannot become"):
+        research_db.update_candidate(rdb, first.id, peer_id=-1002)
+    assert research_db.update_candidate(rdb, first.id, peer_id=-1001).peer_id == -1001
+    other = research_db.add_candidate(
+        rdb, session.id, "@name", "username", 1, peer_id=-1002, username="name"
+    )
+    assert other is not None and other.identity == "peer:-1002" and other.kind == "peer"
+    assert research_db.candidate_for(rdb, session.id, "@name", peer_id=-1002) == other
+    assert research_db.same_chat_candidates(rdb, other) == []
+
+
 async def test_an_invite_that_now_leads_elsewhere_is_not_taken_for_the_approved_chat(
     rdb: sqlite3.Connection, conn: sqlite3.Connection, paths: Paths
 ) -> None:

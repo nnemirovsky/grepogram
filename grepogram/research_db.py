@@ -549,13 +549,22 @@ def add_candidate(
     An identity already present keeps its row, status included; it takes the smaller depth and
     fills fields it did not know yet. So does a chat the session already holds under another
     spelling — ``@name``, ``peer:<id>`` and an invite are one chat once a probe tied them
-    together, and ``peer_id`` / ``username`` name that chat here (:func:`candidate_for`). An
+    together, and ``peer_id`` / ``username`` name that chat here (:func:`candidate_for`). A
+    candidate's peer id is fixed once known: an identity whose row a probe tied to *another*
+    peer (a username that moved since) cannot name ``peer_id``'s chat, which is recorded as
+    ``peer:<peer_id>`` instead. An
     excluded chat, under any spelling it is known by (:func:`excluded_by`), gets no row at all
     and answers ``None`` — exclusions are global, so no session proposes one again.
     """
     if depth < 0:
         raise ValueError(f"a candidate's depth cannot be negative: {depth}")
     with db.transaction(conn):
+        spelled = candidate_by_identity(conn, session_id, identity)
+        if spelled is not None and _other_peer(spelled, peer_id):
+            # the spelling already names another chat (a username that moved): this one is
+            # recorded under its marked id, never folded into the row a human may have decided on
+            assert peer_id is not None
+            identity, kind = f"peer:{peer_id}", "peer"
         if excluded_by(conn, identity, peer_id=peer_id, username=username) is not None:
             return None
         known = candidate_for(
@@ -641,11 +650,14 @@ def candidate_for(
     invite_hash: str | None = None,
 ) -> Candidate | None:
     """The session's candidate for the chat ``identity`` names: the row of that identity, else
-    the oldest one a probe tied to the same ``peer_id``, ``username`` or ``invite_hash``."""
+    the oldest one a probe tied to the same ``peer_id``, ``username`` or ``invite_hash``.
+
+    A row tied to a peer other than ``peer_id`` is another chat, whatever name it shares: a
+    username or an invite matches only a row whose peer id is unknown or ``peer_id`` itself."""
     found = candidate_by_identity(conn, session_id, identity)
-    if found is not None:
+    if found is not None and not _other_peer(found, peer_id):
         return found
-    clauses, params = _same_chat(peer_id, username, invite_hash)
+    clauses, params = _same_chat(peer_id, username, invite_hash, strict=True)
     if not clauses:
         return None
     row = conn.execute(
@@ -656,34 +668,64 @@ def candidate_for(
     return None if row is None else _candidate(row)
 
 
+def _other_peer(candidate: Candidate, peer_id: int | None) -> bool:
+    """Whether ``candidate`` is tied to a known peer other than ``peer_id``."""
+    return peer_id is not None and candidate.peer_id is not None and candidate.peer_id != peer_id
+
+
 def _same_chat(
-    peer_id: int | None, username: str | None, invite_hash: str | None = None
+    peer_id: int | None,
+    username: str | None,
+    invite_hash: str | None = None,
+    *,
+    strict: bool = False,
 ) -> tuple[list[str], list[Any]]:
     """The ``candidates`` conditions naming the chat ``peer_id`` / ``username`` / an invite
-    identify."""
+    identify.
+
+    ``strict`` matches a username or an invite only on rows tied to no peer or to ``peer_id``:
+    what finds or merges *the* candidate of a chat must never take a row of another chat that
+    once went by the same name. An exclusion asks without it, since covering too much is the
+    safe side there."""
     clauses: list[str] = []
     params: list[Any] = []
+    guard = " AND (peer_id IS NULL OR peer_id = ?)" if strict and peer_id is not None else ""
     if peer_id is not None:
         clauses.append("peer_id = ?")
         params.append(peer_id)
     if username:
-        clauses.append("username = ?")
-        params.append(username.lower())
+        clauses.append(f"(username = ?{guard})")
+        params.extend([username.lower(), *([peer_id] if guard else [])])
     if invite_hash:
-        clauses.append("invite_hash = ?")
-        params.append(invite_hash)
+        clauses.append(f"(invite_hash = ?{guard})")
+        params.extend([invite_hash, *([peer_id] if guard else [])])
     return clauses, params
 
 
 def same_chat_candidates(conn: sqlite3.Connection, candidate: Candidate) -> list[Candidate]:
     """The other candidates of ``candidate``'s session a probe has tied to the same chat."""
-    clauses, params = _same_chat(candidate.peer_id, candidate.username)
+    clauses, params = _same_chat(candidate.peer_id, candidate.username, strict=True)
     if not clauses:
         return []
     rows = conn.execute(
         f"SELECT * FROM candidates WHERE session_id = ? AND id <> ? AND ({' OR '.join(clauses)}) "
         "ORDER BY id",
         (candidate.session_id, candidate.id, *params),
+    ).fetchall()
+    return [_candidate(row) for row in rows]
+
+
+def renamed_away(
+    conn: sqlite3.Connection, session_id: int, identity: str, username: str | None, peer_id: int
+) -> list[Candidate]:
+    """The candidates of the session that a probe tied to a peer other than ``peer_id`` but that
+    go by the name Telegram now gives ``peer_id``'s chat — ``identity`` or ``@username``: the
+    name moved away from the chat they were probed as."""
+    names = [identity, *([f"@{username.lower()}"] if username else [])]
+    rows = conn.execute(
+        "SELECT * FROM candidates WHERE session_id = ? AND peer_id IS NOT NULL AND peer_id <> ? "
+        f"AND (identity IN ({_placeholders(len(names))}) OR username = ?) ORDER BY id",
+        (session_id, peer_id, *names, (username or "").lower() or None),
     ).fetchall()
     return [_candidate(row) for row in rows]
 
@@ -779,11 +821,21 @@ def update_candidate(conn: sqlite3.Connection, candidate_id: int, **fields: Any)
     """Set the named fields of one candidate and return it as stored.
 
     Only what a probe or a run learns may change (:data:`_CANDIDATE_FIELDS`); a candidate's
-    identity, session, kind, depth and parent are what it *is*.
+    identity, session, kind, depth and parent are what it *is*, and so is its peer id once
+    known — setting another one raises :class:`ValueError`.
     """
     unknown = set(fields) - _CANDIDATE_FIELDS
     if unknown:
         raise ValueError(f"cannot set candidate field(s): {', '.join(sorted(unknown))}")
+    if fields.get("peer_id") is not None:
+        current = get_candidate(conn, candidate_id)
+        if current is not None and _other_peer(current, fields["peer_id"]):
+            # a candidate's Telegram identity is fixed once a probe learned it: an answer naming
+            # another peer is another chat, and a human may have approved this one
+            raise ValueError(
+                f"candidate {candidate_id} is peer {current.peer_id}; it cannot become "
+                f"peer {fields['peer_id']}"
+            )
     if not fields:
         found = get_candidate(conn, candidate_id)
         if found is None:

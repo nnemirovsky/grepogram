@@ -544,7 +544,9 @@ grepogram research stop 1            # explores no further; the sources it added
   It adds each as a source of the session's account, with history back to the session's horizon
   (`since_days` before the session started) and comments for a channel. It joins and adds the
   very chat the probe saw: a joined chat's source names it by its id, and a chat whose username
-  has since moved to another chat is refused rather than followed. It fetches exactly those
+  has since moved to another chat is refused rather than followed — when a later discover,
+  search or admission check sees that name on another chat, the approved candidate is set aside
+  (`failed`, its approval voided) and the other chat is proposed on its own. It fetches exactly those
   chats through an ordinary sync, bounded by `run_budget_s` and `max_messages_per_run`. If
   another sync holds the lock, the run adds no sources and fetches nothing — joins it already
   made stay made — and the report says so (`stopped_by: sync_busy`); the next run takes it

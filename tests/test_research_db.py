@@ -197,9 +197,14 @@ def test_a_candidate_is_unique_per_session_by_identity(rdb: sqlite3.Connection) 
     assert again.id == first.id
     assert again.depth == 1 and again.username == "chan" and again.peer_id == -1001
     assert again.created_at == 1 and again.status == "proposed"
-    deeper = research_db.add_candidate(rdb, sid, "@chan", "username", 3, peer_id=-1002)
+    deeper = research_db.add_candidate(rdb, sid, "@chan", "username", 3, peer_id=-1001)
     assert deeper is not None and deeper.depth == 1 and deeper.peer_id == -1001
     assert [c.id for c in research_db.list_candidates(rdb, sid)] == [first.id]
+    # another peer under the same name is another chat: its own row, never folded into this one
+    moved = research_db.add_candidate(rdb, sid, "@chan", "username", 3, peer_id=-1002)
+    assert moved is not None and moved.id != first.id
+    assert (moved.identity, moved.kind, moved.peer_id) == ("peer:-1002", "peer", -1002)
+    assert research_db.get_candidate(rdb, first.id) == deeper
     with pytest.raises(sqlite3.IntegrityError):
         rdb.execute(
             "INSERT INTO candidates(session_id, identity, kind, depth, created_at) "

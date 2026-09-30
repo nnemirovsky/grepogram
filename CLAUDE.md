@@ -678,7 +678,14 @@ never change the git identity.
   identity, peer id, username or invite hash, `add_candidate` returns that row rather than a
   second one, and a probe that ties two rows to one chat folds the undecided one into the other
   (`research._reconcile` → `research_db.merge_candidate`, never a row with a grant or a decided
-  status). An exclusion names one spelling and covers every other (`research_db.excluded_by`,
+  status). **A candidate's peer id is fixed once a probe learned it**: `update_candidate` raises
+  on another one, `candidate_for` / `same_chat_candidates` match a username or invite only on a
+  row with no peer or the same peer (`_same_chat(strict=True)`), and `add_candidate` records a
+  chat whose name another row's peer holds as `peer:<id>`. A name that now leads elsewhere — a
+  probe, an admission recheck, a shared folder's child or a search result carrying it — sets the
+  old candidate aside (`research._name_moved`: grants voided, `proposed` → `unavailable`,
+  `approved` / `joined` / `pending_admission` → `failed`), so a later find can never repoint
+  an approval at a chat no human saw. An exclusion names one spelling and covers every other (`research_db.excluded_by`,
   `_covered`): it moves undecided candidates to `excluded` and voids the live grants of every
   candidate of the chat, joined or waiting ones included, and `research.authorized` refuses an
   excluded chat whatever its grants say; `skip` takes joined and waiting candidates too.

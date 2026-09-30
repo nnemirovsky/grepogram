@@ -1230,6 +1230,44 @@ async def probe(
         return ProbeOutcome(candidate=refused, result="unavailable")
 
 
+_NAME_MOVED_TO: dict[CandidateStatus, CandidateStatus] = {
+    "proposed": "unavailable",
+    "approved": "failed",
+    "joined": "failed",
+    "pending_admission": "failed",
+}
+"""What a candidate becomes once the name it was found by names another chat: an undecided one
+is ``unavailable`` under that name, one a run was about to act on ``failed``; the others keep
+their status and take the note."""
+
+
+def _name_moved(
+    rdb: sqlite3.Connection, candidate: Candidate, entity: Any, stamp: int
+) -> Candidate:
+    """Record that the name ``candidate`` was found by now leads to ``entity``, a chat other
+    than the one it was probed as, inside the caller's transaction or its own.
+
+    Its peer id is never rewritten — the chat a human saw and approved is the probed one — and
+    nothing is done for it any more: its grants are voided and a run it was waiting on skips it.
+    A new approval, once someone has looked again, is what brings a ``failed`` one back."""
+    facts = entity_facts(entity)
+    where = f" {_quoted(facts['title'])}" if facts.get("title") else ""
+    name = f"@{candidate.username}" if candidate.username else candidate.identity
+    note = (
+        f"{shown(name)} now leads to a different chat{where} (id {facts.get('peer_id')}) than "
+        f"the one probed (id {candidate.peer_id}); nothing is done for it — look again and "
+        "approve anew if it is still wanted"
+    )
+    fields: dict[str, Any] = {"note": note}
+    if candidate.status in _NAME_MOVED_TO:
+        fields["status"] = _NAME_MOVED_TO[candidate.status]
+    with db.transaction(rdb):
+        moved = research_db.update_candidate(rdb, candidate.id, **fields)
+        research_db.void_grants(rdb, candidate.session_id, candidate_ids=[candidate.id], now=stamp)
+    log.info("research candidate %d: its name now leads to another chat", candidate.id)
+    return moved
+
+
 def _entity_outcome(
     rdb: sqlite3.Connection,
     candidate: Candidate,
@@ -1240,6 +1278,10 @@ def _entity_outcome(
     note: str | None = None,
 ) -> ProbeOutcome:
     facts = entity_facts(entity)
+    if candidate.peer_id is not None and facts["peer_id"] != candidate.peer_id:
+        # the username or invite leads elsewhere now: that chat is not this candidate's
+        moved = _name_moved(rdb, candidate, entity, stamp)
+        return ProbeOutcome(candidate=moved, result="unavailable")
     if member is not None:
         facts["member"] = member
     if candidate.kind == "invite":
@@ -1661,6 +1703,11 @@ def _record_entity(
     account joined it); the candidate is named by its ``@username`` or else its marked id
     (:func:`entity_target`), ``depth`` hops from the question and inside ``parent_id``. The
     evidence was found ``in_itself`` — in the chat, for a search result — or nowhere indexed.
+
+    A candidate probed as another peer that goes by this chat's name is a name that moved: it
+    is set aside (:func:`_name_moved`) and this chat becomes a candidate of its own, under its
+    marked id when the name is taken (:func:`grepogram.research_db.add_candidate`) — never
+    written over the row a human may have approved.
     """
     if isinstance(entity, types.User):
         return _Recorded("person")
@@ -1671,6 +1718,11 @@ def _record_entity(
     target = entity_target(entity)
     if target is None:
         return _Recorded("unnamed")
+    for moved in research_db.renamed_away(
+        rdb, session.id, target.target, known.get("username"), marked
+    ):
+        # the chat Telegram answered with goes by a name another candidate was probed under
+        _name_moved(rdb, moved, entity, stamp)
     existing = research_db.candidate_for(
         rdb, session.id, target.target, peer_id=marked, username=known.get("username")
     )
@@ -2692,6 +2744,10 @@ async def _recheck_admissions(
             _flood_note(report, exc, "checking admission requests")
             return True
         current = outcome.candidate
+        if current.status != "pending_admission":
+            # the name it was requested by leads elsewhere now (_name_moved): set aside
+            report.failed.append(current.id)
+            continue
         if current.member:
             research_db.update_candidate(
                 rdb, current.id, status="joined", note="admitted by the chat's admins"
