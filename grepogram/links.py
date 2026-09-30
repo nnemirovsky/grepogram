@@ -43,18 +43,24 @@ def message_url(chat: ChatRow, msg_id: int, topic_id: int | None = None) -> Link
     ``topic_id`` is inserted only for forum supergroups, where it is a topic root: outside a
     forum the same column may still carry a legacy thread id, which no link form uses. A
     comment's channel post id lives in ``comment_of_msg_id`` and never reaches here.
+
+    Every form is built from ``chat.peer_id``, Telegram's own id, never from ``chat.id``: the
+    two are equal for every channel and supergroup, but a private chat or legacy group another
+    account's row already held the peer id of is stored under a synthetic id no Telegram client
+    knows (:data:`grepogram.db.SYNTHETIC_BASE`).
     """
     if chat.type in ("channel", "supergroup"):
         topic = topic_id if chat.is_forum and topic_id is not None else None
         if chat.username:
             base = f"https://t.me/{chat.username}"
         else:
-            base = f"https://t.me/c/{strip_channel_prefix(chat.id)}"
+            base = f"https://t.me/c/{strip_channel_prefix(chat.peer_id)}"
         return Link(f"{base}/{msg_id}" if topic is None else f"{base}/{topic}/{msg_id}")
     if chat.type in ("user", "bot"):
         return Link(
-            f"tg://openmessage?user_id={chat.id}&message_id={msg_id}", f"tg://user?id={chat.id}"
+            f"tg://openmessage?user_id={chat.peer_id}&message_id={msg_id}",
+            f"tg://user?id={chat.peer_id}",
         )
     if chat.type == "group":
-        return Link(f"tg://openmessage?chat_id={abs(chat.id)}&message_id={msg_id}")
+        return Link(f"tg://openmessage?chat_id={abs(chat.peer_id)}&message_id={msg_id}")
     raise ValueError(f"unknown chat type: {chat.type!r}")

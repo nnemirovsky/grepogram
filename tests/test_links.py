@@ -211,6 +211,18 @@ def test_message_url_web_links_have_no_fallback_and_a_dm_link_does() -> None:
     assert links.message_url(_chat(GROUP, "group"), MSG) == Link(GROUP_URL)
 
 
+def test_message_url_addresses_a_synthetic_row_by_its_peer_id() -> None:
+    """A second account's private chat or legacy group is stored under a synthetic id when the
+    first account's row holds the peer id; no Telegram client knows that id, so the link names
+    the peer."""
+    synthetic = 1 << 62
+    for type_ in ("user", "bot"):
+        chat = ChatRow(id=synthetic, peer_id=USER, type=type_, title="t", scope="work")
+        assert links.message_url(chat, MSG) == Link(USER_URL, USER_FALLBACK)
+    group = ChatRow(id=synthetic + 1, peer_id=GROUP, type="group", title="t", scope="work")
+    assert links.message_url(group, MSG) == Link(GROUP_URL)
+
+
 def test_message_url_private_supergroup_with_bad_id_raises() -> None:
     chat = ChatRow(id=-1234, type="supergroup", title="t")
     with pytest.raises(ValueError, match="-1234"):
