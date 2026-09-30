@@ -1519,14 +1519,13 @@ async def _leave(
     when the answer was no. A folder, a private chat and a bot are refused: there is nothing
     to leave.
 
-    The session is first put to :func:`grepogram.sync.check_account`, before anything is
+    The session is first put to :func:`grepogram.sync.signed_in_user`, before anything is
     resolved or asked: a session swapped into place by hand is another Telegram user, and
     leaving is the one outward action a new invite may be needed to undo, so such a session
     raises :class:`~grepogram.tg.OtherUser` with nothing sent. The question names the Telegram
     user the session is, not only the account name."""
     async with tg.connected(client, account):
-        await sync.check_account(conn, account, client)
-        me = await client.get_me()
+        me = await sync.signed_in_user(conn, account, client)
         if me is None:
             raise tg.AuthRequired(account=account)
         who = f"{utils.get_display_name(me) or 'user'} (user {me.id})"
