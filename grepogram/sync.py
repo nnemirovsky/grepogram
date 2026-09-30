@@ -33,13 +33,13 @@ indexing and the flag are one transaction, so the flag never clears over derived
 there; the worker thread they run on is joined even when the surrounding tool call is cancelled
 (:func:`_joined_to_thread`), so the :class:`SyncLock` outlives every write it covers.
 
-:func:`map_message` reads raw TL attributes only — ``msg.message``, ``msg.media``,
-``msg.reply_to``, ``msg.fwd_from``, ``msg.reactions``, ``msg.from_id``, ``msg.post``, ``msg.date``,
-``msg.edit_date`` — and never the client-bound helpers (``msg.text``, ``msg.file``, ``msg.sender``,
-``msg.chat``), so a message built without a client (the test fixtures) maps exactly like one
-Telethon yields from ``iter_messages``. Display names come from a ``names`` map built with
-:func:`collect_users` out of the users and chats Telegram returns alongside messages
-(:func:`peers_of`); the same rows feed the ``users`` upsert.
+:func:`map_message` reads raw TL attributes only — ``msg.message``, ``msg.entities``,
+``msg.media``, ``msg.reply_markup``, ``msg.reply_to``, ``msg.fwd_from``, ``msg.reactions``,
+``msg.from_id``, ``msg.post``, ``msg.date``, ``msg.edit_date`` — and never the client-bound
+helpers (``msg.text``, ``msg.file``, ``msg.sender``, ``msg.chat``), so a message built without a
+client (the test fixtures) maps exactly like one Telethon yields from ``iter_messages``. Display
+names come from a ``names`` map built with :func:`collect_users` out of the users and chats
+Telegram returns alongside messages (:func:`peers_of`); the same rows feed the ``users`` upsert.
 """
 
 import asyncio
@@ -56,10 +56,10 @@ from collections.abc import Awaitable, Callable, Collection, Iterable, Mapping, 
 from dataclasses import dataclass, field
 from typing import Any, NoReturn
 
-from telethon import errors, utils
+from telethon import errors, helpers, utils
 from telethon.tl import functions, types
 
-from grepogram import db, dialogs, index, tg, units
+from grepogram import db, dialogs, index, leads, tg, units
 from grepogram.config import ConfigError
 from grepogram.dialogs import entity_username
 from grepogram.embed import Embedder
@@ -68,6 +68,7 @@ from grepogram.models import (
     AccountRow,
     ChatRow,
     Config,
+    LinkKind,
     MediaKind,
     MessageRow,
     PruneReport,
@@ -200,6 +201,10 @@ def map_message(
     id Telegram knows, which a scoped row stored under a synthetic id does not share. Text is the
     message text or caption; a poll, venue or contact — media that carries its content outside
     the text — contributes its own text when the message has none.
+
+    A forward's origin is kept structured as well as named (:func:`forward_origin`), and every
+    Telegram destination the message names — in its text, its hyperlinks, its buttons, its link
+    preview — becomes a ``links`` pair (:func:`links_of`).
     """
     if isinstance(msg, types.MessageService) or not isinstance(msg, types.Message):
         return None
@@ -211,6 +216,7 @@ def map_message(
         from_name = chat.title
     reply_to_msg_id, topic_id = reply_of(msg.reply_to, chat.peer_id)
     media_kind, media_filename = media_of(msg.media)
+    fwd_peer_id, fwd_msg_id, fwd_date = forward_origin(msg.fwd_from)
     return MessageRow(
         chat_id=chat.id,
         msg_id=int(msg.id),
@@ -221,10 +227,14 @@ def map_message(
         reply_to_msg_id=reply_to_msg_id,
         topic_id=topic_id,
         fwd_from=forward_of(msg.fwd_from, names),
+        fwd_peer_id=fwd_peer_id,
+        fwd_msg_id=fwd_msg_id,
+        fwd_date=fwd_date,
         text=msg.message or media_text(msg.media),
         media_kind=media_kind,
         media_filename=media_filename,
         reactions_total=reactions_total(msg.reactions),
+        links=links_of(msg),
     )
 
 
@@ -340,6 +350,66 @@ def forward_of(fwd: Any, names: Mapping[int, str]) -> str | None:
         marked = int(utils.get_peer_id(fwd.from_id))
         return names.get(marked) or fwd.from_name or fwd.post_author or unknown_name(marked)
     return fwd.from_name or fwd.post_author or UNKNOWN_SENDER
+
+
+def forward_origin(fwd: Any) -> tuple[int | None, int | None, int | None]:
+    """``(fwd_peer_id, fwd_msg_id, fwd_date)``: where a forwarded message came from.
+
+    The address of the original message when Telegram gives one — a channel post
+    (``from_id`` + ``channel_post``), else the chat and message it was saved from
+    (``saved_from_peer`` + ``saved_from_msg_id``) — so forwards of one post share one origin
+    wherever they land; else the author alone (``from_id``, no message), and nothing at all for
+    an account that hides itself behind ``from_name``. ``fwd_date`` is when the original was
+    sent. Ids are marked peer ids; nothing here asks whether this account can reach them.
+    """
+    if fwd is None:
+        return None, None, None
+    date = epoch(fwd.date) if fwd.date is not None else None
+    if fwd.from_id is not None and fwd.channel_post is not None:
+        return int(utils.get_peer_id(fwd.from_id)), int(fwd.channel_post), date
+    if fwd.saved_from_peer is not None and fwd.saved_from_msg_id is not None:
+        return int(utils.get_peer_id(fwd.saved_from_peer)), int(fwd.saved_from_msg_id), date
+    if fwd.from_id is not None:
+        return int(utils.get_peer_id(fwd.from_id)), None, date
+    return None, None, date
+
+
+def links_of(msg: Any) -> tuple[tuple[LinkKind, str], ...]:
+    """Every Telegram destination ``msg`` names, as sorted, distinct ``(kind, target)`` pairs.
+
+    Read from the raw attributes only: ``msg.entities`` (a visible URL → ``link``, a hidden
+    ``text_url`` hyperlink, an ``@mention`` or a mention by user id → ``mention``),
+    ``msg.reply_markup`` (URL buttons) and ``msg.media`` (the link preview's URL → ``webpage``).
+    Targets are normalized by :func:`grepogram.leads.normalize`, and a URL that names no
+    Telegram destination is dropped. Entity offsets count UTF-16 code units, hence the
+    surrogate round trip before slicing the text.
+    """
+    found: set[tuple[LinkKind, str]] = set()
+
+    def add(kind: LinkKind, value: Any) -> None:
+        if isinstance(value, str) and (lead := leads.normalize(value)) is not None:
+            found.add((kind, lead.target))
+
+    entities = list(msg.entities or ())
+    wide = helpers.add_surrogate(msg.message or "") if entities else ""
+    for entity in entities:
+        span = helpers.del_surrogate(wide[entity.offset : entity.offset + entity.length])
+        if isinstance(entity, types.MessageEntityUrl):
+            add("link", span)
+        elif isinstance(entity, types.MessageEntityTextUrl):
+            add("text_url", entity.url)
+        elif isinstance(entity, types.MessageEntityMention):
+            add("mention", span)
+        elif isinstance(entity, types.MessageEntityMentionName):
+            add("mention", f"peer:{int(entity.user_id)}")
+    markup = msg.reply_markup
+    if isinstance(markup, types.ReplyInlineMarkup):
+        for row in markup.rows:
+            for button in row.buttons:
+                add("button", getattr(button, "url", None))
+    if isinstance(msg.media, types.MessageMediaWebPage):
+        add("webpage", getattr(msg.media.webpage, "url", None))
+    return tuple(sorted(found))
 
 
 def reactions_total(reactions: Any) -> int:
@@ -927,7 +997,7 @@ async def _refetch_edits(run: _Run, cfg: Config) -> list[int]:
             replies[row.msg_id] = replies_count(msg)
     if not seen:
         return []
-    stored = {row.msg_id: row for row in db.get_messages(run.conn, chat.id, since_msg_id=min(seen))}
+    stored = _with_links(run.conn, db.get_messages(run.conn, chat.id, since_msg_id=min(seen)))
     changed = [row for row in fresh if row.msg_id in stored and _differs(stored[row.msg_id], row)]
     if changed:
         log.debug(
@@ -1004,6 +1074,17 @@ def _apply_drop(run: _Run, cfg: Config, gone: Sequence[MessageRow], msg_ids: Seq
         index.index_units(run.conn, units.invalidate_units_for(run.conn, run.chat, cfg, gone))
 
 
+def _with_links(conn: sqlite3.Connection, rows: Iterable[MessageRow]) -> dict[int, MessageRow]:
+    """``rows`` by ``msg_id``, each carrying its stored links — a row read back from the index
+    carries ``None`` there (not read), which :func:`_differs` would take for a change."""
+    by_msg_id = {row.msg_id: row for row in rows}
+    links = db.message_links(conn, [row.id for row in by_msg_id.values() if row.id is not None])
+    return {
+        msg_id: dataclasses.replace(row, links=links.get(row.id, ()) if row.id is not None else ())
+        for msg_id, row in by_msg_id.items()
+    }
+
+
 def _differs(stored: MessageRow, fresh: MessageRow) -> bool:
     """Whether storing ``fresh`` would change ``stored``.
 
@@ -1022,10 +1103,19 @@ def _differs(stored: MessageRow, fresh: MessageRow) -> bool:
     ``media_filename`` — the two columns that say so — are compared here in full, so a replaced
     attachment reaches ``store`` as an edit and is cleared there while a caption edit is not and
     keeps its text.
+
+    The forward origin and the ``links`` are compared in full (``stored`` carries its links,
+    :func:`_with_links`), so **changed links alone re-store a row**: a bot that swaps its URL
+    buttons with ``edit_hide`` set moves no ``edit_date``, and the upsert replaces the stored
+    links with exactly what the re-stored row carries — never with less than a comparison saw.
+    The first sync after schema step 8 therefore re-stores, once, the rows of each chat's
+    ``edit_refetch`` window that name a Telegram destination or were forwarded, which is how
+    those rows gain what step 8 captures; rows outside the window keep none, and discovery reads
+    their text instead (:func:`grepogram.db.links_captured_from`).
     """
     kept = {
         field: getattr(stored, field) if getattr(fresh, field) is None else getattr(fresh, field)
-        for field in ("topic_id", "comment_of_chat_id", "comment_of_msg_id")
+        for field in ("topic_id", "comment_of_chat_id", "comment_of_msg_id", "links")
     }
     return _comparable(dataclasses.replace(stored, id=None)) != _comparable(
         dataclasses.replace(fresh, **kept)

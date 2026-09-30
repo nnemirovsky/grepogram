@@ -27,6 +27,9 @@ MediaKind = Literal[
     "webpage",
     "other",
 ]
+LinkKind = Literal["link", "text_url", "mention", "button", "webpage"]
+"""How a message names a Telegram destination (``message_links.kind``): a visible URL, a hidden
+``text_url`` hyperlink, an ``@mention`` (or a mention by id), a URL button, a link preview."""
 
 
 DEFAULT_ACCOUNT = "default"
@@ -271,6 +274,14 @@ class MessageRow:
     (:data:`grepogram.db.MEDIA_PENDING` and the states beside it). Both are written by that pass
     alone: :func:`grepogram.db.upsert_messages` never touches them, so a re-store of a message
     Telegram re-read does not throw away what was extracted from its media.
+
+    ``fwd_peer_id`` / ``fwd_msg_id`` / ``fwd_date`` are a forward's structured origin — the peer
+    and message it was forwarded from and when that was sent (:func:`grepogram.sync.forward_origin`)
+    — beside ``fwd_from``, the name shown for it. ``links`` is every Telegram destination the
+    message names as ``(kind, target)`` pairs, sorted, targets normalized by
+    :func:`grepogram.leads.normalize`; ``None`` means *not read*, not *none*: a row read back from
+    the index does not carry them (:func:`grepogram.db.message_links` does), and
+    :func:`grepogram.db.upsert_messages` replaces a message's stored links only with a tuple.
     """
 
     id: int | None = None
@@ -285,12 +296,16 @@ class MessageRow:
     comment_of_chat_id: int | None = None
     comment_of_msg_id: int | None = None
     fwd_from: str | None = None
+    fwd_peer_id: int | None = None
+    fwd_msg_id: int | None = None
+    fwd_date: int | None = None
     text: str = ""
     media_kind: MediaKind | None = None
     media_filename: str | None = None
     reactions_total: int = 0
     extracted_text: str | None = None
     media_state: int = 0
+    links: tuple[tuple[LinkKind, str], ...] | None = None
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)

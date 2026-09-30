@@ -613,19 +613,32 @@ voided_at)`, `exclusions(identity PRIMARY KEY, reason, created_at)`,
 
 **Files:**
 - Create: `grepogram/leads.py`, `tests/test_leads.py`
-- Modify: `grepogram/db.py`, `grepogram/models.py`, `grepogram/sync.py`, `tests/fixtures/tl.py`, `tests/test_sync_map.py`, `tests/test_db.py`
+- Modify: `grepogram/db.py`, `grepogram/models.py`, `grepogram/sync.py`, `tests/fixtures/tl.py`, `tests/test_sync_map.py`, `tests/test_db.py`, `tests/test_sync.py`
 
-- [ ] `leads.py` (pure): `normalize(url_or_mention) -> LeadTarget | None` for `t.me` /
+- [x] `leads.py` (pure): `normalize(url_or_mention) -> LeadTarget | None` for `t.me` /
   `telegram.me` / `tg://resolve` / `tg://join` / `tg://addlist` forms, usernames, `c/<id>/<post>`,
   invites, `addlist`, and `text_leads(text)` regex fallback
-- [ ] `_V8` + `MIGRATIONS[8]`; `MessageRow.fwd_peer_id/fwd_msg_id/fwd_date`,
+  ➕ also `telegram.dog`, `<name>.t.me`, `t.me/s/…`, forum `…/<topic>/<post>`,
+  `tg://privatepost`, `tg://user`; `normalize` reads its own targets back; `text_leads` returns
+  `(kind, target)` pairs shaped like `MessageRow.links` (`link` / `mention`)
+- [x] `_V8` + `MIGRATIONS[8]`; `MessageRow.fwd_peer_id/fwd_msg_id/fwd_date`,
   `MessageRow.links: tuple[tuple[str, str], ...]`; `upsert_messages` writes/replaces links
-- [ ] `map_message` reads `msg.entities` (`MessageEntityUrl`, `TextUrl`, `Mention`,
+  ➕ `links` is `tuple[tuple[LinkKind, str], ...] | None`: `None` = not read (rows read back from
+  the index, imports) and leaves stored links alone, a tuple (even empty) replaces them;
+  `models.LinkKind = link | text_url | mention | button | webpage`; `db.message_links(ids)`;
+  step 8 also records `meta['links_captured_from']` (first row id with captured links,
+  `db.links_captured_from`) so task 13 knows which rows need the `text_leads` fallback
+- [x] `map_message` reads `msg.entities` (`MessageEntityUrl`, `TextUrl`, `Mention`,
   `MentionName`), `msg.reply_markup` URL buttons, `msg.media.webpage.url`, and `msg.fwd_from`
   (`from_id`, `channel_post`, `date`, `saved_from_peer` / `saved_from_msg_id`)
-- [ ] extend `tests/fixtures/tl.py` with a hyperlink, a mention, a URL button and a channel-post
+  ➕ `sync.forward_origin`: channel post address first, then saved-from chat + message, else the
+  author alone, nothing for a hidden account; `sync.links_of` slices entity text in UTF-16 units.
+  `_differs` compares the fwd columns and `links` in full (stored rows get their links through
+  `sync._with_links`), so changed links alone re-store a row and the first sync after step 8
+  re-stores the linked / forwarded rows of each `edit_refetch` window once
+- [x] extend `tests/fixtures/tl.py` with a hyperlink, a mention, a URL button and a channel-post
   forward; tests for mapping, normalization table, upsert replacement, v7 → v8 migration
-- [ ] run checks — must pass before task 12
+- [x] run checks — must pass before task 12
 
 ### Task 12: `[research]` config and `research.db`
 

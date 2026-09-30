@@ -533,6 +533,87 @@ async def test_edit_refetch_keeps_extracted_media_text_across_syncs(
     assert after.media_state == db.MEDIA_EXTRACTED
 
 
+def _stored_links(conn: sqlite3.Connection, msg_id: int) -> tuple[tuple[str, str], ...]:
+    row = db.get_message(conn, ARG_ID, msg_id)
+    assert row is not None and row.id is not None
+    return db.message_links(conn, [row.id]).get(row.id, ())
+
+
+def _linked_history() -> list[types.Message]:
+    return [
+        tl.button_message(ARG_ID, 1, "join us", {"Join": "https://t.me/+Invite_1"}, sender=1),
+        tl.hyperlink_message(
+            ARG_ID, 2, "the folder", anchor="folder", url="https://t.me/addlist/Slug", sender=1
+        ),
+        tl.channel_forward(ARG_ID, 3, "repost", channel=NEWS, post=7, sender=1),
+    ]
+
+
+async def test_sync_stores_links_and_forward_origins(conn: sqlite3.Connection) -> None:
+    client = _client(messages={ARG_ID: _linked_history()})
+    chat = db.upsert_chat(conn, ChatRow(id=ARG_ID, type="supergroup"))
+    await sync.sync_chat(client, conn, chat, ARG_SOURCE, SyncBudget(), cfg=_cfg(edit_refetch=3))
+    assert _stored_links(conn, 1) == (("button", "+Invite_1"),)
+    assert _stored_links(conn, 2) == (("text_url", "addlist/Slug"),)
+    assert _stored_links(conn, 3) == ()
+    forwarded = db.get_message(conn, ARG_ID, 3)
+    assert forwarded is not None
+    assert (forwarded.fwd_peer_id, forwarded.fwd_msg_id) == (NEWS_ID, 7)
+
+
+async def test_edit_refetch_leaves_unchanged_links_alone_and_restores_changed_ones(
+    conn: sqlite3.Connection,
+) -> None:
+    """Links a stored row already carries are not an edit; a bot swapping its buttons with no
+    ``edit_date`` is one, and the stored links become exactly the new ones."""
+    client = _client(messages={ARG_ID: _linked_history()})
+    chat = db.upsert_chat(conn, ChatRow(id=ARG_ID, type="supergroup"))
+    cfg = _cfg(edit_refetch=3)
+    first = await sync.sync_chat(client, conn, chat, ARG_SOURCE, SyncBudget(), cfg=cfg)
+    again = await sync.sync_chat(client, conn, first.chat, ARG_SOURCE, SyncBudget(), cfg=cfg)
+    assert again.new_msg_ids == []
+
+    client.messages[ARG_ID][0] = tl.button_message(
+        ARG_ID, 1, "join us", {"Join": "https://t.me/+Invite_2"}, sender=1
+    )
+    swapped = await sync.sync_chat(client, conn, again.chat, ARG_SOURCE, SyncBudget(), cfg=cfg)
+    row = db.get_message(conn, ARG_ID, 1)
+    assert row is not None
+    assert swapped.new_msg_ids == [row.id]
+    assert _stored_links(conn, 1) == (("button", "+Invite_2"),)
+
+
+async def test_edit_refetch_gives_rows_stored_before_step_8_their_links_once(
+    conn: sqlite3.Connection,
+) -> None:
+    """A row stored before links were captured has none; the ``edit_refetch`` window re-stores it
+    once with what it names, and the next sync finds nothing to do."""
+    client = _client(messages={ARG_ID: _linked_history()})
+    chat = db.upsert_chat(conn, ChatRow(id=ARG_ID, type="supergroup"))
+    cfg = _cfg(edit_refetch=3)
+    first = await sync.sync_chat(client, conn, chat, ARG_SOURCE, SyncBudget(), cfg=cfg)
+    conn.execute("DELETE FROM message_links")
+    conn.execute("UPDATE messages SET fwd_peer_id = NULL, fwd_msg_id = NULL, fwd_date = NULL")
+
+    upgraded = await sync.sync_chat(client, conn, first.chat, ARG_SOURCE, SyncBudget(), cfg=cfg)
+    assert len(upgraded.new_msg_ids) == 3
+    assert _stored_links(conn, 1) == (("button", "+Invite_1"),)
+    assert _stored_links(conn, 2) == (("text_url", "addlist/Slug"),)
+    forwarded = db.get_message(conn, ARG_ID, 3)
+    assert forwarded is not None and forwarded.fwd_msg_id == 7
+
+    settled = await sync.sync_chat(client, conn, upgraded.chat, ARG_SOURCE, SyncBudget(), cfg=cfg)
+    assert settled.new_msg_ids == []
+
+
+def test_differs_compares_links_only_when_the_fresh_row_carries_them() -> None:
+    stored = MessageRow(id=7, chat_id=ARG_ID, msg_id=2, date=100, links=(("link", "@news"),))
+    assert not sync._differs(stored, dataclasses.replace(stored, id=None))
+    assert not sync._differs(stored, dataclasses.replace(stored, id=None, links=None))
+    assert sync._differs(stored, dataclasses.replace(stored, links=()))
+    assert sync._differs(stored, dataclasses.replace(stored, fwd_msg_id=5))
+
+
 def _reacted_history() -> list[types.Message]:
     """Three messages numbered from 101, so the chat's rowids and its Telegram ids differ.
 

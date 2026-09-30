@@ -24,6 +24,7 @@ TABLES = {
     "accounts",
     "chat_access",
     "chat_sources",
+    "message_links",
 }
 INDEXES = {
     "messages_chat_date",
@@ -34,6 +35,8 @@ INDEXES = {
     "messages_comments",
     "messages_media_pending",
     "chats_scope_peer",
+    "messages_fwd_origin",
+    "message_links_target",
 }
 
 
@@ -174,12 +177,14 @@ def test_connection_usable_from_second_thread(conn: sqlite3.Connection) -> None:
 def test_fresh_migrate_creates_schema() -> None:
     connection = db.connect(":memory:")
     assert db.schema_version(connection) == 0
-    assert db.migrate(connection) == db.SCHEMA_VERSION == 7
+    assert db.migrate(connection) == db.SCHEMA_VERSION == 8
     assert TABLES <= _names(connection, "table")
     assert INDEXES <= _names(connection, "index")
-    assert db.schema_version(connection) == 7
-    assert db.get_meta(connection, "schema_version") == "7"
+    assert db.schema_version(connection) == 8
+    assert db.get_meta(connection, "schema_version") == "8"
     assert {"peer_id", "scope"} <= _columns(connection, "chats")
+    assert {"fwd_peer_id", "fwd_msg_id", "fwd_date"} <= _columns(connection, "messages")
+    assert db.links_captured_from(connection) == 1
     assert not db.has_vec_table(connection)
     assert not connection.in_transaction
     messages_sql = connection.execute(
@@ -256,6 +261,10 @@ def test_fresh_migrate_adds_the_v6_columns_exactly_once() -> None:
     connection.close()
 
 
+_V8_COLUMNS = frozenset({"fwd_peer_id", "fwd_msg_id", "fwd_date"})
+"""The columns step 8 adds to ``messages``, left out of a dump compared across it."""
+
+
 def _identity_dump(conn: sqlite3.Connection) -> dict[str, list[tuple[object, ...]]]:
     """Every row step 7 must leave as it found it: chats by their pre-v7 columns, messages,
     units and the virtual tables by every column they have."""
@@ -269,7 +278,13 @@ def _identity_dump(conn: sqlite3.Connection) -> dict[str, list[tuple[object, ...
         ]
     }
     for table in ("messages", "units"):
-        dumped[table] = [tuple(row) for row in conn.execute(f"SELECT * FROM {table} ORDER BY id")]
+        rows = conn.execute(f"SELECT * FROM {table} ORDER BY id")
+        dumped[table] = [
+            tuple(
+                value for key, value in zip(row.keys(), row, strict=True) if key not in _V8_COLUMNS
+            )
+            for row in rows
+        ]
     for virtual in ("msg_fts", "unit_fts", "unit_vec"):
         rows = conn.execute(f"SELECT rowid, * FROM {virtual} ORDER BY rowid")
         dumped[virtual] = [tuple(row) for row in rows]
@@ -320,7 +335,7 @@ def test_migrate_upgrades_a_v6_index_and_fills_chat_identity(v6_conn: sqlite3.Co
         )
     before = _identity_dump(connection)
 
-    assert db.migrate(connection) == db.SCHEMA_VERSION == 7
+    assert db.migrate(connection) == db.SCHEMA_VERSION == 8
 
     assert _identity_dump(connection) == before
     stored = {chat.id: chat for chat in db.list_chats(connection)}
@@ -360,6 +375,54 @@ def test_fresh_migrate_adds_the_v7_columns_exactly_once() -> None:
     assert names.count("peer_id") == 1
     assert names.count("scope") == 1
     assert connection.execute("SELECT count(*) FROM chat_access").fetchone()[0] == 0
+    connection.close()
+
+
+def test_migrate_upgrades_a_v7_index_and_marks_where_link_capture_starts(
+    v6_conn: sqlite3.Connection,
+) -> None:
+    """Step 8 on a populated v7 index: every row survives, the new columns are empty on what was
+    stored before, and ``links_captured_from`` names the first row id that will carry them."""
+    connection = v6_conn
+    for statement in db.MIGRATIONS[7]:
+        connection.execute(statement)
+    db.set_meta(connection, db.META_SCHEMA_VERSION, "7")
+    db.ensure_vec_table(connection, 4)
+    connection.execute(
+        "INSERT INTO chats(id, peer_id, type, title) VALUES (-1001, -1001, 'channel', 'c')"
+    )
+    for msg_id in (1, 2, 3):
+        connection.execute(
+            "INSERT INTO messages(chat_id, msg_id, date, text, fwd_from, indexed) "
+            "VALUES (-1001, ?, 100, 'see t.me/news', 'News', 1)",
+            (msg_id,),
+        )
+    before = _identity_dump(connection)
+
+    assert db.migrate(connection) == db.SCHEMA_VERSION == 8
+
+    assert _identity_dump(connection) == before
+    stored = db.get_messages(connection, -1001)
+    assert [(row.fwd_from, row.fwd_peer_id, row.fwd_msg_id, row.fwd_date) for row in stored] == [
+        ("News", None, None, None)
+    ] * 3
+    assert db.message_links(connection, [row.id for row in stored if row.id is not None]) == {}
+    last = max(row.id for row in stored if row.id is not None)
+    assert db.links_captured_from(connection) == last + 1
+    (fresh,) = db.upsert_messages(connection, [_message(-1001, 4, links=(("link", "@news"),))])
+    assert fresh >= db.links_captured_from(connection)
+
+
+def test_fresh_migrate_adds_the_v8_columns_exactly_once() -> None:
+    """Step 8's columns belong to step 8 alone, so the chain from the base adds each once."""
+    earlier = " ".join(db.MIGRATIONS[db.BASE_VERSION] + db.MIGRATIONS[6] + db.MIGRATIONS[7])
+    for name in ("fwd_peer_id", "fwd_msg_id", "fwd_date", "message_links"):
+        assert name not in earlier
+    connection = db.connect(":memory:")
+    assert db.migrate(connection) == db.SCHEMA_VERSION
+    names = [row["name"] for row in connection.execute("PRAGMA table_info(messages)")]
+    for column in _V8_COLUMNS:
+        assert names.count(column) == 1
     connection.close()
 
 
@@ -1204,6 +1267,9 @@ def test_upsert_messages_returns_ids_and_stores_all_columns(conn: sqlite3.Connec
         reply_to_msg_id=3,
         topic_id=2,
         fwd_from="Some Channel",
+        fwd_peer_id=-1000000000200,
+        fwd_msg_id=7,
+        fwd_date=90,
         media_kind="document",
         media_filename="rules.pdf",
         reactions_total=4,
@@ -1224,6 +1290,9 @@ def test_upsert_messages_returns_ids_and_stores_all_columns(conn: sqlite3.Connec
         reply_to_msg_id=3,
         topic_id=2,
         fwd_from="Some Channel",
+        fwd_peer_id=-1000000000200,
+        fwd_msg_id=7,
+        fwd_date=90,
         text="message 10",
         media_kind="document",
         media_filename="rules.pdf",
@@ -1932,6 +2001,51 @@ def test_upsert_chat_keeps_discussion_of_when_the_new_row_has_none(
     assert plain.discussion_of is None
 
 
+def test_upsert_messages_replaces_links_with_what_the_row_carries(
+    conn: sqlite3.Connection,
+) -> None:
+    """A tuple replaces the stored links — an empty one clears them — and ``None`` (a row that
+    was read back, or an import's) leaves them as they are."""
+    db.upsert_chat(conn, _chat(1))
+    first = _message(1, 5, links=(("button", "+Invite_1"), ("link", "@news")))
+    (row_id,) = db.upsert_messages(conn, [first, _message(1, 6)])[:1]
+    assert db.message_links(conn, [row_id]) == {
+        row_id: (("button", "+Invite_1"), ("link", "@news"))
+    }
+    stored = db.get_message(conn, 1, 5)
+    assert stored is not None and stored.links is None
+
+    db.upsert_messages(conn, [dataclasses.replace(stored, text="read back and re-stored")])
+    assert db.message_links(conn, [row_id]) == {
+        row_id: (("button", "+Invite_1"), ("link", "@news"))
+    }
+
+    db.upsert_messages(conn, [_message(1, 5, links=(("text_url", "addlist/Slug"),))])
+    assert db.message_links(conn, [row_id]) == {row_id: (("text_url", "addlist/Slug"),)}
+
+    db.upsert_messages(conn, [_message(1, 5, links=())])
+    assert db.message_links(conn, [row_id]) == {}
+
+
+def test_message_links_are_deleted_with_their_message_and_chat(conn: sqlite3.Connection) -> None:
+    db.upsert_chat(conn, _chat(1))
+    db.upsert_chat(conn, _chat(2))
+    ids = db.upsert_messages(
+        conn,
+        [
+            _message(1, 1, links=(("link", "@a_chat"),)),
+            _message(1, 2, links=(("link", "@b_chat"),)),
+        ],
+    )
+    (other,) = db.upsert_messages(conn, [_message(2, 1, links=(("mention", "@c_chat"),))])
+    db.delete_messages(conn, 1, [1])
+    assert set(db.message_links(conn, [*ids, other])) == {ids[1], other}
+    db.delete_chat(conn, 1)
+    assert set(db.message_links(conn, [*ids, other])) == {other}
+    targets = conn.execute("SELECT target FROM message_links").fetchall()
+    assert [row["target"] for row in targets] == ["@c_chat"]
+
+
 def test_upsert_messages_rewrites_every_column_on_conflict(conn: sqlite3.Connection) -> None:
     db.upsert_chat(conn, _chat(1))
     first = MessageRow(chat_id=1, msg_id=5, date=100, from_id=1, from_name="Ann", text="a")
@@ -1946,6 +2060,9 @@ def test_upsert_messages_rewrites_every_column_on_conflict(conn: sqlite3.Connect
         reply_to_msg_id=3,
         topic_id=9,
         fwd_from="Carol",
+        fwd_peer_id=3,
+        fwd_msg_id=None,
+        fwd_date=80,
         text="b",
         media_kind="photo",
         media_filename="x.jpg",

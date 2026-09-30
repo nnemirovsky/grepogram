@@ -11,7 +11,7 @@ import datetime as dt
 from collections.abc import Iterable, Mapping
 from typing import Any
 
-from telethon import utils
+from telethon import helpers, utils
 from telethon.tl import types
 
 EPOCH = dt.datetime(2025, 1, 1, tzinfo=dt.UTC)
@@ -92,15 +92,58 @@ def forward_header(
     channel_post: int | None = None,
     post_author: str | None = None,
     date: dt.datetime | None = None,
+    saved_from: int | Any | None = None,
+    saved_from_msg_id: int | None = None,
 ) -> types.MessageFwdHeader:
     """``MessageFwdHeader``: ``origin`` is the original sender (id or entity), ``origin_name`` the
-    name Telegram shows for a hidden account, ``channel_post`` the id in the origin channel."""
+    name Telegram shows for a hidden account, ``channel_post`` the id in the origin channel,
+    ``saved_from`` / ``saved_from_msg_id`` the chat and message it was saved from."""
     return types.MessageFwdHeader(
         date=date or EPOCH,
         from_id=peer(origin) if origin is not None else None,
         from_name=origin_name,
         channel_post=channel_post,
         post_author=post_author,
+        saved_from_peer=peer(saved_from) if saved_from is not None else None,
+        saved_from_msg_id=saved_from_msg_id,
+    )
+
+
+def span(text: str, fragment: str) -> tuple[int, int]:
+    """``(offset, length)`` of ``fragment`` in ``text`` in UTF-16 code units, as Telegram counts
+    entity offsets — an emoji before it takes two."""
+    start = text.index(fragment)
+    return len(helpers.add_surrogate(text[:start])), len(helpers.add_surrogate(fragment))
+
+
+def url_entity(text: str, fragment: str) -> types.MessageEntityUrl:
+    """A visible URL: Telegram marks it in the text it already shows."""
+    return types.MessageEntityUrl(*span(text, fragment))
+
+
+def text_url_entity(text: str, fragment: str, url: str) -> types.MessageEntityTextUrl:
+    """A hidden hyperlink: ``fragment`` is shown, ``url`` is where it goes."""
+    return types.MessageEntityTextUrl(*span(text, fragment), url=url)
+
+
+def mention_entity(text: str, fragment: str) -> types.MessageEntityMention:
+    return types.MessageEntityMention(*span(text, fragment))
+
+
+def mention_name_entity(text: str, fragment: str, user_id: int) -> types.MessageEntityMentionName:
+    """A mention of a user with no username, by id."""
+    return types.MessageEntityMentionName(*span(text, fragment), user_id=user_id)
+
+
+def url_buttons(*rows: Mapping[str, str]) -> types.ReplyInlineMarkup:
+    """An inline keyboard of URL buttons, one ``{label: url}`` mapping per row."""
+    return types.ReplyInlineMarkup(
+        rows=[
+            types.KeyboardButtonRow(
+                buttons=[types.KeyboardButtonUrl(text=label, url=url) for label, url in row.items()]
+            )
+            for row in rows
+        ]
     )
 
 
@@ -267,6 +310,26 @@ def webpage_message(
     return message(chat_id, msg_id, text, media=types.MessageMediaWebPage(webpage=webpage), **kw)
 
 
+def hyperlink_message(
+    chat_id: int | Any, msg_id: int, text: str, *, anchor: str, url: str, **kw: Any
+) -> types.Message:
+    """A message whose ``anchor`` text hides a hyperlink to ``url``."""
+    return message(chat_id, msg_id, text, entities=[text_url_entity(text, anchor, url)], **kw)
+
+
+def mention_message(chat_id: int | Any, msg_id: int, text: str, **kw: Any) -> types.Message:
+    """A message with every ``@word`` in ``text`` marked as a mention, as Telegram marks them."""
+    words = [word.rstrip(".,!?") for word in text.split() if word.startswith("@")]
+    return message(chat_id, msg_id, text, entities=[mention_entity(text, w) for w in words], **kw)
+
+
+def button_message(
+    chat_id: int | Any, msg_id: int, text: str, buttons: Mapping[str, str], **kw: Any
+) -> types.Message:
+    """A message (typically a bot's or a channel's) carrying one row of URL buttons."""
+    return message(chat_id, msg_id, text, reply_markup=url_buttons(buttons), **kw)
+
+
 def contact_message(
     chat_id: int | Any,
     msg_id: int,
@@ -342,6 +405,21 @@ def forwarded_message(
     header = forward_header(
         origin, origin_name=origin_name, channel_post=channel_post, post_author=post_author
     )
+    return message(chat_id, msg_id, text, fwd_from=header, **kw)
+
+
+def channel_forward(
+    chat_id: int | Any,
+    msg_id: int,
+    text: str,
+    *,
+    channel: int | Any,
+    post: int,
+    posted: dt.datetime | None = None,
+    **kw: Any,
+) -> types.Message:
+    """A repost of post ``post`` of ``channel`` (a marked id or an entity), sent at ``posted``."""
+    header = forward_header(channel, channel_post=post, date=posted)
     return message(chat_id, msg_id, text, fwd_from=header, **kw)
 
 

@@ -39,6 +39,7 @@ from grepogram.models import (
     DEFAULT_ACCOUNT,
     AccountRow,
     ChatRow,
+    LinkKind,
     MessageRow,
     UnitRow,
     UserRow,
@@ -62,6 +63,9 @@ META_RECUT_PREFIX = "unit_recut:"
 """Prefix of the per-chat marker a re-cut writes, ``unit_recut:<chat_id>``."""
 META_PRUNE_PREFIX = "prune_sweep:"
 """Prefix of the deletion sweep's cursor, ``prune_sweep:<chat_id>`` (:func:`prune_cursor`)."""
+META_LINKS_CAPTURED_FROM = "links_captured_from"
+"""The first ``messages.id`` stored with its links and forward origin captured (step 8); see
+:func:`links_captured_from`."""
 
 _V5: tuple[str, ...] = (
     "CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT)",
@@ -188,6 +192,27 @@ _V7: tuple[str, ...] = (
     "WHERE source_id IS NULL OR source_id NOT LIKE 'import:%'",
 )
 
+_V8: tuple[str, ...] = (
+    # a forward's structured origin beside the display name in fwd_from: the peer and message it
+    # came from and when that was sent (sync.forward_origin)
+    "ALTER TABLE messages ADD COLUMN fwd_peer_id INTEGER",
+    "ALTER TABLE messages ADD COLUMN fwd_msg_id INTEGER",
+    "ALTER TABLE messages ADD COLUMN fwd_date INTEGER",
+    """CREATE INDEX messages_fwd_origin ON messages(fwd_peer_id, fwd_msg_id)
+       WHERE fwd_peer_id IS NOT NULL""",
+    # every Telegram destination a message names, target normalized by leads.normalize
+    """CREATE TABLE message_links(
+        message_id INTEGER NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+        kind TEXT NOT NULL,
+        target TEXT NOT NULL,
+        PRIMARY KEY (message_id, kind, target))""",
+    "CREATE INDEX message_links_target ON message_links(target)",
+    # rows stored before this step carry no links and no forward origin; this fill records where
+    # capture starts, so discovery knows which rows only a scan of their text can speak for
+    "INSERT INTO meta(key, value) SELECT 'links_captured_from', COALESCE(MAX(id), 0) + 1 "
+    "FROM messages",
+)
+
 SYNTHETIC_BASE = 1 << 62
 """The first ``chats.id`` a scoped row takes when another account's row already holds its peer id.
 
@@ -220,7 +245,7 @@ rest of the code querying columns that are not there. Every version below this o
 belongs to that chain and is refused outright; :func:`migrate` upgrades only from a version this
 build itself wrote."""
 
-MIGRATIONS: dict[int, tuple[str, ...]] = {BASE_VERSION: _V5, 6: _V6, 7: _V7}
+MIGRATIONS: dict[int, tuple[str, ...]] = {BASE_VERSION: _V5, 6: _V6, 7: _V7, 8: _V8}
 """The schema, keyed by the version each step brings a database to.
 
 :data:`BASE_VERSION` builds it from nothing and only an empty file gets that step;
@@ -231,7 +256,8 @@ write is rebuilt from Telegram, see :func:`migrate`.
 
 A step may **fill the columns and tables it adds**, deterministically from values already stored
 (step 7 derives ``chats.peer_id``, ``chats.scope``, ``chat_sources`` and ``chat_access`` that
-way), and never rewrites a value that is already there. The index is derived, but an imported
+way; step 8 records in ``meta`` the first row id it captures links for), and never rewrites a
+value that is already there. The index is derived, but an imported
 history is not — Telegram cannot serve it again — so "delete index.db and sync again" is not an
 upgrade path a released schema may ask for."""
 SCHEMA_VERSION = max(MIGRATIONS)
@@ -263,9 +289,9 @@ _ATTACHMENT_REPLACED = (
 
 _MESSAGE_UPSERT = f"""
     INSERT INTO messages(chat_id, msg_id, date, edit_date, from_id, from_name, reply_to_msg_id,
-                         topic_id, comment_of_chat_id, comment_of_msg_id, fwd_from, text,
-                         media_kind, media_filename, reactions_total)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                         topic_id, comment_of_chat_id, comment_of_msg_id, fwd_from, fwd_peer_id,
+                         fwd_msg_id, fwd_date, text, media_kind, media_filename, reactions_total)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(chat_id, msg_id) DO UPDATE SET
         date = excluded.date,
         edit_date = excluded.edit_date,
@@ -276,6 +302,9 @@ _MESSAGE_UPSERT = f"""
         comment_of_chat_id = COALESCE(excluded.comment_of_chat_id, messages.comment_of_chat_id),
         comment_of_msg_id = COALESCE(excluded.comment_of_msg_id, messages.comment_of_msg_id),
         fwd_from = excluded.fwd_from,
+        fwd_peer_id = excluded.fwd_peer_id,
+        fwd_msg_id = excluded.fwd_msg_id,
+        fwd_date = excluded.fwd_date,
         text = excluded.text,
         media_kind = excluded.media_kind,
         media_filename = excluded.media_filename,
@@ -1369,6 +1398,11 @@ def upsert_messages(conn: sqlite3.Connection, batch: Iterable[MessageRow]) -> li
     all (see :data:`_MESSAGE_UPSERT`): they belong to the extraction pass, which owns them through
     its own writers. Every row written, new or updated, is flagged ``indexed = 0`` until a rebuild
     covers it (:func:`mark_indexed`). The chat row must exist (foreign key).
+
+    A row's ``links`` **replace** the message's stored ``message_links`` when they are a tuple —
+    an empty one included, a message whose last link was edited away — and leave them alone when
+    they are ``None``, what a row carries that was read back from the index or built by an
+    import that knows no links; the same "not supplied" idiom the ``COALESCE`` columns use.
     """
     ids: list[int] = []
     with transaction(conn):
@@ -1387,14 +1421,58 @@ def upsert_messages(conn: sqlite3.Connection, batch: Iterable[MessageRow]) -> li
                     message.comment_of_chat_id,
                     message.comment_of_msg_id,
                     message.fwd_from,
+                    message.fwd_peer_id,
+                    message.fwd_msg_id,
+                    message.fwd_date,
                     message.text,
                     message.media_kind,
                     message.media_filename,
                     message.reactions_total,
                 ),
             ).fetchone()
-            ids.append(int(row["id"]))
+            message_id = int(row["id"])
+            if message.links is not None:
+                _replace_links(conn, message_id, message.links)
+            ids.append(message_id)
     return ids
+
+
+def _replace_links(
+    conn: sqlite3.Connection, message_id: int, links: Iterable[tuple[LinkKind, str]]
+) -> None:
+    conn.execute("DELETE FROM message_links WHERE message_id = ?", (message_id,))
+    conn.executemany(
+        "INSERT OR IGNORE INTO message_links(message_id, kind, target) VALUES (?, ?, ?)",
+        [(message_id, kind, target) for kind, target in links],
+    )
+
+
+def message_links(
+    conn: sqlite3.Connection, ids: Iterable[int]
+) -> dict[int, tuple[tuple[LinkKind, str], ...]]:
+    """The stored links of the messages ``ids`` (``messages.id``), sorted like
+    ``MessageRow.links``; a message with none is absent."""
+    found: dict[int, list[tuple[LinkKind, str]]] = {}
+    for chunk in _chunks(ids):
+        rows = conn.execute(
+            f"SELECT message_id, kind, target FROM message_links "
+            f"WHERE message_id IN ({_marks(chunk)}) ORDER BY message_id, kind, target",
+            chunk,
+        )
+        for row in rows:
+            found.setdefault(int(row["message_id"]), []).append((row["kind"], row["target"]))
+    return {message_id: tuple(links) for message_id, links in found.items()}
+
+
+def links_captured_from(conn: sqlite3.Connection) -> int:
+    """The first ``messages.id`` whose links and forward origin were captured when stored.
+
+    Rows below it were stored before schema step 8 and carry neither — unless a later edit
+    re-stored them — so only :func:`grepogram.leads.text_leads` over their text can speak for
+    what they link to. Every row of an index built at step 8 or later is at or above it (``1``).
+    """
+    value = get_meta(conn, META_LINKS_CAPTURED_FROM)
+    return int(value) if value else 1
 
 
 def attachment_replaced(stored: MessageRow, fresh: MessageRow) -> bool:
@@ -2179,6 +2257,9 @@ def _message_row(row: sqlite3.Row) -> MessageRow:
         comment_of_chat_id=row["comment_of_chat_id"],
         comment_of_msg_id=row["comment_of_msg_id"],
         fwd_from=row["fwd_from"],
+        fwd_peer_id=row["fwd_peer_id"],
+        fwd_msg_id=row["fwd_msg_id"],
+        fwd_date=row["fwd_date"],
         text=row["text"],
         media_kind=row["media_kind"],
         media_filename=row["media_filename"],
