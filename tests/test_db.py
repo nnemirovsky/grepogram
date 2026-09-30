@@ -10,10 +10,21 @@ import pytest
 import sqlite_vec
 
 from grepogram import db
-from grepogram.models import ChatRow, MessageRow, UnitRow, UserRow
+from grepogram.models import AccountRow, ChatRow, MessageRow, UnitRow, UserRow, chat_scope
 from grepogram.paths import Paths
 
-TABLES = {"meta", "chats", "users", "messages", "units", "msg_fts", "unit_fts"}
+TABLES = {
+    "meta",
+    "chats",
+    "users",
+    "messages",
+    "units",
+    "msg_fts",
+    "unit_fts",
+    "accounts",
+    "chat_access",
+    "chat_sources",
+}
 INDEXES = {
     "messages_chat_date",
     "messages_reply",
@@ -22,6 +33,7 @@ INDEXES = {
     "chats_discussion_of",
     "messages_comments",
     "messages_media_pending",
+    "chats_scope_peer",
 }
 
 
@@ -162,11 +174,12 @@ def test_connection_usable_from_second_thread(conn: sqlite3.Connection) -> None:
 def test_fresh_migrate_creates_schema() -> None:
     connection = db.connect(":memory:")
     assert db.schema_version(connection) == 0
-    assert db.migrate(connection) == db.SCHEMA_VERSION == 6
+    assert db.migrate(connection) == db.SCHEMA_VERSION == 7
     assert TABLES <= _names(connection, "table")
     assert INDEXES <= _names(connection, "index")
-    assert db.schema_version(connection) == 6
-    assert db.get_meta(connection, "schema_version") == "6"
+    assert db.schema_version(connection) == 7
+    assert db.get_meta(connection, "schema_version") == "7"
+    assert {"peer_id", "scope"} <= _columns(connection, "chats")
     assert not db.has_vec_table(connection)
     assert not connection.in_transaction
     messages_sql = connection.execute(
@@ -209,7 +222,7 @@ def test_migrate_upgrades_a_v5_database_and_keeps_its_rows() -> None:
         "INSERT INTO units(chat_id, kind, msg_id_start, msg_id_end, msg_ids, date_start, "
         "date_end, text) VALUES (1, 'window', 7, 7, '[7]', 100, 100, 'hello')"
     )
-    assert db.migrate(connection) == db.SCHEMA_VERSION == 6
+    assert db.migrate(connection) == db.SCHEMA_VERSION
     stored = db.get_message(connection, 1, 7)
     assert stored is not None
     assert (stored.text, stored.media_kind, stored.reactions_total) == ("hello", "photo", 3)
@@ -232,7 +245,7 @@ def test_fresh_migrate_adds_the_v6_columns_exactly_once() -> None:
     assert "media_state" not in base
     assert "reactions INTEGER" not in base
     connection = db.connect(":memory:")
-    assert db.migrate(connection) == 6
+    assert db.migrate(connection) == db.SCHEMA_VERSION
     for table, column in (
         ("messages", "extracted_text"),
         ("messages", "media_state"),
@@ -240,6 +253,113 @@ def test_fresh_migrate_adds_the_v6_columns_exactly_once() -> None:
     ):
         names = [row["name"] for row in connection.execute(f"PRAGMA table_info({table})")]
         assert names.count(column) == 1
+    connection.close()
+
+
+def _identity_dump(conn: sqlite3.Connection) -> dict[str, list[tuple[object, ...]]]:
+    """Every row step 7 must leave as it found it: chats by their pre-v7 columns, messages,
+    units and the virtual tables by every column they have."""
+    dumped = {
+        "chats": [
+            tuple(row)
+            for row in conn.execute(
+                "SELECT id, type, title, username, is_forum, source_id, discussion_of, "
+                "last_msg_id, last_sync_at, unavailable, migrated_to FROM chats ORDER BY id"
+            )
+        ]
+    }
+    for table in ("messages", "units"):
+        dumped[table] = [tuple(row) for row in conn.execute(f"SELECT * FROM {table} ORDER BY id")]
+    for virtual in ("msg_fts", "unit_fts", "unit_vec"):
+        rows = conn.execute(f"SELECT rowid, * FROM {virtual} ORDER BY rowid")
+        dumped[virtual] = [tuple(row) for row in rows]
+    return dumped
+
+
+def test_migrate_upgrades_a_v6_index_and_fills_chat_identity(v6_conn: sqlite3.Connection) -> None:
+    """Step 7 on a populated v0.2.0 index: every row, unit, FTS and vec row survives untouched,
+    and the new columns and tables are filled from what was stored — the one account there was
+    reaches every chat but the import, which came from an export and not through any account."""
+    connection = v6_conn
+    db.ensure_vec_table(connection, 4)
+    chats = [
+        (-1001, "channel", "chat:@news", None),
+        (-1002, "supergroup", "chat:@news", -1001),
+        (-1003, "supergroup", "folder:Work", None),
+        (42, "user", "folder:Work", None),
+        (43, "bot", None, None),
+        (-77, "group", "folder:Work", None),
+        (44, "user", "import:ann", None),
+    ]
+    for chat_id, chat_type, source_id, discussion_of in chats:
+        connection.execute(
+            "INSERT INTO chats(id, type, title, source_id, discussion_of, last_msg_id) "
+            "VALUES (?, ?, ?, ?, ?, 9)",
+            (chat_id, chat_type, f"chat {chat_id}", source_id, discussion_of),
+        )
+    for chat_id, *_ in chats:
+        (message_id,) = connection.execute(
+            "INSERT INTO messages(chat_id, msg_id, date, text, indexed) "
+            "VALUES (?, 1, 100, 'hello', 1) RETURNING id",
+            (chat_id,),
+        ).fetchone()
+        connection.execute(
+            "INSERT INTO msg_fts(rowid, raw, stemmed, chat_id, date) "
+            "VALUES (?, 'hello', 'hello', ?, 100)",
+            (message_id, chat_id),
+        )
+        unit_id = _insert_unit(connection, chat_id, [1])
+        connection.execute(
+            "INSERT INTO unit_fts(rowid, raw, stemmed, chat_id, date_start) "
+            "VALUES (?, 'unit', 'unit', ?, 1)",
+            (unit_id, chat_id),
+        )
+        connection.execute(
+            "INSERT INTO unit_vec(rowid, chat_id, date_start, embedding) VALUES (?, ?, 1, ?)",
+            (unit_id, chat_id, sqlite_vec.serialize_float32([1.0, 0.0, 0.0, 0.0])),
+        )
+    before = _identity_dump(connection)
+
+    assert db.migrate(connection) == db.SCHEMA_VERSION == 7
+
+    assert _identity_dump(connection) == before
+    stored = {chat.id: chat for chat in db.list_chats(connection)}
+    assert all(chat.peer_id == chat.id for chat in stored.values())
+    assert {chat_id: chat.scope for chat_id, chat in stored.items()} == {
+        -1003: "",
+        -1002: "",
+        -1001: "",
+        -77: "default",
+        42: "default",
+        43: "default",
+        44: "default",
+    }
+    for chat_id, _, source_id, _ in chats:
+        assert db.chat_source_ids(connection, chat_id) == ([source_id] if source_id else [])
+        expected = [] if source_id == "import:ann" else ["default"]
+        assert db.chat_accounts(connection, chat_id) == expected
+    via = connection.execute("SELECT DISTINCT via FROM chat_access").fetchall()
+    assert [row["via"] for row in via] == ["migrated"]
+    assert db.access_hash(connection, 42, "default") is None
+    assert db.list_accounts(connection) == []
+    assert db.get_chat_by_peer(connection, 42, "default") == stored[42]
+    assert db.get_chat_by_peer(connection, 42, "") is None
+    # the upgraded index is addressed exactly like a fresh one
+    again = db.upsert_chat(connection, ChatRow(id=42, type="user", title="Ann", source_id="x"))
+    assert (again.id, again.last_msg_id, again.title) == (42, 9, "Ann")
+
+
+def test_fresh_migrate_adds_the_v7_columns_exactly_once() -> None:
+    """Step 7's columns belong to step 7 alone, so the chain from the base adds each once."""
+    base = " ".join(db.MIGRATIONS[db.BASE_VERSION] + db.MIGRATIONS[6])
+    assert "peer_id" not in base
+    assert "scope" not in base
+    connection = db.connect(":memory:")
+    assert db.migrate(connection) == db.SCHEMA_VERSION
+    names = [row["name"] for row in connection.execute("PRAGMA table_info(chats)")]
+    assert names.count("peer_id") == 1
+    assert names.count("scope") == 1
+    assert connection.execute("SELECT count(*) FROM chat_access").fetchone()[0] == 0
     connection.close()
 
 
@@ -723,6 +843,125 @@ def test_list_chats_orders_by_id_and_filters_by_source(conn: sqlite3.Connection)
     assert [chat.id for chat in db.list_chats(conn)] == [-1001, 2, 3]
     assert [chat.id for chat in db.list_chats(conn, "folder:A")] == [-1001, 2]
     assert db.list_chats(conn, "folder:none") == []
+
+
+def test_chat_row_defaults_its_peer_to_its_id_and_its_scope_to_the_default_account() -> None:
+    assert ChatRow(id=42, type="user").peer_id == 42
+    assert ChatRow(id=42, type="user").scope == "default"
+    assert ChatRow(id=-77, type="group").scope == "default"
+    assert ChatRow(id=-1001, type="channel").scope == ""
+    assert ChatRow(id=-1001, type="supergroup").is_shared
+    assert not ChatRow(id=42, type="bot").is_shared
+    assert ChatRow(id=db.SYNTHETIC_BASE, type="user", peer_id=42, scope="work").peer_id == 42
+    assert chat_scope("channel", "work") == ""
+    assert chat_scope("user", "work") == "work"
+
+
+def test_two_accounts_private_chats_with_one_person_are_two_rows(conn: sqlite3.Connection) -> None:
+    """Private-chat message ids are per account, so the same person seen from two accounts is
+    two histories: the first keeps the peer id as its row id, the second takes a synthetic one,
+    and each account finds its own row again by ``(scope, peer_id)``."""
+    mine = db.upsert_chat(conn, ChatRow(id=42, type="user", title="Ann"))
+    work = db.upsert_chat(conn, ChatRow(id=42, type="user", title="Ann W"), "work")
+    home = db.upsert_chat(conn, ChatRow(id=42, type="user", title="Ann H"), "home")
+    assert (mine.id, mine.peer_id, mine.scope) == (42, 42, "default")
+    assert (work.id, work.peer_id, work.scope) == (db.SYNTHETIC_BASE, 42, "work")
+    assert (home.id, home.peer_id, home.scope) == (db.SYNTHETIC_BASE + 1, 42, "home")
+    assert db.chats_for_peer(conn, 42) == [mine, work, home]
+    assert db.get_chat_by_peer(conn, 42, "work") == work
+    assert db.chats_for_peer(conn, 404) == []
+
+    renamed = db.upsert_chat(conn, ChatRow(id=42, type="user", title="Ann (work)"), "work")
+    assert renamed.id == db.SYNTHETIC_BASE
+    assert renamed.title == "Ann (work)"
+    # a stored row handed back keeps its own scope: no account argument, no new row
+    retagged = db.upsert_chat(conn, dataclasses.replace(renamed, source_id="work/chat:42"))
+    assert (retagged.id, retagged.source_id) == (db.SYNTHETIC_BASE, "work/chat:42")
+    assert db.get_chat(conn, 42) == mine
+    assert conn.execute("SELECT count(*) FROM chats").fetchone()[0] == 3
+
+    db.upsert_messages(conn, [_message(mine.id, 1), _message(work.id, 1)])
+    assert [m.text for m in db.get_messages(conn, work.id)] == ["message 1"]
+
+
+def test_a_scoped_row_whose_peer_id_is_free_keeps_it(conn: sqlite3.Connection) -> None:
+    """Only a clash moves a row off its peer id: a work-only private chat is stored under it."""
+    work = db.upsert_chat(conn, ChatRow(id=-77, type="group", title="old group"), "work")
+    assert (work.id, work.peer_id, work.scope) == (-77, -77, "work")
+    mine = db.upsert_chat(conn, ChatRow(id=-77, type="group", title="old group"))
+    assert (mine.id, mine.scope) == (db.SYNTHETIC_BASE, "default")
+
+
+def test_a_channel_reached_by_two_accounts_is_one_row_with_two_access_entries(
+    conn: sqlite3.Connection,
+) -> None:
+    first = db.upsert_chat(conn, _chat(-1001, type="channel", discussion_of=None), "default")
+    second = db.upsert_chat(conn, _chat(-1001, type="channel", title="News"), "work")
+    assert first.id == second.id == second.peer_id == -1001
+    assert second.scope == ""
+    assert second.title == "News"
+    assert conn.execute("SELECT count(*) FROM chats").fetchone()[0] == 1
+    db.set_chat_access(conn, -1001, "work", access_hash=222, via="source", checked_at=10)
+    db.set_chat_access(conn, -1001, "default", access_hash=111, via="source", checked_at=10)
+    assert db.chat_accounts(conn, -1001) == ["default", "work"]
+    assert db.access_hash(conn, -1001, "work") == 222
+    assert db.access_hash(conn, -1001, "default") == 111
+    assert db.access_hash(conn, -1001, "home") is None
+    # confirming access without an entity at hand keeps what an earlier resolve recorded
+    db.set_chat_access(conn, -1001, "work", checked_at=20)
+    row = conn.execute(
+        "SELECT access_hash, via, checked_at FROM chat_access WHERE account = 'work'"
+    ).fetchone()
+    assert tuple(row) == (222, "source", 20)
+    assert db.chat_accounts(conn, 404) == []
+
+
+def test_a_shared_chat_is_never_stored_off_its_peer_id(conn: sqlite3.Connection) -> None:
+    """A shared row's id is its peer id — channel-space references name it by that — so one
+    whose peer id another row holds is refused, not given a synthetic id."""
+    db.upsert_chat(conn, _chat(-5, type="group"))
+    with pytest.raises(ValueError, match="cannot be stored under its own peer id"):
+        db.upsert_chat(conn, _chat(-5, type="supergroup"))
+    assert [chat.type for chat in db.list_chats(conn)] == ["group"]
+    assert not conn.in_transaction
+
+
+def test_set_chat_sources_replaces_the_set_and_leaves_the_primary(
+    conn: sqlite3.Connection,
+) -> None:
+    db.upsert_chat(conn, _chat(-1001, source_id="chat:@news"))
+    db.set_chat_sources(conn, -1001, ["work/chat:@news", "chat:@news", "chat:@news"])
+    assert db.chat_source_ids(conn, -1001) == ["chat:@news", "work/chat:@news"]
+    db.set_chat_sources(conn, -1001, ["work/chat:@news"])
+    assert db.chat_source_ids(conn, -1001) == ["work/chat:@news"]
+    assert db.get_chat(conn, -1001).source_id == "chat:@news"  # type: ignore[union-attr]
+    db.set_chat_sources(conn, -1001, [])
+    assert db.chat_source_ids(conn, -1001) == []
+
+
+def test_accounts_are_recorded_once_and_listed_default_first(conn: sqlite3.Connection) -> None:
+    db.upsert_account(conn, AccountRow(name="work", user_id=7, display_name="W", added_at=100))
+    db.upsert_account(conn, AccountRow(name="default", user_id=5, added_at=200))
+    again = db.upsert_account(
+        conn, AccountRow(name="work", user_id=8, display_name="Work", added_at=300)
+    )
+    assert again == AccountRow(name="work", user_id=8, display_name="Work", added_at=100)
+    assert [row.name for row in db.list_accounts(conn)] == ["default", "work"]
+
+
+def test_delete_chat_cascades_access_and_coverage(conn: sqlite3.Connection) -> None:
+    for chat_id in (-1001, -1002):
+        db.upsert_chat(conn, _chat(chat_id))
+        db.set_chat_access(conn, chat_id, "default", access_hash=1)
+        db.set_chat_access(conn, chat_id, "work", access_hash=2)
+        db.set_chat_sources(conn, chat_id, ["folder:Test", "work/folder:Test"])
+    db.delete_chat(conn, -1001)
+    assert db.chat_accounts(conn, -1001) == []
+    assert db.chat_source_ids(conn, -1001) == []
+    rows = conn.execute("SELECT DISTINCT chat_id FROM chat_access").fetchall()
+    assert [row["chat_id"] for row in rows] == [-1002]
+    rows = conn.execute("SELECT DISTINCT chat_id FROM chat_sources").fetchall()
+    assert [row["chat_id"] for row in rows] == [-1002]
 
 
 def test_delete_chat_cascades_and_removes_virtual_rows(conn: sqlite3.Connection) -> None:

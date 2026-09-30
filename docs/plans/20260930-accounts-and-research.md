@@ -373,20 +373,26 @@ voided_at)`, `exclusions(identity PRIMARY KEY, reason, created_at)`,
 **Files:**
 - Modify: `grepogram/db.py`, `grepogram/models.py`, `tests/test_db.py`, `tests/conftest.py`
 
-- [ ] add `_V7` (see Technical Details) and `MIGRATIONS[7]`; amend the `migrate` / `MIGRATIONS`
+- [x] add `_V7` (see Technical Details) and `MIGRATIONS[7]`; amend the `migrate` / `MIGRATIONS`
   docstrings with the fill-new-columns rule
-- [ ] `ChatRow.peer_id`, `ChatRow.scope`; `_chat_row` reads them; `chat_scope(type, account)`
-- [ ] `upsert_chat(conn, chat, account)` looks up by `(scope, peer_id)`, allocates
+- [x] `ChatRow.peer_id`, `ChatRow.scope`; `_chat_row` reads them; `chat_scope(type, account)`
+- [x] `upsert_chat(conn, chat, account)` looks up by `(scope, peer_id)`, allocates
   `id = peer_id` when free else the next synthetic id `>= SYNTHETIC_BASE`, keeps COALESCE rules
-  (`discussion_of`); asserts shared rows keep `id == peer_id`
-- [ ] accessors: `get_chat_by_peer(conn, peer_id, scope)`, `chats_for_peer(conn, peer_id)`,
+  (`discussion_of`); asserts shared rows keep `id == peer_id` (a `ValueError` when another row
+  holds a shared chat's peer id). `account` defaults to `None` = the account `chat.scope` names,
+  so every existing caller keeps storing under `default`; `upsert_chat` writes neither
+  `chat_access` nor `chat_sources` — task 5 owns what covers and reaches a chat.
+  `ChatRow.peer_id = 0` / `scope = ""` resolve on construction to `id` / the default account's
+  scope, so the ~350 existing constructions and calls stay valid
+- [x] accessors: `get_chat_by_peer(conn, peer_id, scope)`, `chats_for_peer(conn, peer_id)`,
   `set_chat_access` / `chat_accounts(conn, chat_id)` / `access_hash(conn, chat_id, account)`,
-  `set_chat_sources` / `chat_source_ids(conn, chat_id)`, `upsert_account` / `list_accounts`
-- [ ] tests: v6 → v7 migration on a populated index (units, FTS, vec, an `import:` chat) keeps
+  `set_chat_sources` (replaces the set) / `chat_source_ids(conn, chat_id)`, `upsert_account` /
+  `list_accounts` (`models.AccountRow`)
+- [x] tests: v6 → v7 migration on a populated index (units, FTS, vec, an `import:` chat) keeps
   everything and fills the new columns; empty db builds all steps; two accounts' DMs with the same
   user get distinct rows; a channel reached by two accounts is one row with two access entries;
   `delete_chat` cascades the new tables
-- [ ] run checks — must pass before task 4
+- [x] run checks — must pass before task 4
 
 ### Task 4: Address Telegram and links by peer id
 

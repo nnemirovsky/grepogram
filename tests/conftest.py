@@ -59,6 +59,19 @@ def conn() -> Iterator[sqlite3.Connection]:
     connection.close()
 
 
+@pytest.fixture
+def v6_conn() -> Iterator[sqlite3.Connection]:
+    """An empty index in memory at schema 6 — what v0.2.0 left in the field — built from the
+    released steps and not migrated further, for the upgrade tests to populate and walk up."""
+    connection = db.connect(":memory:")
+    for version in (db.BASE_VERSION, 6):
+        for statement in db.MIGRATIONS[version]:
+            connection.execute(statement)
+    db.set_meta(connection, db.META_SCHEMA_VERSION, "6")
+    yield connection
+    connection.close()
+
+
 def file_mode(path: Path) -> int:
     """The permission bits of ``path``, for the 0600 / 0700 assertions."""
     return stat.S_IMODE(path.stat().st_mode)

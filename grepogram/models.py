@@ -168,8 +168,41 @@ class Config:
         return (DEFAULT_ACCOUNT, *(account.name for account in self.accounts))
 
 
+SHARED_CHAT_TYPES: frozenset[ChatType] = frozenset({"channel", "supergroup"})
+"""Chat types whose ids and message ids are global: every account that reaches such a chat sees
+the same peer id and the same ``msg_id`` for each message, so the index holds one row for all of
+them. Users, bots and legacy groups number their messages per account and get a row per account.
+"""
+
+
+def chat_scope(chat_type: ChatType, account: str) -> str:
+    """The ``chats.scope`` a chat of ``chat_type`` reached through ``account`` is stored under.
+
+    ``''`` for a channel or supergroup (:data:`SHARED_CHAT_TYPES`), one row whichever account
+    reaches it; the account name for a user, bot or legacy group, whose history is that
+    account's own. The one rule — the schema step, :func:`grepogram.db.upsert_chat` and every
+    lookup derive the scope here.
+    """
+    return "" if chat_type in SHARED_CHAT_TYPES else account
+
+
 @dataclass(frozen=True, slots=True, kw_only=True)
 class ChatRow:
+    """One stored chat.
+
+    ``id`` is the row's key, the one every other table and every internal reference uses;
+    ``peer_id`` is Telegram's marked id, the one every call to Telegram and every link uses.
+    They are equal for every channel and supergroup — a shared row's ``id`` always *is* its peer
+    id, so ``discussion_of``, ``comment_of_chat_id``, ``migrated_to`` and ``t.me/c/`` links stay
+    in channel space — and for most private chats; a scoped row (a user, bot or legacy group seen
+    by one account) takes a synthetic id (:data:`grepogram.db.SYNTHETIC_BASE` and up) only when
+    another account's row already holds that peer id.
+
+    ``peer_id = 0`` (the default) means "the same as ``id``" and is resolved on construction, so
+    a caller that knows only the Telegram id builds a row as it always did. ``scope`` is
+    :func:`chat_scope`'s answer; left empty it resolves to :data:`DEFAULT_ACCOUNT`'s scope.
+    """
+
     id: int
     type: ChatType
     title: str | None = None
@@ -181,6 +214,19 @@ class ChatRow:
     last_sync_at: int | None = None
     unavailable: bool = False
     migrated_to: int | None = None
+    peer_id: int = 0
+    scope: str = ""
+
+    def __post_init__(self) -> None:
+        if not self.peer_id:
+            object.__setattr__(self, "peer_id", self.id)
+        if not self.scope:
+            object.__setattr__(self, "scope", chat_scope(self.type, DEFAULT_ACCOUNT))
+
+    @property
+    def is_shared(self) -> bool:
+        """Whether this is a channel or supergroup row, one for every account that reaches it."""
+        return self.type in SHARED_CHAT_TYPES
 
     @property
     def is_broadcast(self) -> bool:
@@ -190,6 +236,16 @@ class ChatRow:
         threads carry the comments of the linked group.
         """
         return self.type == "channel" and self.discussion_of is None
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class AccountRow:
+    """One ``accounts`` row: who an account turned out to be when it last signed in."""
+
+    name: str
+    user_id: int | None = None
+    display_name: str | None = None
+    added_at: int | None = None
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
