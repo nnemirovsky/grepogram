@@ -5073,3 +5073,125 @@ async def test_a_forward_origin_is_remembered_for_the_account_that_fetched_it(
     assert db.cached_peer_hash(conn, OTHER_ID, DEFAULT_ACCOUNT) == OTHER.access_hash
     assert db.cached_peer_username(conn, -1000000000205) == "min_origin"
     assert db.cached_peer_hash(conn, -1000000000205, DEFAULT_ACCOUNT) is None, "min: no hash"
+
+
+def _forget_links(conn: sqlite3.Connection, chat_id: int) -> None:
+    """Make ``chat_id``'s rows look stored before schema step 8: no links, no forward origin,
+    never read."""
+    conn.execute(
+        "UPDATE messages SET links_read = 0, fwd_peer_id = NULL, fwd_msg_id = NULL, "
+        "fwd_date = NULL WHERE chat_id = ?",
+        (chat_id,),
+    )
+    conn.execute(
+        "DELETE FROM message_links WHERE message_id IN (SELECT id FROM messages WHERE chat_id = ?)",
+        (chat_id,),
+    )
+
+
+def _history(client: FakeClient) -> list[dict[str, Any]]:
+    return [kw for name, kw in client.calls if name == "get_messages"]
+
+
+async def _recapture(
+    client: FakeClient,
+    conn: sqlite3.Connection,
+    paths: Paths,
+    cfg: Config,
+    budget: SyncBudget | None = None,
+    *,
+    chat_id: int | None = None,
+) -> Any:
+    """The pass as ``grepogram recapture-links`` runs it: on a client of its own, cold."""
+    client.forget_entities()
+    client.calls.clear()
+    async with tg.connected(client):
+        return await sync.recapture_links(
+            {DEFAULT_ACCOUNT: client}, conn, cfg, paths, budget or SyncBudget(), chat_id=chat_id
+        )
+
+
+async def test_recapture_fills_links_and_origins_of_old_rows_and_nothing_else(
+    conn: sqlite3.Connection, paths: Paths
+) -> None:
+    posts = [
+        tl.hyperlink_message(ARG_ID, 101, "flats here", anchor="here", url="https://t.me/flats"),
+        tl.channel_forward(ARG_ID, 102, "reposted", channel=OTHER, post=9, sender=1),
+        tl.message(ARG_ID, 103, "nothing to see", sender=1),
+    ]
+    client = _client(messages={ARG_ID: posts}, entities=[DISC, OTHER])
+    cfg = _cfg(ARG_SOURCE)
+    await _run(client, conn, paths, cfg)
+    _forget_links(conn, ARG_ID)
+    conn.execute("DELETE FROM peer_cache")
+    before = {row.msg_id: row for row in db.get_messages(conn, ARG_ID)}
+    chat_before = db.get_chat(conn, ARG_ID)
+    units_before = db.get_units(conn, ARG_ID)
+    clock = db.lead_clock(conn)
+
+    report = await _recapture(client, conn, paths, cfg)
+
+    assert (report.checked, report.captured, report.remaining) == (3, 3, 0)
+    assert report.chats_done == [ARG_ID] and report.chats_remaining == []
+    after = {row.msg_id: row for row in db.get_messages(conn, ARG_ID)}
+    links = db.message_links(conn, [row.id for row in after.values() if row.id is not None])
+    assert links[after[101].id or 0] == (("text_url", "@flats"),)
+    assert (after[102].fwd_peer_id, after[102].fwd_msg_id) == (OTHER_ID, 9)
+    assert db.cached_peer_username(conn, OTHER_ID) == "other_news"
+    for msg_id, row in after.items():
+        was = before[msg_id]
+        assert (row.text, row.date, row.edit_date, row.reactions_total) == (
+            was.text,
+            was.date,
+            was.edit_date,
+            was.reactions_total,
+        )
+    assert db.unindexed_message_ids(conn, ARG_ID) == [], "nothing to rebuild"
+    assert db.get_units(conn, ARG_ID) == units_before
+    assert db.get_chat(conn, ARG_ID) == chat_before, "no sync cursor moves"
+    assert db.newest_lead_seq(conn, ARG_ID) > clock, "discovery reads them again"
+    assert [kw["ids"] for kw in _history(client)] == [[101, 102, 103]]
+
+    again = await _recapture(client, conn, paths, cfg)
+    assert (again.checked, again.captured) == (0, 0) and _history(client) == []
+
+
+async def test_recapture_passes_over_a_message_telegram_no_longer_has(
+    conn: sqlite3.Connection, paths: Paths
+) -> None:
+    client = _client(messages={ARG_ID: _talk(101, 102)})
+    cfg = _cfg(ARG_SOURCE)
+    await _run(client, conn, paths, cfg)
+    _forget_links(conn, ARG_ID)
+    client.messages[ARG_ID] = [m for m in client.messages[ARG_ID] if m.id != 102]
+
+    report = await _recapture(client, conn, paths, cfg)
+
+    assert (report.checked, report.captured) == (2, 1)
+    assert [m.msg_id for m in db.get_messages(conn, ARG_ID)] == [101, 102], "prune-deleted's job"
+    assert db.recapture_cursor(conn, ARG_ID) == 102
+    assert (await _recapture(client, conn, paths, cfg)).checked == 0, "not asked about again"
+
+
+async def test_recapture_resumes_after_its_budget_and_skips_an_import(
+    conn: sqlite3.Connection, paths: Paths
+) -> None:
+    client = _client(messages={ARG_ID: _talk(101, 102)})
+    cfg = _cfg(ARG_SOURCE)
+    await _run(client, conn, paths, cfg)
+    _forget_links(conn, ARG_ID)
+    db.upsert_chat(conn, ChatRow(id=-1009, type="channel", title="old", source_id="import:old"))
+    db.upsert_messages(conn, [MessageRow(chat_id=-1009, msg_id=1, date=1, text="t.me/x_chat")])
+
+    spent = await _recapture(client, conn, paths, cfg, SyncBudget(0))
+    assert spent.chats_remaining == [ARG_ID] and _history(client) == []
+    assert spent.remaining == 2, "an import is never re-read and not counted either"
+
+    done = await _recapture(client, conn, paths, cfg)
+    assert done.chats_done == [ARG_ID] and done.remaining == 0
+    assert db.count_unread_links(conn) == 1, "the import's row keeps its text fallback"
+
+
+async def test_recapture_holds_the_sync_lock(conn: sqlite3.Connection, paths: Paths) -> None:
+    with SyncLock(paths), pytest.raises(SyncInProgress):
+        await _recapture(_client(), conn, paths, _cfg(ARG_SOURCE))

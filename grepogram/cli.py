@@ -10,11 +10,11 @@ the model.
 
 Every command that talks to Telegram does it as an account: ``auth``, ``dialogs``, ``sources
 add`` and ``leave`` take ``--account`` (``default`` when omitted, the account a config without
-``[[accounts]]`` has always had), while ``sync``, ``extract``, ``prune-deleted`` and ``sources
-prune`` use every signed-in account at once. ``accounts rm`` and ``leave`` change things a
-config edit cannot undo, so they ask on the controlling terminal (:func:`_terminal`) and refuse
-without one; the human confirms by typing back a random code the question shows
-(:func:`_ask`), and no option answers for them.
+``[[accounts]]`` has always had), while ``sync``, ``extract``, ``prune-deleted``,
+``recapture-links`` and ``sources prune`` use every signed-in account at once. ``accounts rm``
+and ``leave`` change things a config edit cannot undo, so they ask on the controlling terminal
+(:func:`_terminal`) and refuse without one; the human confirms by typing back a random code the
+question shows (:func:`_ask`), and no option answers for them.
 ``research`` drives :mod:`grepogram.research` over ``research.db`` and refuses every command while
 ``[research] enabled`` is false. ``research approve`` is the CLI's consent channel: it writes the
 exact :func:`~grepogram.research.approval_summary` to the controlling terminal and reads the answer
@@ -86,6 +86,7 @@ from grepogram.models import (
     MediaReport,
     MessageView,
     PruneReport,
+    RecaptureReport,
     ResearchSession,
     RunReport,
     SearchResult,
@@ -593,6 +594,87 @@ def _print_prune_report(report: PruneReport) -> None:
     if report.chats_unreachable:
         ids = ", ".join(str(chat_id) for chat_id in report.chats_unreachable)
         typer.echo(f"chats no signed-in account reaches: {len(report.chats_unreachable)} ({ids})")
+    for warning in report.warnings:
+        typer.echo(f"warning: {warning}", err=True)
+
+
+@app.command("recapture-links")
+def recapture_links_cmd(
+    chat: Annotated[
+        str | None,
+        typer.Option(
+            "--chat",
+            help="Re-read only this chat and the discussion group it links; "
+            + _CHAT_HELP.removeprefix("The chat the message is in, "),
+        ),
+    ] = None,
+    budget: Annotated[
+        int | None,
+        typer.Option(
+            "--budget",
+            min=1,
+            help="Stop after this many seconds; the pass resumes where it stopped.",
+        ),
+    ] = None,
+) -> None:
+    """Re-read the indexed messages whose links were never captured and store what they link to;
+    needs a session.
+
+    Messages stored before this version were stored without their hidden hyperlinks, URL
+    buttons and forward origins, so research could only read the links visible in their text.
+    This asks Telegram about exactly those messages, a hundred per request, and writes down their
+    links and forward origins — nothing else of them changes, and no sync resumes from anywhere
+    else. It is resumable: a run stopped by `--budget` or by a flood wait carries on next time.
+    """
+    paths, cfg, conn = _load()
+    _require_api_keys(cfg, paths)
+    try:
+        chat_id = None if chat is None else filters.resolve_chat(conn, cfg, chat)
+        clients = _signed_in_clients(cfg, paths)
+        report = asyncio.run(_run_recapture(clients, conn, cfg, paths, budget, chat_id))
+    except FilterError as exc:
+        fail(str(exc))
+    except (tg.AuthRequired, tg.SessionError, sync.SyncInProgress, ConfigError) as exc:
+        fail(str(exc), hint=getattr(exc, "hint", None))
+    except (tg_errors.RPCError, ConnectionError) as exc:
+        fail(f"telegram error: {exc}")
+    finally:
+        conn.close()
+    _print_recapture_report(report)
+
+
+async def _run_recapture(
+    clients: Mapping[str, TelegramClient],
+    conn: sqlite3.Connection,
+    cfg: Config,
+    paths: Paths,
+    budget: int | None,
+    chat_id: int | None,
+) -> RecaptureReport:
+    """Connect every account and run :func:`grepogram.sync.recapture_links`, which takes the
+    sync lock itself."""
+    async with tg.connected_all(clients) as live:
+        _warn_refused(live.refused)
+        return await sync.recapture_links(
+            live.clients, conn, cfg, paths, sync.SyncBudget(budget), chat_id=chat_id
+        )
+
+
+def _print_recapture_report(report: RecaptureReport) -> None:
+    typer.echo(f"messages re-read: {report.captured}")
+    typer.echo(f"messages asked about: {report.checked}")
+    typer.echo(f"chats done: {len(report.chats_done)}")
+    if report.chats_remaining:
+        ids = ", ".join(str(chat_id) for chat_id in report.chats_remaining)
+        typer.echo(
+            f"chats not finished: {len(report.chats_remaining)} ({ids}); "
+            "run recapture-links again to carry on"
+        )
+    if report.chats_unreachable:
+        ids = ", ".join(str(chat_id) for chat_id in report.chats_unreachable)
+        typer.echo(f"chats no signed-in account reaches: {len(report.chats_unreachable)} ({ids})")
+    if report.remaining:
+        typer.echo(f"messages whose links are still unread: {report.remaining}")
     for warning in report.warnings:
         typer.echo(f"warning: {warning}", err=True)
 
@@ -1589,7 +1671,8 @@ def _print_discover(report: DiscoverReport) -> None:
     if report.text_fallback:
         typer.echo(
             f"note: {report.text_fallback} messages stored without their links were read by "
-            "their visible text only; their hidden links and buttons were not seen"
+            "their visible text only; their hidden links and buttons were not seen "
+            "(grepogram recapture-links reads them again)"
         )
     if report.directories:
         typer.echo(f"directories (chats that list many others): {_ids(report.directories)}")

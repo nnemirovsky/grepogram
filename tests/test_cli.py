@@ -38,6 +38,7 @@ from grepogram.models import (
     MediaReport,
     MessageRow,
     PruneReport,
+    RecaptureReport,
     SearchMode,
 )
 from grepogram.paths import Paths
@@ -753,6 +754,51 @@ def test_prune_deleted_passes_the_chat_and_the_budget_through(
     assert f"chats not finished: 1 ({PRUNE_ID})" in result.stdout
     assert "chats no signed-in account reaches: 1 (77)" in result.stdout
     assert "warning: careful" in result.stderr
+
+
+def test_recapture_links_reads_the_links_of_rows_stored_without_them(
+    tmp_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    paths = _signed_in(tmp_home)
+    client = _prune_chat(paths)
+    client.messages[PRUNE_ID] = [
+        tl.hyperlink_message(PRUNE_ID, 101, "kept here", anchor="here", url="https://t.me/flats")
+    ]
+    monkeypatch.setattr(tg, "make_client", lambda *_: client)
+    result = runner.invoke(cli.app, ["recapture-links", "--budget", "30"])
+    assert result.exit_code == 0, result.output
+    assert result.stdout.splitlines()[:3] == [
+        "messages re-read: 1",
+        "messages asked about: 2",
+        "chats done: 1",
+    ]
+    conn = db.connect(paths)
+    stored = dict(conn.execute("SELECT kind, target FROM message_links").fetchall())
+    conn.close()
+    assert stored == {"text_url": "@flats"}
+
+
+def test_recapture_links_passes_the_chat_and_the_budget_through(
+    tmp_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    paths = _signed_in(tmp_home)
+    _prune_chat(paths)
+    seen: dict[str, object] = {}
+
+    async def record(
+        client: object, conn: object, cfg: object, paths: object, budget: Any, **kw: Any
+    ) -> RecaptureReport:
+        seen.update(kw)
+        seen["seconds"] = budget.seconds
+        return RecaptureReport(checked=4, remaining=9, chats_remaining=[PRUNE_ID])
+
+    monkeypatch.setattr(tg, "make_client", lambda *_: FakeClient())
+    monkeypatch.setattr(sync, "recapture_links", record)
+    result = runner.invoke(cli.app, ["recapture-links", "--chat", str(PRUNE_ID), "--budget", "7"])
+    assert result.exit_code == 0, result.output
+    assert seen == {"chat_id": PRUNE_ID, "seconds": 7}
+    assert f"chats not finished: 1 ({PRUNE_ID})" in result.stdout
+    assert "messages whose links are still unread: 9" in result.stdout
 
 
 def test_prune_deleted_with_an_unknown_chat_is_a_clean_error(

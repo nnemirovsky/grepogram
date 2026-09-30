@@ -72,6 +72,7 @@ from grepogram.models import (
     MediaKind,
     MessageRow,
     PruneReport,
+    RecaptureReport,
     Source,
     SyncCfg,
     SyncReport,
@@ -1253,7 +1254,8 @@ def _differs(stored: MessageRow, fresh: MessageRow) -> bool:
     The first sync after schema step 8 therefore re-stores, once, the rows of each chat's
     ``edit_refetch`` window that name a Telegram destination or were forwarded, which is how
     those rows gain what step 8 captures; rows outside the window keep none — discovery reads
-    their text instead (``messages.links_read``).
+    their text instead (``messages.links_read``) until ``grepogram recapture-links``
+    (:func:`recapture_links`) re-reads them.
     """
     kept = {
         field: getattr(stored, field) if getattr(fresh, field) is None else getattr(fresh, field)
@@ -2747,6 +2749,144 @@ async def prune_deleted(
             complete = await _sweep_chat(route, conn, cfg, chat, budget, tally)
             (tally.done if complete else tally.remaining).append(chat.id)
         return tally.report()
+
+
+# --- the link recapture pass -----------------------------------------------------------------
+
+
+@dataclass(slots=True)
+class _RecaptureTally:
+    """What the recapture pass accumulates on its way to a :class:`RecaptureReport`."""
+
+    checked: int = 0
+    captured: int = 0
+    done: list[int] = field(default_factory=list)
+    remaining: list[int] = field(default_factory=list)
+    unreachable: list[int] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
+
+
+async def recapture_links(
+    clients: Mapping[str, Any],
+    conn: sqlite3.Connection,
+    cfg: Config,
+    paths: Paths,
+    budget: SyncBudget,
+    *,
+    chat_id: int | None = None,
+) -> RecaptureReport:
+    """Re-read the stored messages whose links were never read and write down what they link to.
+
+    Rows stored before schema step 8 carry neither their links nor their forward origin, and a
+    sync only ever re-reads the newest ``edit_refetch`` messages of a chat — so an upgraded index
+    would keep the hidden hyperlinks, buttons and forward origins of its older history out of
+    research's reach for good, leaving only the visible text for discovery's fallback. This pass
+    asks Telegram about exactly those rows (``messages.links_read = 0``) by id, a hundred per
+    request (:data:`PRUNE_BATCH`), through an account that reaches each chat
+    (:class:`StoredPass`, which also warms each client first — a client grepogram builds knows
+    no peer), and writes onto them **only** the ``message_links``, the ``fwd_*`` columns and
+    ``links_read`` (:func:`grepogram.db.set_captured_links`): no text, no media, no ``indexed``
+    flag and no sync cursor moves — ``chats.last_msg_id`` stays where the sync left it — and no
+    unit changes, because a unit renders none of these. Each row it writes takes the next
+    lead-clock tick, so research's discovery reads it again. The forward origins the answers
+    carry are recorded for the answering account (:func:`remember_forward_peers`).
+
+    A message Telegram no longer has is passed over — telling deletions apart is
+    ``prune-deleted``'s — and a chat whose history never came from Telegram (an import) or that
+    Telegram refuses is not asked about (:func:`refetchable`). Progress is a ``meta`` cursor per
+    chat written with each page, so a run stopped by its budget or a flood wait resumes where it
+    stopped. It is a long, flood-exposed network pass over old history, so it runs under the
+    :class:`SyncLock` from ``grepogram recapture-links`` alone — never inside a sync and never as
+    an MCP tool. ``chat_id`` narrows it to one chat and the discussion group it links.
+    """
+    with SyncLock(paths):
+        targets = _recapture_targets(conn, chat_id)
+        route = await StoredPass.start(
+            conn, clients, targets, cfg.sync, budget, _recapture_flood_warning
+        )
+        tally = _RecaptureTally(warnings=route.warnings)
+        tally.unreachable.extend(chat.id for chat in route.unreachable)
+        routed = [chat for chat in targets if chat.id in route.routes]
+        for position, chat in enumerate(routed):
+            if budget.expired:
+                tally.remaining.extend(rest.id for rest in routed[position:])
+                break
+            complete = await _recapture_chat(route, conn, chat, budget, tally)
+            (tally.done if complete else tally.remaining).append(chat.id)
+        left = db.count_unread_links(conn, [chat.id for chat in targets])
+    log.info(
+        "recapture-links: %d of %d messages re-read, %d chats done, %d left",
+        tally.captured,
+        tally.checked,
+        len(tally.done),
+        len(tally.remaining),
+    )
+    return RecaptureReport(
+        checked=tally.checked,
+        captured=tally.captured,
+        remaining=left,
+        chats_done=tally.done,
+        chats_remaining=tally.remaining,
+        chats_unreachable=tally.unreachable,
+        warnings=tally.warnings,
+    )
+
+
+def _recapture_targets(conn: sqlite3.Connection, chat_id: int | None) -> list[ChatRow]:
+    """The chats holding rows whose links were never read that a pass may re-fetch, in id order;
+    ``chat_id`` narrows them to that chat and its discussion group."""
+    wanted = set(db.chats_with_unread_links(conn))
+    if chat_id is not None:
+        group = db.get_discussion_chat(conn, chat_id)
+        wanted &= {chat_id, *([group.id] if group is not None else [])}
+    chats = [db.get_chat(conn, found) for found in sorted(wanted)]
+    return [chat for chat in chats if chat is not None and refetchable(chat)]
+
+
+async def _recapture_chat(
+    route: StoredPass,
+    conn: sqlite3.Connection,
+    chat: ChatRow,
+    budget: SyncBudget,
+    tally: _RecaptureTally,
+) -> bool:
+    """One chat from its cursor on; ``True`` once no unread row is left above it."""
+    cursor = db.recapture_cursor(conn, chat.id)
+    while not budget.expired:
+        page = db.unread_link_ids(conn, chat.id, cursor, PRUNE_BATCH)
+        if not page:
+            return True
+
+        async def read(account: str, client: Any, page: list[int] = page) -> tuple[str, Any]:
+            return account, await client.get_messages(chat.peer_id, ids=page)
+
+        answered = await route.visit_as(chat, read)
+        if answered is None:
+            return False
+        account, answer = answered
+        if not isinstance(answer, list) or len(answer) != len(page):
+            route.warn(
+                account,
+                f"chat {chat.id} ({chat.title}): Telegram's answer did not line up with the "
+                f"{len(page)} ids asked about; nothing was written",
+            )
+            return False
+        found = [
+            msg for msg in answer if msg is not None and not isinstance(msg, types.MessageEmpty)
+        ]
+        rows = [row for msg in found if (row := map_message(msg, chat, {})) is not None]
+        remember_forward_peers(conn, account, found)
+        cursor = page[-1]
+        tally.checked += len(page)
+        tally.captured += db.set_captured_links(conn, chat.id, rows, cursor)
+    return False
+
+
+def _recapture_flood_warning(seconds: int) -> str:
+    return (
+        f"flood wait: Telegram asks to wait {seconds}s before more requests; "
+        "run `grepogram recapture-links` again later"
+    )
 
 
 def _prune_flood_warning(seconds: int) -> str:

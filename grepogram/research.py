@@ -15,7 +15,8 @@ turns every Telegram destination they name into a *candidate* one hop further ou
 - for a row whose links were never read (``messages.links_read``: stored before link capture,
   or by an import whose export spelled no entities), whatever
   :func:`grepogram.leads.text_leads` finds in its text — visible URLs and mentions only, which
-  the report counts as ``text_fallback`` so a caller can say that hidden links were not seen.
+  the report counts as ``text_fallback`` so a caller can say that hidden links were not seen
+  (``grepogram recapture-links`` reads such rows again, :func:`grepogram.sync.recapture_links`).
 
 Where it has read to is a cursor on the index's lead clock (:func:`grepogram.db.lead_clock`),
 not a message id: a discussion group stores comments out of ``msg_id`` order, and an edit or a

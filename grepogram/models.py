@@ -564,6 +564,26 @@ class PruneReport:
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
+class RecaptureReport:
+    """What one link recapture pass did — :func:`grepogram.sync.recapture_links`'s answer.
+
+    ``checked`` counts the stored messages whose links were never read that the pass asked
+    Telegram about, ``captured`` the rows it wrote links and a forward origin onto (a message
+    Telegram no longer has is left as it is — ``prune-deleted`` is for that). ``remaining`` is
+    how many such rows are still unread in the chats it may re-fetch. Chats are reported as a
+    deletion sweep reports them (:class:`PruneReport`).
+    """
+
+    checked: int = 0
+    captured: int = 0
+    remaining: int = 0
+    chats_done: list[int] = field(default_factory=list)
+    chats_remaining: list[int] = field(default_factory=list)
+    chats_unreachable: list[int] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
 class ChatStatus:
     id: int
     title: str | None
