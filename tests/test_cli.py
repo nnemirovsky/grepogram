@@ -1636,6 +1636,23 @@ def test_leave_answered_no_or_naming_a_private_chat_leaves_nothing(
     assert _leaves(clients[WORK]) == []
 
 
+def test_leave_refuses_a_target_of_another_account_than_the_one_named(
+    tmp_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``--account default`` with ``work/chat:@news`` is a contradiction, never a quiet pick."""
+    _two_account_home(tmp_home)
+    clients = _leave_clients()
+    _per_account(monkeypatch, clients)
+    _answer(monkeypatch, YES)
+    result = runner.invoke(cli.app, ["leave", "work/chat:@news", "-a", DEFAULT_ACCOUNT])
+    assert result.exit_code == 1
+    assert "names a chat of account work, but --account is default" in result.stderr
+    assert all(client.calls == [] for client in clients.values())
+    agreed = runner.invoke(cli.app, ["leave", "work/chat:@news", "-a", WORK])
+    assert agreed.exit_code == 0, agreed.output
+    assert len(_leaves(clients[WORK])) == 1
+
+
 # --- research --------------------------------------------------------------------------------
 
 

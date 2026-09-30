@@ -1372,6 +1372,10 @@ def leave_cmd(
     _require_api_keys(cfg, paths)
     try:
         parsed = sources.parse_target(target)
+        if account and parsed.account and account.casefold() != parsed.account:
+            raise sources.InvalidTarget(
+                f"{target!r} names a chat of account {parsed.account}, but --account is {account}"
+            )
         name = _known_account(cfg, account or parsed.account or DEFAULT_ACCOUNT)
         tg.ensure_session_mode(paths, name)
         with _terminal("leave") as tty:
