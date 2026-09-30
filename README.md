@@ -65,7 +65,8 @@ never inside one; see [Reading Text Out of Media](#reading-text-out-of-media).
 
 Two front ends share that index: `grepogram-mcp`, a stdio MCP server for Claude Code, Cursor,
 Codex or any other MCP client, and the `grepogram` CLI for the same searches in a terminal.
-Everything lives in one SQLite file.
+The whole index lives in one SQLite file; research, once you switch it on, keeps your decisions
+in a second one beside it.
 
 ## Requirements
 
@@ -131,7 +132,7 @@ Everything lives in one SQLite file.
 
    ```sh
    grepogram config init
-   grepogram config path          # prints where config, session, index and log live
+   grepogram config path          # prints where the config, sessions, index and log live
    ```
 
    Edit `~/.config/grepogram/config.toml` and set `[telegram] api_id` and `api_hash`.
@@ -197,6 +198,22 @@ index older than an hour on its own (see below). A `launchd` job or a cron entry
 `grepogram sync --budget 300` works fine next to a running MCP server: only one sync runs at a
 time, and the two never contend for the session file.
 
+## Upgrading from v0.2.0
+
+Install the new version over the old one; there is nothing to run by hand. The first command
+that opens `index.db` migrates it in place (schema steps 7 to 9: accounts, captured links and
+forward origins, the discovery clock) and keeps every message, unit, vector and import. The
+`session.session` you signed in with becomes the `default` account, and a config without
+`[[accounts]]` means exactly what it meant before. The first `sync` afterwards re-stores, once,
+the messages among each chat's newest `edit_refetch` that carry links or a forward, now with
+those links; every other message stored before the upgrade offers research only the links
+visible in its text until you run `grepogram recapture-links`.
+
+**Do not go back to v0.2.0 afterwards.** It refuses the migrated index as newer and tells you
+to delete `index.db` and sync again, which gives back everything Telegram still serves and loses
+every `import:` history for good, since those chats cannot be fetched again. A config this
+version saved also carries a `[research]` section v0.2.0 rejects as an unknown key.
+
 ## CLI Reference
 
 Global options: `--version`, `--verbose` / `-v` (DEBUG logging). Command output goes to stdout,
@@ -205,7 +222,7 @@ diagnostics and logs to stderr and the log file.
 | command | what it does |
 |---|---|
 | `grepogram config init` | write the annotated config template; refuses to overwrite |
-| `grepogram config path` | print the resolved config, session, index, lock and log paths |
+| `grepogram config path` | print the resolved paths of the config, the default session, the `sessions/` directory of the other accounts, the index, `research.db`, the sync lock and the log |
 | `grepogram auth [--account NAME] [--label L]` | sign in (phone, code, optional 2FA password) and store the session; `--account` signs in another account, which is added to `[[accounts]]` once the sign-in succeeds |
 | `grepogram accounts ls` | every account with its label, session state (`missing`, `present`, `authorized`), the Telegram user it signed in as, its sources and the chats it reaches; offline |
 | `grepogram accounts rm <name>` | remove an account: its sources, the chats only they cover, what it was recorded as reaching, its research sessions' unused approvals, and its session file; asks on the terminal first. Nothing changes on Telegram |
@@ -422,7 +439,9 @@ only the account it hit, even while its sources are being read, and the others c
 as deleted while another still reads them: it removes a message only when every account that
 reaches the chat says it is gone, and leaves the chat alone while one of them is signed out.
 `extract`, `prune-deleted` and `recapture-links` report a chat that no connected account reaches
-as unreachable, not as an error. An account with no session, or one Telegram has signed out, is left out with a
+as unreachable, not as an error. `sources prune` reads each folder through the account that owns
+its source, and a folder whose account cannot connect counts as a folder that did not resolve:
+nothing is pruned at all until every folder answers. An account with no session, or one Telegram has signed out, is left out with a
 warning (the MCP `sync` lists it under `accounts_skipped`) and the rest still sync. `dialogs`, `sources add`, `import` and `leave` act as
 one account, `default` unless `--account` names another.
 
@@ -431,8 +450,13 @@ folder and a `chat` entry both list) is deleted only when the last of them goes.
 `sources rm` hands it to a remaining source and says which chats it kept. `accounts rm <name>`
 removes that account's sources under the same rule, all of it or nothing. It also forgets which
 chats the account reached, stops its research sessions so no approval outlives it, and deletes its
-session file, after asking on the terminal. The only account left cannot be removed. **Neither command leaves anything on Telegram.** `grepogram leave <target> --account
-<name>` is the one command that does. It asks on the terminal first, refuses private chats, bots
+session file, after asking on the terminal. The only account left cannot be removed. `default`
+can be removed while another account exists: that deletes `session.session` and the `default`
+sources, and `accounts ls` still lists `default` with its session `missing` until
+`grepogram auth` signs it in again. `--label` belongs to a named account; `auth --label`
+without `--account` is refused, `default` having no `[[accounts]]` entry to hold it.
+**Neither command leaves anything on Telegram.** `grepogram leave <target> --account <name>` is
+the one command that does. It asks on the terminal first, refuses private chats, bots
 and folders, and touches neither the config nor the index.
 
 ## Research: Finding Chats You Do Not Index Yet
@@ -459,7 +483,9 @@ grepogram research stop 1            # explores no further; the sources it added
 
 - **start** takes the question, the seed chats (any spec `search --chat` takes) and the account
   that will later join and fetch (`--account`, `default` otherwise). It also fixes the session's
-  limits from `[research]`, and the flags override any of them.
+  limits from `[research]`; `--max-depth`, `--max-candidates`, `--probe-limit`, `--since-days`,
+  `--max-messages` and `--budget` override those, while `max_session_candidates` and
+  `admission_timeout_days` always come from the config.
 - **discover** reads the indexed messages of the seeds, and of every chat a run fetched for the
   session one hop further out — a channel's discussion group always with its channel — and
   proposes each chat they name as a candidate. A candidate is a chat: a link to a post leads to
@@ -476,15 +502,24 @@ grepogram research stop 1            # explores no further; the sources it added
   the index does not hold is probed with what the sync learned about that channel when it
   fetched the forward — its username and the account's access hash — so it is not a dead end.
   `max_candidates` bounds one call and `max_session_candidates` the whole session. Then it
-  **probes** the best `probe_limit` candidates as the session's account. A probe reads metadata only: title, type, size, whether the account is a
-  member, and whether joining needs the admins' approval. It never reads history. A shared-folder
-  (`addlist`) link turns into one candidate per chat in the folder. `--offline` skips the probing
-  and asks Telegram nothing.
+  **probes** the best `probe_limit` candidates as the session's account. A probe reads metadata
+  only: title, type, size, whether the account is a member, and whether joining needs the
+  admins' approval. It never reads history. A shared-folder (`addlist`) link turns into one
+  candidate per chat in the folder. `--offline` skips the probing, the pinned posts and the
+  global search and asks Telegram nothing; a candidate nothing has probed yet cannot be
+  approved, so one found offline, or left over past `probe_limit`, waits for the next online
+  `discover`. Discover is also the one step that sends a global search (see below).
 - **candidates** ranks candidates by **corroboration**, which counts distinct origins: a post
   forwarded into ten chats is one piece of evidence, not ten. Ties go to how many of the
   question's words the evidence shares, and then to depth. Three facts are kept apart for each
   one: `member` (the account is in it), `cached` (the index already holds it, and through which
-  accounts) and `authorized` (what you approved).
+  accounts) and `authorized` (what you approved). `--status` (repeatable) narrows the list and
+  `--evidence N` sets how many pieces of evidence each candidate prints (3 by default). A
+  candidate is `proposed`, `approved`, `skipped`, `excluded`, `joined` (in, not fetched yet),
+  `pending_admission`, `fetched` (a source now), `unavailable` (Telegram refused it) or
+  `failed` (a run could not finish it; approving it again retries). `start`, `discover`,
+  `candidates`, `run` and `status` take `--json` and print the document the matching MCP tool
+  returns.
 - **approve** grants named candidates named actions: `join`, `request` (an admission request),
   `fetch` and `add_source`. `fetch` always comes with `add_source`. A bare id means joining the
   chat, public or private, and fetching it as an ongoing source (`join,fetch,add_source`). It
@@ -497,7 +532,12 @@ grepogram research stop 1            # explores no further; the sources it added
   source, and the account, horizon and comments the fetch will really use. Titles, usernames and
   the question are printed on one line with any control or invisible formatting character shown
   as `�`, so a chat's name cannot forge or hide a line. The question itself is limited to one
-  line of plain text of at most 500 characters.
+  line of plain text of at most 500 characters. Some approvals are refused before anything is
+  asked: a candidate not probed yet, a person or a bot, a shared folder itself (approve its
+  chats), an excluded, `unavailable` or `fetched` one; `fetch` without `add_source`; `join`
+  where the admins approve joins (that is `request`) and `request` anywhere else; `join` and
+  `request` together; and reading a private chat the account is not in without `join` or
+  `request`.
 - **run** re-checks pending admission requests — one no admin answered within
   `admission_timeout_days` is given up as `failed`, and approving `request` again sends a new one
   — and joins or requests exactly the approved chats.
@@ -506,8 +546,9 @@ grepogram research stop 1            # explores no further; the sources it added
   very chat the probe saw: a joined chat's source names it by its id, and a chat whose username
   has since moved to another chat is refused rather than followed. It fetches exactly those
   chats through an ordinary sync, bounded by `run_budget_s` and `max_messages_per_run`. If
-  another sync is already running, the fetch waits for the next run and the report says so
-  (`stopped_by: sync_busy`). Then it reads the new messages and the pinned posts of what it
+  another sync holds the lock, the run adds no sources and fetches nothing — joins it already
+  made stay made — and the report says so (`stopped_by: sync_busy`); the next run takes it
+  from there. Then it reads the new messages and the pinned posts of what it
   fetched one hop deeper and only *proposes* what they lead to. A run stopped by a budget or a flood wait resumes on the
   next `run`, and approvals it has not carried out yet stay valid.
 - **skip**, **exclude** and **unexclude** only narrow the session and need no confirmation.
@@ -515,7 +556,10 @@ grepogram research stop 1            # explores no further; the sources it added
   a chat a run already joined. An exclusion is global and permanent: that chat is never proposed
   again, in any session, until you `unexclude` it. It covers the chat under every name it is
   known by (`@name`, its id, an invite link), and it withdraws whatever is still approved for
-  it. `research status` lists every exclusion with the `--reason` it was given. A chat found
+  it. Both take candidate ids (with `--session` / `-s` naming their session), `@usernames`,
+  `t.me` links or marked chat ids. `research status` lists every exclusion under the name it
+  was made by, with the `--reason` it was given, and `unexclude` lifts it by that name: an
+  exclusion covers every spelling of the chat, but only its own lifts it. A chat found
   under two names in one session is one candidate.
 - **stop** ends the exploring and voids the approvals no run used. **Every source a run added
   stays**: it is an ordinary source now, synced and searched like the rest. Take one out with
@@ -539,7 +583,10 @@ stops, so nothing asks twice for work you already approved.
 
 **Telegram's own search stays off by default.** `chat_search` (Telegram's public chat search by
 name) and `post_search` (its public-post search) are `false`. Even with them on, a session
-searches only after you approve `global_search` for it. That approval's text says that the
+searches only after you approve `global_search` for it
+(`grepogram research approve 1 global_search`, and `paid_search` beside it to allow paying).
+The search is sent by the next online `discover`, with the session's question as the query,
+once per kind of search per session; a run never searches. That approval's text says that the
 question is sent to Telegram and may bring back snippets from chats you know nothing about. The
 results are stored as candidates and evidence in `research.db` and never as indexed messages.
 A search sends the session's question and nothing else. Post search has a small free daily
@@ -623,15 +670,18 @@ accounts differ.
 
 The server re-reads `config.toml` when the file changes, so a source added with the CLI while
 an agent session runs is picked up by the next tool call. Every change to the file — by the server or
-by `grepogram sources add` / `rm` in a terminal — is a read-modify-write under `config.lock`, so
-one side's save never undoes the other's. Models are loaded once per server process; a model that
+by `grepogram sources add` / `rm`, `auth --account`, `accounts rm` or `research run` in a
+terminal — is a read-modify-write under `config.lock`, so one side's save never undoes the
+other's. Models are loaded once per server process; a model that
 fails to load is not retried until the server restarts.
 
 ## Configuration
 
 `grepogram config init` writes this file to `~/.config/grepogram/config.toml` (mode 0600). Every
-key is optional; the values shown are the defaults. `grepogram sources add` / `rm` rewrite the
-file without comments.
+key is optional; the values shown are the defaults. Every command that edits the file rewrites
+it without comments: `sources add` / `rm`, `auth --account` (which lists the new account),
+`accounts rm`, a `research run` that adds sources, and the MCP `sources_add`, `sources_remove`
+and `research_run`.
 
 ```toml
 [telegram]
@@ -914,9 +964,11 @@ one transaction, and each run checks the units of the chats it indexes against t
 a run interrupted by an older version — or by a killed process — is repaired rather than marked
 done, and no re-download is ever needed. A non-blocking file lock keeps two syncs off
 the same index:
-a CLI `sync`, `embed`, `sources rm` or MCP `sync` / `sources_remove` started while another sync
-runs fails at once with `SyncInProgress`, and the MCP `search` auto-sync turns that into a
-warning. Inside the MCP server, syncs queue instead: a `search` that finds the index stale while
+every command that writes the index — the CLI `sync`, `extract`, `embed`, `import`,
+`sources rm`, `accounts rm`, `prune-deleted`, `recapture-links` and the deletion of
+`sources prune`, the MCP `sync` and `sources_remove` — started while another sync runs fails at
+once with `SyncInProgress`; a research run reports `stopped_by: sync_busy` rather than failing, and the MCP
+`search` auto-sync turns it into a warning. Inside the MCP server, syncs queue instead: a `search` that finds the index stale while
 another tool call is already syncing waits for it — for at most `auto_sync_budget_s` seconds —
 and then searches the fresh index; a sync still running after that is reported as a warning and
 the search runs on the index as it is. A sync resolves its sources from the config as it is once
@@ -947,7 +999,7 @@ a session created with `grepogram auth` while the server runs is picked up by it
 | `~/.config/grepogram/config.toml` | settings, API keys, sources | 0600 |
 | `~/.config/grepogram/session.session` | Telethon session with the default account's auth key | 0600 |
 | `~/.config/grepogram/sessions/<name>.session` | the session of every other account `grepogram auth --account` signed in (the directory is 0700) | 0600 |
-| `~/Library/Application Support/grepogram/index.db` | messages, units, FTS and vector tables, and which accounts reach which chat (WAL) | — |
+| `~/Library/Application Support/grepogram/index.db` | messages with their links and forward origins, units, FTS and vector tables, and which accounts reach which chat (WAL) | — |
 | `~/Library/Application Support/grepogram/research.db` | research sessions, candidates, evidence, approvals and exclusions — your decisions, kept apart from the rebuildable index | 0600 |
 | `~/.config/grepogram/config.lock` | cross-process lock around every edit of `config.toml` | 0600 |
 | `~/Library/Application Support/grepogram/sync.lock` | cross-process sync lock | 0600 |
@@ -1109,7 +1161,11 @@ connections are held open rather than refused — a firewall prompt nobody answe
 - Only one session at a time can be written: `grepogram auth` while another client has an
   uncommitted write open on the session file (a sync in another Telethon-based tool, say) can
   fail with `database is locked`; grepogram's own clients only read it.
-- `sources add` / `rm` and the MCP tools rewrite `config.toml` without its comments.
+- Every command and tool that edits `config.toml` — `sources add` / `rm`, `auth --account`,
+  `accounts rm`, `research run`, and the MCP `sources_add`, `sources_remove` and
+  `research_run` — rewrites it without its comments,
+  so signing in a second account drops the annotated template; the template is the block in
+  [Configuration](#configuration).
 - The MCP contract targets the `mcp` 1.x SDK (`FastMCP`); 2.x renamed the API and is excluded by
   the dependency pin.
 
