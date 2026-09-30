@@ -52,7 +52,7 @@ import sqlite3
 import threading
 import time
 from collections import deque
-from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, NoReturn
 
@@ -84,6 +84,7 @@ from grepogram.sources import (
     imported_tag,
     parse_since,
     resolve_sources,
+    source_account,
 )
 from grepogram.units import UNKNOWN_SENDER
 
@@ -2056,6 +2057,158 @@ def _self_row(me: Any) -> UserRow | None:
     return next(iter(users.values()), None)
 
 
+# --- passes over stored chats ----------------------------------------------------------------
+
+
+def reaching_accounts(
+    conn: sqlite3.Connection, chat: ChatRow, connected: Collection[str]
+) -> list[str]:
+    """The accounts of ``connected`` a pass may ask about ``chat`` through, in the order to try.
+
+    A private chat, a bot or a legacy group is its scope account's history and nobody else's —
+    another account's chat with the same person carries other message ids — so it is asked
+    through that account or not at all, never through a defaulted one. A channel or supergroup
+    is one shared row: the account of its primary source goes first (the one a sync fetches it
+    through), then every account ``chat_access`` records as reaching it, then — for a discussion
+    group, which a sync reaches through its channel's link rather than a resolve of its own and
+    so may have no access row — the accounts that reach the channel it holds the comments of,
+    and the channel's primary source's. A shared row nothing ties to any account at all (one
+    built by hand, or by a link to a channel the index no longer holds) is anyone's to ask
+    about: every connected account, the default one first.
+    """
+    if not chat.is_shared:
+        return [chat.scope] if chat.scope in connected else []
+    order: list[str] = []
+    if chat.source_id and not chat.source_id.startswith(IMPORT_PREFIX):
+        order.append(source_account(chat.source_id))
+    order += db.chat_accounts(conn, chat.id)
+    if chat.discussion_of is not None:
+        order += db.chat_accounts(conn, chat.discussion_of)
+        channel = db.get_chat(conn, chat.discussion_of)
+        if channel is not None and channel.source_id:
+            order.append(source_account(channel.source_id))
+    if not order:
+        order = sorted(connected, key=lambda account: (account != DEFAULT_ACCOUNT, account))
+    return [account for account in dict.fromkeys(order) if account in connected]
+
+
+_REROUTE_ERRORS: tuple[type[Exception], ...] = (ValueError, *UNAVAILABLE_ERRORS)
+"""What sends :meth:`StoredPass.visit` on to the next account that reaches a shared chat: a
+refusal, or a peer this account's client cannot address at all."""
+
+
+@dataclass(slots=True, eq=False)
+class StoredPass:
+    """Which account a pass over stored chats asks about each chat through.
+
+    :func:`prune_deleted` and :func:`grepogram.media.run` walk ``chats`` rows rather than a
+    source list and re-fetch by id, so each chat needs an account that reaches it and a client
+    that can address it. :meth:`start` routes every chat (:func:`reaching_accounts`) and warms
+    each client with the chats it is asked about first (:func:`warm_peer_cache`, seeded from the
+    stored access hashes before any request); a chat no connected account reaches is put in
+    ``unreachable`` — reported, never an error, and never asked through an account it is not.
+
+    :meth:`visit` asks through the first account left: a flood wait stops that account for the
+    rest of the pass (its chats move on to the next account that reaches them, or wait for the
+    next run), a shared chat its account is refused — or cannot address at all — is tried
+    through the next one, warmed for that chat first, and any other error costs the chat its turn
+    with a warning. Warnings name their account whenever the pass holds one but the default.
+    """
+
+    conn: sqlite3.Connection
+    clients: Mapping[str, Any]
+    sync_cfg: SyncCfg
+    budget: SyncBudget
+    flood_warning: Callable[[int], str]
+    routes: dict[int, list[str]] = field(default_factory=dict)
+    unreachable: list[ChatRow] = field(default_factory=list)
+    stopped: set[str] = field(default_factory=set)
+    warnings: list[str] = field(default_factory=list)
+
+    @classmethod
+    async def start(
+        cls,
+        conn: sqlite3.Connection,
+        clients: Mapping[str, Any],
+        chats: Sequence[ChatRow],
+        sync_cfg: SyncCfg,
+        budget: SyncBudget,
+        flood_warning: Callable[[int], str],
+    ) -> "StoredPass":
+        """Route ``chats`` and, unless the budget is already spent, warm every client for the
+        chats it goes first for — the flood-sleep cap goes on **before** each warm-up, which
+        makes requests of its own."""
+        state = cls(conn, clients, sync_cfg, budget, flood_warning)
+        first: dict[str, list[ChatRow]] = {}
+        for chat in chats:
+            route = reaching_accounts(conn, chat, clients)
+            if not route:
+                state.unreachable.append(chat)
+                log.info(
+                    "chat %s (%s): no connected account reaches it; left alone",
+                    chat.id,
+                    chat.title,
+                )
+                continue
+            state.routes[chat.id] = route
+            first.setdefault(route[0], []).append(chat)
+        if budget.expired:
+            return state
+        for account, routed in first.items():
+            client = clients[account]
+            _cap_flood_sleep(client, sync_cfg, budget)
+            try:
+                await warm_peer_cache(client, routed, conn, account)
+            except errors.UnauthorizedError as exc:
+                _reraise_unauthorized(exc, account)
+        return state
+
+    @property
+    def labelled(self) -> bool:
+        return any(account != DEFAULT_ACCOUNT for account in self.clients)
+
+    def warn(self, account: str, warning: str) -> None:
+        self.warnings.append(f"account {account}: {warning}" if self.labelled else warning)
+
+    async def visit[T](self, chat: ChatRow, act: Callable[[Any], Awaitable[T]]) -> T | None:
+        """``act(client)`` for the first account that answers about ``chat``; ``None`` when none
+        did — a flood wait, a refusal, an error or the budget ended its turn."""
+        route = [account for account in self.routes.get(chat.id, ()) if account not in self.stopped]
+        refused: tuple[str, Exception] | None = None
+        for position, account in enumerate(route):
+            if self.budget.expired:
+                break
+            client = self.clients[account]
+            _cap_flood_sleep(client, self.sync_cfg, self.budget)
+            try:
+                if position:
+                    await warm_peer_cache(client, [chat], self.conn, account)
+                return await act(client)
+            except errors.FloodWaitError as exc:
+                log.warning(
+                    "flood wait of %ss on chat %s through account %s; stopping it for this run",
+                    exc.seconds,
+                    chat.id,
+                    account,
+                )
+                self.stopped.add(account)
+                self.warn(account, self.flood_warning(exc.seconds))
+            except errors.UnauthorizedError as exc:
+                _reraise_unauthorized(exc, account)
+            except (errors.RPCError, ValueError) as exc:
+                log.warning(
+                    "chat %s (%s) through account %s: %s", chat.id, chat.title, account, exc
+                )
+                if chat.is_shared and isinstance(exc, _REROUTE_ERRORS):
+                    refused = (account, exc)
+                    continue
+                self.warn(account, f"chat {chat.id} ({chat.title}): {exc}")
+                return None
+        if refused is not None:
+            self.warn(refused[0], f"chat {chat.id} ({chat.title}): {refused[1]}")
+        return None
+
+
 # --- the deletion sweep ----------------------------------------------------------------------
 
 
@@ -2071,6 +2224,7 @@ class _PruneTally:
     checked: int = 0
     done: list[int] = field(default_factory=list)
     remaining: list[int] = field(default_factory=list)
+    unreachable: list[int] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
 
     def report(self) -> PruneReport:
@@ -2086,12 +2240,13 @@ class _PruneTally:
             checked=self.checked,
             chats_done=self.done,
             chats_remaining=self.remaining,
+            chats_unreachable=self.unreachable,
             warnings=self.warnings,
         )
 
 
 async def prune_deleted(
-    client: Any,
+    clients: Mapping[str, Any],
     conn: sqlite3.Connection,
     cfg: Config,
     paths: Paths,
@@ -2113,11 +2268,17 @@ async def prune_deleted(
     plain exception rather than an ``RPCError`` and would otherwise end the whole sweep on the
     first chat that hit it.
 
+    ``clients`` maps an account to its connected client, and every chat is asked about through
+    an account that reaches it (:class:`StoredPass`): a private chat through its own account
+    alone, a shared one through its primary source's account first and another that reaches it
+    when that one is refused or stopped by a flood wait. A chat no connected account reaches is
+    left alone and reported in ``chats_unreachable`` — its cursor untouched, nothing removed.
+
     Addressing a chat by its stored id is only possible once the client knows that peer, and a
-    client grepogram builds knows none: :func:`warm_peer_cache` reads the dialog list first, for
-    the reasons written there. A sync gets that for free from
-    :func:`~grepogram.sources.resolve_sources`; this pass walks ``chats`` rows instead of a
-    source list, so it asks by hand.
+    client grepogram builds knows none: :func:`warm_peer_cache` seeds the stored access hashes
+    and reads the dialog list for the rest, for the reasons written there. A sync gets that for
+    free from :func:`~grepogram.sources.resolve_sources`; this pass walks ``chats`` rows instead
+    of a source list, so it asks by hand.
 
     It is a whole-index pass of about one request per hundred stored messages, so it is never
     automatic and never an MCP tool: like ``sources prune``, deleting indexed history stays a
@@ -2143,35 +2304,31 @@ async def prune_deleted(
     """
     with SyncLock(paths):
         targets = _sweep_targets(conn, chat_id)
-        tally = _PruneTally()
-        _cap_flood_sleep(client, cfg.sync, budget)
-        await warm_peer_cache(client, targets, conn, DEFAULT_ACCOUNT)
-        for position, chat in enumerate(targets):
+        route = await StoredPass.start(
+            conn, clients, targets, cfg.sync, budget, _prune_flood_warning
+        )
+        tally = _PruneTally(warnings=route.warnings)
+        tally.unreachable.extend(chat.id for chat in route.unreachable)
+        routed = [chat for chat in targets if chat.id in route.routes]
+        for position, chat in enumerate(routed):
             if budget.expired:
-                tally.remaining.extend(rest.id for rest in targets[position:])
+                tally.remaining.extend(rest.id for rest in routed[position:])
                 break
-            _cap_flood_sleep(client, cfg.sync, budget)
-            try:
-                complete = await _sweep_chat(client, conn, cfg, chat, budget, tally)
-            except errors.FloodWaitError as exc:
-                log.warning("flood wait of %ss on chat %s; stopping this run", exc.seconds, chat.id)
-                tally.warnings.append(
-                    f"flood wait: Telegram asks to wait {exc.seconds}s before more requests; "
-                    "run `grepogram prune-deleted` again later"
-                )
-                tally.remaining.extend(rest.id for rest in targets[position:])
-                break
-            except errors.UnauthorizedError:
-                raise
-            except (errors.RPCError, ValueError) as exc:
-                log.warning(
-                    "chat %s (%s): %s; nothing was removed from it", chat.id, chat.title, exc
-                )
-                tally.warnings.append(f"chat {chat.id} ({chat.title}): {exc}")
-                tally.remaining.append(chat.id)
-                continue
+            complete = await route.visit(
+                chat,
+                functools.partial(
+                    _sweep_chat, conn=conn, cfg=cfg, chat=chat, budget=budget, tally=tally
+                ),
+            )
             (tally.done if complete else tally.remaining).append(chat.id)
         return tally.report()
+
+
+def _prune_flood_warning(seconds: int) -> str:
+    return (
+        f"flood wait: Telegram asks to wait {seconds}s before more requests; "
+        "run `grepogram prune-deleted` again later"
+    )
 
 
 def _sweep_targets(conn: sqlite3.Connection, chat_id: int | None) -> list[ChatRow]:

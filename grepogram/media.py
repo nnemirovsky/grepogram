@@ -36,17 +36,15 @@ import functools
 import logging
 import sqlite3
 import tempfile
-from collections.abc import Iterator, Sequence
+from collections.abc import Collection, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, get_args
 
-from telethon import errors
-
 from grepogram import db, extract, index, sync, units
 from grepogram.extract import ExtractError, Extractor
-from grepogram.models import DEFAULT_ACCOUNT, ChatRow, Config, MediaKind, MediaReport, MessageRow
+from grepogram.models import ChatRow, Config, MediaKind, MediaReport, MessageRow
 
 log = logging.getLogger(__name__)
 
@@ -133,40 +131,48 @@ def resolve_offline_states(
 
 async def run(
     conn: sqlite3.Connection,
-    client: Any,
+    clients: Mapping[str, Any],
     cfg: Config,
     budget: sync.SyncBudget,
     *,
     retry_failed: bool = False,
 ) -> MediaReport:
-    """Extract what the queue holds within ``budget``; the client must be connected.
+    """Extract what the queue holds within ``budget``; every client must be connected.
+
+    ``clients`` maps an account to its client, and each chat's media is re-fetched through an
+    account that reaches the chat (:class:`grepogram.sync.StoredPass`): a private chat through
+    its own account alone, a shared one through its primary source's account first and through
+    another that reaches it when that one is refused or stopped by a flood wait. A chat no
+    connected account reaches is left alone — its media counted in ``unreachable`` and the chat
+    in ``chats_unreachable``, never an error.
 
     The caller holds the :class:`grepogram.sync.SyncLock` — this writes ``media_state``,
     ``extracted_text`` and ``indexed``, and ``db.Connection``'s lock only serialises threads
     within one process.
 
-    A flood wait ends the run with what it earned; any other Telegram error costs one chat its
-    turn and is reported. Every message the pass looks at leaves with a state written, so a run
-    can never spin on a batch it cannot resolve. The client's ``flood_sleep_threshold`` is capped
-    against the time left exactly as a sync caps it (:func:`grepogram.sync._cap_flood_sleep`), so
-    a bounded run never sleeps through a wait longer than it has.
+    A flood wait stops that account for the rest of the run with what it earned; any other
+    Telegram error costs one chat its turn and is reported. Every message the pass looks at
+    leaves with a state written, so a run can never spin on a batch it cannot resolve. Each
+    client's ``flood_sleep_threshold`` is capped against the time left exactly as a sync caps it
+    (:func:`grepogram.sync._cap_flood_sleep`), so a bounded run never sleeps through a wait
+    longer than it has.
 
-    The re-fetch names a chat by its stored id alone, which a client can only turn into a peer
-    once it knows that one — and a client grepogram builds knows none:
-    :func:`grepogram.sync.warm_peer_cache` reads the dialog list first, for the reasons written
-    there. Without it this pass resolved *nothing* on a real account and every chat left a
-    "Could not find the input entity" warning below. The cap goes on **before** that warm-up:
-    it makes requests of its own, and a client still at the default 120-second threshold would
-    sleep a sub-threshold flood wait out well past a five-second extraction budget before the
-    first chat had been looked at.
+    The re-fetch names a chat by its stored peer id alone, which a client can only turn into a
+    peer once it knows that one — and a client grepogram builds knows none:
+    :func:`grepogram.sync.warm_peer_cache` seeds the stored access hashes and reads the dialog
+    list for the rest, for the reasons written there. Without it this pass resolved *nothing* on
+    a real account and every chat left a "Could not find the input entity" warning below. The cap
+    goes on **before** that warm-up: it makes requests of its own, and a client still at the
+    default 120-second threshold would sleep a sub-threshold flood wait out well past a
+    five-second extraction budget before the first chat had been looked at.
     """
-    warnings: list[str] = []
     if not cfg.media.enabled:
         log.info("[media] enabled is false; the extraction pass did nothing")
-        remaining, unreachable = _queue_left(conn)
+        remaining, unreachable, cut_off = _queue_left(conn, clients)
         return MediaReport(
             remaining=remaining,
             unreachable=unreachable,
+            chats_unreachable=cut_off,
             warnings=["[media] enabled is false in the config; nothing was extracted"],
         )
     extractors = extract.registry()
@@ -178,28 +184,26 @@ async def run(
     )
     with _scratch() as scratch:
         chats = _fetchable_rows(conn)
-        if not budget.expired:
-            sync._cap_flood_sleep(client, cfg.sync, budget)
-            await sync.warm_peer_cache(client, chats, conn, DEFAULT_ACCOUNT)
+        route = await sync.StoredPass.start(conn, clients, chats, cfg.sync, budget, _flood_warning)
         for chat in chats:
             if budget.expired:
                 break
-            sync._cap_flood_sleep(client, cfg.sync, budget)
-            try:
-                await _extract_chat(conn, client, chat, extractors, cfg, scratch, budget, tally)
-            except errors.FloodWaitError as exc:
-                log.warning("flood wait of %ss on chat %s; stopping this run", exc.seconds, chat.id)
-                warnings.append(
-                    f"flood wait: Telegram asks to wait {exc.seconds}s before more media "
-                    "requests; run `grepogram extract` again later"
-                )
-                break
-            except errors.UnauthorizedError:
-                raise
-            except (errors.RPCError, ValueError) as exc:
-                log.warning("chat %s: %s; its media was skipped this run", chat.id, exc)
-                warnings.append(f"chat {chat.id}: {exc}")
-    remaining, unreachable = _queue_left(conn)
+            if chat.id not in route.routes:
+                continue
+            await route.visit(
+                chat,
+                functools.partial(
+                    _extract_chat,
+                    conn,
+                    chat=chat,
+                    extractors=extractors,
+                    cfg=cfg,
+                    scratch=scratch,
+                    budget=budget,
+                    tally=tally,
+                ),
+            )
+    remaining, unreachable, cut_off = _queue_left(conn, clients)
     return MediaReport(
         extracted=tally[db.MEDIA_EXTRACTED],
         failed=tally[db.MEDIA_FAILED],
@@ -209,28 +213,40 @@ async def run(
         requeued=requeued,
         remaining=remaining,
         unreachable=unreachable,
-        warnings=warnings,
+        chats_unreachable=cut_off,
+        warnings=route.warnings,
     )
 
 
-def _queue_left(conn: sqlite3.Connection) -> tuple[int, int]:
-    """What the queue still holds, split into what a next run could read and what none can.
+def _flood_warning(seconds: int) -> str:
+    return (
+        f"flood wait: Telegram asks to wait {seconds}s before more media requests; "
+        "run `grepogram extract` again later"
+    )
+
+
+def _queue_left(conn: sqlite3.Connection, accounts: Collection[str]) -> tuple[int, int, list[int]]:
+    """What the queue still holds: what a next run could read, what none can, and the chats
+    holding pending media that no account of ``accounts`` reaches.
 
     ``remaining`` is the pass's only completion signal — ``grepogram extract`` prints "run
     extract again" for it and a script may loop on it — so it counts the chats this pass would
-    walk, not the whole index (:func:`_fetchable_chats`, :func:`grepogram.db.count_pending_media`).
+    walk, not the whole index (:func:`_fetchable_rows`, :func:`grepogram.db.count_pending_media`).
     An imported chat's media carries a ``media_kind`` like any other and sits at
     ``MEDIA_PENDING`` for good, since nothing may ever re-fetch the message it hangs on: counted
     with the rest it would make every run after any import report work that can never be done.
-    It is reported as ``unreachable`` instead, which says what it is and asks for nothing.
+    It is reported as ``unreachable`` instead, which says what it is and asks for nothing — and
+    so is the media of a chat no connected account reaches
+    (:func:`grepogram.sync.reaching_accounts`), which another run of the same accounts could not
+    read either.
     """
-    fetchable = db.count_pending_media(conn, _fetchable_chats(conn))
-    return fetchable, db.count_pending_media(conn) - fetchable
-
-
-def _fetchable_chats(conn: sqlite3.Connection) -> list[int]:
-    """The ids of :func:`_fetchable_rows`, which is what the queue counts are keyed by."""
-    return [chat.id for chat in _fetchable_rows(conn)]
+    reachable: list[int] = []
+    cut_off: list[int] = []
+    for chat in _fetchable_rows(conn):
+        routed = sync.reaching_accounts(conn, chat, accounts)
+        (reachable if routed else cut_off).append(chat.id)
+    fetchable = db.count_pending_media(conn, reachable)
+    return fetchable, db.count_pending_media(conn) - fetchable, cut_off
 
 
 def _fetchable_rows(conn: sqlite3.Connection) -> list[ChatRow]:
@@ -244,7 +260,8 @@ def _fetchable_rows(conn: sqlite3.Connection) -> list[ChatRow]:
     would leave ``grepogram extract`` as a traceback rather than a warning.
 
     The rows rather than the ids, because :func:`grepogram.sync.warm_peer_cache` needs
-    ``discussion_of`` to reach a group the dialog list does not list.
+    ``discussion_of`` to reach a group the dialog list does not list, and the routing needs the
+    scope and the primary source.
     """
     stored = {chat.id: chat for chat in db.list_chats(conn)}
     return [

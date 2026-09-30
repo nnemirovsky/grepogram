@@ -604,13 +604,14 @@ def test_extract_reports_unreachable_media_apart_from_the_queue(
     async def parked(
         conn: object, client: object, cfg: object, budget: object, **kw: object
     ) -> Any:
-        return MediaReport(unreachable=4)
+        return MediaReport(unreachable=4, chats_unreachable=[77])
 
     monkeypatch.setattr(tg, "make_client", lambda cfg, paths: FakeClient())
     monkeypatch.setattr(media, "run", parked)
     result = runner.invoke(cli.app, ["extract"])
     assert result.exit_code == 0, result.output
     assert "in chats nothing can re-fetch: 4" in result.stdout
+    assert "chats no signed-in account reaches: 1 (77)" in result.stdout
     assert "run extract again" not in result.stdout
 
 
@@ -712,7 +713,13 @@ def test_prune_deleted_passes_the_chat_and_the_budget_through(
     ) -> PruneReport:
         seen.update(kw)
         seen["seconds"] = budget.seconds
-        return PruneReport(removed=0, checked=4, chats_remaining=[PRUNE_ID], warnings=["careful"])
+        return PruneReport(
+            removed=0,
+            checked=4,
+            chats_remaining=[PRUNE_ID],
+            chats_unreachable=[77],
+            warnings=["careful"],
+        )
 
     monkeypatch.setattr(tg, "make_client", lambda cfg, paths: FakeClient())
     monkeypatch.setattr(sync, "prune_deleted", record)
@@ -720,6 +727,7 @@ def test_prune_deleted_passes_the_chat_and_the_budget_through(
     assert result.exit_code == 0, result.output
     assert seen == {"chat_id": PRUNE_ID, "seconds": 7}
     assert f"chats not finished: 1 ({PRUNE_ID})" in result.stdout
+    assert "chats no signed-in account reaches: 1 (77)" in result.stdout
     assert "warning: careful" in result.stderr
 
 

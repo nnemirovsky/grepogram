@@ -322,7 +322,11 @@ async def _run_extract(
     """Connect and run :func:`grepogram.media.run` under the sync lock the caller holds."""
     async with tg.connected(client):
         return await media.run(
-            conn, client, cfg, sync.SyncBudget(budget), retry_failed=retry_failed
+            conn,
+            {DEFAULT_ACCOUNT: client},
+            cfg,
+            sync.SyncBudget(budget),
+            retry_failed=retry_failed,
         )
 
 
@@ -338,6 +342,9 @@ def _print_media_report(report: MediaReport) -> None:
     ):
         if count:
             typer.echo(f"{label}: {count}")
+    if report.chats_unreachable:
+        ids = ", ".join(str(chat_id) for chat_id in report.chats_unreachable)
+        typer.echo(f"chats no signed-in account reaches: {len(report.chats_unreachable)} ({ids})")
     if report.remaining:
         typer.echo(f"media pending: {report.remaining}; run extract again")
     if report.extracted:
@@ -402,7 +409,7 @@ async def _run_prune(
     """Connect and run :func:`grepogram.sync.prune_deleted`, which takes the sync lock itself."""
     async with tg.connected(client):
         return await sync.prune_deleted(
-            client, conn, cfg, paths, sync.SyncBudget(budget), chat_id=chat_id
+            {DEFAULT_ACCOUNT: client}, conn, cfg, paths, sync.SyncBudget(budget), chat_id=chat_id
         )
 
 
@@ -416,6 +423,9 @@ def _print_prune_report(report: PruneReport) -> None:
             f"chats not finished: {len(report.chats_remaining)} ({ids}); "
             "run prune-deleted again to carry on"
         )
+    if report.chats_unreachable:
+        ids = ", ".join(str(chat_id) for chat_id in report.chats_unreachable)
+        typer.echo(f"chats no signed-in account reaches: {len(report.chats_unreachable)} ({ids})")
     for warning in report.warnings:
         typer.echo(f"warning: {warning}", err=True)
 

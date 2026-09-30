@@ -402,7 +402,10 @@ class MediaReport:
     remaining: int = 0
     """Pending media a further run could still read — what "run extract again" is offered for."""
     unreachable: int = 0
-    """Pending media in a chat no run may re-fetch: an imported or an unavailable one."""
+    """Pending media in a chat no run may re-fetch: an imported or an unavailable one, or one no
+    connected account reaches."""
+    chats_unreachable: list[int] = field(default_factory=list)
+    """The chats holding pending media that no connected account reaches, left alone."""
     warnings: list[str] = field(default_factory=list)
 
 
@@ -413,13 +416,15 @@ class PruneReport:
     ``checked`` counts the stored ids the sweep asked Telegram about, ``removed`` the messages
     that came back empty and were dropped. A chat is in ``chats_done`` once the sweep reached the
     end of its history and in ``chats_remaining`` when a budget, a flood wait or an error stopped
-    it partway — its cursor stays where it got to, so the next run carries on from there.
+    it partway — its cursor stays where it got to, so the next run carries on from there. A
+    chat no connected account reaches is in ``chats_unreachable`` and was not asked about.
     """
 
     removed: int = 0
     checked: int = 0
     chats_done: list[int] = field(default_factory=list)
     chats_remaining: list[int] = field(default_factory=list)
+    chats_unreachable: list[int] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
 
 

@@ -497,13 +497,25 @@ voided_at)`, `exclusions(identity PRIMARY KEY, reason, created_at)`,
 
 **Files:**
 - Modify: `grepogram/media.py`, `grepogram/sync.py` (`prune_deleted`), `tests/test_media.py`, `tests/test_sync.py`
+- Modify: `grepogram/models.py` (`MediaReport.chats_unreachable`, `PruneReport.chats_unreachable`),
+  `grepogram/cli.py` (passes `{DEFAULT_ACCOUNT: client}` until task 8, prints the unreachable
+  chats), `tests/test_cli.py`
 
-- [ ] `media.run` and `prune_deleted` take the client mapping and route each chat to an account
+- [x] `media.run` and `prune_deleted` take the client mapping and route each chat to an account
   in `chat_access` (primary source's account first), warming that client first
-- [ ] a chat no connected account reaches is reported `unreachable`, never an error
-- [ ] tests: media of a second account's DM is extracted through that account; a chat reachable
+  — both through one driver, `sync.StoredPass` (`sync.reaching_accounts` orders the accounts:
+  a scoped chat only its own scope account; a shared one its primary source's account, then
+  `chat_access`, then for a discussion group the channel's accesses and primary; a shared row
+  nothing ties to an account is tried through every connected account, default first). A flood
+  wait stops that account for the pass and its chats move on to the next account that reaches
+  them; a shared chat refused (or unaddressable) is retried through the next account, warmed
+  for it first
+- [x] a chat no connected account reaches is reported `unreachable`, never an error
+  (`MediaReport.chats_unreachable` with its media in `unreachable`,
+  `PruneReport.chats_unreachable`)
+- [x] tests: media of a second account's DM is extracted through that account; a chat reachable
   by none is counted; `forget_entities` after sync still resolves via stored access hashes
-- [ ] run checks — must pass before task 8
+- [x] run checks — must pass before task 8
 
 ### Task 8: CLI accounts, per-account commands and `leave`
 

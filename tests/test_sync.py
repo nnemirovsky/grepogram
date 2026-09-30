@@ -828,6 +828,7 @@ async def _prune(
     budget: SyncBudget | None = None,
     *,
     chat_id: int | None = None,
+    account: str = DEFAULT_ACCOUNT,
 ) -> PruneReport:
     """Run the sweep the way ``grepogram prune-deleted`` does: on a client of its own.
 
@@ -839,7 +840,7 @@ async def _prune(
     client.forget_entities()
     async with tg.connected(client):
         return await sync.prune_deleted(
-            client, conn, cfg, paths, budget or SyncBudget(), chat_id=chat_id
+            {account: client}, conn, cfg, paths, budget or SyncBudget(), chat_id=chat_id
         )
 
 
@@ -3200,7 +3201,7 @@ async def test_a_dm_under_a_synthetic_id_is_swept_by_its_peer_id(
     client = _client(messages={ALICE_ID: _talk(101, 102, 103)})
     await sync.sync_chat(client, conn, chat, WORK_ALICE_SOURCE, SyncBudget())
     client.messages[ALICE_ID] = [m for m in client.messages[ALICE_ID] if m.id != 102]
-    report = await _prune(client, conn, paths, _cfg(), chat_id=chat.id)
+    report = await _prune(client, conn, paths, _cfg(), chat_id=chat.id, account=WORK)
     assert (report.removed, report.checked) == (1, 3)
     assert _swept(client) == [ALICE_ID]
     assert _texts(conn, chat.id) == {101: "m101", 103: "m103"}
@@ -4331,3 +4332,79 @@ async def test_a_replaced_attachment_cuts_the_old_text_out_of_a_closed_window(
     assert not any("отдел виз" in text for text in stored), "the old file's text left the unit"
     assert not any("отдел виз" in raw for raw in _unit_fts(conn, ARG_ID)), "and left unit_fts"
     assert not index.unit_index_gaps(conn, ARG_ID)
+
+
+async def _prune_accounts(
+    clients: dict[str, FakeClient],
+    conn: sqlite3.Connection,
+    paths: Paths,
+    cfg: Config,
+    **kw: Any,
+) -> PruneReport:
+    """The sweep as ``grepogram prune-deleted`` runs it after a sync: fresh clients, one per
+    account, whose entity caches know nothing yet."""
+    async with contextlib.AsyncExitStack() as stack:
+        for account, client in clients.items():
+            client.forget_entities()
+            client.calls.clear()
+            await stack.enter_async_context(tg.connected(client, account))
+        return await sync.prune_deleted(clients, conn, cfg, paths, SyncBudget(), **kw)
+
+
+def _cfg_two_accounts() -> Config:
+    return _cfg(
+        Source(chat="@alice"),
+        Source(chat="@alice", account=WORK),
+        Source(chat=PRIV_ID, account=WORK),
+    )
+
+
+async def test_the_sweep_asks_each_account_about_its_own_chats_by_stored_hashes(
+    conn: sqlite3.Connection, paths: Paths
+) -> None:
+    """After a two-account sync, fresh clients sweep with no dialog walk at all: every chat is
+    addressed through the account that reaches it, by the access hash the sync stored for it."""
+    world = _world()
+    home, work = _home(world), _work(world)
+    clients = {DEFAULT_ACCOUNT: home, WORK: work}
+    cfg = _cfg_two_accounts()
+    await _run_accounts(clients, conn, paths, cfg)
+    work.messages[ALICE_ID] = [m for m in work.messages[ALICE_ID] if m.id != 8]
+    work.messages[PRIV_ID] = [m for m in work.messages[PRIV_ID] if m.id != 2]
+
+    report = await _prune_accounts(clients, conn, paths, cfg)
+
+    work_alice = db.get_chat_by_peer(conn, ALICE_ID, WORK)
+    home_alice = db.get_chat_by_peer(conn, ALICE_ID, DEFAULT_ACCOUNT)
+    assert work_alice is not None and home_alice is not None
+    assert (report.removed, report.checked) == (2, 1 + 2 + 3)
+    assert report.warnings == [] and report.chats_unreachable == []
+    assert sorted(report.chats_done) == sorted([PRIV_ID, home_alice.id, work_alice.id])
+    assert _swept(home) == [ALICE_ID]
+    assert sorted(_swept(work)) == sorted([PRIV_ID, ALICE_ID])
+    for client in clients.values():
+        assert [name for name, _ in client.calls if name in ("get_dialogs", "get_entity")] == []
+    assert _texts(conn, work_alice.id) == {7: "work hello"}
+    assert _texts(conn, PRIV_ID) == {1: "club 1", 3: "club 3"}
+    assert _texts(conn, home_alice.id) == {1: "home hello"}
+
+
+async def test_the_sweep_leaves_a_chat_no_connected_account_reaches(
+    conn: sqlite3.Connection, paths: Paths
+) -> None:
+    """Only the default account is signed in this time: the work account's chats — its chat
+    with Alice above all, whose ids the default account's would misread — are reported and
+    never asked about."""
+    world = _world()
+    home, work = _home(world), _work(world)
+    cfg = _cfg_two_accounts()
+    await _run_accounts({DEFAULT_ACCOUNT: home, WORK: work}, conn, paths, cfg)
+    work_alice = db.get_chat_by_peer(conn, ALICE_ID, WORK)
+    home_alice = db.get_chat_by_peer(conn, ALICE_ID, DEFAULT_ACCOUNT)
+    assert work_alice is not None and home_alice is not None
+
+    report = await _prune_accounts({DEFAULT_ACCOUNT: home}, conn, paths, cfg)
+
+    assert report.chats_done == [home_alice.id] and report.removed == 0
+    assert sorted(report.chats_unreachable) == sorted([PRIV_ID, work_alice.id])
+    assert report.warnings == [] and _swept(home) == [ALICE_ID]

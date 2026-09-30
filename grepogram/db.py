@@ -1462,7 +1462,7 @@ def count_pending_media(conn: sqlite3.Connection, chat_ids: Sequence[int] | None
     """How many rows are left in the extraction queue; ``chat_ids`` scopes it to those chats.
 
     The scoped figure is what ``grepogram extract`` reports as ``remaining``, over the chats the
-    pass can actually re-fetch (:func:`grepogram.media._fetchable_chats`). A row in an imported
+    pass can actually re-fetch (:func:`grepogram.media._queue_left`). A row in an imported
     or unavailable chat never leaves :data:`MEDIA_PENDING`, so the index-wide count would tell
     the user to "run extract again" for work no run can ever do, and a script looping until it
     reaches zero would never stop. An empty ``chat_ids`` is an empty scope, not the whole index.
