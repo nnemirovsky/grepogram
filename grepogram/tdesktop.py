@@ -21,7 +21,10 @@ project has already paid for once.
 (``{"type": "link", "text": "…"}``), and newer exports carry the same content again as
 ``text_entities``, where even the plain runs are objects. :func:`flatten_text` prefers
 ``text_entities`` and falls back to ``text``, so both export generations flatten to the same
-plain string.
+plain string. The same runs say where the message links to — visible URLs, hidden
+``text_link`` hyperlinks, mentions — which :func:`export_links` turns into the ``links`` a live
+message gets from :func:`grepogram.sync.links_of`, and a forward's ``forwarded_from_id`` becomes
+its structured origin, so research reads an import like a sync.
 
 A half-written export is the normal case — someone cancels the export, or the disk fills — so
 nothing here raises part-way through a file. A truncated JSON document is recovered up to its
@@ -42,7 +45,8 @@ from typing import Any, TypeGuard
 from telethon import utils
 from telethon.tl import types
 
-from grepogram.models import ChatRow, ChatType, MediaKind, MessageRow
+from grepogram import leads
+from grepogram.models import ChatRow, ChatType, LinkKind, MediaKind, MessageRow
 from grepogram.units import UNKNOWN_SENDER
 
 log = logging.getLogger(__name__)
@@ -387,11 +391,61 @@ def _parse_message(raw: Any, chat: ChatRow, notes: _Notes) -> MessageRow | None:
         from_name=_display_name(raw.get("from")),
         reply_to_msg_id=_reply_to(raw, chat),
         fwd_from=_forwarded_from(raw),
+        fwd_peer_id=_forwarded_peer(raw),
         text=flatten_text(raw) or media_text(raw),
         media_kind=media_kind,
         media_filename=media_filename,
         reactions_total=reactions_total(raw.get("reactions")),
+        links=export_links(raw),
     )
+
+
+_LINK_RUNS: dict[str, LinkKind] = {
+    "link": "link",
+    "text_link": "text_url",
+    "mention": "mention",
+    "mention_name": "mention",
+}
+"""The run types of an export that name a Telegram destination, and the link kind each is —
+the same kinds :func:`grepogram.sync.links_of` gives a live message's entities."""
+
+
+def export_links(message: Mapping[str, Any]) -> tuple[tuple[LinkKind, str], ...] | None:
+    """Every Telegram destination a message's runs name, as :func:`grepogram.sync.links_of`
+    reads them off a live message: a visible URL (``link``), a hidden hyperlink (``text_link``
+    and its ``href``), an ``@mention`` and a mention of a user by id (``mention_name``).
+
+    ``None`` — *not read* — when the export spells no runs at all (a plain string ``text`` and no
+    ``text_entities``): nothing then says what was hidden behind the text, and research's text
+    fallback is what reads it. Buttons and link previews are not in an export.
+    """
+    runs = message.get("text_entities")
+    if not isinstance(runs, list):
+        runs = message.get("text")
+        if not isinstance(runs, list):
+            return None
+    found: set[tuple[LinkKind, str]] = set()
+    for run in runs:
+        if not isinstance(run, Mapping):
+            continue
+        kind = _LINK_RUNS.get(str(run.get("type")))
+        if kind is None:
+            continue
+        if run.get("type") == "text_link":
+            value: Any = run.get("href")
+        elif run.get("type") == "mention_name":
+            user = run.get("user_id")
+            value = f"peer:{int(user)}" if _is_int(user) else None
+        else:
+            value = run.get("text")
+        if isinstance(value, str) and (lead := leads.normalize(value)) is not None:
+            found.add((kind, lead.target))
+    return tuple(sorted(found))
+
+
+def _forwarded_peer(message: Mapping[str, Any]) -> int | None:
+    """The marked id a forward came from, where the export names it (``forwarded_from_id``)."""
+    return peer_id(message.get("forwarded_from_id")) if "forwarded_from" in message else None
 
 
 def flatten_text(message: Mapping[str, Any]) -> str:
