@@ -2049,3 +2049,57 @@ async def test_research_tools_never_write_to_stdout(
         "discover noise",
         "run noise",
     ]
+
+
+async def test_ordinary_search_never_widens_what_research_found(
+    researching: FakeClient, paths: Paths, conn: sqlite3.Connection
+) -> None:
+    """A candidate approved but not yet run stays outside `search`: only `research_run` acts on
+    a grant, so a search neither fetches it, nor asks Telegram anything about it, nor spends
+    the grant."""
+    await _discovered()
+    approved = await tools.research_approve(1, ["1"], FakeContext(answer=_accept()))  # type: ignore[arg-type]
+    assert approved["approved"] is True
+    rent = db.get_chat(conn, RENT_PEER)
+    assert rent is not None
+    ids = [
+        row["id"] for row in conn.execute("SELECT id FROM messages WHERE chat_id = ?", (RENT_PEER,))
+    ]
+    index.index_chat(conn, rent, ids, units.rebuild_for_chat(conn, rent, RESEARCH_CFG, ids))
+    db.set_chat_progress(conn, RENT_PEER, 1, int(time.time()))
+    requests, calls = len(researching.requests), len(researching.calls)
+
+    result = await tools.search("flat", mode="lexical")
+
+    assert {hit["chat"]["id"] for hit in result["hits"]} == {RENT_PEER}
+    assert researching.requests[requests:] == [] and researching.calls[calls:] == []
+    assert db.message_counts(conn) == {RENT_PEER: 1}
+    assert config.load(paths).sources == []
+    (candidate,) = tools.research_candidates(1)["candidates"]
+    assert (candidate["status"], candidate["authorized"]) == ("approved", ["fetch", "add_source"])
+
+
+async def test_removing_a_source_research_added_leaves_the_chat_joined(
+    researching: FakeClient, paths: Paths, conn: sqlite3.Connection
+) -> None:
+    """Stopping a session keeps the source its run added; removing that source afterwards
+    deletes the config entry and the indexed history and never the membership — leaving a chat
+    is `grepogram leave`, a command of its own."""
+    await _discovered()
+    ctx = FakeContext(answer=_accept())
+    approved = await tools.research_approve(1, ["1:join,fetch,add_source"], ctx)  # type: ignore[arg-type]
+    assert approved["approved"] is True
+    ran = await tools.research_run(1)
+    assert (ran["joined"], ran["fetched"]) == ([1], [1])
+    assert FLATS_PEER in researching.members
+    assert tools.research_stop(1)["stopped"] is True
+    assert [source.id for source in config.load(paths).sources] == ["chat:@tb_flats"]
+
+    removed = tools.sources_remove("chat:@tb_flats")
+
+    assert removed["removed_chat_ids"] == [FLATS_PEER]
+    assert config.load(paths).sources == []
+    assert db.get_chat(conn, FLATS_PEER) is None
+    leaving = (functions.channels.LeaveChannelRequest, functions.messages.DeleteChatUserRequest)
+    assert [r for r in researching.requests if isinstance(r, leaving)] == []
+    assert FLATS_PEER in researching.members, "the account is still in the chat"
