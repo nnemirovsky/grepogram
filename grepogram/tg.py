@@ -93,7 +93,7 @@ class OtherUser(AuthRequired):
 
     Everything tied to an account name — its private chats, the access hashes it stored, its
     research approvals — belongs to the recorded user, so a pass leaves such an account out
-    rather than act as someone else (:func:`grepogram.sync.check_account`). The way out is not a
+    rather than act as someone else (:func:`grepogram.accounts.check_account`). The way out is not a
     sign-in under the same name, which ``grepogram auth`` refuses, but removing the account
     first; ``hint`` says so."""
 

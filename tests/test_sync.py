@@ -20,7 +20,7 @@ from telethon.tl import functions, types
 from telethon.tl.types import messages as tl_messages
 from typer.testing import CliRunner
 
-from grepogram import cli, db, index, search, sources, sync, tg, units
+from grepogram import accounts, cli, db, index, search, sources, sync, tg, units
 from grepogram.config import ConfigError
 from grepogram.models import (
     DEFAULT_ACCOUNT,
@@ -1377,12 +1377,12 @@ async def test_the_warm_up_reraises_a_revoked_session_and_swallows_the_rest(
     arm(revoked)
     with pytest.raises(tg.AuthRequired):
         async with tg.connected(client):
-            await sync.warm_peer_cache(client, chats, conn, DEFAULT_ACCOUNT)
+            await accounts.warm_peer_cache(client, chats, conn, DEFAULT_ACCOUNT)
 
     arm(other)
     async with tg.connected(client):
         # anything else is still swallowed: the chat is left to the caller's per-chat handler
-        await sync.warm_peer_cache(client, chats, conn, DEFAULT_ACCOUNT)
+        await accounts.warm_peer_cache(client, chats, conn, DEFAULT_ACCOUNT)
 
 
 async def test_the_sweep_resolves_a_public_chat_the_dialog_list_never_lists(
@@ -1446,7 +1446,7 @@ async def test_the_warm_up_resolves_a_channel_before_asking_it_for_its_discussio
     ]
 
     async with tg.connected(client):
-        await sync.warm_peer_cache(client, chats, conn, DEFAULT_ACCOUNT)
+        await accounts.warm_peer_cache(client, chats, conn, DEFAULT_ACCOUNT)
 
     assert {OTHER_ID, group_id} <= client.resolved
 
@@ -3903,7 +3903,7 @@ async def test_a_flood_wait_on_one_accounts_get_me_leaves_the_others_running(
     assert report.warnings == [
         f"account {WORK}: flood wait: Telegram asks to wait 45s before asking who the account "
         "is; it sat this pass out"
-    ], "worded like every other pass that asks who an account is (sync.ask_account)"
+    ], "worded like every other pass that asks who an account is (accounts.ask_account)"
     assert [name for name, _ in work.calls] == ["connect", "is_user_authorized", "disconnect"]
 
 

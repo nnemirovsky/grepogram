@@ -132,7 +132,7 @@ from typing import Any, Literal, NoReturn, get_args
 from telethon import errors, utils
 from telethon.tl import functions, types
 
-from grepogram import config, db, dialogs, leads, research_db, sources, stem, sync, tg
+from grepogram import accounts, config, db, dialogs, leads, research_db, sources, stem, sync, tg
 from grepogram.embed import Embedder
 from grepogram.filters import resolve_chats
 from grepogram.leads import LeadTarget
@@ -1020,7 +1020,9 @@ async def read_pins(
         (asked if _pin_reader(target.chat, session) else foreign).append(target)
     del asked[max(limit, 0) :]
     if asked:
-        await sync.warm_peer_cache(client, [target.chat for target in asked], conn, session.account)
+        await accounts.warm_peer_cache(
+            client, [target.chat for target in asked], conn, session.account
+        )
     scan = LeadScan()
     done: list[ScanTarget] = list(foreign)
     extra: dict[int, set[str]] = {}
@@ -1034,9 +1036,9 @@ async def read_pins(
                 )
             ]
         except errors.FloodError as exc:
-            report.flood_wait_s = sync.flood_seconds(exc)
+            report.flood_wait_s = accounts.flood_seconds(exc)
             report.warnings.append(
-                sync.flood_warning(report.flood_wait_s, "reading more pinned posts", "stopped")
+                accounts.flood_warning(report.flood_wait_s, "reading more pinned posts", "stopped")
             )
             break
         except errors.UnauthorizedError as exc:
@@ -1518,7 +1520,7 @@ async def probe_candidates(
 
     A flood wait stops the pass: the report carries a warning and ``flood_wait_s``, and the
     candidates not reached wait for the next call. The probing half of :func:`discover`, which
-    has put the client to :func:`grepogram.sync.check_account` first.
+    has put the client to :func:`grepogram.accounts.check_account` first.
     """
     require_enabled(cfg)
     session = active_session(rdb, session_id)
@@ -1532,9 +1534,9 @@ async def probe_candidates(
         try:
             outcome = await probe(client, rdb, conn, candidate, now=now)
         except errors.FloodError as exc:
-            report.flood_wait_s = sync.flood_seconds(exc)
+            report.flood_wait_s = accounts.flood_seconds(exc)
             report.warnings.append(
-                sync.flood_warning(report.flood_wait_s, "probing again", "probing stopped")
+                accounts.flood_warning(report.flood_wait_s, "probing again", "probing stopped")
             )
             break
         {
@@ -1616,7 +1618,7 @@ async def search_telegram(
     ends the rest. The global-search half of :func:`discover`, which decides what may run — the
     session's question alone, the one query its ``global_search`` grant's summary names, for the
     searches ``[research]`` switches on *and* that grant covers — and puts the client to
-    :func:`grepogram.sync.check_account` first.
+    :func:`grepogram.accounts.check_account` first.
 
     Every chat found becomes a candidate one hop from the question (depth 1) with its result as
     evidence — a post keeps the origin key ``post:<peer>/<msg>`` discovery gives an indexed
@@ -1637,10 +1639,9 @@ async def search_telegram(
             else:
                 await _post_search(client, rdb, conn, cfg, session, report, stamp)
         except errors.FloodError as exc:
-            report.flood_wait_s = sync.flood_seconds(exc)
-            report.warnings.append(
-                f"{kind}: {sync.flood_warning(report.flood_wait_s, 'searching', 'search stopped')}"
-            )
+            report.flood_wait_s = accounts.flood_seconds(exc)
+            stopped = accounts.flood_warning(report.flood_wait_s, "searching", "search stopped")
+            report.warnings.append(f"{kind}: {stopped}")
             _record_search(rdb, report, stamp)
             break
         except errors.UnauthorizedError as exc:
@@ -2007,7 +2008,7 @@ async def discover(
     stays free meanwhile. Global search runs only while ``[research]`` switches it on and a
     ``global_search`` grant is live; without them this call simply does not search. A flood wait
     while reading pins or searching skips what follows for this call. Nothing is sent before
-    :func:`grepogram.sync.check_account` has made sure the client is the Telegram user the index
+    :func:`grepogram.accounts.check_account` has made sure the client is the Telegram user the index
     recorded for the session's account (:class:`~grepogram.tg.OtherUser` otherwise).
     """
     report = await sync.joined_to_thread(
@@ -2016,7 +2017,7 @@ async def discover(
     if client is None:
         return report
     session = active_session(rdb, session_id)
-    await sync.check_account(conn, session.account, client)
+    await accounts.check_account(conn, session.account, client)
     pins = await read_pins(client, rdb, conn, cfg, session.id, now=now)
     if pins.flood_wait_s is not None:
         return dataclasses.replace(report, pins=pins)
@@ -2762,7 +2763,7 @@ def _is_member(candidate: Candidate) -> bool:
 
 def _flood_note(report: RunReport, exc: errors.FloodError, what: str) -> None:
     report.warnings.append(
-        sync.flood_warning(sync.flood_seconds(exc), what, "the run stopped there")
+        accounts.flood_warning(accounts.flood_seconds(exc), what, "the run stopped there")
     )
     report.stopped_by = "flood"
 
@@ -3617,7 +3618,7 @@ async def run(
     stay for the next run, which is resumable from ``research.db`` alone; progress is recorded
     on the session. A stopped session refuses to run (:class:`SessionStopped`), and every source
     a run added stays when the session stops. A session whose account is signed in as another
-    Telegram user than the index recorded (:func:`grepogram.sync.check_account`) refuses to run
+    Telegram user than the index recorded (:func:`grepogram.accounts.check_account`) refuses to run
     with :class:`~grepogram.tg.OtherUser` before anything is sent.
     """
     require_enabled(cfg)
@@ -3629,7 +3630,7 @@ async def run(
             tg.auth_hint(session.account),
         )
     # a run joins, asks and fetches as this account: never as a Telegram user no approval named
-    await sync.check_account(conn, session.account, client)
+    await accounts.check_account(conn, session.account, client)
     limits = session.limits
     if budget is None:
         budget = sync.SyncBudget(limits.run_budget_s, messages=limits.max_messages_per_run)

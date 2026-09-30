@@ -666,8 +666,8 @@ CHAT_ID = -1001234567890
 
 # The three ``get_messages`` tests below are about the *shape* of an answer, not about resolving
 # the peer that was asked for, so they switch the entity cache off: a real client would have
-# listed its dialogs first (``sync.warm_peer_cache``), and saying so here would only add a dialog
-# fixture to assertions that never look at one. The resolution rule has its own tests in
+# listed its dialogs first (``accounts.warm_peer_cache``), and saying so here would only add a
+# dialog fixture to assertions that never look at one. The resolution rule has its own tests in
 # ``tests/test_tg.py``.
 
 

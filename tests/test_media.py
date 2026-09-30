@@ -124,8 +124,8 @@ def _client(**kwargs: Any) -> FakeClient:
 
     ``tg.make_client`` hands the command a private in-memory copy of the session file holding the
     data centre and the auth key alone, so nothing is addressable by bare id until the pass warms
-    the cache itself (:func:`grepogram.sync.warm_peer_cache`). Every client here starts that way,
-    which is what makes these tests able to fail when it does not.
+    the cache itself (:func:`grepogram.accounts.warm_peer_cache`). Every client here starts that
+    way, which is what makes these tests able to fail when it does not.
     """
     kwargs.setdefault("dialogs", [make_dialog(entity) for entity in ACCOUNT])
     kwargs.setdefault("responses", {functions.channels.GetFullChannelRequest: _news_full()})

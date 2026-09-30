@@ -71,6 +71,7 @@ from grepogram import (
     tdesktop,
     tg,
 )
+from grepogram.accounts import checked_accounts, signed_in_user
 from grepogram.config import TEMPLATE, ConfigError
 from grepogram.dialogs import DialogInfo, FolderInfo, Match
 from grepogram.embed import Embedder, ModelUnavailable
@@ -1318,12 +1319,12 @@ async def _folder_membership(
 ) -> sources.FolderMembership:
     """Connect every account that owns a folder source and read what each of its folders lists
     right now; the folder of an account that is not connected — or whose session is another
-    Telegram user than the index recorded (:func:`grepogram.sync.check_account`), whose folders
+    Telegram user than the index recorded (:func:`grepogram.accounts.check_account`), whose folders
     say nothing about the recorded user's — is recorded as unchecked."""
     if not accounts.clients:
         return await sources.folder_membership(cfg, {})
     async with _connected(accounts) as live:
-        checked, left_out = await sync.checked_accounts(conn, live)
+        checked, left_out = await checked_accounts(conn, live)
         _warn_all(f"account {name}: {reason}" for name, reason in left_out.items())
         catalogs = {name: dialogs.DialogCatalog(client) for name, client in checked.items()}
         return await sources.folder_membership(cfg, catalogs)
@@ -1477,13 +1478,13 @@ async def _leave(
     when the answer was no. A folder, a private chat and a bot are refused: there is nothing
     to leave.
 
-    The session is first put to :func:`grepogram.sync.signed_in_user`, before anything is
+    The session is first put to :func:`grepogram.accounts.signed_in_user`, before anything is
     resolved or asked: a session swapped into place by hand is another Telegram user, and
     leaving is the one outward action a new invite may be needed to undo, so such a session
     raises :class:`~grepogram.tg.OtherUser` with nothing sent. The question names the Telegram
     user the session is, not only the account name."""
     async with tg.connected(client, account):
-        me = await sync.signed_in_user(conn, account, client)
+        me = await signed_in_user(conn, account, client)
         if me is None:
             raise tg.AuthRequired(account=account)
         who = f"{utils.get_display_name(me) or 'user'} (user {me.id})"

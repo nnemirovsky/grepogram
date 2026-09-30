@@ -42,7 +42,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, get_args
 
-from grepogram import db, extract, index, sync, units
+from grepogram import accounts, db, extract, index, sync, units
 from grepogram.extract import ExtractError, Extractor
 from grepogram.models import ChatRow, Config, MediaKind, MediaReport, MessageRow
 
@@ -140,7 +140,7 @@ async def run(
     """Extract what the queue holds within ``budget``; every client must be connected.
 
     ``clients`` maps an account to its client, and each chat's media is re-fetched through an
-    account that reaches the chat (:class:`grepogram.sync.StoredPass`): a private chat through
+    account that reaches the chat (:class:`grepogram.accounts.StoredPass`): a private chat through
     its own account alone, a shared one through its primary source's account first and through
     another that reaches it when that one is refused or stopped by a flood wait. A chat no
     connected account reaches is left alone — its media counted in ``unreachable`` and the chat
@@ -154,12 +154,12 @@ async def run(
     Telegram error costs one chat its turn and is reported. Every message the pass looks at
     leaves with a state written, so a run can never spin on a batch it cannot resolve. Each
     client's ``flood_sleep_threshold`` is capped against the time left exactly as a sync caps it
-    (:func:`grepogram.sync._cap_flood_sleep`), so a bounded run never sleeps through a wait
+    (:func:`grepogram.accounts.cap_flood_sleep`), so a bounded run never sleeps through a wait
     longer than it has.
 
     The re-fetch names a chat by its stored peer id alone, which a client can only turn into a
     peer once it knows that one — and a client grepogram builds knows none:
-    :func:`grepogram.sync.warm_peer_cache` seeds the stored access hashes and reads the dialog
+    :func:`grepogram.accounts.warm_peer_cache` seeds the stored access hashes and reads the dialog
     list for the rest, for the reasons written there. Without it this pass resolved *nothing* on
     a real account and every chat left a "Could not find the input entity" warning below. The cap
     goes on **before** that warm-up: it makes requests of its own, and a client still at the
@@ -170,7 +170,7 @@ async def run(
         log.info("[media] enabled is false; the extraction pass did nothing")
         routed: dict[bool, list[int]] = {True: [], False: []}
         for chat in _fetchable_rows(conn):
-            routed[bool(sync.reaching_accounts(conn, chat, clients))].append(chat.id)
+            routed[bool(accounts.reaching_accounts(conn, chat, clients))].append(chat.id)
         remaining, unreachable, cut_off = _queue_left(conn, routed[True], routed[False])
         return MediaReport(
             remaining=remaining,
@@ -187,7 +187,9 @@ async def run(
     )
     with _scratch() as scratch:
         chats = _fetchable_rows(conn)
-        route = await sync.StoredPass.start(conn, clients, chats, cfg.sync, budget, _flood_warning)
+        route = await accounts.StoredPass.start(
+            conn, clients, chats, cfg.sync, budget, _flood_warning
+        )
         for chat in chats:
             if budget.expired:
                 break
@@ -224,7 +226,9 @@ async def run(
 
 
 def _flood_warning(seconds: int) -> str:
-    return sync.flood_warning(seconds, "more media requests", "run `grepogram extract` again later")
+    return accounts.flood_warning(
+        seconds, "more media requests", "run `grepogram extract` again later"
+    )
 
 
 def _queue_left(
@@ -232,7 +236,7 @@ def _queue_left(
 ) -> tuple[int, int, list[int]]:
     """What the queue still holds: what a next run could read, what none can, and ``cut_off``,
     the chats holding pending media that no connected account reaches — ``reachable`` being the
-    ones one does, as the pass routed them (:class:`grepogram.sync.StoredPass`).
+    ones one does, as the pass routed them (:class:`grepogram.accounts.StoredPass`).
 
     ``remaining`` is the pass's only completion signal — ``grepogram extract`` prints "run
     extract again" for it and a script may loop on it — so it counts the chats this pass would
@@ -242,7 +246,7 @@ def _queue_left(
     with the rest it would make every run after any import report work that can never be done.
     It is reported as ``unreachable`` instead, which says what it is and asks for nothing — and
     so is the media of a chat no connected account reaches
-    (:func:`grepogram.sync.reaching_accounts`), which another run of the same accounts could not
+    (:func:`grepogram.accounts.reaching_accounts`), which another run of the same accounts could not
     read either.
     """
     fetchable = db.count_pending_media(conn, reachable)
@@ -259,7 +263,7 @@ def _fetchable_rows(conn: sqlite3.Connection) -> list[ChatRow]:
     resolve, which Telethon answers with a plain ``ValueError`` — not an ``RPCError``, so it
     would leave ``grepogram extract`` as a traceback rather than a warning.
 
-    The rows rather than the ids, because :func:`grepogram.sync.warm_peer_cache` needs
+    The rows rather than the ids, because :func:`grepogram.accounts.warm_peer_cache` needs
     ``discussion_of`` to reach a group the dialog list does not list, and the routing needs the
     scope and the primary source.
     """

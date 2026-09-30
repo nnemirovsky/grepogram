@@ -685,7 +685,7 @@ def _client() -> FakeClient:
     """A client whose entity cache is already warm, for the tests about message iteration.
 
     Peer resolution has its own tests below; every caller that iterates messages for real has
-    listed its dialogs first (:func:`grepogram.sync.warm_peer_cache`), so stating that here
+    listed its dialogs first (:func:`grepogram.accounts.warm_peer_cache`), so stating that here
     keeps these assertions about ordering, offsets and failures alone.
     """
     supergroup = make_channel(200, "Argentina", username="ru_argentina", megagroup=True)
