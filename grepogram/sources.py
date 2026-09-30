@@ -24,7 +24,8 @@ import datetime as dt
 import logging
 import re
 import sqlite3
-from collections.abc import Callable, Sequence
+import time
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Literal
 
@@ -33,7 +34,16 @@ from telethon.tl import types
 
 from grepogram import db, dialogs
 from grepogram.dialogs import DialogCatalog, DialogInfo, FolderInfo, Match
-from grepogram.models import ChatRow, ChatStatus, Config, Source, SourceStatus
+from grepogram.models import (
+    ACCOUNT_NAME,
+    DEFAULT_ACCOUNT,
+    ChatRow,
+    ChatStatus,
+    Config,
+    Source,
+    SourceStatus,
+    chat_scope,
+)
 from grepogram.tdesktop import ImportedChat
 
 log = logging.getLogger(__name__)
@@ -61,6 +71,12 @@ _LINK_RE = re.compile(
     r"^(?:https?://)?(?:www\.)?(?:t\.me|telegram\.me|telegram\.dog)/(?P<path>[^?#]*)",
     re.IGNORECASE,
 )
+_ACCOUNT_PREFIX_RE = re.compile(
+    rf"^(?P<account>{ACCOUNT_NAME.pattern})/(?=(?:{CHAT_PREFIX}|{FOLDER_PREFIX}))", re.IGNORECASE
+)
+"""The ``<account>/`` in front of a source id of an account other than the default one
+(:attr:`grepogram.models.Source.id`). Only a ``chat:`` or ``folder:`` id carries one, so free
+text with a slash in it stays free text."""
 
 
 class SourceError(Exception):
@@ -105,10 +121,17 @@ class ImportConflict(SourceError):
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class Target:
-    """A parsed target; ``value`` is the marked id for ``kind="id"`` and text otherwise."""
+    """A parsed target; ``value`` is the marked id for ``kind="id"`` and text otherwise.
+
+    ``account`` is the account an ``<account>/chat:…`` or ``<account>/folder:…`` source id
+    names, and ``None`` for everything typed without that prefix — which is not "the default
+    account" but "any account, the default one first" to the readers that match it
+    (:func:`find_source`).
+    """
 
     kind: TargetKind
     value: str | int
+    account: str | None = None
 
     @property
     def text(self) -> str:
@@ -137,6 +160,10 @@ class Removed:
     source_id: str
     source: Source | None
     chat_ids: list[int]
+    """The chats deleted with the source: nothing left in the config covers them."""
+    kept_chat_ids: list[int] = dataclasses.field(default_factory=list)
+    """The chats it covered that another configured source still covers; they stay, with the
+    first of those as their new primary source (:func:`remove_source`)."""
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -198,11 +225,17 @@ def parse_target(raw: str) -> Target:
     ``@name``, ``https://t.me/name`` and ``t.me/s/name`` → username; ``t.me/c/<id>`` → the
     private channel's marked id; ``folder:<name>`` → folder; ``chat:<value>`` → the value parsed
     again (so source ids from ``sources ls`` work); anything else → fuzzy text. Invite links
-    and malformed usernames raise :class:`InvalidTarget`.
+    and malformed usernames raise :class:`InvalidTarget`. A source id of another account,
+    ``<account>/chat:<value>`` or ``<account>/folder:<name>``, parses as the id past the prefix
+    with :attr:`Target.account` set.
     """
     text = raw.strip()
     if not text:
         raise InvalidTarget("empty target")
+    prefixed = _ACCOUNT_PREFIX_RE.match(text)
+    if prefixed is not None:
+        inner = parse_target(text[prefixed.end() :])
+        return dataclasses.replace(inner, account=prefixed.group("account").casefold())
     lowered = text.casefold()
     if lowered.startswith(CHAT_PREFIX):
         return parse_target(text[len(CHAT_PREFIX) :])
@@ -244,6 +277,40 @@ def _username(name: str, raw: str) -> str:
     if not _USERNAME_RE.match(name):
         raise InvalidTarget(f"invalid username in {raw!r}")
     return name
+
+
+def split_source_id(source_id: str) -> tuple[str, str]:
+    """``(account, id past the account prefix)`` of a source id.
+
+    ``work/chat:@x`` → ``("work", "chat:@x")``; an id with no prefix — every default-account
+    source, and ``import:<slug>``, which names no account at all — is the default account's.
+    """
+    prefixed = _ACCOUNT_PREFIX_RE.match(source_id)
+    if prefixed is None:
+        return DEFAULT_ACCOUNT, source_id
+    return prefixed.group("account").casefold(), source_id[prefixed.end() :]
+
+
+def source_account(source_id: str) -> str:
+    """The account a source id belongs to (:func:`split_source_id`)."""
+    return split_source_id(source_id)[0]
+
+
+def _in_account[T](
+    items: Iterable[T], account_of: Callable[[T], str], account: str | None
+) -> list[T]:
+    """The ``items`` a target of ``account`` can mean: that account's alone when it names one,
+    else the default account's when there are any, else all of them.
+
+    A target typed without an ``<account>/`` prefix is how every command has always named the
+    default account's sources, so it keeps doing that when the default account has a match, and
+    reaches another account's only when that is the one match there is.
+    """
+    listed = list(items)
+    if account is not None:
+        return [item for item in listed if account_of(item) == account]
+    default = [item for item in listed if account_of(item) == DEFAULT_ACCOUNT]
+    return default or listed
 
 
 def describe_match(found: Match) -> str:
@@ -358,17 +425,30 @@ async def add_source(
     *,
     since: str | None = None,
     comments: bool = False,
+    account: str = DEFAULT_ACCOUNT,
 ) -> Added:
     """Resolve ``target`` and append it to ``cfg.sources``; the caller saves the config.
 
+    ``catalog`` reads ``account``'s dialogs and the source is that account's. A target that
+    carries an ``<account>/`` prefix naming another account is refused rather than resolved
+    through the wrong session.
+
     Chats are stored as ``@username`` when they have one (readable in ``config.toml``) and as
     the marked id otherwise. Folders are stored by their exact title. An entry that is already
-    present — by id or by another spelling of the same chat — raises :class:`DuplicateSource`.
+    present for the same account — by id or by another spelling of the same chat — raises
+    :class:`DuplicateSource`; another account's source for the same chat is not a duplicate.
     """
+    if target.account is not None and target.account != account:
+        raise InvalidTarget(
+            f"{target.text!r} is named as a source of account {target.account}, but it is being "
+            f"added for account {account}"
+        )
     resolved = await resolve_target(target, catalog)
     normalized_since = _since(since)
     if isinstance(resolved, FolderInfo):
-        source = Source(folder=resolved.title, since=normalized_since, comments=comments)
+        source = Source(
+            folder=resolved.title, since=normalized_since, comments=comments, account=account
+        )
         members = await folder_dialogs(resolved, catalog)
         dialog = None
     else:
@@ -377,7 +457,9 @@ async def add_source(
             raise SourceError(
                 f"comments applies to channels only; {dialog.title!r} is a {dialog.type}"
             )
-        source = Source(chat=chat_value(dialog), since=normalized_since, comments=comments)
+        source = Source(
+            chat=chat_value(dialog), since=normalized_since, comments=comments, account=account
+        )
         members = [dialog]
     updated = with_source(cfg, source, dialog)
     log.info("adding source %s (%s)", source.id, resolved.title)
@@ -391,8 +473,10 @@ async def add_source(
 
 
 def with_source(cfg: Config, source: Source, dialog: DialogInfo | None) -> Config:
-    """``cfg`` with ``source`` appended; :class:`DuplicateSource` when it is already there — by
-    id or, given the ``dialog`` a chat source resolved to, under another spelling of that chat.
+    """``cfg`` with ``source`` appended; :class:`DuplicateSource` when its account already has
+    it — by id or, given the ``dialog`` a chat source resolved to, under another spelling of that
+    chat. The same chat under another account is a second source, not a duplicate: each account
+    fetches what it reaches, and a shared chat is stored once whichever does.
 
     Pure, so a caller that resolved the source over the network can re-read the config right
     before saving and apply the source to that, not to the snapshot it started from.
@@ -433,6 +517,8 @@ def _reject_duplicate(cfg: Config, source: Source, dialog: DialogInfo | None) ->
     for existing in cfg.sources:
         if existing.id == source.id:
             raise DuplicateSource(f"{source.id} is already a source")
+        if existing.account != source.account:
+            continue
         if dialog is not None and existing.chat is not None and _same_chat(existing, dialog):
             raise DuplicateSource(f"{dialog.title!r} is already a source as {existing.id}")
 
@@ -450,8 +536,9 @@ def _target_of(value: str) -> Target | None:
         return None
 
 
-def _names_chat(target: Target, chat_id: int, username: str | None) -> bool:
-    """Whether ``target`` is this very chat: its marked id, or its ``@username`` in any case.
+def _names_chat(target: Target, peer_id: int, username: str | None) -> bool:
+    """Whether ``target`` is this very chat: its marked id (``peer_id``, Telegram's — never a
+    row id, which a scoped chat may hold a synthetic one of), or its ``@username`` in any case.
 
     Identity, never spelling. ``chat =`` takes an id, an ``@username``, ``https://t.me/<name>``
     and ``t.me/c/<id>`` alike, and :func:`parse_target` has already folded all four into those
@@ -459,7 +546,7 @@ def _names_chat(target: Target, chat_id: int, username: str | None) -> bool:
     ``config.toml`` by hand — names no identity without the dialog catalog and matches nothing.
     """
     if target.kind == "id":
-        return target.value == chat_id
+        return target.value == peer_id
     if target.kind == "username":
         return bool(username) and target.text.casefold() == str(username).casefold()
     return False
@@ -482,37 +569,88 @@ def same_target(one: Target, other: Target) -> bool:
 
 
 def remove_source(cfg: Config, conn: sqlite3.Connection, target: Target) -> Removed:
-    """Drop the source ``target`` names and delete every chat indexed through it.
+    """Drop the source ``target`` names and delete every chat nothing else covers any more.
 
-    The target may be a source id (``folder:Argentina``, ``chat:@arg_chat``), a folder name, a
-    chat id / ``@username`` / link, or a fuzzy name matched against source entries and the
-    titles of their indexed chats. A chat entry answers to every spelling of the same chat, its
-    own included: what is compared is the identity a target resolves to, never the text
-    ``config.toml`` happens to hold. Naming a chat that came in through a folder, or a channel's
-    discussion group indexed through the channel's source, is refused: that would silently
-    remove the whole folder or the channel (:func:`_refuse_indirect`). The caller holds the sync
-    lock, so no sync writes to the chats being deleted.
+    The target may be a source id (``folder:Argentina``, ``chat:@arg_chat``,
+    ``work/chat:@arg_chat``), a folder name, a chat id / ``@username`` / link, or a fuzzy name
+    matched against source entries and the titles of their indexed chats. A chat entry answers
+    to every spelling of the same chat, its own included: what is compared is the identity a
+    target resolves to, never the text ``config.toml`` happens to hold. Naming a chat that came
+    in through a folder, or a channel's discussion group indexed through the channel's source,
+    is refused: that would silently remove the whole folder or the channel
+    (:func:`_refuse_indirect`). The caller holds the sync lock, so no sync writes to the chats
+    being deleted.
+
+    **A chat is deleted only when no source left in the config covers it.** Several can — a
+    channel two accounts each configured, a chat both a folder and a ``chat:`` entry list —
+    and ``chat_sources`` records which (:func:`resolve_sources`). A chat another configured
+    source still covers keeps everything indexed from it and only changes its primary owner
+    (``chats.source_id``): to the first remaining covering source in config order, or — for a
+    channel's discussion group known only through the link — to its channel's source
+    (:func:`discussion_source_id`), which is why discussion groups are decided after the
+    channels. A new owner is always a configured source, never an ``import:`` tag
+    (:func:`imported_tag`): an imported chat has no other source and goes with its own. The
+    removed source leaves every chat's coverage, the kept ones included.
 
     Deleting a discussion group takes the comments it fed to a channel's post threads with it
     (:func:`grepogram.db.delete_chat`), so the index never quotes rows this removed.
     """
     source_id = find_source(cfg, conn, target)
     source = next((s for s in cfg.sources if s.id == source_id), None)
-    chats = db.list_chats(conn, source_id=source_id)
+    remaining = [s for s in cfg.sources if s.id != source_id]
+    rank = {s.id: position for position, s in enumerate(remaining)}
+    deleted: list[int] = []
+    kept: list[int] = []
     with db.transaction(conn):
-        for chat in chats:
-            db.delete_chat(conn, chat.id)
-    log.info("removed source %s with %d chats", source_id, len(chats))
+        owned = db.list_chats(conn, source_id=source_id)
+        for chat in sorted(owned, key=lambda c: (c.discussion_of is not None, c.id)):
+            successor = _successor(conn, chat, source_id, rank)
+            if successor is None:
+                db.delete_chat(conn, chat.id)
+                deleted.append(chat.id)
+            else:
+                db.set_primary_source(conn, chat.id, successor)
+                kept.append(chat.id)
+        db.set_source_chats(conn, source_id, [])
+    log.info(
+        "removed source %s with %d chats; %d stay under another source",
+        source_id,
+        len(deleted),
+        len(kept),
+    )
     return Removed(
-        config=dataclasses.replace(cfg, sources=[s for s in cfg.sources if s.id != source_id]),
+        config=dataclasses.replace(cfg, sources=remaining),
         source_id=source_id,
         source=source,
-        chat_ids=[chat.id for chat in chats],
+        chat_ids=sorted(deleted),
+        kept_chat_ids=sorted(kept),
     )
 
 
+def _successor(
+    conn: sqlite3.Connection, chat: ChatRow, removed: str, rank: Mapping[str, int]
+) -> str | None:
+    """The configured source that owns ``chat`` once ``removed`` is gone, ``None`` when none
+    covers it and it goes too. ``rank`` orders the sources left in the config."""
+    if (chat.source_id or "").startswith(IMPORT_PREFIX):
+        return None
+    if chat.discussion_of is not None:
+        channel = db.get_chat(conn, chat.discussion_of)
+        linked = None if channel is None else discussion_source_id(chat, channel)
+        if linked is not None and linked != removed and linked in rank:
+            return linked
+    covering = [s for s in db.chat_source_ids(conn, chat.id) if s in rank]
+    return min(covering, key=rank.__getitem__) if covering else None
+
+
 def find_source(cfg: Config, conn: sqlite3.Connection, target: Target) -> str:
-    """The source id ``target`` refers to, among configured entries and ``chats.source_id``.
+    """The source id ``target`` refers to, among configured entries, ``chats.source_id`` and
+    the coverage ``chat_sources`` records.
+
+    Sources of every account are candidates. A target with an ``<account>/`` prefix
+    (:attr:`Target.account`) means that account's alone; one without means the default
+    account's when it has a match and any account's otherwise, and two accounts' matches with
+    none of the default's are an :class:`AmbiguousTarget` listing both ids (:func:`_in_account`).
 
     An ``import:<slug>`` is matched exactly, like a ``folder:`` name and unlike everything else
     here: it names no ``[[sources]]`` entry and there is nothing to resolve it through, and the
@@ -525,14 +663,16 @@ def find_source(cfg: Config, conn: sqlite3.Connection, target: Target) -> str:
     """
     chats = db.list_chats(conn)
     known = [s.id for s in cfg.sources]
-    known += sorted({c.source_id for c in chats if c.source_id and c.source_id not in known})
+    stored = {c.source_id for c in chats if c.source_id}
+    stored |= {s for ids in db.chat_sources_map(conn).values() for s in ids}
+    known += sorted(stored - set(known))
     if target.kind == "folder":
-        return _folder_source(target.text, known)
+        return _folder_source(target, known)
     if target.kind in ("id", "username"):
         named = _named_source(target, known)
         if named is not None:
             return named
-        return _indexed_source(conn, chats, target)
+        return _indexed_source(chats, target)
     if target.text.casefold().startswith(IMPORT_PREFIX):
         return _import_source(target.text, known)
     return _fuzzy_source(target.text, known, chats)
@@ -546,33 +686,70 @@ def _named_source(target: Target, known: Sequence[str]) -> str | None:
     the target's own kind can answer — nothing maps an ``@username`` to a marked id offline — so
     a chat that *is* indexed still falls through to :func:`_indexed_source`, which knows both.
     """
+    found: list[str] = []
     for source_id in known:
-        if not source_id.casefold().startswith(CHAT_PREFIX):
+        bare = split_source_id(source_id)[1]
+        if not bare.casefold().startswith(CHAT_PREFIX):
             continue
-        other = _target_of(source_id)
+        other = _target_of(bare)
         if other is not None and same_target(other, target):
-            return source_id
-    return None
+            found.append(source_id)
+    found = _in_account(found, source_account, target.account)
+    if len(found) > 1:
+        raise AmbiguousTarget(target.text, found)
+    return found[0] if found else None
 
 
-def _indexed_source(conn: sqlite3.Connection, chats: Sequence[ChatRow], target: Target) -> str:
-    """The source of the indexed chat ``target`` names; refused when that source covers more."""
+def _indexed_source(chats: Sequence[ChatRow], target: Target) -> str:
+    """The source of the indexed chat ``target`` names; refused when that source covers more.
+
+    An id is Telegram's marked id or the row id a search result carries, which differ only for a
+    scoped chat under a synthetic id; a private chat two accounts both hold is two rows of one
+    peer, told apart by the account (:func:`_in_account`).
+    """
     if target.kind == "id":
-        chat_id = int(target.value)
-        return _chat_source(db.get_chat(conn, chat_id), f"id {chat_id}")
-    wanted = target.text.casefold()
-    owner = next((c for c in chats if (c.username or "").casefold() == wanted), None)
-    return _chat_source(owner, f"@{target.text}")
+        label = f"id {target.value}"
+        matched = [c for c in chats if target.value in (c.peer_id, c.id)]
+    else:
+        label = f"@{target.text}"
+        wanted = target.text.casefold()
+        matched = [c for c in chats if (c.username or "").casefold() == wanted]
+    matched = _in_account(matched, _chat_account, target.account)
+    if len(matched) > 1:
+        raise AmbiguousTarget(
+            label, [f"{c.title!r} (id {c.id}) through {c.source_id or '-'}" for c in matched]
+        )
+    return _chat_source(matched[0] if matched else None, label)
 
 
-def _folder_source(name: str, known: list[str]) -> str:
+def _chat_account(chat: ChatRow) -> str:
+    """The account a stored chat belongs to for a lookup: a scoped chat's own, a shared chat's
+    primary source's."""
+    return chat.scope or source_account(chat.source_id or "")
+
+
+def _folder_source(target: Target, known: list[str]) -> str:
+    name = target.text
     wanted = dialogs.normalize(name)
-    folders = [s for s in known if s.startswith(FOLDER_PREFIX)]
-    for source_id in folders:
-        if dialogs.normalize(source_id[len(FOLDER_PREFIX) :]) == wanted:
-            return source_id
-    scored = [(s, dialogs.score(wanted, s[len(FOLDER_PREFIX) :])) for s in folders]
-    hits = [s for s, value in scored if value > 0]
+    folders = [
+        (s, bare[len(FOLDER_PREFIX) :])
+        for s, bare in ((s, split_source_id(s)[1]) for s in known)
+        if bare.startswith(FOLDER_PREFIX)
+    ]
+    exact = _in_account(
+        [s for s, title in folders if dialogs.normalize(title) == wanted],
+        source_account,
+        target.account,
+    )
+    if len(exact) == 1:
+        return exact[0]
+    if exact:
+        raise AmbiguousTarget(name, exact)
+    hits = _in_account(
+        [s for s, title in folders if dialogs.score(wanted, title) > 0],
+        source_account,
+        target.account,
+    )
     if len(hits) == 1:
         return hits[0]
     if hits:
@@ -623,7 +800,7 @@ def _refuse_indirect(chat: ChatRow, label: str) -> None:
     """
     if not chat.source_id:
         return
-    if chat.source_id.startswith(FOLDER_PREFIX):
+    if split_source_id(chat.source_id)[1].startswith(FOLDER_PREFIX):
         raise SourceError(
             f"{label} is indexed through {chat.source_id}; remove that folder source instead "
             "or take the chat out of the folder in Telegram"
@@ -647,11 +824,11 @@ def _own_source(chat: ChatRow) -> bool:
     link forms of one chat all count as covering it directly — a group configured as
     ``chat = "https://t.me/..."`` owns its rows exactly as one configured by id does.
     """
-    source_id = chat.source_id or ""
+    source_id = split_source_id(chat.source_id or "")[1]
     if not source_id.casefold().startswith(CHAT_PREFIX):
         return False
     target = _target_of(source_id)
-    return target is not None and _names_chat(target, chat.id, chat.username)
+    return target is not None and _names_chat(target, chat.peer_id, chat.username)
 
 
 def _fuzzy_source(text: str, known: list[str], chats: list[ChatRow]) -> str:
@@ -687,15 +864,29 @@ def _fuzzy_source(text: str, known: list[str], chats: list[ChatRow]) -> str:
 # --- resolution on sync ----------------------------------------------------------------------
 
 
-async def resolve_sources(cfg: Config, client: Any, conn: sqlite3.Connection) -> list[ChatRow]:
+async def resolve_sources(
+    cfg: Config, clients: Mapping[str, Any], conn: sqlite3.Connection
+) -> list[ChatRow]:
     """Upsert a ``chats`` row for every chat the configured sources currently cover.
 
-    Folder membership and entities are re-read from Telegram each time (``client`` must be
-    connected). A chat covered by two sources keeps the first source's id; a source that no
-    longer resolves is logged at WARNING and skipped. Sync state on existing rows is preserved,
+    ``clients`` maps an account to its connected client, and each source is resolved through
+    its own account's (one :class:`~grepogram.dialogs.DialogCatalog` per account): folder
+    membership and entities are re-read from Telegram each time. A source whose account has no
+    client in the mapping — not signed in, or not part of this run — is logged at WARNING and
+    skipped like a source that no longer resolves. Sync state on existing rows is preserved,
     and so is a stored ``discussion_of`` (:func:`grepogram.db.upsert_chat`): a channel's
     discussion group listed by a source is synced as a chat of its own and keeps holding the
     channel's comments.
+
+    Every row is stored through the account whose source reached it — a private chat or legacy
+    group as that account's own row, a channel or supergroup as the one shared row
+    (:func:`grepogram.models.chat_scope`) — never under the default account by omission. A chat
+    covered by several sources keeps the first one (in config order) as its primary
+    ``source_id``; each covering source is recorded in ``chat_sources`` and each account that
+    reached it in ``chat_access``, with the access hash its client addresses the chat by. The
+    coverage of a source that resolved is replaced by what it lists now, the chats a folder
+    names but whose entity would not resolve included (they are still listed); a source that
+    did not resolve keeps what it had, since an error says nothing about what it covers.
 
     **A chat held as an ``import:`` is left alone**, logged and not returned. ``upsert_chat``
     writes ``source_id`` unconditionally, so without this a resolve would quietly replace
@@ -709,50 +900,118 @@ async def resolve_sources(cfg: Config, client: Any, conn: sqlite3.Connection) ->
     an event, and it would otherwise be printed once per held chat on every sync — including
     every automatic one inside an MCP ``search``.
     """
-    catalog = DialogCatalog(client)
+    catalogs: dict[str, DialogCatalog] = {}
     rows: list[ChatRow] = []
-    seen: set[int] = set()
+    stored: dict[tuple[str, int], ChatRow] = {}
+    held_back: set[tuple[str, int]] = set()
+    coverage: dict[str, set[int]] = {}
+    now = int(time.time())
     for source in cfg.sources:
+        client = clients.get(source.account)
+        if client is None:
+            log.warning(
+                "skipping source %s: account %s has no signed-in client in this run",
+                source.id,
+                source.account,
+            )
+            continue
+        catalog = catalogs.setdefault(source.account, DialogCatalog(client))
         try:
-            infos = await source_dialogs(source, catalog)
+            infos, named = await _source_listing(source, catalog)
         except SourceError as exc:
             log.warning("skipping source %s: %s", source.id, exc)
             continue
+        covered = coverage.setdefault(source.id, set())
+        covered |= _still_named(conn, source, named)
         for info in infos:
-            if info.id in seen:
-                log.debug("chat %s already covered by another source, keeping the first", info.id)
+            key = (chat_scope(info.type, source.account), info.id)
+            if key in held_back:
                 continue
-            seen.add(info.id)
-            held = imported_tag(conn, info.id)
-            if held is not None:
-                log.info(
-                    "chat %s (%s) is held as %s, a Telegram Desktop import; source %s does not "
-                    "take it over — run `grepogram sources rm %s` first to sync it from Telegram",
+            chat = stored.get(key)
+            if chat is None:
+                held = imported_tag(conn, info.id, scope=key[0])
+                if held is not None:
+                    held_back.add(key)
+                    log.info(
+                        "chat %s (%s) is held as %s, a Telegram Desktop import; source %s does "
+                        "not take it over — run `grepogram sources rm %s` first to sync it from "
+                        "Telegram",
+                        info.id,
+                        info.title,
+                        held,
+                        source.id,
+                        held,
+                    )
+                    continue
+                chat = db.upsert_chat(conn, _source_chat(info, source), source.account)
+                stored[key] = chat
+                rows.append(chat)
+            else:
+                log.debug(
+                    "chat %s is also covered by %s; %s stays its primary source",
                     info.id,
-                    info.title,
-                    held,
                     source.id,
-                    held,
+                    chat.source_id,
                 )
-                continue
-            rows.append(
-                db.upsert_chat(
-                    conn,
-                    ChatRow(
-                        id=info.id,
-                        type=info.type,
-                        title=info.title,
-                        username=info.username,
-                        is_forum=info.is_forum,
-                        source_id=source.id,
-                    ),
-                )
+            covered.add(chat.id)
+            db.set_chat_access(
+                conn,
+                chat.id,
+                source.account,
+                access_hash=catalog.access_hash(info.id),
+                via="source",
+                checked_at=now,
             )
+    for source_id, chat_ids in coverage.items():
+        db.set_source_chats(conn, source_id, chat_ids)
     log.info("resolved %d chats from %d sources", len(rows), len(cfg.sources))
     return rows
 
 
-def imported_tag(conn: sqlite3.Connection, chat_id: int) -> str | None:
+def _source_chat(info: DialogInfo, source: Source) -> ChatRow:
+    """The row ``source`` proposes for a chat it lists, filed under the source's account."""
+    return ChatRow(
+        id=info.id,
+        peer_id=info.id,
+        scope=chat_scope(info.type, source.account),
+        type=info.type,
+        title=info.title,
+        username=info.username,
+        is_forum=info.is_forum,
+        source_id=source.id,
+    )
+
+
+async def _source_listing(
+    source: Source, catalog: DialogCatalog
+) -> tuple[list[DialogInfo], frozenset[int]]:
+    """What ``source`` covers now, plus the peers a folder names outright (resolvable or not)."""
+    if source.folder is None:
+        return await source_dialogs(source, catalog), frozenset()
+    folder = await find_folder(source.folder, catalog)
+    named = (folder.include_ids | folder.pinned_ids) - folder.exclude_ids
+    return await folder_dialogs(folder, catalog), frozenset(named)
+
+
+def _still_named(conn: sqlite3.Connection, source: Source, named: frozenset[int]) -> set[int]:
+    """The chats ``source`` covered so far whose peer its folder still names outright.
+
+    :func:`folder_dialogs` drops a named peer whose entity Telegram will not hand over — a
+    channel gone private, say — and such a peer is still very much listed by the folder, so its
+    coverage stays; dropping it would let ``sources rm`` of another source delete a chat this
+    folder still holds.
+    """
+    if not named:
+        return set()
+    kept: set[int] = set()
+    for chat_id in db.source_chat_ids(conn, source.id):
+        chat = db.get_chat(conn, chat_id)
+        if chat is not None and chat.peer_id in named:
+            kept.add(chat_id)
+    return kept
+
+
+def imported_tag(conn: sqlite3.Connection, chat_id: int, *, scope: str | None = None) -> str | None:
     """The ``import:<slug>`` this chat is held under, ``None`` when it is not an import.
 
     The one question every writer of ``chats.source_id`` has to ask before it writes, because
@@ -760,8 +1019,14 @@ def imported_tag(conn: sqlite3.Connection, chat_id: int) -> str | None:
     sync, :func:`refuse_imported` for the two commands that add a source, and
     :func:`grepogram.sync.link_discussion_chat` for a channel whose discussion group turns out
     to be one.
+
+    ``chat_id`` is a row id; with ``scope`` it is a Telegram peer id instead, looked up under
+    that scope (:func:`grepogram.db.get_chat_by_peer`), which is how a caller holding only what
+    Telegram answered asks about the row that answer would be stored in.
     """
-    stored = db.get_chat(conn, chat_id)
+    stored = (
+        db.get_chat(conn, chat_id) if scope is None else db.get_chat_by_peer(conn, chat_id, scope)
+    )
     source_id = "" if stored is None else (stored.source_id or "")
     return source_id if source_id.startswith(IMPORT_PREFIX) else None
 
@@ -808,7 +1073,8 @@ def discussion_source_id(group: ChatRow | None, channel: ChatRow) -> str | None:
     """
     if group is None or not group.source_id:
         return channel.source_id
-    if group.source_id.startswith((FOLDER_PREFIX, IMPORT_PREFIX)) or _own_source(group):
+    bare = split_source_id(group.source_id)[1]
+    if bare.startswith((FOLDER_PREFIX, IMPORT_PREFIX)) or _own_source(group):
         return group.source_id
     return channel.source_id or group.source_id
 
@@ -879,12 +1145,9 @@ def prunable(cfg: Config, conn: sqlite3.Connection, folders: FolderMembership) -
     coverage is a union over every source, so one unchecked source means no chat can be *proved*
     uncovered. The caller reports that instead of deleting anything.
     """
-    covered: set[int] = set()
-    for ids in folders.listed.values():
-        covered |= ids
     named = [
-        target
-        for target in (_target_of(str(s.chat)) for s in cfg.sources if s.chat is not None)
+        (source.account, target)
+        for source, target in ((s, _target_of(str(s.chat))) for s in cfg.sources if s.chat)
         if target is not None
     ]
     counts = db.message_counts(conn)
@@ -897,9 +1160,15 @@ def prunable(cfg: Config, conn: sqlite3.Connection, folders: FolderMembership) -
 
     for chat in db.list_chats(conn):
         source_id = chat.source_id or ""
-        if source_id.startswith(IMPORT_PREFIX) or not source_id.startswith(FOLDER_PREFIX):
+        if not split_source_id(source_id)[1].startswith(FOLDER_PREFIX):
             continue  # an import and a chat entry name themselves; neither can leave a folder
-        if chat.id in covered or any(_names_chat(t, chat.id, chat.username) for t in named):
+        if any(
+            chat.peer_id in ids and _reaches(chat, source_account(listed))
+            for listed, ids in folders.listed.items()
+        ) or any(
+            _reaches(chat, account) and _names_chat(t, chat.peer_id, chat.username)
+            for account, t in named
+        ):
             continue
         if source_id in folders.failed:
             record(kept, chat, f"{source_id} could not be checked")
@@ -912,6 +1181,12 @@ def prunable(cfg: Config, conn: sqlite3.Connection, folders: FolderMembership) -
     if unresolved:
         log.warning("prune scan is inconclusive: %s", "; ".join(unresolved))
     return PruneScan(prunable=[] if unresolved else offered, kept=kept, unresolved=unresolved)
+
+
+def _reaches(chat: ChatRow, account: str) -> bool:
+    """Whether a source of ``account`` listing ``chat``'s peer means this very row: always for a
+    shared chat, and for a private chat or legacy group only when it is that account's own."""
+    return chat.is_shared or chat.scope == account
 
 
 def prune_chats(conn: sqlite3.Connection, candidates: Sequence[PruneCandidate]) -> list[int]:
@@ -1032,8 +1307,10 @@ def import_chats(conn: sqlite3.Connection, entries: Sequence[ImportedChat]) -> l
     return stored
 
 
-def refuse_imported(conn: sqlite3.Connection, covered: Sequence[DialogInfo]) -> None:
-    """Refuse a live source that would cover a chat this index holds as an import.
+def refuse_imported(
+    conn: sqlite3.Connection, covered: Sequence[DialogInfo], account: str = DEFAULT_ACCOUNT
+) -> None:
+    """Refuse a live source of ``account`` that would cover a chat this index holds as an import.
 
     :func:`grepogram.db.upsert_chat` writes ``source_id`` unconditionally, so the very next sync
     would replace ``import:<slug>`` with the new source's id — and every protection keyed on that
@@ -1048,7 +1325,7 @@ def refuse_imported(conn: sqlite3.Connection, covered: Sequence[DialogInfo]) -> 
     on every sync from now on.
     """
     for dialog in covered:
-        source_id = imported_tag(conn, dialog.id)
+        source_id = imported_tag(conn, dialog.id, scope=chat_scope(dialog.type, account))
         if source_id is None:
             continue
         raise ImportConflict(
@@ -1147,17 +1424,26 @@ def _refuse_live(conn: sqlite3.Connection, chats: Sequence[ChatRow]) -> None:
 
 def sources_status(cfg: Config, conn: sqlite3.Connection) -> list[SourceStatus]:
     """Per-source view of the indexed chats: configured sources first, in config order, then
-    any ``source_id`` still present in the database but gone from the config."""
+    any source id still present in the database but gone from the config.
+
+    A chat is listed under every source that covers it — its primary ``source_id`` and each one
+    ``chat_sources`` records — so a channel two accounts configured shows under both. Each entry
+    names the account its source belongs to; an ``import:`` names none.
+    """
     counts = db.message_counts(conn)
+    coverage = db.chat_sources_map(conn)
     by_source: dict[str, list[ChatRow]] = {}
     for chat in db.list_chats(conn):
-        if chat.source_id:
-            by_source.setdefault(chat.source_id, []).append(chat)
+        owners = dict.fromkeys([chat.source_id] if chat.source_id else [])
+        owners.update(dict.fromkeys(coverage.get(chat.id, [])))
+        for source_id in owners:
+            by_source.setdefault(source_id, []).append(chat)
     configured = [s.id for s in cfg.sources]
     order = configured + sorted(set(by_source) - set(configured))
     return [
         SourceStatus(
             source_id=source_id,
+            account=None if source_id.startswith(IMPORT_PREFIX) else source_account(source_id),
             chats=[
                 ChatStatus(
                     id=chat.id,

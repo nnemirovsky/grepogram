@@ -990,6 +990,46 @@ def chat_source_ids(conn: sqlite3.Connection, chat_id: int) -> list[str]:
     return [str(row["source_id"]) for row in rows]
 
 
+def set_source_chats(conn: sqlite3.Connection, source_id: str, chat_ids: Iterable[int]) -> None:
+    """Make ``chat_ids`` the whole set of chats source ``source_id`` covers — the other side of
+    :func:`set_chat_sources`, for a resolve that has just read what one source lists. An empty
+    set drops the source from every chat's coverage."""
+    with transaction(conn):
+        conn.execute("DELETE FROM chat_sources WHERE source_id = ?", (source_id,))
+        conn.executemany(
+            "INSERT INTO chat_sources(chat_id, source_id) VALUES (?, ?)",
+            [(chat_id, source_id) for chat_id in dict.fromkeys(chat_ids)],
+        )
+
+
+def source_chat_ids(conn: sqlite3.Connection, source_id: str) -> list[int]:
+    """Every chat recorded as covered by ``source_id``, ordered by id."""
+    rows = conn.execute(
+        "SELECT chat_id FROM chat_sources WHERE source_id = ? ORDER BY chat_id", (source_id,)
+    )
+    return [int(row["chat_id"]) for row in rows]
+
+
+def chat_sources_map(conn: sqlite3.Connection) -> dict[int, list[str]]:
+    """Chat id → every source recorded as covering it, for the readers that walk all chats."""
+    covering: dict[int, list[str]] = {}
+    for row in conn.execute(
+        "SELECT chat_id, source_id FROM chat_sources ORDER BY chat_id, source_id"
+    ):
+        covering.setdefault(int(row["chat_id"]), []).append(str(row["source_id"]))
+    return covering
+
+
+def set_primary_source(conn: sqlite3.Connection, chat_id: int, source_id: str) -> None:
+    """Move chat ``chat_id``'s primary owner (``chats.source_id``) to ``source_id``.
+
+    The caller has asked :func:`grepogram.sources.imported_tag` first, like every writer of the
+    column; nothing else of the row changes.
+    """
+    with transaction(conn):
+        conn.execute("UPDATE chats SET source_id = ? WHERE id = ?", (source_id, chat_id))
+
+
 def upsert_account(conn: sqlite3.Connection, account: AccountRow) -> AccountRow:
     """Record who ``account.name`` is; ``added_at`` is kept from the first time it was stored."""
     with transaction(conn):

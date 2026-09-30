@@ -891,7 +891,10 @@ def sources_rm(
         fail(str(exc), hint=getattr(exc, "hint", None))
     finally:
         conn.close()
-    typer.echo(f"removed {removed.source_id} ({len(removed.chat_ids)} chats deleted)")
+    kept = (
+        f", {len(removed.kept_chat_ids)} kept under another source" if removed.kept_chat_ids else ""
+    )
+    typer.echo(f"removed {removed.source_id} ({len(removed.chat_ids)} chats deleted{kept})")
 
 
 @sources_app.command("prune")

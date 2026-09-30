@@ -3151,14 +3151,41 @@ async def test_a_source_of_another_account_cannot_fetch_a_scoped_chat(
     assert _texts(conn, chat.id) == {}
 
 
-async def test_a_sync_run_skips_a_scoped_chat_another_accounts_source_names(
-    conn: sqlite3.Connection, paths: Paths
+async def test_a_sync_run_skips_a_source_of_an_account_it_has_no_client_for(
+    conn: sqlite3.Connection, paths: Paths, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """The run does not fall over on it either: the chat is reported and the others go on."""
+    """The run holds the default account's client alone, so the work account's source is not
+    resolved at all — neither read through the wrong session nor filed under ``default`` — and
+    the other sources go on."""
     chat = _work_dm(conn)
     client = _client(messages={ALICE_ID: [tl.message(ALICE_ID, 1, "hi")]})
     cfg = _cfg(Source(chat="@alice", account=WORK), ARG_SOURCE)
     client.messages[ARG_ID] = [tl.message(ARG_ID, 1, "still synced", sender=2)]
+    with caplog.at_level(logging.WARNING, logger="grepogram.sources"):
+        await _run(client, conn, paths, cfg)
+    assert "account work has no signed-in client" in caplog.text
+    assert _texts(conn, ARG_ID) == {1: "still synced"}
+    assert _texts(conn, ALICE_ID) == {} and _texts(conn, chat.id) == {}
+
+
+async def test_a_sync_run_skips_a_scoped_chat_another_accounts_source_names(
+    conn: sqlite3.Connection, paths: Paths, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Should a resolve ever hand the run another account's private chat under a source it does
+    not belong to, the run does not fall over on it: the chat is reported and the others go on."""
+    chat = _work_dm(conn)
+    default_row = db.get_chat(conn, ALICE_ID)
+    assert default_row is not None
+    client = _client(messages={ALICE_ID: [tl.message(ALICE_ID, 1, "hi")]})
+    cfg = _cfg(Source(chat="@alice", account=WORK), ARG_SOURCE)
+    client.messages[ARG_ID] = [tl.message(ARG_ID, 1, "still synced", sender=2)]
+    arg = db.upsert_chat(conn, ChatRow(id=ARG_ID, type="supergroup", source_id=ARG_SOURCE.id))
+    misfiled = dataclasses.replace(default_row, source_id=WORK_ALICE_SOURCE.id)
+
+    async def resolved(*_: object) -> list[ChatRow]:
+        return [misfiled, arg]
+
+    monkeypatch.setattr(sync, "resolve_sources", resolved)
     report = await _run(client, conn, paths, cfg)
     assert any("default's own user" in warning for warning in report.warnings)
     assert _texts(conn, ARG_ID) == {1: "still synced"}

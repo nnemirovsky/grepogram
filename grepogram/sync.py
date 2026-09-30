@@ -63,6 +63,7 @@ from grepogram.config import ConfigError
 from grepogram.dialogs import entity_username
 from grepogram.embed import Embedder
 from grepogram.models import (
+    DEFAULT_ACCOUNT,
     ChatRow,
     Config,
     MediaKind,
@@ -1704,7 +1705,10 @@ async def _sync_chats(
     describe; the tally becomes the report.
     """
     me = _self_row(await client.get_me())
-    queue = deque(sorted(await resolve_sources(cfg, client, conn), key=_sync_order))
+    # one client, the default account's, until the run fetches per account: a source of another
+    # account is skipped by the resolve rather than read through a session that is not its own
+    resolved = await resolve_sources(cfg, {DEFAULT_ACCOUNT: client}, conn)
+    queue = deque(sorted(resolved, key=_sync_order))
     queued = {chat.id for chat in queue}
     sources = {source.id: source for source in cfg.sources}
     tally = _Tally()

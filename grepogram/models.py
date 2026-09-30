@@ -436,5 +436,9 @@ class ChatStatus:
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class SourceStatus:
+    """One source and the chats it covers; ``account`` is the account the source belongs to,
+    ``None`` for an ``import:`` that came from an export rather than through any account."""
+
     source_id: str
+    account: str | None = DEFAULT_ACCOUNT
     chats: list[ChatStatus]

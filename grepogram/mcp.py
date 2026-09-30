@@ -668,9 +668,10 @@ async def sync(budget_s: int = 45) -> ToolResult:
 
 @guarded
 def sources() -> ToolResult:
-    """List every source the index holds chats under, with the chats indexed through each: `id`,
-    `title`, `type`, `username`, `message_count`, `last_sync_at` (unix seconds, null before the
-    first sync) and `unavailable`. A source with no chats has not been synced yet.
+    """List every source the index holds chats under, with the `account` it belongs to and the
+    chats indexed through each: `id`, `title`, `type`, `username`, `message_count`,
+    `last_sync_at` (unix seconds, null before the first sync) and `unavailable`. A chat several
+    sources cover is listed under each. A source with no chats has not been synced yet.
     `index_age_min` is minutes since the last completed sync (null before the first).
 
     The configured sources come first, then any other `source_id` still in the database. An
@@ -766,8 +767,10 @@ def sources_remove(target: str) -> ToolResult:
     source id from `sources` (`folder:Argentina`, `chat:@name`), a folder name, a chat id /
     `@username`, or a fuzzy title. A chat that came in through a folder cannot be removed on
     its own (remove the folder source or take the chat out of the folder in Telegram), nor can
-    a channel's discussion group indexed through the channel's source. Refused with `error`
-    while a sync is running.
+    a channel's discussion group indexed through the channel's source. A chat another source
+    still covers (a channel a second account also configured) is kept and listed in
+    `kept_chat_ids`; `removed_chat_ids` are the chats deleted. Refused with `error` while a
+    sync is running.
     """
     state = _app()
     parsed = sourcing.parse_target(target)
@@ -779,6 +782,7 @@ def sources_remove(target: str) -> ToolResult:
     return {
         "source_id": removed.source_id,
         "removed_chat_ids": removed.chat_ids,
+        "kept_chat_ids": removed.kept_chat_ids,
         "config_updated": removed.source is not None,
     }
 
