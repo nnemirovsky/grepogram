@@ -2024,7 +2024,11 @@ def test_approval_items_read_back_what_they_print() -> None:
     )
 
 
-@pytest.mark.parametrize("tokens", [[], ["abc"], ["12:"], ["-3:fetch"], ["global_search:x"]])
+@pytest.mark.parametrize(
+    "tokens",
+    # "²" and "٣" pass str.isdigit and make int() raise: a digit is an ASCII one
+    [[], ["abc"], ["12:"], ["-3:fetch"], ["global_search:x"], ["²"], ["٣:fetch"], ["1²:join"]],
+)
 def test_a_malformed_approval_item_is_refused(tokens: list[str]) -> None:
     with pytest.raises(research.ResearchError) as caught:
         research.parse_approval(tokens)
@@ -3147,3 +3151,35 @@ def test_prepare_approval_is_what_both_consent_channels_show(
     )
     with pytest.raises(research.ResearchError, match="not an approval item"):
         research.prepare_approval(rdb, conn, CFG, session.id, ["nine"])
+
+
+@pytest.mark.parametrize("ref", ["²", "-²", "٣"])
+def test_a_target_in_non_ascii_digits_names_no_chat(rdb: sqlite3.Connection, ref: str) -> None:
+    with pytest.raises(research.ResearchError, match="names no chat"):
+        research.target_identities(rdb, [ref], session_id=1)
+
+
+async def test_a_refusal_quoting_a_folder_link_stays_out_of_the_log_above_debug(
+    rdb: sqlite3.Connection,
+    conn: sqlite3.Connection,
+    paths: Paths,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A shared folder's link came out of someone's message and opens a private way in: the
+    note naming it is the candidate's, and the log says only what became of the candidate."""
+    world = _run_world()
+    client = _run_client(world)
+    session, found = await _discovered(rdb, conn, client, "https://t.me/addlist/Tbilisi1")
+    private = {c.identity: c for c in research_db.list_candidates(rdb, session.id)}[
+        f"peer:{_marked(FOLDER_PRIVATE)}"
+    ]
+    _approve(rdb, conn, session, _item(private, "join"))
+    world.chatlists["Tbilisi1"] = FakeChatlist("Tbilisi housing", [FOLDER_CHAN])
+
+    with caplog.at_level(logging.INFO, logger="grepogram"):
+        report = await _run(rdb, conn, paths, client, session)
+
+    assert report.unavailable == [private.id]
+    assert "t.me/addlist/Tbilisi1" in (_status(rdb, private).note or "")
+    assert f"research candidate {private.id} is unavailable" in caplog.text
+    assert "Tbilisi1" not in caplog.text

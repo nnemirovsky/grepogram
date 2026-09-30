@@ -877,6 +877,20 @@ async def test_sources_add_fuzzy_writes_config_and_reads_dialogs_afresh(
     assert config.load(paths).sources == expected
 
 
+async def test_a_refused_join_link_reaches_the_caller_and_not_the_log(
+    bind: Callable[..., tools.AppState], caplog: pytest.LogCaptureFixture
+) -> None:
+    """An invite or folder link a tool refuses can be a private way in someone wrote in a
+    message: the result quotes it for the caller, the log says only what kind of refusal it was
+    unless it runs at DEBUG."""
+    bind(Config(telegram=KEYS))
+    with caplog.at_level(logging.INFO, logger="grepogram"):
+        refused = await tools.sources_add("https://t.me/+SecretDoor")
+    assert "SecretDoor" in refused["error"]
+    assert "sources_add failed: InvalidTarget" in caplog.text
+    assert "SecretDoor" not in caplog.text
+
+
 async def test_sources_add_refuses_a_chat_already_held_as_an_import(
     bind: Callable[..., tools.AppState], paths: Paths, conn: sqlite3.Connection
 ) -> None:

@@ -2473,6 +2473,12 @@ def skip(
     return wanted
 
 
+def _is_number(text: str) -> bool:
+    """Whether ``text`` is a whole number spelled in ASCII digits — what ``int`` reads back
+    exactly. ``str.isdigit`` also takes ``²`` and other digits ``int`` refuses."""
+    return text.isascii() and text.isdecimal()
+
+
 def target_identities(
     rdb: sqlite3.Connection, refs: Sequence[str], session_id: int | None = None
 ) -> list[str]:
@@ -2482,7 +2488,7 @@ def target_identities(
     identities: list[str] = []
     for ref in refs:
         text = ref.strip()
-        if text.isdigit():
+        if _is_number(text):
             if session_id is None:
                 raise ResearchError(
                     f"{text} is a candidate id and needs a session", "name the session too"
@@ -2495,7 +2501,7 @@ def target_identities(
             identities.append(candidate.identity)
             continue
         target = leads.normalize(text)
-        if target is None and text.lstrip("-").isdigit():
+        if target is None and _is_number(text.removeprefix("-")):
             target = leads.peer(int(text))
         chat = None if target is None else chat_level(target)
         if chat is None:
@@ -2598,7 +2604,10 @@ def _refuse_candidate(
         research_db.update_candidate(rdb, candidate.id, status=status, note=note)
         research_db.void_grants(rdb, session.id, candidate_ids=[candidate.id])
     (report.unavailable if status == "unavailable" else report.failed).append(candidate.id)
-    log.info("research candidate %d is %s: %s", candidate.id, status, note)
+    # a note can quote a shared folder's or an invite's link — a private way in that came out
+    # of someone's message — so it stays at DEBUG, like message text
+    log.info("research candidate %d is %s", candidate.id, status)
+    log.debug("research candidate %d: %s", candidate.id, note)
 
 
 class _OtherChat(ValueError):
@@ -3379,7 +3388,7 @@ def parse_approval(tokens: Sequence[str]) -> list[ApprovalItem]:
             items.append(ApprovalItem(candidate_id=None, actions=(head,)))
             continue
         actions = tuple(action.strip() for action in tail.split(",") if action.strip())
-        if not head.isdigit() or (sep and not actions):
+        if not _is_number(head) or (sep and not actions):
             raise ResearchError(f"{token!r} is not an approval item", APPROVAL_GRAMMAR)
         items.append(ApprovalItem(candidate_id=int(head), actions=actions))
     if not items:

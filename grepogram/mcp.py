@@ -584,8 +584,16 @@ def failure(exc: BaseException) -> ToolResult:
 
 
 def tool_failure(name: str, exc: Exception) -> ToolResult:
-    """Log a tool's expected failure and turn it into the result the caller sees."""
-    log.warning("%s failed: %s", name, exc)
+    """Log a tool's expected failure and turn it into the result the caller sees.
+
+    A research refusal or a source target's can quote what someone else wrote — an invite or
+    shared-folder link out of a message, which is a private way in — so its text is logged at
+    DEBUG, like message text, and only its kind above it; the caller gets it all either way."""
+    if isinstance(exc, research.ResearchError | SourceError):
+        log.warning("%s failed: %s", name, type(exc).__name__)
+        log.debug("%s failed: %s", name, exc)
+    else:
+        log.warning("%s failed: %s", name, exc)
     return failure(exc)
 
 
