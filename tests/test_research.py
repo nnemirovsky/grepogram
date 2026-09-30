@@ -7,6 +7,7 @@ import logging
 import re
 import sqlite3
 import threading
+import time
 from collections.abc import Callable, Iterator
 from typing import Any
 
@@ -25,6 +26,7 @@ from grepogram.models import (
     ChatKey,
     ChatRow,
     Config,
+    DiscoverReport,
     Grant,
     LinkKind,
     MessageRow,
@@ -1175,6 +1177,41 @@ async def test_discover_composes_offline_leads_search_and_probing(
 
     assert again.searches == (), "a question already searched is not sent again"
     assert len(research_db.list_searches(rdb, session.id)) == 2
+
+
+async def test_a_cancelled_discover_joins_its_offline_pass_first(
+    rdb: sqlite3.Connection, conn: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The offline half writes research.db on a worker thread; a cancelled call — an MCP tool
+    call under an ``anyio`` cancel scope, or ``research run`` holding the sync lock — must not
+    unwind while that thread still writes (:func:`grepogram.sync.joined_to_thread`)."""
+    session = _start(rdb, conn)
+    landed: list[str] = []
+    running = threading.Event()
+    real = research.discover_offline
+
+    def slow(*args: Any, **kwargs: Any) -> DiscoverReport:
+        running.set()
+        time.sleep(0.2)
+        report = real(*args, **kwargs)
+        landed.append("offline")
+        return report
+
+    monkeypatch.setattr(research, "discover_offline", slow)
+
+    async def call() -> None:
+        try:
+            await research.discover(rdb, conn, CFG, session.id)
+        finally:
+            landed.append("unwound")
+
+    task = asyncio.create_task(call())
+    while not running.is_set():
+        await asyncio.sleep(0.005)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert landed == ["offline", "unwound"]
 
 
 async def test_discover_without_a_grant_or_a_client_never_searches(

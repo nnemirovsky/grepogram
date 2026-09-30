@@ -303,7 +303,7 @@ async def _extract_chat(
         if not rows:
             return
         outcomes = await _extract_batch(client, chat, rows, extractors, cfg, scratch, budget)
-        await sync._joined_to_thread(
+        await sync.joined_to_thread(
             functools.partial(_store, conn, stored, cfg, outcomes), budget.cancel
         )
         for outcome in outcomes:
@@ -381,7 +381,7 @@ async def _extract_one(
             log.debug("message %s/%s: nothing downloaded", row.chat_id, row.msg_id)
             return _Outcome(row_id, db.MEDIA_FAILED)
         written = Path(answer)
-        text = await sync._joined_to_thread(
+        text = await sync.joined_to_thread(
             functools.partial(_read, extractor, written), budget.cancel
         )
     except (ExtractError, OSError) as exc:

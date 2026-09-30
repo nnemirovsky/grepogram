@@ -117,7 +117,6 @@ classes of Telethon 1.44 / layer 227 for the exact fields):
 Message text never reaches the log above DEBUG; counts do.
 """
 
-import asyncio
 import dataclasses
 import functools
 import json
@@ -2013,7 +2012,9 @@ async def discover(
     :func:`grepogram.sync.check_account` has made sure the client is the Telegram user the index
     recorded for the session's account (:class:`~grepogram.tg.OtherUser` otherwise).
     """
-    report = await asyncio.to_thread(discover_offline, rdb, conn, cfg, session_id, now=now)
+    report = await sync.joined_to_thread(
+        functools.partial(discover_offline, rdb, conn, cfg, session_id, now=now)
+    )
     if client is None:
         return report
     session = active_session(rdb, session_id)
@@ -3669,8 +3670,8 @@ async def run(
             client, rdb, conn, cfg, session.id, only=registered, now=stamp
         )
     if registered:
-        report.discovery = await asyncio.to_thread(
-            discover_offline, rdb, conn, cfg, session.id, now=stamp
+        report.discovery = await sync.joined_to_thread(
+            functools.partial(discover_offline, rdb, conn, cfg, session.id, now=stamp)
         )
     _record_progress(rdb, session, report, stamp)
     log.info(

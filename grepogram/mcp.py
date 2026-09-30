@@ -1126,8 +1126,8 @@ async def research_discover(session_id: int, offline: bool = False) -> ToolResul
     rdb = state.research_store(cfg)
     session = research.active_session(rdb, session_id)
     if offline:
-        report = await asyncio.to_thread(
-            research.discover_offline, rdb, state.conn, cfg, session.id
+        report = await syncing.joined_to_thread(
+            functools.partial(research.discover_offline, rdb, state.conn, cfg, session.id)
         )
         return research.report_document(report)
     try:

@@ -31,7 +31,7 @@ A run that dies between a commit and the rebuild therefore leaves nothing behind
 does not pick up (:func:`grepogram.db.unindexed_message_ids`). The rebuild, the
 indexing and the flag are one transaction, so the flag never clears over derived data that is not
 there; the worker thread they run on is joined even when the surrounding tool call is cancelled
-(:func:`_joined_to_thread`), so the :class:`SyncLock` outlives every write it covers.
+(:func:`joined_to_thread`), so the :class:`SyncLock` outlives every write it covers.
 
 :func:`map_message` reads raw TL attributes only — ``msg.message``, ``msg.entities``,
 ``msg.media``, ``msg.reply_markup``, ``msg.reply_to``, ``msg.fwd_from``, ``msg.reactions``,
@@ -524,7 +524,7 @@ class SyncBudget:
         """Expire the budget now, whatever the clock says and whatever it was given.
 
         How a cancelled run stops the work a worker thread is pacing against this budget at its
-        next boundary instead of waiting the whole of it out (:func:`_joined_to_thread`).
+        next boundary instead of waiting the whole of it out (:func:`joined_to_thread`).
         """
         self._cancelled = True
 
@@ -731,7 +731,7 @@ class _Run:
         the one unit no ``json_each`` over ``units.msg_ids`` can reach.
 
         The whole write is one transaction, and it goes to a worker thread
-        (:func:`_joined_to_thread`) only when there is something to cut — a re-cut runs to the
+        (:func:`joined_to_thread`) only when there is something to cut — a re-cut runs to the
         end of the chat, which is what :func:`_drop_deleted` is pushed off the event loop for,
         while the ordinary batch is a plain upsert that has always run on it.
         """
@@ -747,7 +747,7 @@ class _Run:
             and db.attachment_replaced(was, row)
         ]
         write = functools.partial(self._write, chat_id, rows, stale)
-        ids = await _joined_to_thread(write, self.budget.cancel) if stale else write()
+        ids = await joined_to_thread(write, self.budget.cancel) if stale else write()
         fresh = sum(1 for row in rows if row.msg_id not in known)
         self.inserted[chat_id] = self.inserted.get(chat_id, 0) + fresh
         self.budget.spend(fresh)
@@ -1184,7 +1184,7 @@ async def _drop_deleted(
     left holding no messages is dropped instead of being rebuilt empty. Returns the ids removed.
 
     That transaction goes to a worker thread joined even under cancellation
-    (:func:`_joined_to_thread`), like every other write a sync makes:
+    (:func:`joined_to_thread`), like every other write a sync makes:
     :func:`grepogram.units.invalidate_units_for` re-cuts every window from the deleted message to
     the end of the chat, which is exactly the work :func:`on_chat_synced` is pushed off the event
     loop for — the client's keepalives run on while it happens.
@@ -1198,7 +1198,7 @@ async def _drop_deleted(
     if not gone:
         return []
     msg_ids = [row.msg_id for row in gone]
-    await _joined_to_thread(
+    await joined_to_thread(
         functools.partial(_apply_drop, run, cfg, gone, msg_ids), run.budget.cancel
     )
     log.info(
@@ -1568,7 +1568,7 @@ def on_chat_synced(
         db.mark_indexed(conn, new_msg_ids)
 
 
-async def _joined_to_thread[T](job: Callable[[], T], abort: Callable[[], None] | None = None) -> T:
+async def joined_to_thread[T](job: Callable[[], T], abort: Callable[[], None] | None = None) -> T:
     """Run ``job`` on a worker thread and never leave it writing on its own.
 
     ``await asyncio.to_thread(...)`` submits the job before it suspends, so a cancellation —
@@ -1626,7 +1626,7 @@ async def index_pending(conn: sqlite3.Connection, cfg: Config, chat: ChatRow) ->
     left behind get them on the next run. The chat rows are re-read, since a fetch may have
     changed them or linked the discussion group; a chat removed meanwhile has nothing to index.
     This is the step a cancelled sync runs on its way out, so the worker thread is joined rather
-    than abandoned (:func:`_joined_to_thread`). Rows flagged in a chat this run holds no handle on
+    than abandoned (:func:`joined_to_thread`). Rows flagged in a chat this run holds no handle on
     — a discussion group it was unlinked from meanwhile — are :func:`index_stranded`'s to repair
     at the end of the run.
     """
@@ -1635,7 +1635,7 @@ async def index_pending(conn: sqlite3.Connection, cfg: Config, chat: ChatRow) ->
             continue
         pending = db.unindexed_message_ids(conn, row.id)
         if pending:
-            await _joined_to_thread(functools.partial(on_chat_synced, conn, row, cfg, pending))
+            await joined_to_thread(functools.partial(on_chat_synced, conn, row, cfg, pending))
 
 
 async def index_stranded(
@@ -1667,7 +1667,7 @@ async def index_stranded(
             chat.title,
             len(pending),
         )
-        await _joined_to_thread(functools.partial(on_chat_synced, conn, chat, cfg, pending))
+        await joined_to_thread(functools.partial(on_chat_synced, conn, chat, cfg, pending))
 
 
 async def recut_pending_chats(
@@ -1701,7 +1701,7 @@ async def recut_pending_chats(
        still ends it, and the marker makes the next run continue. A budget that was *cancelled*
        keeps nothing back: the caller is going away and the lock with it;
     #. each chat is one transaction on a worker thread joined even under cancellation
-       (:func:`_joined_to_thread`, with :meth:`SyncBudget.cancel` as the abort): re-read the chat
+       (:func:`joined_to_thread`, with :meth:`SyncBudget.cancel` as the abort): re-read the chat
        row and skip it when it is gone, :func:`grepogram.units.recut_chat`, index the delta,
        repair the unit index, write the marker. The indexing lives here rather than in
        :mod:`grepogram.units`, which cannot import :mod:`grepogram.index`, and **no message ids
@@ -1726,9 +1726,7 @@ async def recut_pending_chats(
                 len(pending) - position,
             )
             break
-        done = await _joined_to_thread(
-            functools.partial(_recut_one, conn, cfg, chat), budget.cancel
-        )
+        done = await joined_to_thread(functools.partial(_recut_one, conn, cfg, chat), budget.cancel)
         recut += int(done)
     if recut and embedder is None:
         log.warning(
@@ -1856,7 +1854,7 @@ async def _embed_after_sync(
 ) -> SyncReport:
     """Embed what the sync left dirty, off the event loop so the client's keepalives run on.
 
-    Joined like the indexing step (:func:`_joined_to_thread`): a cancelled run releases the
+    Joined like the indexing step (:func:`joined_to_thread`): a cancelled run releases the
     :class:`SyncLock` only once the worker thread has stopped writing vectors. This is the long
     job of the two, so the cancellation expires the budget it paces itself against
     (:meth:`SyncBudget.cancel`) and it stops after the batch it is on rather than after the
@@ -1864,7 +1862,7 @@ async def _embed_after_sync(
     """
     warnings = list(report.warnings)
     try:
-        embedded = await _joined_to_thread(
+        embedded = await joined_to_thread(
             functools.partial(index.embed_dirty_units, conn, embedder, budget=budget),
             budget.cancel,
         )
@@ -3213,7 +3211,7 @@ async def _sweep_chat(
     A page of stored ids, one request per witness, one transaction: the ids every witness
     answered empty (:func:`_confirmed_gone`) are deleted, the units holding them are cut again
     and the cursor moves to the last id of the page. The write goes to a worker thread that is
-    joined even under cancellation (:func:`_joined_to_thread`), like every other write a sync
+    joined even under cancellation (:func:`joined_to_thread`), like every other write a sync
     makes.
 
     An answer that does not line up with the page is not an answer: the chat's turn ends with its
@@ -3250,7 +3248,7 @@ async def _sweep_chat(
             return False
         tally.checked += len(page)
         cursor = page[-1]
-        tally.removed += await _joined_to_thread(
+        tally.removed += await joined_to_thread(
             functools.partial(_prune_batch, conn, cfg, chat, gone, cursor), budget.cancel
         )
     return False

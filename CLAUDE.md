@@ -397,7 +397,7 @@ never change the git identity.
   `db.attachment_replaced` over the row as it is stored *before* the upsert, and for the rows
   that actually carried text runs `units.invalidate_units_for` + `index.index_units` and
   `sync._invalidate_comment_posts` in the upsert's own transaction — the same pairing
-  `media._recut` runs in the other direction, off the event loop (`_joined_to_thread`) because a
+  `media._recut` runs in the other direction, off the event loop (`joined_to_thread`) because a
   re-cut runs to the end of the chat. Rows that carried no text are deliberately left alone: a
   changed rendered line inside a closed window is the documented v1 limitation
   (`units.rebuild_for_chat`), and widening this to every attachment change would re-cut a chat's
@@ -425,8 +425,9 @@ never change the git identity.
   the space `units.msg_ids` stores, while everything on the `edit_refetch` path carries
   `messages.id` rowids — the caller converts. In a fixture chat the two coincide from 1, which is
   exactly how this ships broken.
-- Work a sync hands to a worker thread goes through `sync._joined_to_thread`, never bare
-  `asyncio.to_thread`: an `anyio` cancel scope (how the MCP server cancels a tool call) abandons
+- Work a sync — or a research pass (`media.run`, `research.discover` and `research.run`'s
+  `discover_offline`, the MCP `research_discover` offline branch) — hands to a worker thread that
+  writes goes through `sync.joined_to_thread`, never bare `asyncio.to_thread`: an `anyio` cancel scope (how the MCP server cancels a tool call) abandons
   the future rather than the job, and the `SyncLock` must not be released while a detached thread
   still writes. The join is a `threading.Event` — a cancelled scope raises out of every `await`,
   so it cannot be one — and it is **not** bounded: a bound would give the lock up over a live

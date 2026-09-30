@@ -4854,7 +4854,7 @@ async def test_a_cancelled_index_step_joins_its_worker_thread_first() -> None:
 
     async def call() -> None:
         try:
-            await sync._joined_to_thread(job)
+            await sync.joined_to_thread(job)
         finally:
             landed.append("unwound")
 
@@ -4891,7 +4891,7 @@ async def test_a_cancelled_index_step_waits_for_its_worker_however_long_it_takes
 
     async def call() -> None:
         try:
-            await sync._joined_to_thread(job)
+            await sync.joined_to_thread(job)
         finally:
             landed.append("unwound")
 
@@ -4934,7 +4934,7 @@ async def test_a_cancelled_job_that_can_be_aborted_is_asked_to_stop() -> None:
         landed.append("ran to the end")
         return "ran to the end"
 
-    task = asyncio.create_task(sync._joined_to_thread(job, budget.cancel))
+    task = asyncio.create_task(sync.joined_to_thread(job, budget.cancel))
     await asyncio.sleep(0.05)
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
@@ -4943,13 +4943,13 @@ async def test_a_cancelled_job_that_can_be_aborted_is_asked_to_stop() -> None:
 
 
 async def test_joined_to_thread_returns_the_result_and_propagates_failures() -> None:
-    assert await sync._joined_to_thread(lambda: 7) == 7
+    assert await sync.joined_to_thread(lambda: 7) == 7
 
     def explode() -> int:
         raise RuntimeError("boom")
 
     with pytest.raises(RuntimeError, match="boom"):
-        await sync._joined_to_thread(explode)
+        await sync.joined_to_thread(explode)
 
 
 async def test_a_job_that_fails_on_its_own_does_not_abort_the_run() -> None:
@@ -4961,7 +4961,7 @@ async def test_a_job_that_fails_on_its_own_does_not_abort_the_run() -> None:
         raise sqlite3.IntegrityError("gone")
 
     with pytest.raises(sqlite3.IntegrityError):
-        await sync._joined_to_thread(explode, budget.cancel)
+        await sync.joined_to_thread(explode, budget.cancel)
     assert not budget.expired and not budget.cancelled
 
 
