@@ -671,7 +671,12 @@ never change the git identity.
   session's account and concrete actions (`join`, `request`, `fetch`, `add_source`), and
   `research.grants.authorized(target, action)` is the one check before every outward step of a run:
   only a grant naming that very target counts, so approving a chat approves nothing discovered
-  inside it, and a shared folder is approved chat by chat, never whole. Probes read metadata,
+  inside it, and a shared folder is approved chat by chat, never whole. **It is asked right
+  before the request goes out, after every await in front of it** — a username resolved for a
+  join, `chatlists.checkChatlistInvite` before a folder join, `contacts.search` and
+  `checkSearchPostsFlood` before the next search (`research.joining._still_approved`,
+  `research.searching._still_granted`) — so research stopped or an approval withdrawn while
+  Telegram answered sends nothing more. Probes read metadata,
   never history; a `peer:` candidate is looked up only with an access hash stored for the
   session's account or by the username a sync saw it under (see `peer_cache` above) and is
   `unresolvable` otherwise, never guessed. `max_candidates` bounds one call and

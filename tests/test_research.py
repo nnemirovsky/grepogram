@@ -3929,3 +3929,134 @@ async def test_a_refusal_quoting_a_folder_link_stays_out_of_the_log_above_debug(
     assert "t.me/addlist/Tbilisi1" in (_status(rdb, private).note or "")
     assert f"research candidate {private.id} is unavailable" in caplog.text
     assert "Tbilisi1" not in caplog.text
+
+
+# --- review phase 3: consent is asked again after every await ----------------------------------
+
+
+def _ending(
+    rdb: sqlite3.Connection, session: ResearchSession, how: str, *revoked: Candidate
+) -> None:
+    """End consent the way a human can while a request is on its way: stop the session, or
+    withdraw the approval of ``revoked``."""
+    if how == "stopped":
+        research_db.stop_session(rdb, session.id)
+    else:
+        research_db.void_grants(rdb, session.id, candidate_ids=[c.id for c in revoked])
+
+
+@pytest.mark.parametrize("how", ["stopped", "withdrawn"])
+async def test_consent_ended_during_the_folder_check_sends_no_folder_join(
+    rdb: sqlite3.Connection, conn: sqlite3.Connection, paths: Paths, how: str
+) -> None:
+    """``chatlists.checkChatlistInvite`` is awaited before the join goes out; research stopped,
+    or the chat's approval withdrawn, while Telegram answered keeps the folder join unsent."""
+    client = _run_client(_run_world())
+    session, found = await _discovered(rdb, conn, client, "https://t.me/addlist/Tbilisi1")
+    private = found[f"peer:{_marked(FOLDER_PRIVATE)}"]
+    _approve(rdb, conn, session, _item(private, "join"))
+
+    def check_then_end(request: Any) -> Any:
+        _ending(rdb, session, how, private)
+        return client._check_chatlist(request)
+
+    client.responses[functions.chatlists.CheckChatlistInviteRequest] = check_then_end
+
+    report = await _run(rdb, conn, paths, client, session)
+
+    assert not any(
+        isinstance(
+            r,
+            functions.chatlists.JoinChatlistInviteRequest
+            | functions.chatlists.JoinChatlistUpdatesRequest,
+        )
+        for r in client.requests
+    )
+    assert client.chatlist_joins == [] and "Tbilisi1" not in client.chatlists_joined
+    assert _marked(FOLDER_PRIVATE) not in client.members and report.joined == []
+    assert report.warnings == [
+        f"candidate {private.id}: its approval ended before the join went out; nothing was sent"
+    ]
+    assert _status(rdb, private).status == "approved", "nothing happened on Telegram"
+
+
+async def test_consent_ended_while_a_join_resolves_its_chat_sends_no_join(
+    rdb: sqlite3.Connection,
+    conn: sqlite3.Connection,
+    paths: Paths,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A join by username awaits the resolve of its chat first; a stop meanwhile sends none."""
+    client = _run_client(_run_world())
+    session, found = await _discovered(rdb, conn, client, "@tb_flats")
+    flats = found["@tb_flats"]
+    _approve(rdb, conn, session, _item(flats, "join"))
+    resolve = research.joining._input_channel
+
+    async def resolve_then_stop(*args: Any) -> Any:
+        channel = await resolve(*args)
+        research_db.stop_session(rdb, session.id)
+        return channel
+
+    monkeypatch.setattr(research.joining, "_input_channel", resolve_then_stop)
+
+    report = await _run(rdb, conn, paths, client, session)
+
+    assert not any(isinstance(r, functions.channels.JoinChannelRequest) for r in client.requests)
+    assert _marked(FLATS) not in client.members and report.joined == []
+    assert "its approval ended before the join went out" in report.warnings[0]
+
+
+@pytest.mark.parametrize(
+    ("during", "sent"),
+    [
+        (functions.contacts.SearchRequest, [functions.contacts.SearchRequest]),
+        (
+            functions.channels.CheckSearchPostsFloodRequest,
+            [functions.contacts.SearchRequest, functions.channels.CheckSearchPostsFloodRequest],
+        ),
+    ],
+)
+async def test_research_stopped_during_a_search_request_sends_no_further_search(
+    rdb: sqlite3.Connection, conn: sqlite3.Connection, during: type, sent: list[type]
+) -> None:
+    """Every search request asks about the ``global_search`` grant right before it goes out:
+    research stopped while the chat search or the quota check was answered fetches no post."""
+    session = _asking(rdb, conn, "apartment")
+    _approve(rdb, conn, session, _item(None, "global_search"), cfg=SEARCH_CFG)
+    client = _posts_world().client("default")
+    answer = client._research_answer
+
+    def answer_then_stop(request: Any) -> Any:
+        research_db.stop_session(rdb, session.id)
+        return answer(request)
+
+    client.responses[during] = answer_then_stop
+
+    reports = await _search(client, rdb, conn, SEARCH_CFG, session.id)
+
+    assert [type(r) for r in client.requests] == sent
+    posts = next(report for report in reports if report.kind == "post_search")
+    assert not posts.ran and posts.results == 0
+    assert "approval ended before the search went out; nothing was sent" in posts.warnings[0]
+
+
+async def test_a_paid_search_stopped_during_the_quota_check_neither_pays_nor_searches(
+    rdb: sqlite3.Connection, conn: sqlite3.Connection
+) -> None:
+    session = _asking(rdb, conn, "apartment")
+    _approve(rdb, conn, session, _item(None, "global_search", "paid_search"), cfg=PAYING)
+    client = _posts_world().client("default", search_flood=SPENT)
+
+    def quota_then_stop(_: Any) -> Any:
+        research_db.stop_session(rdb, session.id)
+        return SPENT
+
+    client.responses[functions.channels.CheckSearchPostsFloodRequest] = quota_then_stop
+
+    (report,) = await _search(client, rdb, conn, PAYING, session.id)
+
+    assert [type(r) for r in client.requests] == [functions.channels.CheckSearchPostsFloodRequest]
+    assert not report.ran and report.paid_stars == 0
+    paid = research_db.live_grants(rdb, session.id, None)
+    assert paid == [], "stopping voids the grants; the paid one was never consumed by a search"

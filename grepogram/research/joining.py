@@ -62,6 +62,19 @@ def _flood_note(report: RunReport, exc: errors.FloodError, what: str) -> None:
     report.stopped_by = "flood"
 
 
+def _withdrawn(report: RunReport, candidate: Candidate, what: str) -> None:
+    """Say that ``candidate``'s ``what`` was never sent: between the check that planned it and
+    the request, its approval was withdrawn or the session stopped (:func:`authorized` is asked
+    again right before every request that changes membership, after whatever was awaited
+    first). The candidate is left as it stands — nothing happened on Telegram."""
+    report.warnings.append(
+        f"candidate {candidate.id}: its approval ended before the {what} went out; nothing was sent"
+    )
+    log.info(
+        "research candidate %d: approval ended before the %s; nothing sent", candidate.id, what
+    )
+
+
 def _refuse_candidate(
     rdb: sqlite3.Connection,
     session: ResearchSession,
@@ -342,6 +355,11 @@ async def _join_one(
             request = functions.channels.JoinChannelRequest(
                 channel=await _input_channel(client, candidate)
             )
+        # resolving the username awaited Telegram: the approval is asked about again right
+        # before the join, so a stop or a withdrawal meanwhile sends nothing
+        if not authorized(rdb, candidate, action):
+            _withdrawn(report, candidate, action)
+            return
         answer = await client(request)
     except errors.FloodError:
         raise
@@ -403,6 +421,20 @@ async def _join_one(
         )
 
 
+def _still_approved(
+    rdb: sqlite3.Connection, children: Sequence[Candidate], report: RunReport
+) -> list[Candidate]:
+    """The ``children`` a live grant still approves joining, now; each of the others is
+    reported as :func:`_withdrawn`."""
+    kept: list[Candidate] = []
+    for child in children:
+        if authorized(rdb, child, "join"):
+            kept.append(child)
+        else:
+            _withdrawn(report, child, "join")
+    return kept
+
+
 async def _join_folder(
     client: Any,
     rdb: sqlite3.Connection,
@@ -418,10 +450,16 @@ async def _join_folder(
     holds now: a folder not imported yet is joined with ``chatlists.joinChatlistInvite``, one
     already imported gets its missing chats through ``chatlists.joinChatlistUpdates``. A chat
     the folder no longer lists is ``unavailable``; one the account is already in is ``joined``.
+    Every child's approval is asked about again (:func:`authorized`) before the check and once
+    more after it, right before the join: one withdrawn — or the session stopped — while
+    Telegram answered is left out of the request, which is not sent at all when none is left.
     """
     slug = parent.addlist_slug
     assert slug is not None  # _way_in_folder only names folders with a slug
     account = session.account
+    children = _still_approved(rdb, children, report)
+    if not children:
+        return
     try:
         answer = await client(functions.chatlists.CheckChatlistInviteRequest(slug=slug))
     except errors.FloodError:
@@ -452,6 +490,10 @@ async def _join_folder(
             _refuse_candidate(rdb, session, child, "unavailable", note, report)
         else:
             to_join.append((child, entity))
+    # the folder check awaited Telegram: a stop or a withdrawn approval meanwhile keeps that
+    # chat out of the join, and a join naming none of them is never sent
+    approved = {child.id for child in _still_approved(rdb, [c for c, _ in to_join], report)}
+    to_join = [(child, entity) for child, entity in to_join if child.id in approved]
     if not to_join:
         return
     peers = [utils.get_input_peer(entity) for _, entity in to_join]
