@@ -3274,6 +3274,60 @@ async def test_migrated_group_links_the_new_supergroup(conn: sqlite3.Connection)
     assert ("get_entity", {"key": OLD_ID}) not in client.calls
 
 
+async def test_a_migrated_supergroup_inherits_the_group_s_coverage_and_reach(
+    conn: sqlite3.Connection,
+) -> None:
+    """The supergroup is covered by every source that covered the legacy group and reached by
+    its account, so removing the group's primary source keeps it while another source still
+    covers the group — and a sync that finds it gone checks the migration again instead of
+    following a dangling id."""
+    folder = Source(folder="Old")
+    source = Source(chat=OLD_ID)
+    cfg = _cfg(source, folder)
+    old = db.upsert_chat(
+        conn, ChatRow(id=OLD_ID, type="group", title="Old group", source_id=source.id)
+    )
+    db.set_source_chats(conn, source.id, [OLD_ID])
+    db.set_source_chats(conn, folder.id, [OLD_ID])
+    db.set_chat_access(conn, OLD_ID, DEFAULT_ACCOUNT)
+    client = _client(messages={OLD_ID: [tl.message(OLD_ID, 1, "old times", sender=1)]})
+
+    synced = await sync.sync_chat(client, conn, old, source, SyncBudget())
+
+    assert synced.migrated_to is not None and synced.migrated_to.id == GEORGIA_ID
+    assert db.chat_source_ids(conn, GEORGIA_ID) == sorted([source.id, folder.id])
+    assert db.chat_accounts(conn, GEORGIA_ID) == [DEFAULT_ACCOUNT]
+    assert db.access_hash(conn, GEORGIA_ID, DEFAULT_ACCOUNT) == GEORGIA.access_hash
+
+    removed = sources.remove_source_id(cfg, conn, source.id)
+
+    assert removed.chat_ids == [] and removed.kept_chat_ids == sorted([OLD_ID, GEORGIA_ID])
+    kept = db.get_chat(conn, GEORGIA_ID)
+    assert kept is not None and kept.source_id == folder.id
+
+    db.delete_chat(conn, GEORGIA_ID)
+    group = db.get_chat(conn, OLD_ID)
+    assert group is not None and group.migrated_to == GEORGIA_ID
+    again = await sync.sync_chat(client, conn, group, folder, SyncBudget())
+
+    assert again.migrated_to is not None and again.migrated_to.id == GEORGIA_ID
+    assert db.chat_source_ids(conn, GEORGIA_ID) == [folder.id]
+
+
+async def test_a_resolve_listing_only_the_legacy_group_keeps_the_supergroup_covered(
+    conn: sqlite3.Connection, paths: Paths
+) -> None:
+    """``chat = -10`` resolves to the legacy group every sync, and a resolve replaces the
+    source's coverage with what it listed: the supergroup the group became stays in it."""
+    client = _client(messages={OLD_ID: [tl.message(OLD_ID, 1, "old times", sender=1)]})
+    cfg = _cfg(Source(chat=OLD_ID))
+
+    await _run(client, conn, paths, cfg)
+    await _run(client, conn, paths, cfg)
+
+    assert db.source_chat_ids(conn, "chat:-10") == sorted([OLD_ID, GEORGIA_ID])
+
+
 async def test_group_without_migration_is_synced_normally(conn: sqlite3.Connection) -> None:
     plain = make_group(11, "Plain group")
     client = _client(entities=[plain], messages={-11: [tl.message(-11, 1, "hi", sender=1)]})

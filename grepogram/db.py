@@ -1137,6 +1137,17 @@ def set_source_chats(conn: sqlite3.Connection, source_id: str, chat_ids: Iterabl
         )
 
 
+def add_chat_sources(conn: sqlite3.Connection, chat_id: int, source_ids: Iterable[str]) -> None:
+    """Record that every source of ``source_ids`` covers chat ``chat_id`` too, keeping what
+    each already covers — for a chat a sync learns of outside any source's listing (the
+    supergroup a legacy group migrated to)."""
+    with transaction(conn):
+        conn.executemany(
+            "INSERT OR IGNORE INTO chat_sources(chat_id, source_id) VALUES (?, ?)",
+            [(chat_id, source_id) for source_id in dict.fromkeys(source_ids)],
+        )
+
+
 def source_chat_ids(conn: sqlite3.Connection, source_id: str) -> list[int]:
     """Every chat recorded as covered by ``source_id``, ordered by id."""
     rows = conn.execute(

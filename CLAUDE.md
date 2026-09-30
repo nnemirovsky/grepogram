@@ -176,7 +176,11 @@ never change the git identity.
   neither table. `sources.resolve_sources(cfg, clients, conn)` does, each account's sources
   through that account's `DialogCatalog`, and replaces a source's coverage
   (`db.set_source_chats`) only when that source resolved this run — a failed source, or one whose
-  account has no client, keeps what it had. `sources.remove_source` deletes a chat only when no
+  account has no client, keeps what it had. A legacy group's supergroup inherits the group's
+  coverage and reach when the migration is found (`sync._inherit_coverage`), and a resolve that
+  lists the group keeps the supergroup covered (`sources._with_migrations`); a `migrated_to`
+  naming a row deleted since makes the next sync check the migration again rather than follow
+  a dangling id. `sources.remove_source` deletes a chat only when no
   source left in the config covers it; otherwise the primary moves to the first remaining
   covering source in config order — for a link-only discussion group to its channel's
   (`discussion_source_id`), which is why channels are decided before groups — and never onto an

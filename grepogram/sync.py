@@ -885,8 +885,18 @@ async def sync_chat(
     if foreign is not None:
         raise ValueError(foreign)
     if chat.migrated_to is not None:
-        log.debug("chat %s migrated to %s; its history is frozen", chat.id, chat.migrated_to)
-        return SyncedChat(chat=chat, migrated_to=db.get_chat(conn, chat.migrated_to))
+        supergroup = db.get_chat(conn, chat.migrated_to)
+        if supergroup is not None:
+            log.debug("chat %s migrated to %s; its history is frozen", chat.id, chat.migrated_to)
+            return SyncedChat(chat=chat, migrated_to=supergroup)
+        # the supergroup's row was deleted since (its source removed): ask again, so it is
+        # stored anew rather than followed as a dangling id for good
+        log.info(
+            "chat %s (%s) migrated to %s, which the index no longer holds; checking again",
+            chat.id,
+            chat.title,
+            chat.migrated_to,
+        )
     run = _Run(
         client=client,
         conn=conn,
@@ -1344,6 +1354,12 @@ async def _check_migration(
     The group is asked about by its peer id, which a group stored under a synthetic row id does
     not share; the supergroup is a shared chat, found by its Telegram identity and stored through
     ``account``, whose client is the one asking.
+
+    The supergroup inherits the group's coverage and reach (:func:`_inherit_coverage`): every
+    source that covered the group covers it in ``chat_sources``, and every account that reached
+    the group reaches it in ``chat_access`` — ``account`` with the access hash it resolved.
+    Without them ``sources rm`` of the primary would delete the supergroup while another
+    configured source still covers the group, and a fallback would not know who reaches it.
     """
     try:
         entity = await client.get_entity(chat.peer_id)
@@ -1355,6 +1371,7 @@ async def _check_migration(
         return None
     new_id = dialogs.peer_id(types.PeerChannel(int(target.channel_id)))
     new_chat = db.get_chat_by_peer(conn, new_id, chat_scope("supergroup", account))
+    resolved: int | None = None
     if new_chat is None:
         try:
             entity = await client.get_entity(new_id)
@@ -1370,9 +1387,36 @@ async def _check_migration(
         new_chat = db.upsert_chat(
             conn, _chat_row_from_entity(entity, chat.source_id, account), account
         )
+        found = getattr(entity, "access_hash", None)
+        resolved = None if found is None else int(found)
+    _inherit_coverage(conn, chat, new_chat, account, resolved)
     db.set_chat_migrated(conn, chat.id, new_chat.id)
     log.info("chat %s (%s) migrated to supergroup %s", chat.id, chat.title, new_chat.id)
     return new_chat
+
+
+def _inherit_coverage(
+    conn: sqlite3.Connection,
+    group: ChatRow,
+    supergroup: ChatRow,
+    account: str,
+    access_hash: int | None,
+) -> None:
+    """Give ``supergroup`` the coverage and reach of the legacy ``group`` it replaced, in one
+    transaction: its sources (``chat_sources``, the primary included) and its accounts
+    (``chat_access``), ``account`` — the one that found the migration — with ``access_hash``."""
+    covering = [*db.chat_source_ids(conn, group.id)]
+    if group.source_id and not group.source_id.startswith(IMPORT_PREFIX):
+        covering.append(group.source_id)
+    with db.transaction(conn):
+        db.add_chat_sources(conn, supergroup.id, covering)
+        for reaching in dict.fromkeys([*db.chat_accounts(conn, group.id), account]):
+            db.set_chat_access(
+                conn,
+                supergroup.id,
+                reaching,
+                access_hash=access_hash if reaching == account else None,
+            )
 
 
 async def link_discussion_chat(

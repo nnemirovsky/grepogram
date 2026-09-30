@@ -1041,9 +1041,24 @@ async def resolve_sources(
         covered |= _still_named(conn, source, named)
         covered |= _store_listed(conn, source, catalog, infos, stored, held_back, rows)
     for source_id, chat_ids in coverage.items():
-        db.set_source_chats(conn, source_id, chat_ids)
+        db.set_source_chats(conn, source_id, _with_migrations(conn, chat_ids))
     log.info("resolved %d chats from %d sources", len(rows), len(cfg.sources))
     return Resolution(chats=rows, flooded=flooded, failed=failed, unresolved=unresolved)
+
+
+def _with_migrations(conn: sqlite3.Connection, chat_ids: Iterable[int]) -> list[int]:
+    """``chat_ids`` and the supergroup each legacy group among them migrated to, while the index
+    still holds it: a source that covers the group covers what it became
+    (:func:`grepogram.sync._check_migration` recorded it), and a resolve that lists only the
+    group — or a folder the old dialog still sits in — must not take that coverage back."""
+    covered = list(dict.fromkeys(chat_ids))
+    for chat_id in list(covered):
+        chat = db.get_chat(conn, chat_id)
+        if chat is None or chat.migrated_to is None or chat.migrated_to in covered:
+            continue
+        if db.get_chat(conn, chat.migrated_to) is not None:
+            covered.append(chat.migrated_to)
+    return covered
 
 
 def _store_listed(
