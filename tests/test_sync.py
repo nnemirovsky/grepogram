@@ -3856,7 +3856,7 @@ def test_cli_sync_prints_the_report(tmp_home: Path, monkeypatch: pytest.MonkeyPa
     fake = _client(
         messages={ALICE_ID: [tl.message(ALICE_ID, i, f"m{i}", sender=1) for i in (1, 2)]}
     )
-    monkeypatch.setattr(tg, "make_client", lambda cfg, paths: fake)
+    monkeypatch.setattr(tg, "make_client", lambda *_: fake)
     result = runner.invoke(cli.app, ["sync"])
     assert result.exit_code == 0, result.output
     assert "new messages: 2" in result.stdout
@@ -3876,7 +3876,7 @@ def test_cli_sync_smallest_budget_reports_remaining(
     """One second is the smallest budget the CLI takes; an expired one leaves every chat behind."""
     _setup(tmp_home)
     fake = _client(messages={ALICE_ID: [tl.message(ALICE_ID, 1, "m1", sender=1)]})
-    monkeypatch.setattr(tg, "make_client", lambda cfg, paths: fake)
+    monkeypatch.setattr(tg, "make_client", lambda *_: fake)
 
     def expired(seconds: float) -> SyncBudget:
         return SyncBudget(seconds, clock=_clock(0, seconds + 1))
@@ -3894,7 +3894,7 @@ def test_cli_sync_prints_warnings_and_unavailable(
 ) -> None:
     _setup(tmp_home, CONFIG + '\n[[sources]]\nfolder = "Argentina"\n')
     fake = _client(failures={ARG_ID: errors.FloodWaitError(request=None, capture=60)})
-    monkeypatch.setattr(tg, "make_client", lambda cfg, paths: fake)
+    monkeypatch.setattr(tg, "make_client", lambda *_: fake)
     result = runner.invoke(cli.app, ["sync"])
     assert result.exit_code == 0, result.output
     assert "warning: flood wait" in result.stderr
@@ -3924,12 +3924,12 @@ def test_cli_sync_reports_lock_and_auth_errors(
     tmp_home: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     paths = _setup(tmp_home)
-    monkeypatch.setattr(tg, "make_client", lambda cfg, paths: _client(messages={}))
+    monkeypatch.setattr(tg, "make_client", lambda *_: _client(messages={}))
     with SyncLock(paths):
         locked = runner.invoke(cli.app, ["sync"])
     assert locked.exit_code == 1
     assert "another sync is running" in locked.stderr
-    monkeypatch.setattr(tg, "make_client", lambda cfg, paths: _client(authorized=False))
+    monkeypatch.setattr(tg, "make_client", lambda *_: _client(authorized=False))
     unauthorized = runner.invoke(cli.app, ["sync"])
     assert unauthorized.exit_code == 1
     assert "grepogram auth" in unauthorized.stderr
@@ -3951,7 +3951,7 @@ def test_cli_sync_maps_network_errors(tmp_home: Path, monkeypatch: pytest.Monkey
         raise ConnectionError("offline")
 
     monkeypatch.setattr(offline, "connect", failing_connect)
-    monkeypatch.setattr(tg, "make_client", lambda cfg, paths: offline)
+    monkeypatch.setattr(tg, "make_client", lambda *_: offline)
     result = runner.invoke(cli.app, ["sync"])
     assert result.exit_code == 1
     assert "error: telegram error: offline" in result.stderr
@@ -3962,7 +3962,7 @@ def test_cli_sync_maps_network_errors(tmp_home: Path, monkeypatch: pytest.Monkey
             )
         }
     )
-    monkeypatch.setattr(tg, "make_client", lambda cfg, paths: flooded)
+    monkeypatch.setattr(tg, "make_client", lambda *_: flooded)
     result = runner.invoke(cli.app, ["sync"])
     assert result.exit_code == 1
     assert "error: telegram error:" in result.stderr and "30" in result.stderr

@@ -20,8 +20,8 @@ number on stdin; :func:`connected` connects without prompting and turns dead-ses
 import os
 import sqlite3
 import stat
-from collections.abc import AsyncIterator, Awaitable, Callable, Iterable
-from contextlib import asynccontextmanager
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Mapping
+from contextlib import AsyncExitStack, asynccontextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -234,8 +234,51 @@ async def connected(
         await client.disconnect()
 
 
-async def login(client: TelegramClient, *, phone: Prompt, code: Prompt, password: Prompt) -> str:
-    """Run Telethon's interactive sign-in and return the account's display name.
+@dataclass(frozen=True, slots=True)
+class Live:
+    """What :func:`connected_all` connected: a client per account that is signed in, and the
+    :class:`AuthRequired` of each account whose session Telegram does not accept."""
+
+    clients: dict[str, TelegramClient] = field(default_factory=dict)
+    refused: dict[str, AuthRequired] = field(default_factory=dict)
+
+
+@asynccontextmanager
+async def connected_all(clients: Mapping[str, TelegramClient]) -> AsyncIterator[Live]:
+    """:func:`connected` for every account of ``clients`` at once; all of them are disconnected
+    on the way out.
+
+    An account whose session is not authorized is left out and reported in
+    :attr:`Live.refused` rather than raised — one signed-out account must not keep the others
+    from syncing — unless it leaves no account connected at all, when its :class:`AuthRequired`
+    is raised as :func:`connected` would. Any other failure (the network) is raised.
+    """
+    live = Live()
+    async with AsyncExitStack() as stack:
+        for account, client in clients.items():
+            try:
+                await stack.enter_async_context(connected(client, account))
+            except AuthRequired as exc:
+                live.refused[account] = exc
+                continue
+            live.clients[account] = client
+        if not live.clients and live.refused:
+            raise next(iter(live.refused.values()))
+        yield live
+
+
+@dataclass(frozen=True, slots=True)
+class SignedIn:
+    """Who :func:`login` signed in: the display name and Telegram's user id."""
+
+    name: str
+    user_id: int
+
+
+async def login(
+    client: TelegramClient, *, phone: Prompt, code: Prompt, password: Prompt
+) -> SignedIn:
+    """Run Telethon's interactive sign-in and return who the account is.
 
     ``phone`` and ``code`` are asked when the session is not authorized yet; ``password`` only
     when the account has two-step verification enabled.
@@ -247,4 +290,4 @@ async def login(client: TelegramClient, *, phone: Prompt, code: Prompt, password
         await client.disconnect()
     if me is None:
         raise AuthRequired("sign-in did not produce an authorized session")
-    return str(utils.get_display_name(me))
+    return SignedIn(name=str(utils.get_display_name(me)), user_id=int(me.id))

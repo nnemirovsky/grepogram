@@ -4,7 +4,7 @@ import logging
 import os
 import sqlite3
 import stat
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -785,7 +785,7 @@ def test_cli_sources_help_lists_commands() -> None:
 def test_cli_sources_add_writes_config(tmp_home: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     config_file = _signed_in(tmp_home)
     fake = _client()
-    monkeypatch.setattr(tg, "make_client", lambda cfg, paths: fake)
+    monkeypatch.setattr(tg, "make_client", lambda *_: fake)
     result = runner.invoke(cli.app, ["sources", "add", "@arg_chat"])
     assert result.exit_code == 0, result.output
     assert result.stdout.splitlines() == [
@@ -830,13 +830,18 @@ def test_cli_sources_add_keeps_a_change_saved_while_the_target_resolved(
     is applied to the file as it is by then, under the config lock, so the removal survives."""
     _signed_in(tmp_home, '[[sources]]\nchat = "@alice"\n')
     paths = Paths.from_env()
-    monkeypatch.setattr(tg, "make_client", lambda cfg, paths: _client())
+    monkeypatch.setattr(tg, "make_client", lambda *_: _client())
     real_add = cli._add_source
 
     async def add_after_the_removal(
-        client: Any, cfg: Config, target: sources.Target, since: str | None, comments: bool
+        client: Any,
+        cfg: Config,
+        target: sources.Target,
+        since: str | None,
+        comments: bool,
+        account: str,
     ) -> sources.Added:
-        added = await real_add(client, cfg, target, since, comments)
+        added = await real_add(client, cfg, target, since, comments, account)
         config.update(paths, lambda current: dataclasses.replace(current, sources=[]))
         return added
 
@@ -853,13 +858,18 @@ def test_cli_sources_add_refuses_a_source_another_process_added_meanwhile(
 ) -> None:
     _signed_in(tmp_home)
     paths = Paths.from_env()
-    monkeypatch.setattr(tg, "make_client", lambda cfg, paths: _client())
+    monkeypatch.setattr(tg, "make_client", lambda *_: _client())
     real_add = cli._add_source
 
     async def add_after_the_other_add(
-        client: Any, cfg: Config, target: sources.Target, since: str | None, comments: bool
+        client: Any,
+        cfg: Config,
+        target: sources.Target,
+        since: str | None,
+        comments: bool,
+        account: str,
     ) -> sources.Added:
-        added = await real_add(client, cfg, target, since, comments)
+        added = await real_add(client, cfg, target, since, comments, account)
         config.update(paths, lambda current: sources.with_source(current, added.source, None))
         return added
 
@@ -874,7 +884,7 @@ def test_cli_sources_add_reports_source_errors(
     tmp_home: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     config_file = _signed_in(tmp_home)
-    monkeypatch.setattr(tg, "make_client", lambda cfg, paths: _client())
+    monkeypatch.setattr(tg, "make_client", lambda *_: _client())
     ambiguous = runner.invoke(cli.app, ["sources", "add", "arg"])
     assert ambiguous.exit_code == 1
     assert "be more specific" in ambiguous.stderr
@@ -910,7 +920,7 @@ def test_cli_sources_add_maps_network_errors(
         raise ConnectionError("offline")
 
     monkeypatch.setattr(broken, "connect", failing_connect)
-    monkeypatch.setattr(tg, "make_client", lambda cfg, paths: broken)
+    monkeypatch.setattr(tg, "make_client", lambda *_: broken)
     result = runner.invoke(cli.app, ["sources", "add", "@arg_chat"])
     assert result.exit_code == 1
     assert "telegram error: offline" in result.stderr
@@ -934,6 +944,7 @@ def test_cli_sources_ls_prints_table_and_empty_message(tmp_home: Path) -> None:
     assert result.exit_code == 0, result.output
     lines = result.stdout.splitlines()
     assert lines[0].split() == [
+        "account",
         "source",
         "id",
         "type",
@@ -944,11 +955,13 @@ def test_cli_sources_ls_prints_table_and_empty_message(tmp_home: Path) -> None:
         "sync",
         "status",
     ]
-    assert lines[1].startswith(f"folder:Argentina  {NEWS_ID}  channel     News")
+    assert lines[1].startswith(f"default  folder:Argentina  {NEWS_ID}  channel     News")
     assert lines[1].endswith("0         never             unavailable")
-    assert lines[2].startswith(f"folder:Argentina  {ARG_ID}  supergroup  Argentina chat  @arg_chat")
+    assert lines[2].startswith(
+        f"default  folder:Argentina  {ARG_ID}  supergroup  Argentina chat  @arg_chat"
+    )
     assert "  3  " in lines[2] and lines[2].endswith("ok")
-    assert lines[3].startswith("chat:@alice")
+    assert lines[3].startswith("default  chat:@alice")
     assert lines[3].endswith("not synced yet")
     assert not any(line.endswith(" ") for line in lines)
 
@@ -1178,7 +1191,7 @@ def _membership(
 
 async def test_folder_membership_lists_every_peer_a_folder_names() -> None:
     cfg = _cfg(Source(folder="Argentina"), Source(chat="@alice"))
-    membership = await sources.folder_membership(cfg, _catalog())
+    membership = await sources.folder_membership(cfg, {"default": _catalog()})
     # GHOST_ID has no entity to resolve, and is still listed by the folder: `folder_dialogs`
     # drops such a peer, and reading that as "it left" is what would delete a live chat
     assert membership.listed == {"folder:Argentina": {ARG_ID, NEWS_ID, OUTSIDE_ID, GHOST_ID}}
@@ -1193,21 +1206,35 @@ async def test_folder_membership_drops_a_peer_the_folder_also_excludes() -> None
     folder = make_folder(3, "Argentina", include=[ARG, GHOST_ID], pinned=[NEWS], exclude=[NEWS])
     client = FakeClient(dialogs=[make_dialog(ARG), make_dialog(NEWS)], folders=[folder])
     membership = await sources.folder_membership(
-        _cfg(Source(folder="Argentina")), DialogCatalog(client)
+        _cfg(Source(folder="Argentina")), {"default": DialogCatalog(client)}
     )
     assert membership.listed == {"folder:Argentina": {ARG_ID, GHOST_ID}}
 
 
 async def test_folder_membership_records_an_unresolvable_source_instead_of_skipping_it() -> None:
     cfg = _cfg(Source(folder="Xyz"), Source(folder="Argentina"))
-    membership = await sources.folder_membership(cfg, _catalog())
+    membership = await sources.folder_membership(cfg, {"default": _catalog()})
     assert set(membership.listed) == {"folder:Argentina"}
     assert "no folder named" in membership.failed["folder:Xyz"]
 
 
+async def test_folder_membership_reads_a_folder_through_its_own_account_only() -> None:
+    """A folder is one account's: one whose account has no catalog is unchecked — a prune then
+    stops — and never read through the default account's folder of the same name."""
+    cfg = _cfg(Source(folder="Argentina"), Source(folder="Argentina", account="work"))
+    membership = await sources.folder_membership(cfg, {"default": _catalog()})
+    assert set(membership.listed) == {"folder:Argentina"}
+    assert membership.failed == {"work/folder:Argentina": "account work is not signed in"}
+    only_work = await sources.folder_membership(cfg, {"work": _catalog()})
+    assert set(only_work.listed) == {"work/folder:Argentina"}
+    assert set(only_work.failed) == {"folder:Argentina"}
+
+
 async def test_folder_membership_records_a_transient_rpc_error() -> None:
     flooded = _catalog(entity_errors={GHOST_ID: errors.FloodWaitError(request=None, capture=30)})
-    membership = await sources.folder_membership(_cfg(Source(folder="Argentina")), flooded)
+    membership = await sources.folder_membership(
+        _cfg(Source(folder="Argentina")), {"default": flooded}
+    )
     assert membership.listed == {}
     assert "wait" in membership.failed["folder:Argentina"].casefold()
 
@@ -1222,7 +1249,7 @@ async def test_folder_membership_reraises_a_revoked_session() -> None:
     cfg = _cfg(Source(folder="Argentina"))
     with pytest.raises(tg.AuthRequired):
         async with tg.connected(client):
-            await sources.folder_membership(cfg, DialogCatalog(client))
+            await sources.folder_membership(cfg, {"default": DialogCatalog(client)})
 
 
 def test_prunable_offers_a_chat_the_folder_no_longer_lists(conn: sqlite3.Connection) -> None:
@@ -1405,7 +1432,7 @@ def _prune_home(tmp_home: Path, monkeypatch: pytest.MonkeyPatch, extra: str = ""
     _store(conn, _chat(ARG_ID, "folder:Argentina", title="Argentina chat", username="arg_chat"), 3)
     _store(conn, _left(), 4)
     conn.close()
-    monkeypatch.setattr(tg, "make_client", lambda cfg, paths: _client())
+    monkeypatch.setattr(tg, "make_client", lambda *_: _client())
     return paths
 
 
@@ -1503,11 +1530,11 @@ def test_cli_sources_prune_resolves_before_it_takes_the_sync_lock(
     order: list[str] = []
 
     async def membership_without_the_lock(
-        client: TelegramClient, cfg: Config
+        clients: Mapping[str, TelegramClient], cfg: Config
     ) -> sources.FolderMembership:
         with sync.SyncLock(paths):  # free while the network is being read
             order.append("resolved")
-        return await real_membership(client, cfg)
+        return await real_membership(clients, cfg)
 
     def prune_under_the_lock(
         conn: sqlite3.Connection, candidates: Sequence[sources.PruneCandidate]
@@ -1548,7 +1575,7 @@ def test_cli_sources_prune_maps_network_errors(
         raise ConnectionError("offline")
 
     monkeypatch.setattr(broken, "connect", failing_connect)
-    monkeypatch.setattr(tg, "make_client", lambda cfg, paths: broken)
+    monkeypatch.setattr(tg, "make_client", lambda *_: broken)
     result = runner.invoke(cli.app, ["sources", "prune"])
     assert result.exit_code == 1
     assert "telegram error: offline" in result.stderr
@@ -1787,7 +1814,7 @@ def _import_home(tmp_home: Path, monkeypatch: pytest.MonkeyPatch, chat_id: int) 
     db.migrate(conn)
     sources.import_chats(conn, _export(_imported(chat_id, "Argentina chat"), messages=2))
     conn.close()
-    monkeypatch.setattr(tg, "make_client", lambda cfg, paths: _client())
+    monkeypatch.setattr(tg, "make_client", lambda *_: _client())
     return paths
 
 

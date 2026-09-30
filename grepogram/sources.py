@@ -595,7 +595,13 @@ def remove_source(cfg: Config, conn: sqlite3.Connection, target: Target) -> Remo
     Deleting a discussion group takes the comments it fed to a channel's post threads with it
     (:func:`grepogram.db.delete_chat`), so the index never quotes rows this removed.
     """
-    source_id = find_source(cfg, conn, target)
+    return remove_source_id(cfg, conn, find_source(cfg, conn, target))
+
+
+def remove_source_id(cfg: Config, conn: sqlite3.Connection, source_id: str) -> Removed:
+    """:func:`remove_source` for a source id already known exactly — a ``[[sources]]`` entry's
+    own :attr:`~grepogram.models.Source.id`, as ``accounts rm`` walks an account's sources —
+    with no target to parse or match. The same rules decide what is deleted and what stays."""
     source = next((s for s in cfg.sources if s.id == source_id), None)
     remaining = [s for s in cfg.sources if s.id != source_id]
     rank = {s.id: position for position, s in enumerate(remaining)}
@@ -1082,8 +1088,11 @@ def discussion_source_id(group: ChatRow | None, channel: ChatRow) -> str | None:
 # --- prune -----------------------------------------------------------------------------------
 
 
-async def folder_membership(cfg: Config, catalog: DialogCatalog) -> FolderMembership:
-    """Read what every folder source lists right now; ``catalog``'s client must be connected.
+async def folder_membership(cfg: Config, catalogs: Mapping[str, DialogCatalog]) -> FolderMembership:
+    """Read what every folder source lists right now, each through the catalog of its own
+    account (``catalogs``, whose clients must be connected). A folder source whose account has
+    no catalog — not signed in — is recorded as failed: its folders are that account's, and no
+    other account's folder of the same name says anything about them.
 
     The network half of ``sources prune``, and it differs from :func:`resolve_sources` in the
     one way that matters here: a source that does not resolve is *recorded* as failed instead of
@@ -1106,6 +1115,10 @@ async def folder_membership(cfg: Config, catalog: DialogCatalog) -> FolderMember
     failed: dict[str, str] = {}
     for source in cfg.sources:
         if source.folder is None:
+            continue
+        catalog = catalogs.get(source.account)
+        if catalog is None:
+            failed[source.id] = f"account {source.account} is not signed in"
             continue
         try:
             folder = await find_folder(source.folder, catalog)
@@ -1274,8 +1287,17 @@ def _still_prunable(conn: sqlite3.Connection, stored: ChatRow, candidate: PruneC
 # --- import ----------------------------------------------------------------------------------
 
 
-def import_chats(conn: sqlite3.Connection, entries: Sequence[ImportedChat]) -> list[Imported]:
-    """Store a parsed Telegram Desktop export, tagging each of its chats ``import:<slug>``.
+def import_chats(
+    conn: sqlite3.Connection, entries: Sequence[ImportedChat], account: str = DEFAULT_ACCOUNT
+) -> list[Imported]:
+    """Store a parsed Telegram Desktop export of ``account``, tagging each of its chats
+    ``import:<slug>``.
+
+    ``account`` is whose export it is, and it matters for the chats whose history is one
+    account's own: a private chat, a bot or a legacy group is stored under that account's scope
+    (:func:`grepogram.models.chat_scope`), beside — never over — another account's chat with
+    the same peer, which may then take a synthetic row id; the messages are stored under the id
+    the row got. A channel or supergroup is one row whoever exported it.
 
     The rows go in through :func:`grepogram.db.upsert_messages` like any other, so the caller
     rebuilds units, indexes and embeds them exactly as a sync does; nothing here derives
@@ -1291,15 +1313,21 @@ def import_chats(conn: sqlite3.Connection, entries: Sequence[ImportedChat]) -> l
     it. A chat already stored as an import is not a conflict — re-running an import is how a
     partial one is finished, and it is idempotent because the ids come from the export.
     """
-    rows = [entry.chat for entry in entries]
+    rows = [
+        dataclasses.replace(entry.chat, scope=chat_scope(entry.chat.type, account))
+        for entry in entries
+    ]
     _refuse_live(conn, rows)
     source_ids = import_source_ids(conn, rows)
     stored: list[Imported] = []
     with db.transaction(conn):
-        for entry in entries:
-            source_id = source_ids[entry.chat.id]
-            chat = db.upsert_chat(conn, dataclasses.replace(entry.chat, source_id=source_id))
-            message_ids = db.upsert_messages(conn, entry.messages)
+        for entry, row in zip(entries, rows, strict=True):
+            source_id = source_ids[row.id]
+            chat = db.upsert_chat(conn, dataclasses.replace(row, source_id=source_id), account)
+            messages = entry.messages
+            if chat.id != row.id:
+                messages = [dataclasses.replace(m, chat_id=chat.id) for m in messages]
+            message_ids = db.upsert_messages(conn, messages)
             stored.append(Imported(chat=chat, source_id=source_id, messages=len(message_ids)))
     log.info(
         "imported %d chats and %d messages", len(stored), sum(item.messages for item in stored)
@@ -1356,8 +1384,9 @@ def import_source_ids(conn: sqlite3.Connection, chats: Sequence[ChatRow]) -> dic
     """
     slugs = {chat.id: import_slug(chat.title) or f"chat-{abs(chat.id)}" for chat in chats}
     shared = {slug for slug, count in collections.Counter(slugs.values()).items() if count > 1}
+    identity = {chat.id: (chat.scope, chat.peer_id) for chat in chats}
     held = {
-        str(chat.source_id): chat.id
+        str(chat.source_id): (chat.scope, chat.peer_id)
         for chat in db.list_chats(conn)
         if (chat.source_id or "").startswith(IMPORT_PREFIX)
     }
@@ -1365,8 +1394,12 @@ def import_source_ids(conn: sqlite3.Connection, chats: Sequence[ChatRow]) -> dic
     taken: set[str] = set()
 
     def claimed(source_id: str, chat_id: int) -> bool:
-        """Whether ``source_id`` belongs to some other chat — in this export or in the index."""
-        return source_id in taken or held.get(source_id, chat_id) != chat_id
+        """Whether ``source_id`` belongs to some other chat — in this export or in the index.
+
+        A stored chat is the same chat when its Telegram identity (scope and peer) is, not its
+        row id: an account's private chat may be stored under a synthetic one."""
+        mine = identity[chat_id]
+        return source_id in taken or held.get(source_id, mine) != mine
 
     for chat_id in sorted(slugs):
         slug = slugs[chat_id]
@@ -1408,7 +1441,7 @@ def _refuse_live(conn: sqlite3.Connection, chats: Sequence[ChatRow]) -> None:
     would both retag the chat and leave two writers over the same ``(chat_id, msg_id)`` rows.
     """
     for chat in chats:
-        stored = db.get_chat(conn, chat.id)
+        stored = db.get_chat_by_peer(conn, chat.peer_id, chat.scope)
         if stored is None or (stored.source_id or "").startswith(IMPORT_PREFIX):
             continue
         through = f"through {stored.source_id}" if stored.source_id else "with no source"

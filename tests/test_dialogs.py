@@ -519,7 +519,7 @@ def test_cli_dialogs_requires_a_session(tmp_home: Path) -> None:
 def test_cli_dialogs_prints_a_table(tmp_home: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     _signed_in(tmp_home)
     fake = _client()
-    monkeypatch.setattr(tg, "make_client", lambda cfg, paths: fake)
+    monkeypatch.setattr(tg, "make_client", lambda *_: fake)
     result = runner.invoke(cli.app, ["dialogs", "arg"])
     assert result.exit_code == 0, result.output
     lines = result.stdout.splitlines()
@@ -537,7 +537,7 @@ def test_cli_dialogs_honours_limit_and_reports_no_matches(
     tmp_home: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     _signed_in(tmp_home)
-    monkeypatch.setattr(tg, "make_client", lambda cfg, paths: _client())
+    monkeypatch.setattr(tg, "make_client", lambda *_: _client())
     limited = runner.invoke(cli.app, ["dialogs", "a", "-n", "1"])
     assert limited.exit_code == 0, limited.output
     assert len(limited.stdout.splitlines()) == 2
@@ -550,7 +550,7 @@ def test_cli_dialogs_maps_auth_and_network_errors(
     tmp_home: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     _signed_in(tmp_home)
-    monkeypatch.setattr(tg, "make_client", lambda cfg, paths: _client(authorized=False))
+    monkeypatch.setattr(tg, "make_client", lambda *_: _client(authorized=False))
     unauthorized = runner.invoke(cli.app, ["dialogs", "arg"])
     assert unauthorized.exit_code == 1
     assert "run: grepogram auth" in unauthorized.stderr
@@ -560,7 +560,7 @@ def test_cli_dialogs_maps_auth_and_network_errors(
         raise ConnectionError("no route to Telegram")
 
     monkeypatch.setattr(broken, "connect", failing_connect)
-    monkeypatch.setattr(tg, "make_client", lambda cfg, paths: broken)
+    monkeypatch.setattr(tg, "make_client", lambda *_: broken)
     offline = runner.invoke(cli.app, ["dialogs", "arg"])
     assert offline.exit_code == 1
     assert "telegram error: no route to Telegram" in offline.stderr

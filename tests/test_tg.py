@@ -465,6 +465,38 @@ async def test_connected_disconnects_a_client_that_failed_while_connecting() -> 
     assert [name for name, _ in client.calls] == ["disconnect"]
 
 
+async def test_connected_all_leaves_out_a_signed_out_account() -> None:
+    home, work = FakeClient(), FakeClient(authorized=False)
+    async with tg.connected_all({"default": home, "work": work}) as live:
+        assert live.clients == {"default": home}
+        assert list(live.refused) == ["work"]
+        assert live.refused["work"].hint == "run: grepogram auth --account work"
+        assert home.is_connected() and not work.is_connected()
+    assert not home.is_connected()
+
+
+async def test_connected_all_raises_when_no_account_is_signed_in() -> None:
+    work = FakeClient(authorized=False)
+    with pytest.raises(tg.AuthRequired) as raised:
+        async with tg.connected_all({"work": work}):
+            pytest.fail("nothing is connected")
+    assert raised.value.account == "work"
+    assert not work.is_connected()
+
+
+async def test_connected_all_disconnects_every_account_when_one_cannot_connect() -> None:
+    home, work = FakeClient(), FakeClient()
+
+    async def offline() -> None:
+        raise ConnectionError("offline")
+
+    work.connect = offline  # type: ignore[method-assign]
+    with pytest.raises(ConnectionError):
+        async with tg.connected_all({"default": home, "work": work}):
+            pytest.fail("the network failed")
+    assert not home.is_connected()
+
+
 # --- login -----------------------------------------------------------------------------------
 
 
@@ -475,7 +507,7 @@ async def test_login_runs_all_prompts_for_a_two_factor_account() -> None:
     name = await tg.login(
         client, phone=lambda: "+15551234567", code=lambda: "12345", password=lambda: "hunter2"
     )
-    assert name == "Ann Lee"
+    assert name == tg.SignedIn(name="Ann Lee", user_id=1)
     assert client.start_inputs == {"phone": "+15551234567", "code": "12345", "password": "hunter2"}
     assert client.authorized
     assert not client.is_connected()
@@ -492,7 +524,7 @@ async def test_login_skips_prompts_for_an_authorized_session() -> None:
     name = await tg.login(
         client, phone=lambda: ask("phone"), code=lambda: ask("code"), password=lambda: ask("pw")
     )
-    assert name == "Ann"
+    assert name.name == "Ann"
     assert asked == []
 
 
@@ -538,7 +570,7 @@ def test_auth_signs_in_with_prompts_and_stores_a_private_session(
     fake = FakeClient(authorized=False, two_factor=True, me=make_user(1, "Ann", "Lee"))
     seen: dict[str, object] = {}
 
-    def make_login_client(cfg: Config, paths: Paths) -> FakeClient:
+    def make_login_client(cfg: Config, paths: Paths, account: str) -> FakeClient:
         seen["cfg"] = cfg
         seen["paths"] = paths
         return fake
@@ -560,7 +592,7 @@ def test_auth_without_prompts_when_already_signed_in(
 ) -> None:
     (tmp_home / "config.toml").write_text(CONFIG_WITH_KEYS, encoding="utf-8")
     fake = FakeClient(me=make_user(1, "Ann"))
-    monkeypatch.setattr(tg, "make_login_client", lambda cfg, paths: fake)
+    monkeypatch.setattr(tg, "make_login_client", lambda *_: fake)
     result = runner.invoke(cli.app, ["auth"], input="")
     assert result.exit_code == 0, result.output
     assert "signed in as Ann" in result.stdout
@@ -576,7 +608,7 @@ def test_auth_reports_a_failed_sign_in(tmp_home: Path, monkeypatch: pytest.Monke
         raise errors.PhoneNumberInvalidError(request=None)
 
     monkeypatch.setattr(fake, "start", failing_start)
-    monkeypatch.setattr(tg, "make_login_client", lambda cfg, paths: fake)
+    monkeypatch.setattr(tg, "make_login_client", lambda *_: fake)
     result = runner.invoke(cli.app, ["auth"], input="+1\n")
     assert result.exit_code == 1
     assert "sign-in failed" in result.stderr

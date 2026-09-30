@@ -779,7 +779,7 @@ def test_cli_sync_embeds_and_only_warns_without_the_model(
     paths.config_file.write_text(CONFIG)
     paths.session_file.touch()
     client = _client([tl.message(CHAT, 1, "hello", sender=1)])
-    monkeypatch.setattr(tg, "make_client", lambda cfg, paths: client)
+    monkeypatch.setattr(tg, "make_client", lambda *_: client)
     result = runner.invoke(cli.app, ["sync"])
     assert result.exit_code == 0, result.output
     assert "new messages: 1" in result.stdout

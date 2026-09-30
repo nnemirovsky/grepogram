@@ -521,20 +521,45 @@ voided_at)`, `exclusions(identity PRIMARY KEY, reason, created_at)`,
 
 **Files:**
 - Modify: `grepogram/cli.py`, `tests/test_cli.py`
+- Modify: `grepogram/tg.py` (`connected_all` → `Live(clients, refused)`, `login` → `SignedIn(name,
+  user_id)`), `grepogram/db.py` (`account_chat_counts`, `forget_account`), `grepogram/sources.py`
+  (`remove_source_id`, `folder_membership(cfg, catalogs)` per account, `import_chats(…, account)`)
+- Modify: `tests/conftest.py` (autouse `no_terminal`: no test reads the real terminal),
+  `tests/test_tg.py`, `tests/test_db.py`, `tests/test_sources.py`, `tests/test_sync.py`,
+  `tests/test_dialogs.py`, `tests/test_index_dense.py` — `make_client` / `make_login_client` fakes
+  now take the account
 
-- [ ] `grepogram auth --account NAME` (new names are appended to `[[accounts]]` through
-  `config.update` after a successful login; the `accounts` table records the user)
-- [ ] `accounts ls` (name, label, session present/authorized-at-last-use, user, sources, chats)
+- [x] `grepogram auth --account NAME` (new names are appended to `[[accounts]]` through
+  `config.update` after a successful login; the `accounts` table records the user). The name is
+  checked with `config.check_account_name` before any sign-in; `--label` sets the entry's label
+  (refused for `default`, which has no entry); an index that cannot be opened costs a warning,
+  not the sign-in
+- [x] `accounts ls` (name, label, session present/authorized-at-last-use, user, sources, chats)
   and `accounts rm NAME` (TTY confirmation; under `SyncLock` → `ConfigLock`: remove the account's
   sources through the Task 5 rules, drop its `chat_access` rows, delete its session file;
-  `default` cannot be removed while it is the only account)
-- [ ] `--account` on `dialogs`, `sources add`, `import`; `sync`, `extract`, `prune-deleted` use
-  every signed-in account; `sources ls` shows the account
-- [ ] `grepogram leave TARGET --account NAME`: TTY-confirmed `channels.leaveChannel` /
-  `messages.deleteChatUser(self)`; never touches sources or the index
-- [ ] tests: second account auth flow with fake prompts, `accounts rm` keeps shared chats,
+  `default` cannot be removed while it is the only account). The confirmation is read from the
+  controlling terminal (`cli._terminal` over `/dev/tty`, `cli.NoTerminal` without one), never
+  stdin, and asked before either lock is taken; the sources are then re-read under the locks and
+  removed one by one with `sources.remove_source_id`; `db.forget_account` drops the access rows
+  and the `accounts` row
+- [x] `--account` on `dialogs`, `sources add`, `import`; `sync`, `extract`, `prune-deleted` use
+  every signed-in account; `sources ls` shows the account. An `<account>/` prefix on a `sources
+  add` / `leave` target names the account too; an unknown account is refused by name with the
+  `auth --account` hint. The multi-account commands build clients with `tg.make_clients` and
+  connect them with `tg.connected_all`: an account without a session (warned when it owns a
+  source) or signed out is left out with a warning, and only no account at all is an error.
+  ➕ `sources prune` reads each folder source through its own account's catalog
+  (`folder_membership(cfg, catalogs)`); a folder whose account is not connected is unchecked, so
+  the prune stops rather than reading another account's folder of the same name.
+  ➕ `import --account` stores an export's private chats and legacy groups under that account's
+  scope (a synthetic row id when the default account holds the peer, messages remapped to it);
+  `_refuse_live` and `import_source_ids` compare `(scope, peer_id)`, not row ids
+- [x] `grepogram leave TARGET --account NAME`: TTY-confirmed `channels.leaveChannel` /
+  `messages.deleteChatUser(self)`; never touches sources or the index (the terminal is opened
+  before any network call; private chats, bots and folders are refused)
+- [x] tests: second account auth flow with fake prompts, `accounts rm` keeps shared chats,
   `leave` refuses without TTY and never edits config
-- [ ] run checks — must pass before task 9
+- [x] run checks — must pass before task 9
 
 ### Task 9: MCP multi-account
 

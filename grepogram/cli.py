@@ -8,6 +8,13 @@ or a model is unavailable it falls back to lexical and prints a warning on stder
 new units when the embedding model loads and only warns when it does not; ``embed`` insists on
 the model.
 
+Every command that talks to Telegram does it as an account: ``auth``, ``dialogs``, ``sources
+add`` and ``leave`` take ``--account`` (``default`` when omitted, the account a config without
+``[[accounts]]`` has always had), while ``sync``, ``extract``, ``prune-deleted`` and ``sources
+prune`` use every signed-in account at once. ``accounts rm`` and ``leave`` change things a
+config edit cannot undo, so they ask on the controlling terminal (:func:`_terminal`) and refuse
+without one; no option answers for the human.
+
 ``thread`` and ``context`` are the readers a hit leads to, the CLI half of the MCP tools of the
 same names: they take the chat specs ``search -c`` takes (through
 :func:`grepogram.filters.resolve_chat`, which insists on one chat) and print the messages around
@@ -15,20 +22,22 @@ one, or with ``--json`` the same document those tools return.
 """
 
 import asyncio
+import contextlib
 import dataclasses
 import datetime as dt
 import functools
 import json
 import logging
 import sqlite3
-from collections.abc import Sequence
+import time
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import asdict
 from enum import StrEnum
 from pathlib import Path
-from typing import Annotated, NoReturn
+from typing import Annotated, NoReturn, TextIO
 
 import typer
-from telethon import TelegramClient
+from telethon import TelegramClient, functions, types, utils
 from telethon import errors as tg_errors
 
 from grepogram import (
@@ -47,12 +56,14 @@ from grepogram import (
     tg,
 )
 from grepogram.config import TEMPLATE, ConfigError
-from grepogram.dialogs import Match
+from grepogram.dialogs import DialogInfo, FolderInfo, Match
 from grepogram.embed import Embedder, ModelUnavailable
 from grepogram.filters import FilterError
 from grepogram.log import setup_logging
 from grepogram.models import (
     DEFAULT_ACCOUNT,
+    AccountCfg,
+    AccountRow,
     ChatRow,
     Config,
     MediaReport,
@@ -73,8 +84,25 @@ _CHAT_HELP = (
 app = typer.Typer(name="grepogram", help=HELP, no_args_is_help=True, add_completion=False)
 config_app = typer.Typer(help="Show or create the config file.", no_args_is_help=True)
 sources_app = typer.Typer(help="Manage indexed sources (folders and chats).", no_args_is_help=True)
+accounts_app = typer.Typer(help="List or remove signed-in Telegram accounts.", no_args_is_help=True)
 app.add_typer(config_app, name="config")
 app.add_typer(sources_app, name="sources")
+app.add_typer(accounts_app, name="accounts")
+
+TERMINAL = "/dev/tty"
+"""Where :func:`_terminal` asks a confirmation: the controlling terminal, never stdin, so a
+pipe or an agent's tool call cannot answer for the human."""
+
+_ACCOUNT_HELP = "The account to act as, as `grepogram accounts ls` lists it (default: default)."
+AccountOption = Annotated[str | None, typer.Option("--account", "-a", help=_ACCOUNT_HELP)]
+
+
+class NoTerminal(Exception):
+    """A command that must ask a human first has no terminal to ask on."""
+
+    def __init__(self, command: str) -> None:
+        self.hint = f"run `grepogram {command}` yourself in a terminal"
+        super().__init__(f"{command} asks for a confirmation on a terminal, and there is none")
 
 
 class Mode(StrEnum):
@@ -110,19 +138,45 @@ def main(
 
 
 @app.command()
-def auth() -> None:
-    """Sign in to Telegram (phone, login code, optional 2FA password) and store the session."""
+def auth(
+    account: Annotated[
+        str,
+        typer.Option(
+            "--account",
+            "-a",
+            help="Sign in this account: a new name (lowercase letters, digits, '_' or '-') is "
+            "added to [[accounts]] once the sign-in succeeds.",
+        ),
+    ] = DEFAULT_ACCOUNT,
+    label: Annotated[
+        str | None,
+        typer.Option("--label", help="A note for `accounts ls`, such as 'work phone'."),
+    ] = None,
+) -> None:
+    """Sign in to Telegram (phone, login code, optional 2FA password) and store the session.
+
+    Every account keeps its own session file; several can be signed in at once, and `sync`
+    fetches every account's sources.
+    """
     paths = Paths.from_env()
     cfg = _load_config(paths)
     _require_api_keys(cfg, paths)
-    tg.prepare_session(paths)
+    if account != DEFAULT_ACCOUNT:
+        try:
+            config.check_account_name(account)
+        except ConfigError as exc:
+            fail(str(exc), hint=exc.hint)
+    elif label is not None:
+        fail("the default account has no [[accounts]] entry to label; label a named account")
+    tg.prepare_session(paths, account)
+    again = "grepogram " + " ".join(_auth_args(account))
     try:
-        client = tg.make_login_client(cfg, paths)
-        name = asyncio.run(
+        client = tg.make_login_client(cfg, paths, account)
+        who = asyncio.run(
             tg.login(client, phone=_ask_phone, code=_ask_code, password=_ask_password)
         )
     except tg.SessionError as exc:
-        fail(f"{exc}; if the file is damaged, delete it and run grepogram auth again")
+        fail(f"{exc}; if the file is damaged, delete it and run {again} again")
     except (
         tg.AuthRequired,
         tg_errors.RPCError,
@@ -131,9 +185,53 @@ def auth() -> None:
         sqlite3.Error,
     ) as exc:
         fail(f"sign-in failed: {exc}")
-    tg.ensure_session_mode(paths)
-    typer.echo(f"signed in as {name}")
-    typer.echo(f"session stored at {paths.session_file}")
+    tg.ensure_session_mode(paths, account)
+    if account != DEFAULT_ACCOUNT:
+        try:
+            config.update(paths, lambda current: _with_account(current, account, label))
+        except ConfigError as exc:
+            fail(str(exc), hint=exc.hint)
+    _remember_account(paths, account, who)
+    named = "" if account == DEFAULT_ACCOUNT else f" (account {account})"
+    typer.echo(f"signed in as {who.name}{named}")
+    typer.echo(f"session stored at {paths.session_file_for(account)}")
+
+
+def _auth_args(account: str) -> list[str]:
+    return ["auth"] if account == DEFAULT_ACCOUNT else ["auth", "--account", account]
+
+
+def _with_account(cfg: Config, name: str, label: str | None) -> Config:
+    """``cfg`` with an ``[[accounts]]`` entry for ``name``: appended when it has none, its label
+    replaced when ``label`` is given, and unchanged otherwise."""
+    entry = AccountCfg(name=name, label=label)
+    if all(known.name != name for known in cfg.accounts):
+        return dataclasses.replace(cfg, accounts=[*cfg.accounts, entry])
+    if label is None:
+        return cfg
+    accounts = [entry if known.name == name else known for known in cfg.accounts]
+    return dataclasses.replace(cfg, accounts=accounts)
+
+
+def _remember_account(paths: Paths, account: str, who: tg.SignedIn) -> None:
+    """Record in the index who ``account`` signed in as. The session is what the sign-in was
+    for, so an index that cannot be opened costs a warning and not the sign-in."""
+    try:
+        conn = _open_db(paths)
+        try:
+            db.upsert_account(
+                conn,
+                AccountRow(
+                    name=account,
+                    user_id=who.user_id,
+                    display_name=who.name,
+                    added_at=int(time.time()),
+                ),
+            )
+        finally:
+            conn.close()
+    except (db.SchemaError, db.ExtensionsUnsupported, sqlite3.Error) as exc:
+        typer.echo(f"warning: the index did not record the account: {exc}", err=True)
 
 
 def _ask_phone() -> str:
@@ -152,15 +250,18 @@ def _ask_password() -> str:
 def dialogs_cmd(
     query: Annotated[str, typer.Argument(help="Chat title, @username or folder name (fuzzy).")],
     limit: Annotated[int, typer.Option("--limit", "-n", help="Maximum number of matches.")] = 10,
+    account: AccountOption = None,
 ) -> None:
-    """Find chats and folders whose name matches QUERY; needs a signed-in session."""
+    """Find chats and folders of an account whose name matches QUERY; needs a signed-in
+    session."""
     paths = Paths.from_env()
     cfg = _load_config(paths)
     _require_api_keys(cfg, paths)
+    name = _known_account(cfg, account or DEFAULT_ACCOUNT)
     try:
-        tg.ensure_session_mode(paths)
-        client = tg.make_client(cfg, paths)
-        matches = asyncio.run(_match_dialogs(client, query, limit))
+        tg.ensure_session_mode(paths, name)
+        client = tg.make_client(cfg, paths, name)
+        matches = asyncio.run(_match_dialogs(client, query, limit, name))
     except (tg.AuthRequired, tg.SessionError) as exc:
         fail(str(exc))
     except (tg_errors.RPCError, ConnectionError) as exc:
@@ -183,8 +284,10 @@ def dialogs_cmd(
     _print_table(("kind", "id", "type", "title", "username", "folders", "score"), rows)
 
 
-async def _match_dialogs(client: TelegramClient, query: str, limit: int) -> list[Match]:
-    async with tg.connected(client):
+async def _match_dialogs(
+    client: TelegramClient, query: str, limit: int, account: str = DEFAULT_ACCOUNT
+) -> list[Match]:
+    async with tg.connected(client, account):
         catalog = dialogs.DialogCatalog(client)
         found = await catalog.list_dialogs()
         folders = await catalog.list_folders()
@@ -211,18 +314,18 @@ def sync_cmd(
         ),
     ] = None,
 ) -> None:
-    """Fetch new messages from every configured source and embed them; needs a session."""
+    """Fetch new messages from every configured source of every signed-in account and embed
+    them; needs a session."""
     paths, cfg, conn = _load()
     _require_api_keys(cfg, paths)
     if not cfg.sources:
         conn.close()
         fail("no sources configured; add one with: grepogram sources add <target>")
     try:
-        tg.ensure_session_mode(paths)
-        client = tg.make_client(cfg, paths)
+        clients = _signed_in_clients(cfg, paths)
         embedder = _optional_embedder(cfg)
         current = functools.partial(config.load, paths)
-        report = asyncio.run(_run_sync(client, conn, current, paths, budget, embedder))
+        report = asyncio.run(_run_sync(clients, conn, current, paths, budget, embedder))
     except (tg.AuthRequired, tg.SessionError, sync.SyncInProgress, ConfigError) as exc:
         fail(str(exc), hint=getattr(exc, "hint", None))
     except (tg_errors.RPCError, ConnectionError) as exc:
@@ -230,6 +333,39 @@ def sync_cmd(
     finally:
         conn.close()
     _print_report(report)
+
+
+def _signed_in_clients(
+    cfg: Config, paths: Paths, accounts: Iterable[str] | None = None
+) -> dict[str, TelegramClient]:
+    """A client for every one of ``accounts`` (every configured account when ``None``) that
+    has a session file (:func:`grepogram.tg.make_clients`).
+
+    An account without one is a warning when it owns a configured source — that source is
+    skipped this run — and nothing at all otherwise: an install that signs in only named
+    accounts never had a default session to miss. With no client at all, the reason of an
+    account that owns sources (else the first one's) is raised, so a single-account install
+    reads exactly the "run: grepogram auth" it always did.
+    """
+    built = tg.make_clients(cfg, paths, accounts)
+    owners = {source.account for source in cfg.sources}
+    if not built.clients:
+        reasons = built.unavailable
+        if not reasons:
+            return {}
+        first = next(iter(reasons.values()))
+        raise next((exc for name, exc in reasons.items() if name in owners), first)
+    for name, exc in built.unavailable.items():
+        if name in owners:
+            typer.echo(f"warning: account {name}: {exc}; its sources are skipped", err=True)
+    return built.clients
+
+
+def _warn_refused(refused: Mapping[str, tg.AuthRequired]) -> None:
+    """Report the accounts :func:`grepogram.tg.connected_all` left out: signed out, while
+    another account carries on."""
+    for name, exc in refused.items():
+        typer.echo(f"warning: account {name}: {exc}; skipped this run", err=True)
 
 
 def _optional_embedder(cfg: Config) -> Embedder | None:
@@ -242,19 +378,20 @@ def _optional_embedder(cfg: Config) -> Embedder | None:
 
 
 async def _run_sync(
-    client: TelegramClient,
+    clients: Mapping[str, TelegramClient],
     conn: sqlite3.Connection,
     cfg: sync.ConfigSource,
     paths: Paths,
     budget: int | None,
     embedder: Embedder | None,
 ) -> SyncReport:
-    """Connect and run :func:`grepogram.sync.sync_all`; ``cfg`` is the config loader so the
-    sources come from the file as it is once the sync lock is held, not from the snapshot the
-    command started with (a ``sources rm`` may have run while the model loaded)."""
-    async with tg.connected(client):
+    """Connect every account and run :func:`grepogram.sync.sync_all`; ``cfg`` is the config
+    loader so the sources come from the file as it is once the sync lock is held, not from the
+    snapshot the command started with (a ``sources rm`` may have run while the model loaded)."""
+    async with tg.connected_all(clients) as live:
+        _warn_refused(live.refused)
         return await sync.sync_all(
-            {DEFAULT_ACCOUNT: client}, conn, cfg, paths, sync.SyncBudget(budget), embedder
+            live.clients, conn, cfg, paths, sync.SyncBudget(budget), embedder
         )
 
 
@@ -299,10 +436,9 @@ def extract_cmd(
     paths, cfg, conn = _load()
     _require_api_keys(cfg, paths)
     try:
-        tg.ensure_session_mode(paths)
-        client = tg.make_client(cfg, paths)
+        clients = _signed_in_clients(cfg, paths)
         with sync.SyncLock(paths):
-            report = asyncio.run(_run_extract(client, conn, cfg, budget, retry_failed))
+            report = asyncio.run(_run_extract(clients, conn, cfg, budget, retry_failed))
     except (tg.AuthRequired, tg.SessionError, sync.SyncInProgress, ConfigError) as exc:
         fail(str(exc), hint=getattr(exc, "hint", None))
     except (tg_errors.RPCError, ConnectionError) as exc:
@@ -313,17 +449,19 @@ def extract_cmd(
 
 
 async def _run_extract(
-    client: TelegramClient,
+    clients: Mapping[str, TelegramClient],
     conn: sqlite3.Connection,
     cfg: Config,
     budget: int | None,
     retry_failed: bool,
 ) -> MediaReport:
-    """Connect and run :func:`grepogram.media.run` under the sync lock the caller holds."""
-    async with tg.connected(client):
+    """Connect every account and run :func:`grepogram.media.run` under the sync lock the caller
+    holds; each chat is read through an account that reaches it."""
+    async with tg.connected_all(clients) as live:
+        _warn_refused(live.refused)
         return await media.run(
             conn,
-            {DEFAULT_ACCOUNT: client},
+            live.clients,
             cfg,
             sync.SyncBudget(budget),
             retry_failed=retry_failed,
@@ -384,9 +522,8 @@ def prune_deleted_cmd(
     _require_api_keys(cfg, paths)
     try:
         chat_id = None if chat is None else filters.resolve_chat(conn, cfg, chat)
-        tg.ensure_session_mode(paths)
-        client = tg.make_client(cfg, paths)
-        report = asyncio.run(_run_prune(client, conn, cfg, paths, budget, chat_id))
+        clients = _signed_in_clients(cfg, paths)
+        report = asyncio.run(_run_prune(clients, conn, cfg, paths, budget, chat_id))
     except FilterError as exc:
         fail(str(exc))
     except (tg.AuthRequired, tg.SessionError, sync.SyncInProgress, ConfigError) as exc:
@@ -399,17 +536,19 @@ def prune_deleted_cmd(
 
 
 async def _run_prune(
-    client: TelegramClient,
+    clients: Mapping[str, TelegramClient],
     conn: sqlite3.Connection,
     cfg: Config,
     paths: Paths,
     budget: int | None,
     chat_id: int | None,
 ) -> PruneReport:
-    """Connect and run :func:`grepogram.sync.prune_deleted`, which takes the sync lock itself."""
-    async with tg.connected(client):
+    """Connect every account and run :func:`grepogram.sync.prune_deleted`, which takes the sync
+    lock itself."""
+    async with tg.connected_all(clients) as live:
+        _warn_refused(live.refused)
         return await sync.prune_deleted(
-            {DEFAULT_ACCOUNT: client}, conn, cfg, paths, sync.SyncBudget(budget), chat_id=chat_id
+            live.clients, conn, cfg, paths, sync.SyncBudget(budget), chat_id=chat_id
         )
 
 
@@ -447,6 +586,15 @@ def import_cmd(
             help="Title for the chat this export holds; single-chat exports often carry none.",
         ),
     ] = None,
+    account: Annotated[
+        str | None,
+        typer.Option(
+            "--account",
+            "-a",
+            help="The account the export was made from: its private chats and legacy groups "
+            "are stored as that account's (default: default).",
+        ),
+    ] = None,
 ) -> None:
     """Index a Telegram Desktop export of a chat this account can no longer open (offline).
 
@@ -459,13 +607,14 @@ def import_cmd(
     """
     paths, cfg, conn = _load()
     try:
+        name = _known_account(cfg, account or DEFAULT_ACCOUNT)
         export = tdesktop.read_export(path)
         for warning in export.warnings:
             typer.echo(f"warning: {warning}", err=True)
         entries = _retitled(export.chats, chat_title)
         embedder = _optional_embedder(cfg)
         with sync.SyncLock(paths):
-            stored = _store_import(conn, cfg, entries)
+            stored = _store_import(conn, cfg, entries, name)
             embedded = _embed_imported(conn, embedder)
     except tdesktop.ExportError as exc:
         fail(str(exc))
@@ -477,7 +626,10 @@ def import_cmd(
 
 
 def _store_import(
-    conn: sqlite3.Connection, cfg: Config, entries: Sequence[tdesktop.ImportedChat]
+    conn: sqlite3.Connection,
+    cfg: Config,
+    entries: Sequence[tdesktop.ImportedChat],
+    account: str = DEFAULT_ACCOUNT,
 ) -> list[sources.Imported]:
     """Store an export and cut its units in **one** transaction: all of it or none of it.
 
@@ -493,7 +645,7 @@ def _store_import(
     missing or mismatched model is a warning the import survives (:func:`_embed_imported`).
     """
     with db.transaction(conn):
-        stored = sources.import_chats(conn, entries)
+        stored = sources.import_chats(conn, entries, account)
         for item in stored:
             pending = db.unindexed_message_ids(conn, item.chat.id)
             sync.on_chat_synced(conn, item.chat, cfg, pending)
@@ -797,19 +949,22 @@ def sources_add(
     comments: Annotated[
         bool, typer.Option("--comments", help="Channels only: also index the discussion threads.")
     ] = False,
+    account: AccountOption = None,
 ) -> None:
-    """Add a folder or chat to the indexed sources and save the config; needs a session."""
+    """Add a folder or chat of an account to the indexed sources and save the config; needs
+    that account's session. A `<account>/` prefix on the target names the account too."""
     paths, cfg, conn = _load()
     _require_api_keys(cfg, paths)
     try:
         parsed = sources.parse_target(target)
-        tg.ensure_session_mode(paths)
-        client = tg.make_client(cfg, paths)
-        added = asyncio.run(_add_source(client, cfg, parsed, since, comments))
+        name = _known_account(cfg, account or parsed.account or DEFAULT_ACCOUNT)
+        tg.ensure_session_mode(paths, name)
+        client = tg.make_client(cfg, paths, name)
+        added = asyncio.run(_add_source(client, cfg, parsed, since, comments, name))
         # the index is opened for this one check: a chat held as a Telegram Desktop import must
         # not gain a live source, because `db.upsert_chat` overwrites `source_id` and the next
         # sync would drop the `import:` tag every protection of that history keys on
-        sources.refuse_imported(conn, added.dialogs)
+        sources.refuse_imported(conn, added.dialogs, name)
         # the target was resolved over the network; the source is applied to the file as it is
         # by now, under the config lock, not to the snapshot read before the round trip — the
         # MCP server may have saved a change (a removed source) in the meantime
@@ -831,11 +986,18 @@ def sources_add(
 
 
 async def _add_source(
-    client: TelegramClient, cfg: Config, target: sources.Target, since: str | None, comments: bool
+    client: TelegramClient,
+    cfg: Config,
+    target: sources.Target,
+    since: str | None,
+    comments: bool,
+    account: str = DEFAULT_ACCOUNT,
 ) -> sources.Added:
-    async with tg.connected(client):
+    async with tg.connected(client, account):
         catalog = dialogs.DialogCatalog(client)
-        return await sources.add_source(cfg, target, catalog, since=since, comments=comments)
+        return await sources.add_source(
+            cfg, target, catalog, since=since, comments=comments, account=account
+        )
 
 
 def _when(timestamp: int | None) -> str:
@@ -857,11 +1019,15 @@ def sources_ls() -> None:
         return
     rows: list[tuple[str, ...]] = []
     for status in statuses:
+        owner = status.account or "-"
         if not status.chats:
-            rows.append((status.source_id, "-", "-", "-", "-", "0", "never", "not synced yet"))
+            rows.append(
+                (owner, status.source_id, "-", "-", "-", "-", "0", "never", "not synced yet")
+            )
         for chat in status.chats:
             rows.append(
                 (
+                    owner,
                     status.source_id,
                     str(chat.id),
                     chat.type,
@@ -873,7 +1039,8 @@ def sources_ls() -> None:
                 )
             )
     _print_table(
-        ("source", "id", "type", "title", "username", "messages", "last sync", "status"), rows
+        ("account", "source", "id", "type", "title", "username", "messages", "last sync", "status"),
+        rows,
     )
 
 
@@ -934,9 +1101,9 @@ def sources_prune(
         conn.close()
         fail("no sources configured; add one with: grepogram sources add <target>")
     try:
-        tg.ensure_session_mode(paths)
-        client = tg.make_client(cfg, paths)
-        scan = sources.prunable(cfg, conn, asyncio.run(_folder_membership(client, cfg)))
+        folder_accounts = {source.account for source in cfg.sources if source.folder is not None}
+        clients = _signed_in_clients(cfg, paths, sorted(folder_accounts))
+        scan = sources.prunable(cfg, conn, asyncio.run(_folder_membership(clients, cfg)))
         for candidate in scan.kept:
             typer.echo(f"kept {_chat_label(candidate.chat)}: {candidate.reason}")
         if scan.unresolved:
@@ -975,10 +1142,17 @@ def sources_prune(
         conn.close()
 
 
-async def _folder_membership(client: TelegramClient, cfg: Config) -> sources.FolderMembership:
-    """Connect and read what every folder source lists right now."""
-    async with tg.connected(client):
-        return await sources.folder_membership(cfg, dialogs.DialogCatalog(client))
+async def _folder_membership(
+    clients: Mapping[str, TelegramClient], cfg: Config
+) -> sources.FolderMembership:
+    """Connect every account that owns a folder source and read what each of its folders lists
+    right now; the folder of an account that is not connected is recorded as unchecked."""
+    if not clients:
+        return await sources.folder_membership(cfg, {})
+    async with tg.connected_all(clients) as live:
+        _warn_refused(live.refused)
+        catalogs = {name: dialogs.DialogCatalog(client) for name, client in live.clients.items()}
+        return await sources.folder_membership(cfg, catalogs)
 
 
 def _chat_label(chat: ChatRow) -> str:
@@ -993,6 +1167,175 @@ def _print_prune(candidates: Sequence[sources.PruneCandidate]) -> None:
             for c in candidates
         ],
     )
+
+
+@accounts_app.command("ls")
+def accounts_ls() -> None:
+    """List the accounts: session file, who signed in, sources and reachable chats (offline).
+
+    `session` is `missing` with no session file, `authorized` when the account was signed in
+    the last time grepogram used it (`auth` or a sync recorded who it is), and `present` for a
+    file no run has confirmed yet.
+    """
+    paths, cfg, conn = _load()
+    try:
+        recorded = {row.name: row for row in db.list_accounts(conn)}
+        reached = db.account_chat_counts(conn)
+    finally:
+        conn.close()
+    labels = {entry.name: entry.label for entry in cfg.accounts}
+    rows: list[tuple[str, ...]] = []
+    for name in cfg.account_names():
+        who = recorded.get(name)
+        if not paths.session_file_for(name).exists():
+            state = "missing"
+        else:
+            state = "present" if who is None else "authorized"
+        user = "-" if who is None else f"{who.display_name or '-'} ({who.user_id})"
+        owned = sum(1 for source in cfg.sources if source.account == name)
+        rows.append(
+            (name, labels.get(name) or "-", state, user, str(owned), str(reached.get(name, 0)))
+        )
+    _print_table(("account", "label", "session", "user", "sources", "chats"), rows)
+
+
+@accounts_app.command("rm")
+def accounts_rm(
+    name: Annotated[str, typer.Argument(help="The account to remove, as `accounts ls` lists it.")],
+) -> None:
+    """Remove an account: its sources, the chats only they cover, and its session file.
+
+    Asks on the terminal first and refuses without one. A chat another account's source still
+    covers stays indexed (a channel both accounts configured); the account only stops being
+    recorded as reaching it. Nothing is changed on Telegram — `leave` is its own command.
+    """
+    paths, cfg, conn = _load()
+    try:
+        if name not in cfg.account_names():
+            fail(f"unknown account {name!r}; known: {', '.join(cfg.account_names())}")
+        if name == DEFAULT_ACCOUNT and not cfg.accounts:
+            fail(
+                "the default account is the only account and cannot be removed",
+                hint="delete its sources with `grepogram sources rm` instead",
+            )
+        owned = [source.id for source in cfg.sources if source.account == name]
+        session = paths.session_file_for(name)
+        typer.echo(f"removing account {name} will:")
+        typer.echo(f"  remove {len(owned)} sources{': ' + ', '.join(owned) if owned else ''}")
+        typer.echo("  delete the chats no other source covers, with everything indexed from them")
+        typer.echo("  forget which chats this account reaches")
+        typer.echo(f"  delete its session file {session}")
+        with _terminal("accounts rm") as tty:
+            confirmed = _ask(tty, f"remove account {name}?")
+        if not confirmed:
+            typer.echo("nothing removed")
+            return
+        # the config is read, edited and saved under the same locks as the deletion: a sync
+        # that starts once they are free reads a config without these sources and cannot
+        # re-create their chats, and an MCP edit saved in between is not overwritten
+        with sync.SyncLock(paths), config.ConfigLock(paths):
+            deleted, kept = _drop_account(config.load(paths), conn, paths, name)
+        session.unlink(missing_ok=True)
+    except NoTerminal as exc:
+        fail(str(exc), hint=exc.hint)
+    except (sources.SourceError, sync.SyncInProgress, ConfigError) as exc:
+        fail(str(exc), hint=getattr(exc, "hint", None))
+    finally:
+        conn.close()
+    kept_note = f", {len(kept)} kept under another source" if kept else ""
+    typer.echo(f"removed account {name} ({len(deleted)} chats deleted{kept_note})")
+
+
+def _drop_account(
+    current: Config, conn: sqlite3.Connection, paths: Paths, name: str
+) -> tuple[list[int], list[int]]:
+    """Remove every source of ``name`` from ``current`` through the ordinary source-removal
+    rules, drop its ``[[accounts]]`` entry and save; then forget its access. Returns the chats
+    deleted and those kept under another source. The caller holds both locks."""
+    deleted: list[int] = []
+    kept: list[int] = []
+    for source in [s for s in current.sources if s.account == name]:
+        removed = sources.remove_source_id(current, conn, source.id)
+        current = removed.config
+        deleted += removed.chat_ids
+        kept += removed.kept_chat_ids
+    accounts = [entry for entry in current.accounts if entry.name != name]
+    config.save(dataclasses.replace(current, accounts=accounts), paths)
+    db.forget_account(conn, name)
+    gone = set(deleted)
+    return sorted(gone), sorted({chat_id for chat_id in kept if chat_id not in gone})
+
+
+@app.command("leave")
+def leave_cmd(
+    target: Annotated[
+        str,
+        typer.Argument(help="The group or channel: id, @username, t.me link or a title (fuzzy)."),
+    ],
+    account: AccountOption = None,
+) -> None:
+    """Leave a group or channel on Telegram as an account; asks on the terminal first.
+
+    This is the one command that changes the account on Telegram, and it changes nothing here:
+    the sources stay in the config and everything indexed from the chat stays searchable
+    (`grepogram sources rm` removes those). Removing a source never leaves a chat.
+    """
+    paths = Paths.from_env()
+    cfg = _load_config(paths)
+    _require_api_keys(cfg, paths)
+    try:
+        parsed = sources.parse_target(target)
+        name = _known_account(cfg, account or parsed.account or DEFAULT_ACCOUNT)
+        tg.ensure_session_mode(paths, name)
+        with _terminal("leave") as tty:
+            client = tg.make_client(cfg, paths, name)
+            left = asyncio.run(_leave(client, parsed, name, functools.partial(_ask, tty)))
+    except NoTerminal as exc:
+        fail(str(exc), hint=exc.hint)
+    except (sources.SourceError, tg.AuthRequired, tg.SessionError) as exc:
+        fail(str(exc), hint=getattr(exc, "hint", None))
+    except (tg_errors.RPCError, ConnectionError) as exc:
+        fail(f"telegram error: {exc}")
+    if left is None:
+        typer.echo("nothing changed")
+        return
+    typer.echo(f"left {left.type} {left.title!r} (id {left.id}) as account {name}")
+    typer.echo("its sources and indexed history are unchanged")
+
+
+async def _leave(
+    client: TelegramClient,
+    target: sources.Target,
+    account: str,
+    confirm: Callable[[str], bool],
+) -> DialogInfo | None:
+    """Resolve ``target`` among ``account``'s dialogs, ask ``confirm``, and leave it; ``None``
+    when the answer was no. A folder, a private chat and a bot are refused: there is nothing
+    to leave."""
+    async with tg.connected(client, account):
+        catalog = dialogs.DialogCatalog(client)
+        found = await sources.resolve_target(target, catalog)
+        if isinstance(found, FolderInfo):
+            raise sources.InvalidTarget(
+                f"{found.title!r} is a folder; leave takes one group or channel"
+            )
+        if found.type in ("user", "bot"):
+            raise sources.InvalidTarget(
+                f"{found.title!r} is a private chat with a {found.type}; there is nothing to leave"
+            )
+        if not confirm(f"leave {found.type} {found.title!r} (id {found.id}) as account {account}?"):
+            return None
+        if found.type == "group":
+            chat_id, _ = utils.resolve_id(found.id)
+            await client(
+                functions.messages.DeleteChatUserRequest(
+                    chat_id=chat_id, user_id=types.InputUserSelf()
+                )
+            )
+        else:
+            channel = await catalog.entity(found.id)
+            await client(functions.channels.LeaveChannelRequest(channel=channel))
+    return found
 
 
 @config_app.command("path")
@@ -1031,6 +1374,45 @@ def fail(message: str, code: int = 1, *, hint: str | None = None) -> NoReturn:
     if hint:
         typer.echo(f"hint: {hint}", err=True)
     raise typer.Exit(code)
+
+
+def _known_account(cfg: Config, name: str) -> str:
+    """``name`` when the config knows it (:meth:`~grepogram.models.Config.account_names`), else
+    exit naming the ones it knows and how to add it."""
+    known = cfg.account_names()
+    if name not in known:
+        fail(
+            f"unknown account {name!r}; known: {', '.join(known)}",
+            hint=f"sign it in first: grepogram auth --account {name}",
+        )
+    return name
+
+
+def _open_terminal() -> TextIO:
+    """The controlling terminal, read and written; ``OSError`` when the process has none."""
+    return open(TERMINAL, "r+", encoding="utf-8")
+
+
+@contextlib.contextmanager
+def _terminal(command: str) -> Iterator[TextIO]:
+    """The terminal a confirmation of ``command`` is asked on, or :class:`NoTerminal`.
+
+    It is the controlling terminal and never stdin, so nothing piped into the command and no
+    tool call of an agent can answer; there is no option that skips the question either.
+    """
+    try:
+        tty = _open_terminal()
+    except OSError as exc:
+        raise NoTerminal(command) from exc
+    with tty:
+        yield tty
+
+
+def _ask(tty: TextIO, question: str) -> bool:
+    """Ask ``question`` on ``tty``; only ``y`` or ``yes`` is a yes."""
+    tty.write(f"{question} [y/N]: ")
+    tty.flush()
+    return tty.readline().strip().casefold() in ("y", "yes")
 
 
 def _load_config(paths: Paths) -> Config:

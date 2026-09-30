@@ -8,6 +8,7 @@ from typing import Any, get_args
 import pytest
 import typer
 from telethon import errors as tg_errors
+from telethon import functions, types
 from typer.testing import CliRunner
 
 from grepogram import (
@@ -25,10 +26,18 @@ from grepogram import (
 )
 from grepogram.config import TEMPLATE
 from grepogram.embed import ModelUnavailable
-from grepogram.models import ChatRow, Config, MediaReport, MessageRow, PruneReport, SearchMode
+from grepogram.models import (
+    DEFAULT_ACCOUNT,
+    ChatRow,
+    Config,
+    MediaReport,
+    MessageRow,
+    PruneReport,
+    SearchMode,
+)
 from grepogram.paths import Paths
 from tests.conftest import file_mode
-from tests.fakes import FakeClient, make_channel, make_dialog
+from tests.fakes import FakeClient, FakeWorld, make_channel, make_dialog, make_group, make_user
 from tests.fixtures import chat_ru, tl
 
 runner = CliRunner()
@@ -555,7 +564,7 @@ def test_extract_reads_the_media_and_reports_what_it_did(
 ) -> None:
     paths = _signed_in(tmp_home)
     client = _extract_chat(paths)
-    monkeypatch.setattr(tg, "make_client", lambda cfg, paths: client)
+    monkeypatch.setattr(tg, "make_client", lambda *_: client)
     result = runner.invoke(cli.app, ["extract", "--budget", "30"])
     assert result.exit_code == 0, result.output
     lines = result.stdout.splitlines()
@@ -583,7 +592,7 @@ def test_extract_passes_retry_failed_through(
         seen["seconds"] = budget.seconds  # type: ignore[attr-defined]
         return MediaReport(unsupported=3, remaining=2, warnings=["careful"])
 
-    monkeypatch.setattr(tg, "make_client", lambda cfg, paths: FakeClient())
+    monkeypatch.setattr(tg, "make_client", lambda *_: FakeClient())
     monkeypatch.setattr(media, "run", record)
     result = runner.invoke(cli.app, ["extract", "--retry-failed", "--budget", "7"])
     assert result.exit_code == 0, result.output
@@ -606,7 +615,7 @@ def test_extract_reports_unreachable_media_apart_from_the_queue(
     ) -> Any:
         return MediaReport(unreachable=4, chats_unreachable=[77])
 
-    monkeypatch.setattr(tg, "make_client", lambda cfg, paths: FakeClient())
+    monkeypatch.setattr(tg, "make_client", lambda *_: FakeClient())
     monkeypatch.setattr(media, "run", parked)
     result = runner.invoke(cli.app, ["extract"])
     assert result.exit_code == 0, result.output
@@ -634,7 +643,7 @@ def test_extract_reports_a_held_sync_lock_as_a_clean_error(
     tmp_home: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     paths = _signed_in(tmp_home)
-    monkeypatch.setattr(tg, "make_client", lambda cfg, paths: FakeClient())
+    monkeypatch.setattr(tg, "make_client", lambda *_: FakeClient())
     with sync.SyncLock(paths):
         result = runner.invoke(cli.app, ["extract"])
     assert result.exit_code == 1
@@ -647,7 +656,7 @@ def test_extract_reports_a_telegram_error_as_a_clean_error(
 ) -> None:
     _signed_in(tmp_home)
 
-    def broken(cfg: object, paths: object) -> FakeClient:
+    def broken(*_: object) -> FakeClient:
         raise tg_errors.RPCError(request=None, message="nope")
 
     monkeypatch.setattr(tg, "make_client", broken)
@@ -687,7 +696,7 @@ def test_prune_deleted_removes_what_telegram_no_longer_has(
 ) -> None:
     paths = _signed_in(tmp_home)
     client = _prune_chat(paths)
-    monkeypatch.setattr(tg, "make_client", lambda cfg, paths: client)
+    monkeypatch.setattr(tg, "make_client", lambda *_: client)
     result = runner.invoke(cli.app, ["prune-deleted", "--budget", "30"])
     assert result.exit_code == 0, result.output
     lines = result.stdout.splitlines()
@@ -721,7 +730,7 @@ def test_prune_deleted_passes_the_chat_and_the_budget_through(
             warnings=["careful"],
         )
 
-    monkeypatch.setattr(tg, "make_client", lambda cfg, paths: FakeClient())
+    monkeypatch.setattr(tg, "make_client", lambda *_: FakeClient())
     monkeypatch.setattr(sync, "prune_deleted", record)
     result = runner.invoke(cli.app, ["prune-deleted", "--chat", str(PRUNE_ID), "--budget", "7"])
     assert result.exit_code == 0, result.output
@@ -736,7 +745,7 @@ def test_prune_deleted_with_an_unknown_chat_is_a_clean_error(
 ) -> None:
     paths = _signed_in(tmp_home)
     _prune_chat(paths)
-    monkeypatch.setattr(tg, "make_client", lambda cfg, paths: FakeClient())
+    monkeypatch.setattr(tg, "make_client", lambda *_: FakeClient())
     result = runner.invoke(cli.app, ["prune-deleted", "--chat", "@nowhere"])
     assert result.exit_code == 1
     assert result.stdout == ""
@@ -755,7 +764,7 @@ def test_prune_deleted_reports_a_held_sync_lock_as_a_clean_error(
 ) -> None:
     paths = _signed_in(tmp_home)
     _prune_chat(paths)
-    monkeypatch.setattr(tg, "make_client", lambda cfg, paths: FakeClient())
+    monkeypatch.setattr(tg, "make_client", lambda *_: FakeClient())
     with sync.SyncLock(paths):
         result = runner.invoke(cli.app, ["prune-deleted"])
     assert result.exit_code == 1
@@ -768,7 +777,7 @@ def test_prune_deleted_reports_a_telegram_error_as_a_clean_error(
 ) -> None:
     _signed_in(tmp_home)
 
-    def broken(cfg: object, paths: object) -> FakeClient:
+    def broken(*_: object) -> FakeClient:
         raise tg_errors.RPCError(request=None, message="nope")
 
     monkeypatch.setattr(tg, "make_client", broken)
@@ -986,3 +995,552 @@ def test_import_without_an_embedding_model_says_what_finishes_the_job(
     assert "warning: dense index not updated: no torch here" in result.stderr
     assert "next: grepogram embed" in result.stdout
     assert _chats(Paths.from_env())[EXPATS_ID].source_id == "import:valencia-expats"
+
+
+# --- accounts --------------------------------------------------------------------------------
+
+
+WORK = "work"
+TWO_ACCOUNTS = EXTRACT_KEYS + '\n[[accounts]]\nname = "work"\nlabel = "work phone"\n'
+NEWS_ENTITY = make_channel(700, "News", username="news")
+NEWS_PEER = -1000000000700
+CLUB = make_group(710, "Old club")
+CLUB_PEER = -710
+BOB = make_user(2, "Bob")
+HOME_ME = make_user(42, "Me")
+WORK_ME = make_user(43, "Worker")
+
+
+class Terminal:
+    """The controlling terminal as a test answers it: ``answer`` is what the human types, and
+    everything the command asks is kept in ``asked``."""
+
+    def __init__(self, answer: str) -> None:
+        self.answer = answer
+        self.asked: list[str] = []
+        self.closed = False
+
+    def write(self, text: str) -> int:
+        self.asked.append(text)
+        return len(text)
+
+    def flush(self) -> None:
+        pass
+
+    def readline(self) -> str:
+        return self.answer
+
+    def __enter__(self) -> "Terminal":
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        self.closed = True
+
+
+def _answer(monkeypatch: pytest.MonkeyPatch, answer: str) -> Terminal:
+    terminal = Terminal(answer)
+    monkeypatch.setattr(cli, "_open_terminal", lambda: terminal)
+    return terminal
+
+
+def _two_account_home(tmp_home: Path, sources_toml: str = "") -> Paths:
+    (tmp_home / "config.toml").write_text(TWO_ACCOUNTS + sources_toml, encoding="utf-8")
+    paths = Paths.from_env()
+    paths.ensure_dirs()
+    paths.session_file.touch()
+    paths.session_file_for(WORK).touch()
+    return paths
+
+
+def _two_clients(**work_kwargs: Any) -> dict[str, FakeClient]:
+    """The default account and ``work``: both see the public channel ``@news``, and ``work``
+    alone has a private chat with Bob."""
+    world = FakeWorld(
+        entities=[NEWS_ENTITY, BOB],
+        messages={NEWS_PEER: [tl.channel_post(NEWS_PEER, i, f"news {i}") for i in (1, 2)]},
+    )
+    home = world.client(members=[NEWS_ENTITY], me=HOME_ME)
+    work = world.client(
+        WORK,
+        members=[NEWS_ENTITY, BOB],
+        me=WORK_ME,
+        messages={2: [tl.message(2, 5, "bob at work", sender=2)]},
+        **work_kwargs,
+    )
+    return {DEFAULT_ACCOUNT: home, WORK: work}
+
+
+def _per_account(monkeypatch: pytest.MonkeyPatch, clients: dict[str, FakeClient]) -> None:
+    monkeypatch.setattr(
+        tg, "make_client", lambda cfg, paths, account=DEFAULT_ACCOUNT: clients[account]
+    )
+
+
+SHARED_SOURCES = (
+    '\n[[sources]]\nchat = "@news"\n'
+    '\n[[sources]]\nchat = "@news"\naccount = "work"\n'
+    '\n[[sources]]\nchat = 2\naccount = "work"\n'
+)
+
+
+def _synced_two_accounts(tmp_home: Path, monkeypatch: pytest.MonkeyPatch) -> Paths:
+    """Both accounts synced into one index through the CLI: the channel both cover, and the
+    work account's private chat with Bob."""
+    paths = _two_account_home(tmp_home, SHARED_SOURCES)
+    _per_account(monkeypatch, _two_clients())
+    result = runner.invoke(cli.app, ["sync"])
+    assert result.exit_code == 0, result.output
+    return paths
+
+
+def test_auth_signs_in_a_second_account_and_records_it(
+    tmp_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (tmp_home / "config.toml").write_text(EXTRACT_KEYS, encoding="utf-8")
+    fake = FakeClient(authorized=False, me=make_user(43, "Worker", "Bee"))
+    seen: list[str] = []
+
+    def login_client(cfg: Config, paths: Paths, account: str) -> FakeClient:
+        seen.append(account)
+        return fake
+
+    monkeypatch.setattr(tg, "make_login_client", login_client)
+    result = runner.invoke(
+        cli.app, ["auth", "--account", WORK, "--label", "work phone"], input="+15550001111\n4242\n"
+    )
+    assert result.exit_code == 0, result.output
+    assert seen == [WORK]
+    assert "signed in as Worker Bee (account work)" in result.stdout
+    session = tmp_home / "sessions" / "work.session"
+    assert str(session) in result.stdout
+    assert file_mode(session) == 0o600 and file_mode(tmp_home / "sessions") == 0o700
+    assert not (tmp_home / "session.session").exists()
+    assert fake.start_inputs == {"phone": "+15550001111", "code": "4242"}
+    loaded = config.load(Paths.from_env())
+    assert [(a.name, a.label) for a in loaded.accounts] == [(WORK, "work phone")]
+    conn = db.connect(Paths.from_env())
+    try:
+        [row] = db.list_accounts(conn)
+    finally:
+        conn.close()
+    assert (row.name, row.user_id, row.display_name) == (WORK, 43, "Worker Bee")
+    again = runner.invoke(cli.app, ["auth", "--account", WORK], input="")
+    assert again.exit_code == 0, again.output
+    assert [(a.name, a.label) for a in config.load(Paths.from_env()).accounts] == [
+        (WORK, "work phone")
+    ]
+
+
+@pytest.mark.parametrize(
+    ("args", "message"),
+    [
+        (["auth", "--account", "Work!"], "invalid account name 'Work!'"),
+        (["auth", "--label", "mine"], "the default account has no [[accounts]] entry"),
+    ],
+    ids=["bad-name", "label-on-default"],
+)
+def test_auth_refuses_a_name_it_cannot_store_before_signing_in(
+    tmp_home: Path, monkeypatch: pytest.MonkeyPatch, args: list[str], message: str
+) -> None:
+    (tmp_home / "config.toml").write_text(EXTRACT_KEYS, encoding="utf-8")
+
+    def never(*_: object) -> FakeClient:
+        raise AssertionError("no sign-in for a refused account")
+
+    monkeypatch.setattr(tg, "make_login_client", never)
+    result = runner.invoke(cli.app, args)
+    assert result.exit_code == 1
+    assert message in result.stderr
+    assert not (tmp_home / "sessions").exists() or not any((tmp_home / "sessions").iterdir())
+    assert config.load(Paths.from_env()).accounts == []
+
+
+def test_auth_of_a_failed_second_account_adds_no_entry(
+    tmp_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (tmp_home / "config.toml").write_text(EXTRACT_KEYS, encoding="utf-8")
+    fake = FakeClient(authorized=False)
+
+    async def failing_start(*_: object, **__: object) -> FakeClient:
+        raise tg_errors.PhoneNumberInvalidError(request=None)
+
+    monkeypatch.setattr(fake, "start", failing_start)
+    monkeypatch.setattr(tg, "make_login_client", lambda *_: fake)
+    result = runner.invoke(cli.app, ["auth", "--account", WORK], input="+1\n")
+    assert result.exit_code == 1
+    assert "sign-in failed" in result.stderr
+    assert config.load(Paths.from_env()).accounts == []
+
+
+def test_sync_uses_every_signed_in_account(tmp_home: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    paths = _two_account_home(tmp_home, SHARED_SOURCES)
+    clients = _two_clients()
+    _per_account(monkeypatch, clients)
+    result = runner.invoke(cli.app, ["sync"])
+    assert result.exit_code == 0, result.output
+    assert "new messages: 3" in result.stdout
+    assert all(("disconnect", {}) in client.calls for client in clients.values())
+    conn = db.connect(paths)
+    try:
+        bob = db.get_chat_by_peer(conn, 2, WORK)
+        assert bob is not None
+        assert db.message_counts(conn) == {NEWS_PEER: 2, bob.id: 1}
+        assert db.chat_accounts(conn, NEWS_PEER) == [DEFAULT_ACCOUNT, WORK]
+        assert [row.name for row in db.list_accounts(conn)] == [DEFAULT_ACCOUNT, WORK]
+    finally:
+        conn.close()
+
+
+def test_sync_goes_on_without_an_account_that_is_not_signed_in(
+    tmp_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A second account whose session is missing — or that Telegram signed out — costs its own
+    sources a warning, and the default account's sync still runs."""
+    paths = _two_account_home(tmp_home, SHARED_SOURCES)
+    paths.session_file_for(WORK).unlink()
+    clients = _two_clients()
+    _per_account(monkeypatch, clients)
+    missing = runner.invoke(cli.app, ["sync"])
+    assert missing.exit_code == 0, missing.output
+    assert "warning: account work: no Telegram session" in missing.stderr
+    assert "grepogram auth --account work" in missing.stderr
+    assert "new messages: 2" in missing.stdout
+
+    paths.session_file_for(WORK).touch()
+    _per_account(monkeypatch, _two_clients(authorized=False))
+    refused = runner.invoke(cli.app, ["sync"])
+    assert refused.exit_code == 0, refused.output
+    assert "warning: account work: Telegram session is not authorized" in refused.stderr
+
+
+def test_sync_with_no_signed_in_account_names_the_one_to_sign_in(
+    tmp_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    paths = _two_account_home(tmp_home, '\n[[sources]]\nchat = 2\naccount = "work"\n')
+    paths.session_file.unlink()
+    paths.session_file_for(WORK).unlink()
+    result = runner.invoke(cli.app, ["sync"])
+    assert result.exit_code == 1
+    assert "hint: run: grepogram auth --account work" in result.stderr
+
+
+def test_extract_and_prune_deleted_hand_every_account_to_the_pass(
+    tmp_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _two_account_home(tmp_home)
+    _per_account(monkeypatch, _two_clients())
+    seen: list[list[str]] = []
+
+    async def extract(conn: object, clients: Any, *_: object, **__: object) -> MediaReport:
+        seen.append(sorted(clients))
+        return MediaReport()
+
+    async def prune(clients: Any, *_: object, **__: object) -> PruneReport:
+        seen.append(sorted(clients))
+        return PruneReport(removed=0, checked=0)
+
+    monkeypatch.setattr(media, "run", extract)
+    monkeypatch.setattr(sync, "prune_deleted", prune)
+    assert runner.invoke(cli.app, ["extract"]).exit_code == 0
+    assert runner.invoke(cli.app, ["prune-deleted"]).exit_code == 0
+    assert seen == [[DEFAULT_ACCOUNT, WORK], [DEFAULT_ACCOUNT, WORK]]
+
+
+def test_dialogs_reads_the_named_account(tmp_home: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _two_account_home(tmp_home)
+    clients = _two_clients()
+    _per_account(monkeypatch, clients)
+    result = runner.invoke(cli.app, ["dialogs", "bob", "--account", WORK])
+    assert result.exit_code == 0, result.output
+    assert "Bob" in result.stdout
+    assert clients[DEFAULT_ACCOUNT].calls == []
+    home = runner.invoke(cli.app, ["dialogs", "bob"])
+    assert "no dialogs or folders match 'bob'" in home.stdout
+
+
+def test_an_unknown_account_is_refused_by_name(tmp_home: Path) -> None:
+    _two_account_home(tmp_home)
+    for args in (
+        ["dialogs", "x", "--account", "home"],
+        ["sources", "add", "@xyz_chat", "-a", "home"],
+    ):
+        result = runner.invoke(cli.app, args)
+        assert result.exit_code == 1
+        assert "unknown account 'home'; known: default, work" in result.stderr
+        assert "grepogram auth --account home" in result.stderr
+
+
+def test_sources_add_for_an_account_writes_its_source(
+    tmp_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _two_account_home(tmp_home)
+    clients = _two_clients()
+    _per_account(monkeypatch, clients)
+    result = runner.invoke(cli.app, ["sources", "add", "2", "--account", WORK])
+    assert result.exit_code == 0, result.output
+    assert "added work/chat:2: user 'Bob' (id 2)" in result.stdout
+    prefixed = runner.invoke(cli.app, ["sources", "add", "work/chat:@news"])
+    assert prefixed.exit_code == 0, prefixed.output
+    assert clients[DEFAULT_ACCOUNT].calls == []
+    loaded = config.load(Paths.from_env())
+    assert [(s.id, s.account) for s in loaded.sources] == [
+        ("work/chat:2", WORK),
+        ("work/chat:@news", WORK),
+    ]
+    listed = runner.invoke(cli.app, ["sources", "ls"])
+    assert [line.split()[:2] for line in listed.stdout.splitlines()[1:]] == [
+        [WORK, "work/chat:2"],
+        [WORK, "work/chat:@news"],
+    ]
+
+
+def test_import_for_an_account_stores_its_private_chat_beside_the_default_one(
+    tmp_home: Path,
+) -> None:
+    """The same person's exported chat from two accounts is two histories: the second import
+    takes a row of its own and runs again without a second copy."""
+    _two_account_home(tmp_home)
+    directory = _single_chat_export(tmp_home, name="Nina", type="personal_chat", id=777)
+    home = runner.invoke(cli.app, ["import", str(directory)])
+    assert home.exit_code == 0, home.output
+    for _ in range(2):
+        work = runner.invoke(cli.app, ["import", str(directory), "--account", WORK])
+        assert work.exit_code == 0, work.output
+    conn = db.connect(Paths.from_env())
+    try:
+        rows = db.chats_for_peer(conn, 777)
+        assert [(row.scope, row.source_id) for row in rows] == [
+            (DEFAULT_ACCOUNT, "import:nina"),
+            (WORK, "import:nina-777"),
+        ]
+        assert rows[1].id >= db.SYNTHETIC_BASE
+        assert db.message_counts(conn) == {rows[0].id: 1, rows[1].id: 1}
+    finally:
+        conn.close()
+
+
+def test_sources_prune_checks_each_folder_through_its_own_account(
+    tmp_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A folder is one account's: with that account signed out it is unchecked, never read
+    through another account's folder of the same name."""
+    paths = _two_account_home(tmp_home, '\n[[sources]]\nfolder = "Work"\naccount = "work"\n')
+    paths.session_file_for(WORK).unlink()
+    clients = _two_clients()
+    _per_account(monkeypatch, clients)
+    result = runner.invoke(cli.app, ["sources", "prune"])
+    assert result.exit_code == 1
+    assert "no Telegram session" in result.stderr
+    paths.session_file_for(WORK).touch()
+    _per_account(monkeypatch, _two_clients(authorized=False))
+    refused = runner.invoke(cli.app, ["sources", "prune"])
+    assert refused.exit_code == 1
+    assert "grepogram auth --account work" in refused.stderr
+
+
+def test_accounts_ls_lists_sessions_users_sources_and_chats(
+    tmp_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    paths = _synced_two_accounts(tmp_home, monkeypatch)
+    paths.session_file.unlink()
+    result = runner.invoke(cli.app, ["accounts", "ls"])
+    assert result.exit_code == 0, result.output
+    rows = [line.split("  ") for line in result.stdout.splitlines()]
+    cells = [[cell.strip() for cell in row if cell.strip()] for row in rows]
+    assert cells == [
+        ["account", "label", "session", "user", "sources", "chats"],
+        [DEFAULT_ACCOUNT, "-", "missing", "Me (42)", "1", "1"],
+        [WORK, "work phone", "authorized", "Worker (43)", "2", "2"],
+    ]
+
+
+def test_accounts_rm_refuses_without_a_terminal_and_changes_nothing(
+    tmp_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    paths = _synced_two_accounts(tmp_home, monkeypatch)
+    before = paths.config_file.read_text()
+    chats = _chats(paths)
+    result = runner.invoke(cli.app, ["accounts", "rm", WORK], input="y\n")
+    assert result.exit_code == 1
+    assert "accounts rm asks for a confirmation on a terminal, and there is none" in result.stderr
+    assert paths.config_file.read_text() == before
+    assert _chats(paths) == chats
+    assert paths.session_file_for(WORK).exists()
+
+
+def test_accounts_rm_keeps_shared_chats_and_deletes_the_accounts_own(
+    tmp_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    paths = _synced_two_accounts(tmp_home, monkeypatch)
+    conn = db.connect(paths)
+    bob = db.get_chat_by_peer(conn, 2, WORK)
+    conn.close()
+    assert bob is not None
+    terminal = _answer(monkeypatch, "y\n")
+    result = runner.invoke(cli.app, ["accounts", "rm", WORK])
+    assert result.exit_code == 0, result.output
+    assert terminal.asked == ["remove account work? [y/N]: "] and terminal.closed
+    assert "remove 2 sources: work/chat:@news, work/chat:2" in result.stdout
+    assert "removed account work (1 chats deleted)" in result.stdout
+    loaded = config.load(paths)
+    assert loaded.accounts == [] and [s.id for s in loaded.sources] == ["chat:@news"]
+    assert not paths.session_file_for(WORK).exists() and paths.session_file.exists()
+    conn = db.connect(paths)
+    try:
+        assert db.get_chat(conn, bob.id) is None
+        news = db.get_chat(conn, NEWS_PEER)
+        assert news is not None and news.source_id == "chat:@news"
+        assert db.message_counts(conn) == {NEWS_PEER: 2}
+        assert db.chat_accounts(conn, NEWS_PEER) == [DEFAULT_ACCOUNT]
+        assert db.chat_source_ids(conn, NEWS_PEER) == ["chat:@news"]
+        assert [row.name for row in db.list_accounts(conn)] == [DEFAULT_ACCOUNT]
+    finally:
+        conn.close()
+
+
+def test_accounts_rm_moves_a_shared_chat_to_the_account_that_stays(
+    tmp_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Removing the default account, whose source is the channel's primary, keeps the channel
+    under the work account's source."""
+    paths = _synced_two_accounts(tmp_home, monkeypatch)
+    _answer(monkeypatch, "yes\n")
+    result = runner.invoke(cli.app, ["accounts", "rm", DEFAULT_ACCOUNT])
+    assert result.exit_code == 0, result.output
+    assert "removed account default (0 chats deleted, 1 kept under another source)" in (
+        result.stdout
+    )
+    assert not paths.session_file.exists()
+    conn = db.connect(paths)
+    try:
+        news = db.get_chat(conn, NEWS_PEER)
+        assert news is not None and news.source_id == "work/chat:@news"
+        assert db.chat_accounts(conn, NEWS_PEER) == [WORK]
+    finally:
+        conn.close()
+    assert [a.name for a in config.load(paths).accounts] == [WORK]
+
+
+def test_accounts_rm_answered_no_removes_nothing(
+    tmp_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    paths = _synced_two_accounts(tmp_home, monkeypatch)
+    before = paths.config_file.read_text()
+    _answer(monkeypatch, "\n")
+    result = runner.invoke(cli.app, ["accounts", "rm", WORK])
+    assert result.exit_code == 0, result.output
+    assert result.stdout.splitlines()[-1] == "nothing removed"
+    assert paths.config_file.read_text() == before
+    assert paths.session_file_for(WORK).exists()
+
+
+def test_accounts_rm_refuses_the_only_account_and_an_unknown_one(
+    tmp_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _signed_in(tmp_home)
+    _answer(monkeypatch, "y\n")
+    only = runner.invoke(cli.app, ["accounts", "rm", DEFAULT_ACCOUNT])
+    assert only.exit_code == 1
+    assert "the default account is the only account" in only.stderr
+    unknown = runner.invoke(cli.app, ["accounts", "rm", WORK])
+    assert unknown.exit_code == 1
+    assert "unknown account 'work'" in unknown.stderr
+    assert Paths.from_env().session_file.exists()
+
+
+def test_accounts_rm_refuses_while_a_sync_runs(
+    tmp_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    paths = _synced_two_accounts(tmp_home, monkeypatch)
+    before = paths.config_file.read_text()
+    _answer(monkeypatch, "y\n")
+    with sync.SyncLock(paths):
+        result = runner.invoke(cli.app, ["accounts", "rm", WORK])
+    assert result.exit_code == 1
+    assert "another sync is running" in result.stderr
+    assert paths.config_file.read_text() == before
+    assert paths.session_file_for(WORK).exists()
+
+
+def _leaves(client: FakeClient) -> list[Any]:
+    """The requests of ``client`` that change membership, apart from the reads a resolve makes."""
+    kinds = (functions.channels.LeaveChannelRequest, functions.messages.DeleteChatUserRequest)
+    return [request for request in client.requests if isinstance(request, kinds)]
+
+
+def _leave_clients() -> dict[str, FakeClient]:
+    clients = _two_clients(
+        responses={
+            functions.channels.LeaveChannelRequest: True,
+            functions.messages.DeleteChatUserRequest: True,
+        }
+    )
+    clients[WORK].dialogs.append(make_dialog(CLUB))
+    clients[WORK].entities[CLUB_PEER] = CLUB
+    return clients
+
+
+def test_leave_refuses_without_a_terminal_and_never_edits_config(
+    tmp_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    paths = _synced_two_accounts(tmp_home, monkeypatch)
+    before = paths.config_file.read_text()
+    clients = _leave_clients()
+    _per_account(monkeypatch, clients)
+    result = runner.invoke(cli.app, ["leave", "@news", "--account", WORK], input="y\n")
+    assert result.exit_code == 1
+    assert "leave asks for a confirmation on a terminal, and there is none" in result.stderr
+    assert clients[WORK].calls == [] and clients[WORK].requests == []
+    assert paths.config_file.read_text() == before
+
+
+def test_leave_leaves_a_channel_and_keeps_its_source_and_history(
+    tmp_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    paths = _synced_two_accounts(tmp_home, monkeypatch)
+    before = paths.config_file.read_text()
+    indexed = _chats(paths)
+    clients = _leave_clients()
+    _per_account(monkeypatch, clients)
+    terminal = _answer(monkeypatch, "y\n")
+    result = runner.invoke(cli.app, ["leave", "@news", "--account", WORK])
+    assert result.exit_code == 0, result.output
+    assert terminal.asked == [f"leave channel 'News' (id {NEWS_PEER}) as account work? [y/N]: "]
+    assert f"left channel 'News' (id {NEWS_PEER}) as account work" in result.stdout
+    [request] = _leaves(clients[WORK])
+    assert isinstance(request, functions.channels.LeaveChannelRequest)
+    assert request.channel.id == 700
+    assert request.channel.access_hash == FakeWorld.access_hash(WORK, NEWS_PEER)
+    assert clients[DEFAULT_ACCOUNT].calls == []
+    assert paths.config_file.read_text() == before
+    assert _chats(paths) == indexed
+
+
+def test_leave_a_legacy_group_removes_the_account_from_it(
+    tmp_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _two_account_home(tmp_home)
+    clients = _leave_clients()
+    _per_account(monkeypatch, clients)
+    _answer(monkeypatch, "y\n")
+    result = runner.invoke(cli.app, ["leave", "-a", WORK, "--", str(CLUB_PEER)])
+    assert result.exit_code == 0, result.output
+    [request] = _leaves(clients[WORK])
+    assert isinstance(request, functions.messages.DeleteChatUserRequest)
+    assert request.chat_id == 710 and isinstance(request.user_id, types.InputUserSelf)
+
+
+def test_leave_answered_no_or_naming_a_private_chat_leaves_nothing(
+    tmp_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _two_account_home(tmp_home)
+    clients = _leave_clients()
+    _per_account(monkeypatch, clients)
+    _answer(monkeypatch, "n\n")
+    declined = runner.invoke(cli.app, ["leave", "@news", "-a", WORK])
+    assert declined.exit_code == 0, declined.output
+    assert declined.stdout.strip() == "nothing changed"
+    private = runner.invoke(cli.app, ["leave", "2", "-a", WORK])
+    assert private.exit_code == 1
+    assert "there is nothing to leave" in private.stderr
+    assert _leaves(clients[WORK]) == []

@@ -30,6 +30,21 @@ def plain_cli_output(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.fixture(autouse=True)
+def no_terminal(monkeypatch: pytest.MonkeyPatch) -> None:
+    """No test ever asks the developer's real terminal.
+
+    ``accounts rm`` and ``leave`` confirm on the controlling terminal (``cli._open_terminal``),
+    which a local ``pytest`` run has; the suite runs as if there were none, and a test that
+    answers a confirmation installs its own terminal over this one.
+    """
+
+    def refuse() -> None:
+        raise OSError("no terminal in the test suite")
+
+    monkeypatch.setattr("grepogram.cli._open_terminal", refuse)
+
+
+@pytest.fixture(autouse=True)
 def clean_logging() -> Iterator[None]:
     """Close the file handler every test that configures logging leaves open.
 
