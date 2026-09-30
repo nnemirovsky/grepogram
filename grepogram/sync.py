@@ -1900,7 +1900,7 @@ class _Tally:
     warnings: list[str] = field(default_factory=list)
 
     def warn(self, account: str, warning: str) -> None:
-        self.warnings.append(f"account {account}: {warning}" if self.labelled else warning)
+        self.warnings.append(account_warning(self.labelled, account, warning))
 
     def record(self, chat_id: int, synced: SyncedChat, account: str) -> None:
         """Count one finished chat: its new messages, its warnings — labelled with ``account``,
@@ -1951,11 +1951,27 @@ def _record_failure(tally: _Tally, chat: ChatRow, exc: Exception, account: str) 
     tally.warn(account, f"chat {chat.id} ({chat.title}) was removed while it was being synced")
 
 
+def labels_accounts(accounts: Collection[str]) -> bool:
+    """Whether a pass over ``accounts`` names the account in each warning: whenever it holds any
+    account but the default one, so a report of several accounts says whose request a warning is
+    about, while a single-account install reads exactly what it always did."""
+    return any(account != DEFAULT_ACCOUNT for account in accounts)
+
+
+def account_warning(labelled: bool, account: str, warning: str) -> str:
+    """``warning`` as a report prints it: ``account <name>:`` in front when ``labelled``."""
+    return f"account {account}: {warning}" if labelled else warning
+
+
+def flood_warning(seconds: int | None, before: str, then: str) -> str:
+    """The one wording of a flood wait in a report: how long Telegram asks to wait — "a while"
+    when it named no time —, before what, and what that means for the caller."""
+    wait = "a while" if seconds is None else f"{seconds}s"
+    return f"flood wait: Telegram asks to wait {wait} before {before}; {then}"
+
+
 def _flood_text(seconds: int) -> str:
-    return (
-        f"flood wait: Telegram asks to wait {seconds}s before more history requests; "
-        "run sync again later"
-    )
+    return flood_warning(seconds, "more history requests", "run sync again later")
 
 
 @dataclass(slots=True, eq=False)
@@ -1970,7 +1986,9 @@ class _Lane:
     account: str
     client: Any
     me: UserRow | None
-    queue: deque[ChatRow] = field(default_factory=deque)
+    queue: deque[tuple[ChatRow, Source]] = field(default_factory=deque)
+    """The chats to fetch, each with the source it is fetched for — checked once, when the chat
+    was queued (:func:`_enqueue`)."""
 
 
 @dataclass(slots=True, eq=False)
@@ -2036,7 +2054,7 @@ async def _sync_chats(
     :func:`_record_failure`'s to describe; the tally becomes the report.
     """
     now = int(time.time())
-    tally = _Tally(labelled=any(account != DEFAULT_ACCOUNT for account in clients))
+    tally = _Tally(labelled=labels_accounts(clients))
     lanes: dict[str, _Lane] = {}
     stopped: set[str] = set()
     for account, client in clients.items():
@@ -2170,7 +2188,7 @@ def _enqueue(run: _SyncPass, chat: ChatRow) -> None:
         )
         run.unfetched[source.account] = run.unfetched.get(source.account, 0) + 1
         return
-    run.lanes[route[0]].queue.append(chat)
+    run.lanes[route[0]].queue.append((chat, source))
     run.queued.add(chat.id)
 
 
@@ -2202,18 +2220,9 @@ async def _run_lane(run: _SyncPass, lane: _Lane) -> None:
     """
     tally = run.tally
     while lane.queue:
-        chat = lane.queue.popleft()
+        chat, source = lane.queue.popleft()
         run.queued.discard(chat.id)
         run.processed.add(chat.id)
-        source = run.sources.get(chat.source_id or "")
-        if source is None:
-            log.debug("chat %s has no configured source; skipped", chat.id)
-            continue
-        foreign = foreign_scope(chat, source, lane.account)
-        if foreign is not None:
-            log.warning("%s; skipped", foreign)
-            tally.warn(lane.account, foreign)
-            continue
         if lane.account in run.stopped or run.budget.halted:
             tally.remaining.append(chat.id)
             run.deferred.append(chat)
@@ -2234,12 +2243,23 @@ async def _run_lane(run: _SyncPass, lane: _Lane) -> None:
             tally.record(chat.id, fetched.synced, fetched.account)
             migrated = fetched.synced.migrated_to
             if migrated is not None and migrated.id not in run.processed | run.queued:
-                lane.queue.append(migrated)
-                run.queued.add(migrated.id)
+                _enqueue_migrated(run, lane, migrated)
         if lane.account in run.stopped and lane.queue:
-            tally.remaining.extend(c.id for c in lane.queue)
-            run.deferred.extend(lane.queue)
+            tally.remaining.extend(c.id for c, _ in lane.queue)
+            run.deferred.extend(c for c, _ in lane.queue)
             lane.queue.clear()
+
+
+def _enqueue_migrated(run: _SyncPass, lane: _Lane, supergroup: ChatRow) -> None:
+    """Queue the supergroup a legacy group migrated to on ``lane``, for the source its row is
+    filed under. A supergroup is shared, so no account's scope stands in the way; one no
+    configured source covers is left alone."""
+    source = run.sources.get(supergroup.source_id or "")
+    if source is None:
+        log.debug("chat %s has no configured source; skipped", supergroup.id)
+        return
+    lane.queue.append((supergroup, source))
+    run.queued.add(supergroup.id)
 
 
 @dataclass(frozen=True, slots=True)
@@ -2585,12 +2605,8 @@ class StoredPass:
                 tg.reraise_unauthorized(exc, account)
         return state
 
-    @property
-    def labelled(self) -> bool:
-        return any(account != DEFAULT_ACCOUNT for account in self.clients)
-
     def warn(self, account: str, warning: str) -> None:
-        self.warnings.append(f"account {account}: {warning}" if self.labelled else warning)
+        self.warnings.append(account_warning(labels_accounts(self.clients), account, warning))
 
     def stop(self, account: str, seconds: int) -> None:
         """A flood wait of ``seconds`` on ``account``: no more requests through it this pass."""
@@ -2883,17 +2899,11 @@ async def _recapture_chat(
 
 
 def _recapture_flood_warning(seconds: int) -> str:
-    return (
-        f"flood wait: Telegram asks to wait {seconds}s before more requests; "
-        "run `grepogram recapture-links` again later"
-    )
+    return flood_warning(seconds, "more requests", "run `grepogram recapture-links` again later")
 
 
 def _prune_flood_warning(seconds: int) -> str:
-    return (
-        f"flood wait: Telegram asks to wait {seconds}s before more requests; "
-        "run `grepogram prune-deleted` again later"
-    )
+    return flood_warning(seconds, "more requests", "run `grepogram prune-deleted` again later")
 
 
 def _sweep_targets(conn: sqlite3.Connection, chat_id: int | None) -> list[ChatRow]:

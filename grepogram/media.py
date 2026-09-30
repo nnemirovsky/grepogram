@@ -36,7 +36,7 @@ import functools
 import logging
 import sqlite3
 import tempfile
-from collections.abc import Collection, Iterator, Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -168,7 +168,10 @@ async def run(
     """
     if not cfg.media.enabled:
         log.info("[media] enabled is false; the extraction pass did nothing")
-        remaining, unreachable, cut_off = _queue_left(conn, clients)
+        routed: dict[bool, list[int]] = {True: [], False: []}
+        for chat in _fetchable_rows(conn):
+            routed[bool(sync.reaching_accounts(conn, chat, clients))].append(chat.id)
+        remaining, unreachable, cut_off = _queue_left(conn, routed[True], routed[False])
         return MediaReport(
             remaining=remaining,
             unreachable=unreachable,
@@ -203,7 +206,9 @@ async def run(
                     tally=tally,
                 ),
             )
-    remaining, unreachable, cut_off = _queue_left(conn, clients)
+    remaining, unreachable, cut_off = _queue_left(
+        conn, list(route.routes), [chat.id for chat in route.unreachable]
+    )
     return MediaReport(
         extracted=tally[db.MEDIA_EXTRACTED],
         failed=tally[db.MEDIA_FAILED],
@@ -219,15 +224,15 @@ async def run(
 
 
 def _flood_warning(seconds: int) -> str:
-    return (
-        f"flood wait: Telegram asks to wait {seconds}s before more media requests; "
-        "run `grepogram extract` again later"
-    )
+    return sync.flood_warning(seconds, "more media requests", "run `grepogram extract` again later")
 
 
-def _queue_left(conn: sqlite3.Connection, accounts: Collection[str]) -> tuple[int, int, list[int]]:
-    """What the queue still holds: what a next run could read, what none can, and the chats
-    holding pending media that no account of ``accounts`` reaches.
+def _queue_left(
+    conn: sqlite3.Connection, reachable: list[int], cut_off: list[int]
+) -> tuple[int, int, list[int]]:
+    """What the queue still holds: what a next run could read, what none can, and ``cut_off``,
+    the chats holding pending media that no connected account reaches — ``reachable`` being the
+    ones one does, as the pass routed them (:class:`grepogram.sync.StoredPass`).
 
     ``remaining`` is the pass's only completion signal — ``grepogram extract`` prints "run
     extract again" for it and a script may loop on it — so it counts the chats this pass would
@@ -240,11 +245,6 @@ def _queue_left(conn: sqlite3.Connection, accounts: Collection[str]) -> tuple[in
     (:func:`grepogram.sync.reaching_accounts`), which another run of the same accounts could not
     read either.
     """
-    reachable: list[int] = []
-    cut_off: list[int] = []
-    for chat in _fetchable_rows(conn):
-        routed = sync.reaching_accounts(conn, chat, accounts)
-        (reachable if routed else cut_off).append(chat.id)
     fetchable = db.count_pending_media(conn, reachable)
     return fetchable, db.count_pending_media(conn) - fetchable, cut_off
 
