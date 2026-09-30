@@ -4074,6 +4074,95 @@ async def test_two_accounts_failing_at_once_are_both_named(
     assert any("grepogram auth --account work" in note for note in raised.value.__notes__)
 
 
+# --- the sweep through several accounts ------------------------------------------------------
+
+
+def _shared_club() -> Config:
+    """Both accounts cover the private group, and both synced it."""
+    return _cfg(Source(chat=PRIV_ID), Source(chat=PRIV_ID, account=WORK))
+
+
+async def test_the_sweep_keeps_what_one_account_cannot_see_but_another_can(
+    conn: sqlite3.Connection, paths: Paths
+) -> None:
+    """The default account joined after the group began, and the group hides its history from
+    new members: it sees messages 1 and 2 as empty. The work account reads them. An empty slot
+    through one account is not a deletion while another account that reaches the chat still has
+    the message — only what every one of them answers empty goes."""
+    world = _world()
+    cfg = _shared_club()
+    await _run_accounts({DEFAULT_ACCOUNT: _home(world), WORK: _work(world)}, conn, paths, cfg)
+    late = _home(world)
+    late.messages[PRIV_ID] = [m for m in late.messages[PRIV_ID] if m.id == 3]
+    work = _work(world)
+
+    report = await _prune_accounts({DEFAULT_ACCOUNT: late, WORK: work}, conn, paths, cfg)
+
+    assert (report.removed, report.checked) == (0, 3) and report.chats_done == [PRIV_ID]
+    assert _texts(conn, PRIV_ID) == {1: "club 1", 2: "club 2", 3: "club 3"}
+    work.messages[PRIV_ID] = [m for m in work.messages[PRIV_ID] if m.id != 2]
+
+    report = await _prune_accounts({DEFAULT_ACCOUNT: late, WORK: work}, conn, paths, cfg)
+
+    assert report.removed == 1 and _texts(conn, PRIV_ID) == {1: "club 1", 3: "club 3"}
+
+
+async def test_the_sweep_removes_nothing_while_an_account_that_reaches_the_chat_is_absent(
+    conn: sqlite3.Connection, paths: Paths
+) -> None:
+    world = _world()
+    cfg = _shared_club()
+    await _run_accounts({DEFAULT_ACCOUNT: _home(world), WORK: _work(world)}, conn, paths, cfg)
+    late = _home(world)
+    late.messages[PRIV_ID] = [m for m in late.messages[PRIV_ID] if m.id == 3]
+
+    report = await _prune_accounts({DEFAULT_ACCOUNT: late}, conn, paths, cfg)
+
+    assert report.removed == 0 and report.chats_remaining == [PRIV_ID]
+    assert _swept(late) == [], "not asked at all"
+    [warning] = report.warnings
+    assert warning.startswith(f"chat {PRIV_ID} (Private club): account work reaches it")
+    assert _texts(conn, PRIV_ID) == {1: "club 1", 2: "club 2", 3: "club 3"}
+
+
+async def test_a_flood_wait_on_a_shared_chat_stops_the_sweep_of_it(
+    conn: sqlite3.Connection, paths: Paths
+) -> None:
+    world = _world()
+    cfg = _shared_club()
+    await _run_accounts({DEFAULT_ACCOUNT: _home(world), WORK: _work(world)}, conn, paths, cfg)
+    flooded = _home(world, failures={PRIV_ID: errors.FloodWaitError(request=None, capture=60)})
+    work = _work(world)
+    work.messages[PRIV_ID] = []
+
+    report = await _prune_accounts({DEFAULT_ACCOUNT: flooded, WORK: work}, conn, paths, cfg)
+
+    assert report.removed == 0 and report.chats_remaining == [PRIV_ID]
+    assert report.warnings == [
+        f"account {DEFAULT_ACCOUNT}: flood wait: Telegram asks to wait 60s before more "
+        "requests; run `grepogram prune-deleted` again later"
+    ]
+    assert _texts(conn, PRIV_ID) == {1: "club 1", 2: "club 2", 3: "club 3"}
+
+
+async def test_an_account_refused_the_chat_outright_is_no_witness(
+    conn: sqlite3.Connection, paths: Paths
+) -> None:
+    """The default account has left the group: Telegram refuses it the chat entirely, which
+    hides nothing — the work account's answer alone decides."""
+    world = _world()
+    cfg = _shared_club()
+    await _run_accounts({DEFAULT_ACCOUNT: _home(world), WORK: _work(world)}, conn, paths, cfg)
+    left = _home(world, members=[NEWS, ALICE])
+    work = _work(world)
+    work.messages[PRIV_ID] = [m for m in work.messages[PRIV_ID] if m.id != 2]
+
+    report = await _prune_accounts({DEFAULT_ACCOUNT: left, WORK: work}, conn, paths, cfg)
+
+    assert report.removed == 1 and report.chats_done == [PRIV_ID]
+    assert _texts(conn, PRIV_ID) == {1: "club 1", 3: "club 3"}
+
+
 async def test_a_world_client_reads_as_its_account() -> None:
     """The fake itself: per-account access hashes, and a private group refused to a
     non-member while a public channel reads without joining."""

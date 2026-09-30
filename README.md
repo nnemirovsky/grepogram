@@ -408,6 +408,9 @@ account. Each chat goes through the account of the source that owns it. When Tel
 shared chat to that account, or that account is not signed in, the chat is tried through another
 account that reaches it, and it stays the first source's chat either way. A flood wait stops
 only the account it hit, even while its sources are being read, and the others carry on.
+`prune-deleted` is stricter, because an account that joined a group late can see older messages
+as deleted while another still reads them: it removes a message only when every account that
+reaches the chat says it is gone, and leaves the chat alone while one of them is signed out.
 `extract` and `prune-deleted` report a chat that no connected account reaches as unreachable, not
 as an error. An account with no session, or one Telegram has signed out, is left out with a
 warning (the MCP `sync` lists it under `accounts_skipped`) and the rest still sync. `dialogs`, `sources add`, `import` and `leave` act as

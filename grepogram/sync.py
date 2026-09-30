@@ -2424,9 +2424,10 @@ class StoredPass:
     :func:`prune_deleted` and :func:`grepogram.media.run` walk ``chats`` rows rather than a
     source list and re-fetch by id, so each chat needs an account that reaches it and a client
     that can address it. :meth:`start` routes every chat (:func:`reaching_accounts`) and warms
-    each client with the chats it is asked about first (:func:`warm_peer_cache`, seeded from the
-    stored access hashes before any request); a chat no connected account reaches is put in
-    ``unreachable`` — reported, never an error, and never asked through an account it is not.
+    each client with the chats it is asked about first — or, with ``every``, with every chat it
+    may be asked about at all (:func:`warm_peer_cache`, seeded from the stored access hashes
+    before any request); a chat no connected account reaches is put in ``unreachable`` —
+    reported, never an error, and never asked through an account it is not.
 
     :meth:`visit` asks through the first account left (:func:`through_accounts`): a flood wait
     stops that account for the rest of the pass (its chats move on to the next account that
@@ -2455,10 +2456,12 @@ class StoredPass:
         sync_cfg: SyncCfg,
         budget: SyncBudget,
         flood_warning: Callable[[int], str],
+        *,
+        every: bool = False,
     ) -> "StoredPass":
         """Route ``chats`` and, unless the budget is already spent, warm every client for the
-        chats it goes first for — the flood-sleep cap goes on **before** each warm-up, which
-        makes requests of its own."""
+        chats it goes first for — or, with ``every``, for each chat it is on the route of. The
+        flood-sleep cap goes on **before** each warm-up, which makes requests of its own."""
         state = cls(conn, clients, sync_cfg, budget, flood_warning)
         asked: dict[str, list[ChatRow]] = {}
         for chat in chats:
@@ -2472,7 +2475,8 @@ class StoredPass:
                 )
                 continue
             state.routes[chat.id] = route
-            asked.setdefault(route[0], []).append(chat)
+            for account in route if every else route[:1]:
+                asked.setdefault(account, []).append(chat)
         if budget.expired:
             return state
         for account, routed in asked.items():
@@ -2490,6 +2494,11 @@ class StoredPass:
 
     def warn(self, account: str, warning: str) -> None:
         self.warnings.append(f"account {account}: {warning}" if self.labelled else warning)
+
+    def stop(self, account: str, seconds: int) -> None:
+        """A flood wait of ``seconds`` on ``account``: no more requests through it this pass."""
+        self.stopped.add(account)
+        self.warn(account, self.flood_warning(seconds))
 
     async def visit[T](self, chat: ChatRow, act: Callable[[Any], Awaitable[T]]) -> T | None:
         """``act(client)`` for the first account that answers about ``chat``; ``None`` when none
@@ -2583,10 +2592,17 @@ async def prune_deleted(
     first chat that hit it.
 
     ``clients`` maps an account to its connected client, and every chat is asked about through
-    an account that reaches it (:class:`StoredPass`): a private chat through its own account
-    alone, a shared one through its primary source's account first and another that reaches it
-    when that one is refused or stopped by a flood wait. A chat no connected account reaches is
-    left alone and reported in ``chats_unreachable`` — its cursor untouched, nothing removed.
+    the accounts that reach it (:class:`StoredPass`): a private chat through its own account
+    alone, a shared one through **every** account that reaches it, because one account's empty
+    slot is not proof of a deletion. An account that joined a group after it began — or one the
+    group hides its history from — sees older messages as empty while another account still
+    reads them, and the index holds whatever the account that fetched it could see. So a message
+    is removed only when every account the index records as reaching the chat
+    (:func:`recorded_reach`) answers it empty (:func:`_confirmed_gone`): one of them not in this
+    run or stopped by a flood wait leaves the chat untouched with a warning, and an account
+    Telegram refuses the chat to outright is no witness either way and is passed over — though
+    at least one account must answer. A chat no connected account reaches is left alone and
+    reported in ``chats_unreachable`` — its cursor untouched, nothing removed.
 
     Addressing a chat by its stored id is only possible once the client knows that peer, and a
     client grepogram builds knows none: :func:`warm_peer_cache` seeds the stored access hashes
@@ -2619,7 +2635,7 @@ async def prune_deleted(
     with SyncLock(paths):
         targets = _sweep_targets(conn, chat_id)
         route = await StoredPass.start(
-            conn, clients, targets, cfg.sync, budget, _prune_flood_warning
+            conn, clients, targets, cfg.sync, budget, _prune_flood_warning, every=True
         )
         tally = _PruneTally(warnings=route.warnings)
         tally.unreachable.extend(chat.id for chat in route.unreachable)
@@ -2628,12 +2644,7 @@ async def prune_deleted(
             if budget.expired:
                 tally.remaining.extend(rest.id for rest in routed[position:])
                 break
-            complete = await route.visit(
-                chat,
-                functools.partial(
-                    _sweep_chat, conn=conn, cfg=cfg, chat=chat, budget=budget, tally=tally
-                ),
-            )
+            complete = await _sweep_chat(route, conn, cfg, chat, budget, tally)
             (tally.done if complete else tally.remaining).append(chat.id)
         return tally.report()
 
@@ -2818,7 +2829,7 @@ def _seed_stored_peers(
 
 
 async def _sweep_chat(
-    client: Any,
+    route: StoredPass,
     conn: sqlite3.Connection,
     cfg: Config,
     chat: ChatRow,
@@ -2827,35 +2838,43 @@ async def _sweep_chat(
 ) -> bool:
     """One chat from its cursor on; ``True`` once the sweep has reached the end of its history.
 
-    A page of stored ids, one request, one transaction: the ids that came back empty are deleted,
-    the units holding them are cut again and the cursor moves to the last id of the page. The
-    write goes to a worker thread that is joined even under cancellation
-    (:func:`_joined_to_thread`), like every other write a sync makes.
+    A page of stored ids, one request per witness, one transaction: the ids every witness
+    answered empty (:func:`_confirmed_gone`) are deleted, the units holding them are cut again
+    and the cursor moves to the last id of the page. The write goes to a worker thread that is
+    joined even under cancellation (:func:`_joined_to_thread`), like every other write a sync
+    makes.
 
     An answer that does not line up with the page is not an answer: the chat's turn ends with its
     cursor untouched, so the next run asks the same page again instead of taking the silence for
     a hundred deletions. ``checked`` counts the pages that *were* answered, for the same reason —
     a refused page has told the report nothing, and the next run asks about it again.
     """
+    absent = [account for account in recorded_reach(conn, chat) if account not in route.clients]
+    absent += [account for account in route.routes[chat.id] if account in route.stopped]
+    if absent:
+        who = ", ".join(sorted(set(absent)))
+        log.warning(
+            "chat %s (%s): account %s reaches it but cannot be asked this run; nothing removed",
+            chat.id,
+            chat.title,
+            who,
+        )
+        route.warn(
+            absent[0],
+            f"chat {chat.id} ({chat.title}): account {who} reaches it but is not signed in or "
+            "was stopped; nothing was removed, since only every account that reaches a chat "
+            "can tell a deletion from history one of them cannot see",
+        )
+        return False
+    witnesses = list(route.routes[chat.id])
     cursor = db.prune_cursor(conn, chat.id)
     while not budget.expired:
         page = db.message_ids_after(conn, chat.id, cursor, PRUNE_BATCH)
         if not page:
             db.clear_prune_cursor(conn, chat.id)
             return True
-        gone = _empty_slots(page, await client.get_messages(chat.peer_id, ids=page))
+        gone = await _confirmed_gone(route, chat, page, witnesses)
         if gone is None:
-            log.warning(
-                "chat %s (%s): Telegram's answer did not line up with the %d ids asked about; "
-                "nothing was removed",
-                chat.id,
-                chat.title,
-                len(page),
-            )
-            tally.warnings.append(
-                f"chat {chat.id} ({chat.title}): Telegram's answer did not line up with the "
-                f"{len(page)} ids asked about; nothing was removed"
-            )
             return False
         tally.checked += len(page)
         cursor = page[-1]
@@ -2863,6 +2882,71 @@ async def _sweep_chat(
             functools.partial(_prune_batch, conn, cfg, chat, gone, cursor), budget.cancel
         )
     return False
+
+
+async def _confirmed_gone(
+    route: StoredPass, chat: ChatRow, page: Sequence[int], witnesses: list[str]
+) -> list[int] | None:
+    """The ids of ``page`` every account of ``witnesses`` answered empty, or ``None`` when that
+    cannot be told this run — the chat's turn then ends with nothing removed.
+
+    The first witness is asked about the whole page, each next one only about what the ones
+    before it answered empty, so a chat one account reaches costs what it always did. A flood
+    wait stops the account (:meth:`StoredPass.stop`) and a Telegram error is reported, both
+    ending the turn. A shared chat Telegram refuses to one account outright
+    (:data:`_REROUTE_ERRORS`) drops that account from ``witnesses`` for the rest of the chat: it
+    sees nothing, so it hides nothing either — but when no witness answered at all, nothing is
+    removed.
+    """
+    asked = list(page)
+    answered = False
+    refusal: Refusal | None = None
+    for account in list(witnesses):
+        client = route.clients[account]
+        _cap_flood_sleep(client, route.sync_cfg, route.budget)
+        try:
+            answer = await client.get_messages(chat.peer_id, ids=asked)
+        except errors.FloodWaitError as exc:
+            log.warning(
+                "flood wait of %ss on chat %s through account %s", exc.seconds, chat.id, account
+            )
+            route.stop(account, int(exc.seconds))
+            return None
+        except errors.UnauthorizedError as exc:
+            tg.reraise_unauthorized(exc, account)
+        except (errors.RPCError, ValueError) as exc:
+            log.warning("chat %s (%s) through account %s: %s", chat.id, chat.title, account, exc)
+            if chat.is_shared and isinstance(exc, _REROUTE_ERRORS):
+                witnesses.remove(account)
+                refusal = Refusal(account, str(exc), exc)
+                continue
+            route.warn(account, f"chat {chat.id} ({chat.title}): {exc}")
+            return None
+        empty = _empty_slots(asked, answer)
+        if empty is None:
+            log.warning(
+                "chat %s (%s): Telegram's answer to account %s did not line up with the %d ids "
+                "asked about; nothing was removed",
+                chat.id,
+                chat.title,
+                account,
+                len(asked),
+            )
+            route.warn(
+                account,
+                f"chat {chat.id} ({chat.title}): Telegram's answer did not line up with the "
+                f"{len(asked)} ids asked about; nothing was removed",
+            )
+            return None
+        answered = True
+        asked = empty
+        if not asked:
+            break
+    if not answered:
+        if refusal is not None:
+            route.warn(refusal.account, f"chat {chat.id} ({chat.title}): {refusal.reason}")
+        return None
+    return asked
 
 
 def _empty_slots(page: Sequence[int], answer: Any) -> list[int] | None:

@@ -183,7 +183,11 @@ never change the git identity.
   account is absent is fetched through another that reaches it; one nobody in the run reaches
   is counted in one warning per account (`_SyncPass.unfetched`), not listed as remaining. A
   fallback fetch's own warnings carry the fetching account's label. A flood wait stops only
-  that account's queue; a scoped chat never falls back. `only=` narrows the fetch to the chats
+  that account's queue; a scoped chat never falls back. `prune-deleted` removes a message only
+  when **every** account `recorded_reach` names answers it empty (`sync._confirmed_gone`): an
+  account that joined late may see history as empty that another still reads, so one of them
+  absent or flood-stopped leaves the chat untouched, and only an account refused the chat
+  outright is passed over. `only=` narrows the fetch to the chats
   the named sources cover while every source is still resolved, so a narrowed run never moves a
   primary. `index_pending`, `index_stranded`, the re-cut and embedding stay once per run, and a
   report's warnings read `account <name>: …` only when an account other than `default` is in
