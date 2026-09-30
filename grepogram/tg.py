@@ -35,7 +35,6 @@ from grepogram.models import DEFAULT_ACCOUNT, Config
 from grepogram.paths import DIR_MODE, PRIVATE_FILE_MODE, Paths
 
 DEVICE_MODEL = "grepogram"
-AUTH_HINT = "run: grepogram auth"
 AUTH_ERRORS: tuple[type[Exception], ...] = (
     errors.AuthKeyUnregisteredError,
     errors.SessionRevokedError,
@@ -63,24 +62,28 @@ def auth_command(account: str = DEFAULT_ACCOUNT) -> str:
 
 
 def auth_hint(account: str = DEFAULT_ACCOUNT) -> str:
-    """The CLI's sign-in hint for ``account``: :data:`AUTH_HINT` itself for the default account,
-    so a single-account install reads exactly what it always did, and
-    ``run: grepogram auth --account <name>`` for any other."""
+    """The CLI's sign-in hint for ``account``: ``run:`` and its :func:`auth_command` —
+    ``run: grepogram auth`` for the default account, ``run: grepogram auth --account <name>``
+    for any other."""
     return f"run: {auth_command(account)}"
 
 
 class AuthRequired(Exception):
     """The Telegram session of ``account`` is missing, unauthorized or was rejected by Telegram.
 
-    ``hint`` is :func:`auth_hint` for that account.
+    ``hint`` is what to do about it: :func:`auth_hint` for that account unless a subclass
+    knows better.
     """
 
     def __init__(
-        self, reason: str = "Telegram session is not authorized", account: str = DEFAULT_ACCOUNT
+        self,
+        reason: str = "Telegram session is not authorized",
+        account: str = DEFAULT_ACCOUNT,
+        hint: str | None = None,
     ) -> None:
         self.reason = reason
         self.account = account
-        self.hint = auth_hint(account)
+        self.hint = auth_hint(account) if hint is None else hint
         super().__init__(f"{reason} ({self.hint})")
 
 
@@ -99,13 +102,10 @@ class OtherUser(AuthRequired):
             f"account {account} is signed in as Telegram user {user_id}, not user {recorded} "
             "this index recorded for it; nothing was done as it",
             account,
+            f"run `grepogram accounts rm {account}` and sign it in again if the change is meant",
         )
         self.user_id = user_id
         self.recorded = recorded
-        self.hint = (
-            f"run `grepogram accounts rm {account}` and sign it in again if the change is meant"
-        )
-        self.args = (f"{self.reason} ({self.hint})",)
 
 
 class SessionMissing(AuthRequired):
