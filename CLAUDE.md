@@ -1,6 +1,7 @@
 # CLAUDE.md
 
-grepogram: local hybrid search over opt-in Telegram chats, served to Claude Code over MCP.
+grepogram: local hybrid search over opt-in Telegram chats of one or more signed-in accounts,
+served to Claude Code over MCP, with an opt-in research mode that finds chats beyond them.
 Python 3.12 pinned, `uv` only (no pip, no global installs), developed on macOS.
 
 ## Commands
@@ -72,21 +73,41 @@ never change the git identity.
   and every tool body redirect stdout to stderr, and `tests/test_mcp.py` asserts stdout stays
   empty.
 - Message text never reaches the log above DEBUG; pass it through `log.redact()`.
-- Message mapping (`sync.map_message`) reads raw TL attributes only — `msg.message`, `msg.media`,
-  `msg.reply_to`, `msg.fwd_from`, `msg.reactions`, `msg.from_id`, `msg.post`, `msg.date`,
-  `msg.edit_date` — never the client-bound helpers (`msg.text`, `msg.file`, `msg.sender`,
-  `msg.chat`), so a message built without a client maps exactly like one Telethon yields.
+- Message mapping (`sync.map_message`) reads raw TL attributes only — `msg.message`, `msg.media`
+  (its `webpage.url` included), `msg.reply_to`, `msg.fwd_from` (`from_id`, `channel_post`,
+  `date`, `saved_from_peer`, `saved_from_msg_id`), `msg.entities`, `msg.reply_markup`,
+  `msg.reactions`, `msg.from_id`, `msg.post`, `msg.date`, `msg.edit_date` — never the
+  client-bound helpers (`msg.text`, `msg.file`, `msg.sender`, `msg.chat`), so a message built
+  without a client maps exactly like one Telethon yields. It compares `from_id` with, and hands
+  `reply_of`, `chat.peer_id`, never the row id. The structured forward origin is
+  `sync.forward_origin` (channel post first, then the saved-from pair, else the author alone,
+  nothing for a hidden account); the Telegram destinations a message names are `sync.links_of`
+  (entity offsets are UTF-16 code units) normalized through `leads.normalize`, which drops every
+  non-Telegram URL. `MessageRow.links` is `None` for a row nobody read links for — one read back
+  from the index, an import — and `upsert_messages` then leaves the stored `message_links` alone;
+  a tuple, even an empty one, replaces them. `sync._differs` compares the links and the `fwd_*`
+  columns in full (`sync._with_links` gives a stored row its links), so changed links alone
+  re-store a row.
 - Never `async with client` on a Telethon client (it calls `start()` and prompts on stdin); use
-  `tg.connected(client)`. Only `grepogram auth` opens the session file for writing
-  (`tg.make_login_client`); every other client works on an in-memory copy (`tg.make_client` →
-  `tg.load_session`), because two Telethon clients on one session database block each other and
-  fail with `database is locked`. **That copy carries the data centre and the auth key and
+  `tg.connected(client, account)`, or `tg.connected_all(clients)` for several, which leaves a
+  signed-out account out (`Live.refused`) and raises only when none connects. Every account has
+  a session file of its own (`paths.session_file_for`: `default` keeps `session.session`, any
+  other account `sessions/<name>.session`) and every `tg` function takes the account, so an
+  auth failure names whose session died (`tg.auth_hint(account)`). Only `grepogram auth` opens a
+  session file for writing (`tg.make_login_client`); every other client works on an in-memory
+  copy (`tg.make_client` → `tg.load_session`; `tg.make_clients` for every account, reporting a
+  missing or unreadable session per account in `AccountClients.unavailable` instead of
+  raising), because two Telethon clients on one session database block each other and fail
+  with `database is locked`. **That copy carries the data centre and the auth key and
   nothing else, so its entity cache starts empty and no chat is addressable by its stored id
   until something warms it.** A pass that walks a source list gets that for free
   (`sources.resolve_sources` → `DialogCatalog` → `get_dialogs`, whose peers Telethon writes into
   the session); a pass that walks `chats` rows instead — `sync.prune_deleted` and `media.run`,
-  the two that re-fetch by id — must call `sync.warm_peer_cache` first, or every
-  `client.get_messages(chat.id, ids=…)` raises a plain `ValueError` that is not an `RPCError`.
+  the two that re-fetch by id, both driven by `sync.StoredPass` — must call
+  `sync.warm_peer_cache(client, chats, conn, account)` first, or every
+  `client.get_messages(chat.peer_id, ids=…)` raises a plain `ValueError` that is not an
+  `RPCError`. The warm-up seeds the account's own stored `chat_access.access_hash` first (a
+  legacy group needs none) and reaches for the routes below only for what that left unseeded.
   The dialog list is not the whole account, and `warm_peer_cache` walks the two stored handles a
   `chats` row can carry for what it misses, **in this order**: `chats.username` through
   `client.get_entity`, for a public chat the account follows without joining (a sync only ever
@@ -98,14 +119,66 @@ never change the git identity.
   Those two are the whole of it — `source_id` is a source id and not a peer, `title` is fuzzy
   text matched against the dialog list this already read, and a legacy `PeerChat` id needs no
   access hash at all. What no route resolves costs that chat its turn with a warning, and only an
-  `UnauthorizedError` is re-raised, ahead of every handler. The MCP server builds a fresh client per Telegram-using tool
-  call (`AppState.telegram()`): Telethon caches the authorization check per instance and
+  `UnauthorizedError` is re-raised, ahead of every handler. The MCP server builds a fresh client per account per Telegram-using
+  tool call (`AppState.telegram(account)`, `AppState.telegrams()` for every signed-in account,
+  which skips an unusable one the way the CLI does and reports it): Telethon caches the authorization check per instance and
   concurrent calls must never share a connection one of them will close. Syncs in the server go
   through `AppState.sync_lock`, config writes through `AppState.editing_config()`, and
   `sources_remove` / `sources rm` take the `SyncLock` like a sync does and save the config under
   it. `sync_all` resolves its sources from the config as it is once it holds the `SyncLock`:
   callers pass a loader (`state.config`, `functools.partial(config.load, paths)`), not the
   snapshot they started with, so a source removed while the model loaded is not fetched again.
+- **A chat's Telegram identity is `(scope, peer_id)`, and `chats.id` is only its row.**
+  `peer_id` is Telethon's marked id. `scope` is `''` for a channel or supergroup — global ids and
+  global message ids, so one row whichever account reaches it, fetched once — and the account
+  name for a user, bot or legacy group, whose message ids are that account's own
+  (`models.chat_scope(type, account)` is the one rule). **A shared row's `id` equals its
+  `peer_id`**, and `db.upsert_chat` raises `ValueError` rather than break that, because
+  `discussion_of`, `comment_of_chat_id`, `migrated_to` and `t.me/c/` links all live in channel id
+  space. A scoped row takes `id = peer_id` when that id is free and the next synthetic id
+  `>= db.SYNTHETIC_BASE` (`1 << 62`) otherwise, so two accounts' private chats with one person
+  are two rows. Everything that talks to Telegram or builds a link reads `chat.peer_id`;
+  everything inside the index keeps `chat.id`. A fixture where the two coincide hides every
+  mix-up, which is what the synthetic-id tests and `tests/fixtures/two_accounts.py` exist for. A
+  scoped chat is only ever read through its own account (`sync.foreign_scope`,
+  `sync.reaching_accounts`); an id naming two scoped rows is ambiguous and answered with
+  candidates, and `<account>/<peer>` names one (`filters.resolve_chat`). `ChatRow.peer_id = 0` /
+  `scope = ""` resolve on construction to `id` and the default account's scope.
+- `chat_sources` holds every source that covers a chat and `chat_access` every account that
+  reaches it, with the access hash that account addresses it by; `chats.source_id` stays the
+  *primary* owner the import and discussion-ownership rules read. `db.upsert_chat` writes
+  neither table. `sources.resolve_sources(cfg, clients, conn)` does, each account's sources
+  through that account's `DialogCatalog`, and replaces a source's coverage
+  (`db.set_source_chats`) only when that source resolved this run — a failed source, or one whose
+  account has no client, keeps what it had. `sources.remove_source` deletes a chat only when no
+  source left in the config covers it; otherwise the primary moves to the first remaining
+  covering source in config order — for a link-only discussion group to its channel's
+  (`discussion_source_id`), which is why channels are decided before groups — and never onto an
+  `import:` tag, and `Removed.kept_chat_ids` names what stayed. `accounts rm` removes an
+  account's sources one by one through the same rule (`sources.remove_source_id`), then
+  `db.forget_account` drops its `chat_access` rows. **Removing a source or an account never
+  leaves a chat on Telegram**; `grepogram leave` is the one command that does, CLI-only. An
+  account's reach (`db.chat_reach`, `Hit.accounts`, the `account:` spec and the `accounts` search
+  scope) is its `chat_access` rows plus the discussion groups of the channels it reaches, and an
+  import reaches no account. A scope narrows a query; it is not isolation.
+- `sync.sync_all` takes an account → client mapping, resolves every source once, and fetches
+  each chat through the account of its primary source: one queue per account in an
+  `asyncio.TaskGroup` under the one `SyncLock` and `SyncBudget`. A flood wait stops only that
+  account's queue. A *shared* chat Telegram refuses to its account falls back to another in
+  `chat_access`, warmed first; a scoped chat never does. `only=` narrows the fetch to the chats
+  the named sources cover while every source is still resolved, so a narrowed run never moves a
+  primary. `index_pending`, `index_stranded`, the re-cut and embedding stay once per run, and a
+  report's warnings read `account <name>: …` only when an account other than `default` is in
+  the run, so a single-account report is what it always was. `SyncBudget(seconds, messages=…)`
+  carries a research run's message allowance: the fetch loops check `halted` (clock or cap),
+  while `expired` stays the clock alone so the cap never cuts indexing or embedding. The CLI's
+  multi-account commands and `AppState.telegrams()` leave out an account with no session (warned
+  about only when it owns a source) or one Telegram signed out, and fail only when no account is
+  left; the MCP `sync` reports the skipped ones in `accounts_skipped`.
+- Every confirmation — `accounts rm`, `leave`, `research approve` — is read from the controlling
+  terminal (`cli._terminal` over `/dev/tty`), never stdin, and refused without one
+  (`cli.NoTerminal`); there is no `--yes`. The autouse `no_terminal` fixture runs the suite as if
+  there were no terminal, and a test that answers installs its own.
 - Every edit of `config.toml` is a read-modify-write under `config.ConfigLock` (a blocking flock
   on `config.lock` next to the file, held for milliseconds): the CLI goes through
   `config.update(paths, change)` or takes the lock explicitly inside its `SyncLock`, and
@@ -141,15 +214,26 @@ never change the git identity.
   not a schema this code can classify. `MIGRATIONS` has to run from `BASE_VERSION` to
   `SCHEMA_VERSION` without a gap and `db._missing_steps` is where both paths check it: a
   mis-keyed step is a bug in grepogram, and stamping an empty database at a version every
-  existing one is refused at would hide it. No step transforms rows: an index is derived from
-  Telegram and a rebuild costs one sync. **The schema is append-only now that v0.1.0 is tagged** —
+  existing one is refused at would hide it. No step transforms rows on a guess or rewrites a value
+  already stored: an index is derived from Telegram and a rebuild costs one sync. What a step
+  *may* do is **fill the columns and tables it adds, deterministically from values already
+  stored**, because an imported history is not derived — Telegram cannot serve it again — so
+  "delete index.db and sync again" is no upgrade path a released schema may ask for. Step `7`
+  fills `chats.peer_id = id`, `chats.scope` from `type`, `chat_sources` from `source_id` and
+  `chat_access` for `default` (imports excepted: they reach no account); step `8` records
+  `meta['links_captured_from']`, the first row id whose links are captured, so research knows
+  which rows only `leads.text_leads` can speak for (`db.links_captured_from`). On an empty
+  database those fills run over no rows. **The schema is append-only now that v0.1.0 is tagged** —
   append a step above `BASE_VERSION` and leave `_V5` alone. `migrate()` applies every step from
   `BASE_VERSION` for a database with no schema objects, so a column added to `_V5` *and* to a step
   above it raises `duplicate column name` and fails `tests/conftest.py`'s shared fixture, which is
   the whole suite. v0.2.0's step `6` (`messages.extracted_text`, `messages.media_state`,
-  `units.reactions`, the `messages_media_pending` partial index) is the model. That index's
-  predicate carries `media_kind IS NOT NULL` as well as `media_state = 0`, or it would cover every
-  row in the table forever and the pending query would stay a scan.
+  `units.reactions`, the `messages_media_pending` partial index) is the model, and steps `7`
+  (accounts: `accounts`, `chats.peer_id` / `scope` unique together, `chat_access`,
+  `chat_sources`) and `8` (`messages.fwd_peer_id` / `fwd_msg_id` / `fwd_date`, `message_links`)
+  followed it; `RECIPE_VERSION` did not move for either, unit text being unchanged. The media
+  index's predicate carries `media_kind IS NOT NULL` as well as `media_state = 0`, or it would
+  cover every row in the table forever and the pending query would stay a scan.
 - `messages.indexed` is 0 for a row whose units and `msg_fts` entry are behind: every
   `upsert_messages` sets it, `db.mark_unindexed` raises it for a post whose thread grew, and
   `sync.on_chat_synced` clears it after the rebuild. `sync._sync_chats` runs `index_pending` for
@@ -328,6 +412,9 @@ never change the git identity.
   own `source_id` onto the supergroup it migrated to, and only when that supergroup is not
   already stored. Lose the tag and `sources rm` of the live source deletes the import,
   `prunable` offers it, and the `import:` handle every refusal tells the user to remove is gone.
+  The tag is looked up by identity, `imported_tag(conn, id, scope=…)` finding the row by
+  `(scope, peer_id)`, and `import --account` files an export's private chats and legacy groups
+  under that account's scope (a synthetic row id when `default` holds the peer).
   `sources.prune_chats` asks the same question a fourth time, on the *delete* side: the scan and
   the confirmation both predate the `SyncLock` — a Telegram round trip must never be held across
   it — so every candidate is put to `_still_prunable` again inside the deletion transaction, and
@@ -338,10 +425,16 @@ never change the git identity.
 - Never decide what a `chat:` source covers by comparing `source_id` strings. `chat =` takes an
   id, an `@username`, `https://t.me/<name>` and `t.me/c/<id>`, and all four are one chat:
   `sources.parse_target` folds them into a `Target`, and `sources._names_chat` / `_same_target`
-  compare that against the `chats` row's `id` and `username` (case-insensitively). `_own_source`,
-  `_same_chat` and `find_source`'s `_named_source` all go through them; a spelling-based
-  comparison silently treats a directly configured group as indirect, which hands its rows to the
-  channel's source. A fuzzy `chat =` value names no identity offline and matches nothing.
+  compare that against the `chats` row's `peer_id` and `username` (case-insensitively).
+  `_own_source`, `_same_chat` and `find_source`'s `_named_source` all go through them; a
+  spelling-based comparison silently treats a directly configured group as indirect, which hands
+  its rows to the channel's source. A fuzzy `chat =` value names no identity offline and matches
+  nothing. A source of an account other than `default` has the id `<account>/chat:<value>` or
+  `<account>/folder:<name>`; `parse_target` takes that prefix only in front of `chat:` /
+  `folder:` and sets `Target.account`, `sources.split_source_id` reads it off an id, and an
+  unprefixed target means the default account's match when there is one and any account's
+  otherwise (`_in_account`, `AmbiguousTarget` for two). `filters` honours an `<account>/`
+  prefix on any spec, but only for an account it knows, so a title holding a slash stays fuzzy.
 - `db.delete_chat` is a no-op for a chat this index does not hold — deleting an unknown id must
   not clear the `discussion_of` of a live group that names it — and for a stored one it removes
   the units of *other* chats that quote it: a channel's post threads carry the comments of its
@@ -396,8 +489,10 @@ never change the git identity.
   digits leaves zeros right behind that prefix and any lexical rule either swallows them or
   refuses the id — which took `search`, `thread` and `context` down for the whole chat.
   `sources.parse_target` builds the same mark arithmetically for `t.me/c/<id>`, so such ids reach
-  the index by the front door.
-- A `MessageView` names the chat it is in (`chat_id`), because a list of them can span two:
+  the index by the front door. Every form is built from `chat.peer_id`, never the row id, which
+  for a scoped chat may be synthetic.
+- A `MessageView` names the chat it is in (`chat_id`, with `peer_id` and the `accounts` that
+  reach it beside it, as on a `Hit`), because a list of them can span two:
   `search.thread` follows a channel post with its discussion group's comments, and post ids and
   comment ids both number from 1, so `msg_id` alone names two different messages. The top-level
   `chat_id` of `mcp._messages_result` is the argument, not where every message lives; the tool
@@ -416,17 +511,52 @@ never change the git identity.
   The one connection is shared across threads: `db.Connection` runs every statement to completion
   under a re-entrant lock and `transaction()` holds it from `BEGIN` to `COMMIT`; the connection is
   in autocommit mode, so a bare statement never leaves an implicit transaction open.
-- `config.toml`, the session file and the lock files (`sync.lock`, `config.lock`) are written
-  with `paths.PRIVATE_FILE_MODE` (0600) — `config.write_private`, `tg.prepare_session`,
-  `paths.FileLock`; the directories grepogram creates get `paths.DIR_MODE` (0700) and an existing
+- `config.toml`, every session file, `research.db` and the lock files (`sync.lock`,
+  `config.lock`) are written with `paths.PRIVATE_FILE_MODE` (0600) — `config.write_private`,
+  `tg.prepare_session`, `research_db.connect`, `paths.FileLock`; the directories grepogram
+  creates, `sessions/` among them, get `paths.DIR_MODE` (0700) and an existing
   one (a user's own `GREPOGRAM_HOME`) is left as it is. Both cross-process locks derive from
   `paths.FileLock`: `SyncLock` sets `blocking = False` and its own `busy()`, `ConfigLock` blocks.
+- Research state lives in `research.db` (`paths.research_db_file`, next to `index.db`) and never
+  in the index: the index is derived and may be deleted and rebuilt, while approvals, exclusions
+  and session history are the user's decisions and nothing rebuilds them. It has its own version
+  (`research_db.SCHEMA_VERSION`); its `SchemaError` subclasses `db.SchemaError`, so the existing
+  handlers catch it, and never advises deleting the file. Whether a candidate is *cached* is
+  asked of the index every time and never stored there, and global-search results are
+  candidates and evidence in `research.db`, never `messages` rows, so no sync cursor moves. Every
+  research entry point refuses before opening the file while `[research] enabled` is false
+  (`research.require_enabled`), and ordinary `search` never widens what it reads.
+- **No parameter stands in for consent.** A grant comes from exactly two places: `grepogram
+  research approve`, which writes `research.approval_summary` to the controlling terminal and
+  reads the answer there, and the MCP `research_approve`, which shows the same summary through
+  `ctx.elicit` and grants only on an accepted answer whose strict-boolean `approve` is `true`.
+  Decline, cancel, an unticked box, a client without form elicitation and any failure of the
+  request grant nothing, and the answer's hint is the terminal command
+  (`research.approve_command`). `research_db.add_grant` is the only grant writer and takes `via`
+  keyword-only with no default, `grants.via` is `CHECK (via IN ('elicitation', 'cli'))`, and
+  `research.grant` rebuilds the summary and grants nothing unless it equals the text the human
+  saw. Never add an `approve` / `confirm` / `yes` argument to a tool or a `--yes` to the CLI;
+  `tests/test_mcp.py` asserts no research tool takes a consent-shaped parameter. Skip and
+  exclude only narrow and need no consent.
+- A grant names one candidate (or the session, for `global_search` / `paid_search`), the
+  session's account and concrete actions (`join`, `request`, `fetch`, `add_source`), and
+  `research.authorized(target, action)` is the one check before every outward step of a run:
+  only a grant naming that very target counts, so approving a chat approves nothing discovered
+  inside it, and a shared folder is approved chat by chat, never whole. Probes read metadata,
+  never history; a `peer:` candidate is looked up only with an access hash the index stored for
+  the session's account and is `unresolvable` otherwise, never guessed. Global search needs the
+  `[research]` switch *and* a `global_search` grant; paying needs `paid_stars_max > 0`, a price
+  within it and a `paid_search` grant, consumed before the request is sent. A run adds its
+  sources in one `config.update` under `SyncLock` → `ConfigLock` with no Telegram request under
+  either, syncs through `sync_all(…, recut=False, only=…)`, and discovery over what it stored
+  only proposes. Sources a run added are ordinary sources and survive `stop`, which voids the
+  unconsumed grants and nothing else.
 - Files end with a single newline; no trailing blank lines.
 
 ## Environment variables
 
 - `GREPOGRAM_HOME=<dir>` — every file (`config.toml`, `config.lock`, `session.session`,
-  `index.db`, `sync.lock`, `logs/`) under one directory. The `tmp_home` fixture in
+  `sessions/`, `index.db`, `research.db`, `sync.lock`, `logs/`) under one directory. The `tmp_home` fixture in
   `tests/conftest.py` points it at a `tmp_path` subdirectory; tests must never touch the real
   `~/.config/grepogram`.
 - `GREPOGRAM_FAKE_MODELS=1` — `embed.load_embedder` and `rerank.load_reranker` return
@@ -441,8 +571,10 @@ never change the git identity.
 
 ## Tests
 
-- `tests/conftest.py` — the fixtures every module shares: `fake_models` and `clean_logging`
-  (both autouse), `tmp_home`, `conn` (an in-memory index, migrated) and the `file_mode` helper.
+- `tests/conftest.py` — the fixtures every module shares: `fake_models`, `plain_cli_output`
+  (`TERM=dumb`, so rich prints option names whole), `no_terminal` and `clean_logging` (all
+  autouse), `tmp_home`, `conn` (an in-memory index, migrated), `v6_conn` (an empty index at
+  schema 6, as v0.2.0 left it, for the upgrade tests) and the `file_mode` helper.
   A module that needs more overrides `conn` by requesting it (`tests/test_filters.py`).
 - `tests/fakes.py` — `FakeClient` (async `get_dialogs`, `iter_messages` with Telethon's offset
   semantics, `get_messages(entity, ids=…)`, `get_entity`, `download_media(message, file)`, raw
@@ -459,10 +591,20 @@ never change the git identity.
   `forget_entities()` models the fresh client `extract` and `prune-deleted` each build after a
   sync, and `strict_entities=False` is for a test with no realistic route to warm up. A fake more
   permissive than production is a fake that hides bugs: this one hid a `grepogram extract` that
-  resolved no chat at all on a real account through nine review rounds.
+  resolved no chat at all on a real account through nine review rounds. Several accounts are
+  several `FakeClient`s over one `FakeWorld` (`FakeWorld.client(account, members=…)`), with
+  per-account membership, private-chat histories and access hashes: a hash that is not the
+  account's own is refused, a private channel refuses a non-member, and a channel an account is
+  not in comes back `left`. The world also carries invites, shared folders and the global-search
+  answers research probes.
+- `tests/fixtures/two_accounts.py` — two accounts' chats in one index: a channel both reach and
+  its link-only discussion group, and each account's private chat with the same person (the
+  work one on a synthetic row id, message ids colliding).
+  `tests/test_upgrade.py` builds a v0.2.0 home (schema 6, one `session.session`, imports) from
+  what the CLI writes and checks it migrates, syncs and searches unchanged.
 - `tests/fixtures/tl.py` — real Telethon `types.Message` objects built without a client (text,
   caption with photo, voice, document with filename, reply, forum topic, forward, service message,
-  reactions, channel post).
+  reactions, channel post, hyperlink, mention, URL button, channel-post forward).
 - `tests/fixtures/sample.pdf`, `tests/fixtures/sample.docx` — tiny hand-built documents the
   extraction tests round-trip; `tests/fixtures/tdesktop_export.json` — a Telegram Desktop export
   the import tests parse.
@@ -482,20 +624,28 @@ never change the git identity.
 ## Layout
 
 `grepogram/`: `paths` (file locations, `FileLock`), `config` (TOML and `TEMPLATE`), `models`
-(dataclasses and the shared `Literal`s: `ChatType`, `UnitKind`, `MediaKind`, `SearchMode`),
-`db` (schema, migrations, accessors), `tg` (client, session, auth errors), `dialogs` (folders,
-fuzzy matching), `sources` (targets, resolution, status), `sync` (fetch, mapping, lock, budget),
+(dataclasses and the shared `Literal`s: `ChatType`, `UnitKind`, `MediaKind`, `SearchMode`,
+`LinkKind` and the research ones; the research row types too), `db` (schema, migrations,
+accessors), `tg` (per-account clients and sessions, auth errors, sign-in), `dialogs` (folders,
+fuzzy matching), `sources` (targets, resolution, coverage, status), `sync` (fetch, mapping,
+lock, budget, the per-account queues and `StoredPass`),
 `units` (windows, threads, posts, incremental rebuild, `RECIPE_VERSION`), `stem` (tokenizer,
 Snowball, FTS query), `index` (FTS and vec maintenance, KNN), `embed` and `rerank` (protocols,
 fakes, bge models), `extract` (the extractor registry: PDF, DOCX, macOS Vision OCR), `media` (the
 bounded extraction pass), `tdesktop` (Telegram Desktop export parsing),
-`links` (deep links), `filters` (chat specs, dates, `resolve_chat` for the one-chat
-readers), `search` (retrieval, fusion, dedup, readers), `cli` (typer app: `search` and the
-`thread` / `context` readers beside `sources`, `sync`, `extract`, `embed`, `import`,
-`prune-deleted`, `config`), `mcp` (FastMCP server with eight tools). The CLI and the MCP server
-offer the same readers, and `--json` prints the document the matching tool returns. Four commands
-are **CLI-only by design** and have no MCP tool: `sources prune` and `prune-deleted` delete
-indexed history, `extract` is a long flood-exposed network pass, and `import` reads a directory
-the server cannot see.
+`links` (deep links), `leads` (normalizing a Telegram link or mention to a target, and the
+text fallback for rows stored before links were captured), `filters` (chat specs, dates,
+`account:` scopes, `resolve_chat` for the one-chat readers), `search` (retrieval, fusion,
+dedup, readers), `research_db` (`research.db`: schema and accessors), `research` (discovery,
+probing, global search, approval grammar and summaries, grants, runs, the JSON documents the
+CLI and the tools share), `cli` (typer app: `search` and the `thread` / `context` readers beside
+`sources`, `accounts`, `auth`, `sync`, `extract`, `embed`, `import`, `prune-deleted`, `leave`,
+`research`, `config`), `mcp` (FastMCP server with eighteen tools: the readers, `sync`, the
+source tools, a read-only `accounts` and nine `research_*`). The CLI and the MCP server offer
+the same readers, and `--json` prints the document the matching tool returns. Some commands are
+**CLI-only by design** and have no MCP tool: `sources prune` and `prune-deleted` delete indexed
+history, `extract` is a long flood-exposed network pass, `import` reads a directory the server
+cannot see, `auth` and `accounts rm` sign accounts in and out, `leave` is the one command that
+changes an account on Telegram, and `research unexclude` lifts the user's own decision.
 
 Plans live in `docs/plans/`, finished ones in `docs/plans/completed/`.
