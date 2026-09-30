@@ -950,12 +950,21 @@ voided_at)`, `exclusions(identity PRIMARY KEY, reason, created_at)`,
 
 ### Task 20: [Final] Update documentation
 
-- [ ] README: accounts (auth, sources per account, filters, provenance), research (enabling,
+- [x] README: accounts (auth, sources per account, filters, provenance), research (enabling,
   workflow, consent, global search disclosure, costs), new commands and tools, files table
   (`sessions/`, `research.db`)
-- [ ] CLAUDE.md: identity invariants (`id == peer_id` for shared rows, peer for Telegram),
+  ➕ new sections "Several Accounts" and "Research: Finding Chats You Do Not Index Yet"; the CLI
+  reference, the CLI-only list, the session paragraph, the files table and the privacy note
+  follow the code. Pinned-post and directory evidence (`EvidenceVia` values nothing produces
+  yet) are not documented. Two CLI help strings lost `[[accounts]]` / `[research]` to rich
+  markup and are escaped in `grepogram/cli.py`
+- [x] CLAUDE.md: identity invariants (`id == peer_id` for shared rows, peer for Telegram),
   migration fill rule, `map_message` raw attributes, research consent rule, tool count, layout
-- [ ] CONTRIBUTING.md if gates changed; move this plan to `docs/plans/completed/`
+  ➕ plus coverage and removal (`chat_access`, `chat_sources`, removal never leaves a chat),
+  multi-account sync, terminal-only confirmations, `research.db` separation, per-account
+  sessions, the test fixtures (`no_terminal`, `v6_conn`, `FakeWorld`, `two_accounts`)
+- [x] CONTRIBUTING.md if gates changed (they did not: unchanged); move this plan to
+  `docs/plans/completed/` (moved by the orchestrator at completion)
 
 ## Post-Completion
 
