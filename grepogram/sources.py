@@ -32,7 +32,7 @@ from typing import Any, Literal
 from telethon import errors, utils
 from telethon.tl import types
 
-from grepogram import db, dialogs, tg
+from grepogram import db, dialogs, leads, tg
 from grepogram.dialogs import DialogCatalog, DialogInfo, FolderInfo, Match
 from grepogram.models import (
     ACCOUNT_NAME,
@@ -70,9 +70,9 @@ ENTITY_ERRORS: tuple[type[Exception], ...] = (
 _INT_RE = re.compile(r"^-?\d+$")
 _USERNAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]{3,31}$")
 _LINK_RE = re.compile(
-    r"^(?:https?://)?(?:www\.)?(?:t\.me|telegram\.me|telegram\.dog)/(?P<path>[^?#]*)",
-    re.IGNORECASE,
+    r"^(?:https?://)?(?:www\.)?(?:t\.me|telegram\.me|telegram\.dog)/", re.IGNORECASE
 )
+"""What makes a target a ``t.me`` link, which :func:`grepogram.leads.normalize` then reads."""
 _ACCOUNT_PREFIX_RE = re.compile(
     rf"^(?P<account>{ACCOUNT_NAME.pattern})/(?=(?:{CHAT_PREFIX}|{FOLDER_PREFIX}))", re.IGNORECASE
 )
@@ -250,29 +250,32 @@ def parse_target(raw: str) -> Target:
         return Target(kind="id", value=int(text))
     if text.startswith("@"):
         return Target(kind="username", value=_username(text[1:], raw))
-    link = _LINK_RE.match(text)
-    if link is not None:
-        return _parse_link(link.group("path"), raw)
+    if _LINK_RE.match(text) is not None:
+        return _parse_link(text, raw)
     return Target(kind="fuzzy", value=text)
 
 
-def _parse_link(path: str, raw: str) -> Target:
-    parts = [part for part in path.split("/") if part]
-    if not parts:
-        raise InvalidTarget(f"no chat in link {raw!r}")
-    head = parts[0]
-    if head == "c":
-        if len(parts) < 2 or not parts[1].isdigit():
-            raise InvalidTarget(f"expected t.me/c/<id> in {raw!r}")
-        return Target(kind="id", value=dialogs.peer_id(types.PeerChannel(int(parts[1]))))
-    if head == "s" and len(parts) > 1:
-        head = parts[1]
-    if head.startswith("+") or head == "joinchat":
+def _parse_link(text: str, raw: str) -> Target:
+    """The chat a ``t.me`` link names, read by :func:`grepogram.leads.normalize` — the one parser
+    of Telegram links, whose usernames come lowercased (Telegram ignores their case): a post's
+    link names its chat, ``t.me/c/<id>`` the private channel's marked id. An invite or a shared
+    folder cannot be a source: the account joins in Telegram and adds the chat or folder then."""
+    lead = leads.normalize(text)
+    if lead is not None and lead.kind == "invite":
         raise InvalidTarget(
             f"invite links cannot be indexed ({raw!r}): join the chat in Telegram, then add it "
             "by title, @username or id"
         )
-    return Target(kind="username", value=_username(head, raw))
+    if lead is not None and lead.kind == "addlist":
+        raise InvalidTarget(
+            f"shared-folder links cannot be indexed ({raw!r}): add the folder in Telegram, then "
+            "add it as folder:<name>"
+        )
+    if lead is not None and lead.username:
+        return Target(kind="username", value=lead.username)
+    if lead is not None and lead.kind in ("peer", "private_post") and lead.peer_id is not None:
+        return Target(kind="id", value=lead.peer_id)
+    raise InvalidTarget(f"no chat in link {raw!r}: expected t.me/<username> or t.me/c/<id>")
 
 
 def _username(name: str, raw: str) -> str:
