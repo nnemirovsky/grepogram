@@ -463,8 +463,10 @@ sources, and `accounts ls` still lists `default` with its session `missing` unti
 `grepogram auth` signs it in again. `--label` belongs to a named account; `auth --label`
 without `--account` is refused, `default` having no `[[accounts]]` entry to hold it.
 **Neither command leaves anything on Telegram.** `grepogram leave <target> --account <name>` is
-the one command that does. It asks on the terminal first, refuses private chats, bots
-and folders, and touches neither the config nor the index.
+the one command that does. It asks on the terminal first, naming the Telegram user the session
+is signed in as, refuses a session that is another Telegram user than the one the index recorded
+for the account, refuses private chats, bots and folders, and touches neither the config nor the
+index.
 
 ## Research: Finding Chats You Do Not Index Yet
 

@@ -1887,7 +1887,11 @@ def test_leave_leaves_a_channel_and_keeps_its_source_and_history(
     terminal = _answer(monkeypatch, YES)
     result = runner.invoke(cli.app, ["leave", "@news", "--account", WORK])
     assert result.exit_code == 0, result.output
-    assert terminal.asked == [_question(f"leave channel 'News' (id {NEWS_PEER}) as account work?")]
+    assert terminal.asked == [
+        _question(
+            f"leave channel 'News' (id {NEWS_PEER}) as account work, signed in as Worker (user 43)?"
+        )
+    ]
     assert f"left channel 'News' (id {NEWS_PEER}) as account work" in result.stdout
     [request] = _leaves(clients[WORK])
     assert isinstance(request, functions.channels.LeaveChannelRequest)
@@ -1896,6 +1900,27 @@ def test_leave_leaves_a_channel_and_keeps_its_source_and_history(
     assert clients[DEFAULT_ACCOUNT].calls == []
     assert paths.config_file.read_text() == before
     assert _chats(paths) == indexed
+
+
+def test_leave_refuses_a_session_of_another_telegram_user_before_asking_or_sending(
+    tmp_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A session swapped into ``sessions/work.session`` by hand is another Telegram user than
+    the one the index recorded for ``work``: nothing is resolved, nothing asked, nothing left."""
+    paths = _synced_two_accounts(tmp_home, monkeypatch)
+    clients = _leave_clients()
+    clients[WORK].me = make_user(44, "Someone", "Else")
+    _per_account(monkeypatch, clients)
+    terminal = _answer(monkeypatch, YES)
+    result = runner.invoke(cli.app, ["leave", "@news", "--account", WORK])
+    assert result.exit_code == 1
+    assert "account work is signed in as Telegram user 44, not user 43" in result.stderr
+    assert "grepogram accounts rm work" in result.stderr
+    assert terminal.asked == []
+    assert _leaves(clients[WORK]) == []
+    assert [name for name, _ in clients[WORK].calls if name == "get_dialogs"] == []
+    assert _recorded(WORK) == AccountRow(name=WORK, user_id=43, display_name="Worker")
+    assert paths.session_file_for(WORK).exists()
 
 
 def test_leave_a_legacy_group_removes_the_account_from_it(

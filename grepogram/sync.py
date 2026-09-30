@@ -2176,12 +2176,12 @@ async def check_account(conn: sqlite3.Connection, account: str, client: Any) -> 
     The one identity check every Telegram-facing pass goes through: a sync
     (:func:`_record_account`, which also records a first sign-in), the passes over stored chats
     (:meth:`StoredPass.start`: ``prune-deleted``, ``extract``, ``recapture-links``), the folder
-    read of ``sources prune``, and every research pass that talks to Telegram — a run, a
-    discover, a global search. A session file copied into place by hand, or one ``grepogram
-    auth`` committed before this index recorded anyone, would otherwise delete, join or ask as a
-    user no one chose. Nothing is sent when no user is recorded yet; a rejected session is
-    :class:`~grepogram.tg.AuthRequired` naming ``account``, and any other Telegram error
-    propagates."""
+    read of ``sources prune``, ``grepogram leave``, and every research pass that talks to
+    Telegram — a run, a discover, a global search. A session file copied into place by hand, or
+    one ``grepogram auth`` committed before this index recorded anyone, would otherwise delete,
+    join, leave or ask as a user no one chose. Nothing is sent when no user is recorded yet; a
+    rejected session is :class:`~grepogram.tg.AuthRequired` naming ``account``, and any other
+    Telegram error propagates."""
     if db.get_account(conn, account) is None:
         return
     try:

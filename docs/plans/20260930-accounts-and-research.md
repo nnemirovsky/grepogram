@@ -654,6 +654,9 @@ approval; a candidate carrying a decision is never given a parent folder afterwa
 - [x] `grepogram leave TARGET --account NAME`: TTY-confirmed `channels.leaveChannel` /
   `messages.deleteChatUser(self)`; never touches sources or the index (the terminal is opened
   before any network call; private chats, bots and folders are refused)
+  ➕ review: `leave` opens the index and puts the session to `sync.check_account` before it
+  resolves or asks, so a hand-swapped session (`tg.OtherUser`) leaves nothing; the question
+  names the Telegram user the session is signed in as
 - [x] tests: second account auth flow with fake prompts, `accounts rm` keeps shared chats,
   `leave` refuses without TTY and never edits config
 - [x] run checks — must pass before task 9

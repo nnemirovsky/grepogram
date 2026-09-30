@@ -1486,11 +1486,17 @@ def leave_cmd(
             )
         name = _known_account(cfg, account or parsed.account or DEFAULT_ACCOUNT)
         tg.ensure_session_mode(paths, name)
-        with _terminal("grepogram leave") as tty:
-            client = tg.make_client(cfg, paths, name)
-            left = asyncio.run(_leave(client, parsed, name, functools.partial(_ask, tty)))
+        conn = _open_db(paths)
+        try:
+            with _terminal("grepogram leave") as tty:
+                client = tg.make_client(cfg, paths, name)
+                left = asyncio.run(_leave(client, conn, parsed, name, functools.partial(_ask, tty)))
+        finally:
+            conn.close()
     except NoTerminal as exc:
         fail(str(exc), hint=exc.hint)
+    except (db.SchemaError, db.ExtensionsUnsupported) as exc:
+        fail(str(exc))
     except (sources.SourceError, tg.AuthRequired, tg.SessionError) as exc:
         fail(str(exc), hint=getattr(exc, "hint", None))
     except (tg_errors.RPCError, ConnectionError) as exc:
@@ -1504,14 +1510,26 @@ def leave_cmd(
 
 async def _leave(
     client: TelegramClient,
+    conn: sqlite3.Connection,
     target: sources.Target,
     account: str,
     confirm: Callable[[str], bool],
 ) -> DialogInfo | None:
     """Resolve ``target`` among ``account``'s dialogs, ask ``confirm``, and leave it; ``None``
     when the answer was no. A folder, a private chat and a bot are refused: there is nothing
-    to leave."""
+    to leave.
+
+    The session is first put to :func:`grepogram.sync.check_account`, before anything is
+    resolved or asked: a session swapped into place by hand is another Telegram user, and
+    leaving is the one outward action a new invite may be needed to undo, so such a session
+    raises :class:`~grepogram.tg.OtherUser` with nothing sent. The question names the Telegram
+    user the session is, not only the account name."""
     async with tg.connected(client, account):
+        await sync.check_account(conn, account, client)
+        me = await client.get_me()
+        if me is None:
+            raise tg.AuthRequired(account=account)
+        who = f"{utils.get_display_name(me) or 'user'} (user {me.id})"
         catalog = dialogs.DialogCatalog(client)
         found = await sources.resolve_target(target, catalog)
         if isinstance(found, FolderInfo):
@@ -1522,7 +1540,11 @@ async def _leave(
             raise sources.InvalidTarget(
                 f"{found.title!r} is a private chat with a {found.type}; there is nothing to leave"
             )
-        if not confirm(f"leave {found.type} {found.title!r} (id {found.id}) as account {account}?"):
+        question = (
+            f"leave {found.type} {found.title!r} (id {found.id}) as account {account}, "
+            f"signed in as {who}?"
+        )
+        if not confirm(question):
             return None
         if found.type == "group":
             chat_id, _ = utils.resolve_id(found.id)

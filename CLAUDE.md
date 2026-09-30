@@ -117,7 +117,8 @@ never change the git identity.
   `AuthRequired` whose hint is `accounts rm`): `sync._record_account` in a sync,
   `StoredPass.start` (`prune-deleted`, `extract`, `recapture-links` — through
   `sync.checked_accounts`, which leaves the account out with a warning), the folder read of
-  `sources prune`, and `research.run` / `discover` / `global_search`, which refuse. A session
+  `sources prune`, and `research.run` / `discover` / `global_search` and `grepogram leave`
+  (before it resolves or asks; its question names the Telegram user), which refuse. A session
   swapped by hand never deletes, joins or asks as a user nobody chose. Every other client works on an in-memory
   copy (`tg.make_client` → `tg.load_session`; `tg.make_clients` for every account, reporting a
   missing or unreadable session of an account that owns a source in `Accounts.skipped`
