@@ -305,7 +305,8 @@ voided_at)`, `exclusions(identity PRIMARY KEY, reason, created_at)`,
 
 ### Consent flow
 
-1. `research_approve(session_id, items=[{candidate_id, actions}])` builds a plain-text summary:
+1. `research_approve(session_id, items=["ID:actions", …])` (the CLI's approval grammar,
+   `research.parse_approval`) builds a plain-text summary:
    per target the title, account, membership, and each action in words ("join
    @x as work", "send an admission request to …", "fetch history since 2025-09-30", "**add as an
    ongoing source** — regular sync and search will include it"); for `global_search` the
@@ -881,19 +882,36 @@ voided_at)`, `exclusions(identity PRIMARY KEY, reason, created_at)`,
 ### Task 18: MCP research tools and consent through elicitation
 
 **Files:**
-- Modify: `grepogram/mcp.py`, `tests/test_mcp.py`
+- Modify: `grepogram/mcp.py`, `tests/test_mcp.py`, `README.md` (MCP tool table, consent)
 
-- [ ] tools `research_start`, `research_discover`, `research_candidates`, `research_approve`,
+- [x] tools `research_start`, `research_discover`, `research_candidates`, `research_approve`,
   `research_skip`, `research_exclude`, `research_run`, `research_status`, `research_stop`;
   all refuse with a hint while research is disabled
-- [ ] `research_approve` elicits with the Task 15 summary when the client declares elicitation,
+  ➕ they answer with the CLI's `--json` documents (`research.session_document`,
+  `report_document`, `candidates_document`, `status_document`; `research_run` adds
+  `accounts_skipped`), and refuse (`research.require_enabled`) before `research.db` is opened;
+  `AppState.research_store` opens it once and keeps it. `research_run` runs under
+  `AppState.sync_lock` with every signed-in account (`AppState.telegrams`); `research_discover`
+  connects the session's account and, when its session is missing, points at `offline=true`.
+  `research.ResearchError` and `research_db.SchemaError` are expected failures (`TOOL_ERRORS`)
+- [x] `research_approve` elicits with the Task 15 summary when the client declares elicitation,
   grants `via='elicitation'` only on accept + true; otherwise returns the CLI command as `hint`;
   no parameter accepts an approval flag
-- [ ] `INSTRUCTIONS`: research playbook (seed → discover → review evidence → ask the user to
+  ➕ `items` are the CLI grammar strings (`ID:join,fetch`, bare `ID`, `global_search`,
+  `paid_search`) rather than `{candidate_id, actions}` objects, so the tool, the CLI and the
+  fallback hint (`research.approve_command`) read one grammar. Form elicitation counts when the
+  client declares `elicitation` empty or with `form`; `Confirm.approve` is a strict boolean
+  (default unticked), so only a JSON `true` in an accepted answer grants; decline, cancel, an
+  unticked box and any failure of the request grant nothing
+- [x] `INSTRUCTIONS`: research playbook (seed → discover → review evidence → ask the user to
   approve → run → analyse with `search` / `thread` / `context`), forward origins are not
   independent corroboration, account provenance
-- [ ] tests: accept / decline / cancel, no capability → hint, stdout empty, disabled refusal
-- [ ] run checks — must pass before task 19
+- [x] tests: accept / decline / cancel, no capability → hint, stdout empty, disabled refusal
+  ➕ plus: unticked accept, timeout / `McpError` while asking, url-only elicitation, invalid
+  approvals refused before asking, a real in-memory client session (a string `"true"` refused,
+  decline, accept), no consent-shaped parameter on any research tool, skip / exclude, start's
+  limit and account checks, offline discover hint
+- [x] run checks — must pass before task 19
 
 ### Task 19: Verify acceptance criteria
 

@@ -1,6 +1,6 @@
 """The MCP server: the search engine as tools for Claude Code, spoken over stdio.
 
-:func:`build_server` registers the nine tools of the contract on a
+:func:`build_server` registers the eighteen tools of the contract on a
 :class:`~mcp.server.fastmcp.FastMCP` named ``grepogram`` whose ``instructions`` carry the agent
 playbook (:data:`INSTRUCTIONS`); :func:`main` is the ``grepogram-mcp`` entry point. Every tool is
 a thin wrapper over the library — :mod:`grepogram.search`, :mod:`grepogram.sync`,
@@ -16,8 +16,9 @@ stdout to stderr while the server starts, and :data:`stdout_to_stderr` does the 
 every tool body (:func:`guarded` / :func:`guarded_async`), so a stray ``print`` deep in a library
 cannot corrupt a JSON-RPC frame.
 
-The tools that talk to Telegram (``sync``, ``dialogs``, ``sources_add``) and ``search``, which may
-refresh a stale index first, are coroutines; the offline readers are plain functions. Several
+The tools that talk to Telegram (``sync``, ``dialogs``, ``sources_add``, ``research_discover``,
+``research_run``), ``research_approve``, which waits for the user's answer, and ``search``, which
+may refresh a stale index first, are coroutines; the offline readers are plain functions. Several
 Telegram accounts may be signed in at once: ``sync`` and the refresh inside ``search`` connect
 every one of them (:meth:`AppState.telegrams`) and go on without an account whose session is
 missing or signed out, reporting it with the command that signs it in; ``dialogs`` and
@@ -31,6 +32,14 @@ private in-memory copies of the sessions (:func:`grepogram.tg.make_client`), syn
 go through ``AppState.editing_config`` — the process-wide lock plus the cross-process
 :class:`grepogram.config.ConfigLock` — so neither two ``sources_add`` calls nor a CLI command in
 another terminal can overwrite each other's save.
+
+The ``research_*`` tools drive :mod:`grepogram.research` over ``research.db``
+(:meth:`AppState.research_store`) and answer with the documents ``grepogram research … --json``
+prints. Each refuses while ``[research] enabled`` is false. Consent is the user's alone:
+``research_approve`` puts the exact :func:`~grepogram.research.approval_summary` to the user
+through MCP elicitation and grants (``via="elicitation"``) only on an accepted answer whose
+``approve`` is ``true``; a client that cannot elicit gets the terminal command that asks
+instead (:func:`~grepogram.research.approve_command`), and no tool parameter approves.
 """
 
 import argparse
@@ -51,10 +60,12 @@ from pathlib import Path
 from types import TracebackType
 from typing import Any, TextIO, TypedDict
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server.elicitation import AcceptedElicitation
+from mcp.server.fastmcp import Context, FastMCP
+from pydantic import BaseModel, ConfigDict, Field
 from telethon import errors as tg_errors
 
-from grepogram import config, db, embed, filters, tg
+from grepogram import config, db, embed, filters, research, research_db, tg
 from grepogram import rerank as reranking
 from grepogram import search as retrieval
 from grepogram import sources as sourcing
@@ -99,7 +110,22 @@ act as one account (`account`, the default one when omitted), and a match's `tar
 names it; `sync` fetches through every signed-in account and names any account it had to skip, \
 with the command that signs it in. One search spans every account; each hit's `accounts` says \
 which ones reach its chat, and `search(accounts=[...])` or a `chats` entry `account:<name>` \
-narrows it to what an account reaches — a scope, not isolation.
+narrows it to what an account reaches — a scope, not isolation. Name the account a claim came \
+through when the accounts differ.
+- Research finds chats the user does not index yet; its tools refuse until the user sets \
+`[research] enabled = true`. The playbook: `research_start` with the question, indexed seed \
+chats and the `account` that will join and fetch (what a run adds is reached through it); \
+`research_discover`; `research_candidates`, reading each candidate's `evidence` and its \
+three separate facts — `member`, `cached` (and through which accounts), `authorized`; tell the \
+user what was found and why, and ask which to approve; `research_approve` shows the user the \
+exact summary and only their own confirmation grants anything — when it answers with a `hint` \
+naming a terminal command, hand the user that command unchanged and never run it for them; \
+`research_run`; analyse what it fetched with `search`, `thread` and `context`; `research_stop` \
+when done (the sources stay). Approving a chat approves nothing found inside it. \
+`research_skip` and `research_exclude` only narrow and need no approval.
+- Corroboration counts distinct origins: forwards and copies of one post are one source, not \
+independent confirmation, however many chats repeat them. Say so when a claim rests on one \
+forwarded post, and prefer evidence from independent chats.
 - A result with `error` explains what went wrong and `hint` what to do next; `warnings` are \
 advisory and the hits alongside them are valid.
 """
@@ -138,6 +164,17 @@ CONFIG_HINT = (
 NO_SOURCES_HINT = "find chats with dialogs, add them with sources_add, then sync"
 ACCOUNTS_HINT = "`accounts` lists the accounts; a new one is signed in from a terminal"
 SYNC_NEXT_HINT = "call sync to fetch and index its history"
+NO_ELICITATION = (
+    "this MCP client cannot ask the user to confirm an approval, and nothing else may approve "
+    "for them"
+)
+DECLINED_HINT = (
+    "nothing was granted; ask the user what they want instead — research_skip sets a candidate "
+    "aside, research_exclude never proposes it again"
+)
+RUN_NEXT_HINT = "call research_run to carry it out"
+STOP_HINT = "the sources its runs added stay configured; sources_remove drops one"
+UNEXCLUDE_HINT = "an exclusion is lifted from a terminal: `grepogram research unexclude`"
 
 TOOL_ERRORS: tuple[type[Exception], ...] = (
     AuthRequired,
@@ -148,6 +185,8 @@ TOOL_ERRORS: tuple[type[Exception], ...] = (
     FilterError,
     SourceError,
     UnknownMessage,
+    research.ResearchError,
+    research_db.SchemaError,
     ValueError,
     tg_errors.RPCError,
     ConnectionError,
@@ -328,6 +367,8 @@ class AppState:
         self.rerank_error: str | None = None
         self._models_lock = threading.Lock()
         self._config_lock = threading.Lock()
+        self._research: sqlite3.Connection | None = None
+        self._research_lock = threading.Lock()
 
     @classmethod
     def open(cls, paths: Paths) -> "AppState":
@@ -338,6 +379,8 @@ class AppState:
         return cls(paths, cfg, conn)
 
     def close(self) -> None:
+        if self._research is not None:
+            self._research.close()
         self.conn.close()
 
     def config(self) -> Config:
@@ -365,6 +408,19 @@ class AppState:
         """
         with self._config_lock, config.ConfigLock(self.paths):
             yield self.config()
+
+    def research_store(self, cfg: Config) -> sqlite3.Connection:
+        """``research.db`` for a research tool, opened on first use and kept.
+
+        Refuses with :class:`~grepogram.research.ResearchDisabled` while ``[research] enabled``
+        is false, before the file is opened or created. The connection is shared like the
+        index's: :class:`grepogram.db.Connection` serialises its statements across threads.
+        """
+        research.require_enabled(cfg)
+        with self._research_lock:
+            if self._research is None:
+                self._research = research_db.open_store(self.paths)
+            return self._research
 
     def account(self, cfg: Config, name: str | None) -> str:
         """``name`` (the default account when ``None``) if ``cfg`` knows it, else
@@ -532,6 +588,8 @@ def hint_for(exc: BaseException) -> str | None:
         return PICK_HINT
     if isinstance(exc, UnknownMessage):
         return MESSAGE_HINT
+    if isinstance(exc, research.ResearchError):
+        return exc.hint
     return None
 
 
@@ -996,6 +1054,280 @@ def accounts() -> ToolResult:
     return {"accounts": listed, "hint": ACCOUNTS_HINT}
 
 
+# --- research --------------------------------------------------------------------------------
+
+
+class Confirm(BaseModel):
+    """The one answer an approval elicitation asks for: a box the user ticks.
+
+    Strict, so only a JSON ``true`` approves — never a string or a number a client coerced."""
+
+    model_config = ConfigDict(strict=True)
+
+    approve: bool = Field(
+        default=False,
+        title="Approve",
+        description="Approve everything the message lists, exactly as written",
+    )
+
+
+def _can_elicit(ctx: Context) -> bool:  # type: ignore[type-arg]
+    """Whether the client declared form elicitation when it connected.
+
+    An empty ``elicitation`` capability is form mode (the shape clients sent before modes were
+    named); a client that names its modes must name ``form``. No request context, no client
+    parameters: no.
+    """
+    try:
+        params = ctx.session.client_params
+    except (ValueError, AttributeError):
+        return False
+    if params is None:
+        return False
+    capability = params.capabilities.elicitation
+    if capability is None:
+        return False
+    return capability.form is not None or capability.url is None
+
+
+@guarded
+def research_start(
+    question: str,
+    seeds: list[str],
+    account: str | None = None,
+    max_depth: int | None = None,
+    max_candidates: int | None = None,
+    probe_limit: int | None = None,
+    since_days: int | None = None,
+    max_messages_per_run: int | None = None,
+    run_budget_s: int | None = None,
+) -> ToolResult:
+    """Start a research session (offline): a `question` in the user's words, the indexed chats
+    to start from (`seeds`, each a chat spec as `search`'s `chats` takes it) and the `account`
+    that later joins and fetches (the default one when omitted). The limits default to the
+    config's [research] section: `max_depth` hops from a seed, `max_candidates` new candidates
+    and `probe_limit` probes per discover call, `since_days` of history for every source a run
+    adds, `max_messages_per_run` and `run_budget_s` per run. Returns the session (`id`, `seeds`
+    as chat ids, `limits`, `state`, `horizon` — the date added sources start from). Next:
+    `research_discover`.
+    """
+    state = _app()
+    cfg = state.config()
+    rdb = state.research_store(cfg)
+    name = state.account(cfg, account)
+    overrides = {
+        "max_depth": max_depth,
+        "max_candidates": max_candidates,
+        "probe_limit": probe_limit,
+        "since_days": since_days,
+        "max_messages_per_run": max_messages_per_run,
+        "run_budget_s": run_budget_s,
+    }
+    given = {key: value for key, value in overrides.items() if value is not None}
+    bad = [key for key, value in given.items() if value < 1]
+    if bad:
+        raise ValueError(f"{', '.join(bad)} must be a positive number")
+    limits = dataclasses.replace(cfg.research.limits(), **given)
+    session = research.start_session(rdb, state.conn, cfg, question, seeds, name, limits)
+    return research.session_document(session)
+
+
+@guarded_async
+async def research_discover(session_id: int, offline: bool = False) -> ToolResult:
+    """Find the chats a research session's chats lead to — links, hidden hyperlinks, mentions,
+    buttons, forward origins, shared folders — and propose them as candidates; then, unless
+    `offline`, probe the best of them on Telegram as the session's account (title, type, size,
+    membership, whether admins approve joins — never their history) and run the global searches
+    the user approved. Nothing is joined or fetched: every find is only proposed. Returns the
+    report: `leads`, `new_candidates`, `updated_candidates`, what was left out (`beyond_depth`,
+    `excluded`, `over_cap`), `probe` and `searches`. Next: `research_candidates`.
+    """
+    state = _app()
+    cfg = state.config()
+    rdb = state.research_store(cfg)
+    session = research.active_session(rdb, session_id)
+    if offline:
+        report = await asyncio.to_thread(
+            research.discover_offline, rdb, state.conn, cfg, session.id
+        )
+        return research.report_document(report)
+    try:
+        async with state.telegram(session.account) as client:
+            report = await research.discover(rdb, state.conn, cfg, session.id, client)
+    except (AuthRequired, SessionError) as exc:
+        result = tool_failure("research_discover", exc)
+        offline_hint = "or call research_discover with offline=true to read the index alone"
+        result["hint"] = f"{result['hint']}; {offline_hint}" if result["hint"] else offline_hint
+        return result
+    return research.report_document(report)
+
+
+@guarded
+def research_candidates(session_id: int, status: list[str] | None = None) -> ToolResult:
+    """A research session's candidates, best corroborated first (offline), optionally only those
+    in the given `status`es (proposed, approved, skipped, excluded, joined, pending_admission,
+    fetched, unavailable, failed). Each has `id`, `identity`, `title`, `type`, `participants`,
+    `request_needed`, `depth`, `status`, `note`, `corroboration` (distinct origins — forwards
+    of one post count once), `overlap` (question terms in the evidence) and three separate
+    facts: `member` (the session's account is in it; null before a probe), `cached` (the index
+    already holds it, through `cached_accounts`) and `authorized` (the actions the user
+    approved and no run has carried out yet). `evidence` lists every path that led to it:
+    `via`, the `chat_id` / `msg_id` it was found in, `origin_key` and a `snippet`.
+    """
+    state = _app()
+    cfg = state.config()
+    rdb = state.research_store(cfg)
+    return research.candidates_document(rdb, state.conn, cfg, session_id, status)
+
+
+@guarded_async
+async def research_approve(
+    session_id: int,
+    items: list[str],
+    ctx: Context,  # type: ignore[type-arg]
+) -> ToolResult:
+    """Ask the user to approve candidates and actions. `items` name them: `ID:join,fetch,…` per
+    candidate (actions: `join`, `request` — an admission request —, `fetch`, `add_source`), a
+    bare `ID` for what indexing it takes, `global_search` / `paid_search` for the session.
+
+    The user is shown the exact summary (`summary` in the result: each target, the account,
+    membership, every action in words, that an added source is ongoing) and answers in their
+    client; only their confirmation grants anything, and nothing any tool is passed can stand
+    in for it. `approved=true` comes with `grants`; `approved=false` means nothing was granted
+    (`answer` says whether the user declined or cancelled). A client that cannot ask the user
+    answers with `error` and a `hint` naming the terminal command that asks instead — give the
+    user that command as it is; it only works on their own terminal. Approving a chat approves
+    nothing found inside it. Next: `research_run`.
+    """
+    state = _app()
+    cfg = state.config()
+    rdb = state.research_store(cfg)
+    wanted = research.with_default_actions(rdb, session_id, research.parse_approval(items))
+    summary = research.approval_summary(rdb, state.conn, cfg, session_id, wanted)
+    command = research.approve_command(session_id, wanted)
+    asked: ToolResult = {
+        "session_id": session_id,
+        "items": research.approval_args(wanted),
+        "summary": summary,
+        "approved": False,
+    }
+    terminal_hint = f"ask the user to run this in their own terminal: {command}"
+    if not _can_elicit(ctx):
+        return {**asked, "error": NO_ELICITATION, "hint": terminal_hint}
+    try:
+        answer = await ctx.elicit(message=summary, schema=Confirm)
+    except Exception as exc:  # any failure to ask is a refusal, never a grant
+        log.warning("research_approve: the confirmation could not be asked: %s", exc)
+        return {
+            **asked,
+            "error": f"the confirmation could not be asked: {exc}",
+            "hint": terminal_hint,
+        }
+    approved = isinstance(answer, AcceptedElicitation) and answer.data.approve is True
+    if not approved:
+        log.info("research session %d: the user did not approve (%s)", session_id, answer.action)
+        return {**asked, "answer": answer.action, "hint": DECLINED_HINT}
+    granted = research.grant(
+        rdb, state.conn, cfg, session_id, wanted, via="elicitation", summary=summary
+    )
+    return {
+        **asked,
+        "approved": True,
+        "answer": answer.action,
+        "grants": [
+            {"id": g.id, "candidate_id": g.candidate_id, "account": g.account, "actions": g.actions}
+            for g in granted
+        ],
+        "hint": RUN_NEXT_HINT,
+    }
+
+
+@guarded
+def research_skip(session_id: int, candidate_ids: list[int]) -> ToolResult:
+    """Set candidates of a research session aside (offline); approvals they hold are voided.
+    Needs no confirmation: it only narrows what the session does, and a later approval can take
+    a skipped candidate back. Returns the `skipped` ids."""
+    state = _app()
+    cfg = state.config()
+    rdb = state.research_store(cfg)
+    skipped = research.skip(rdb, cfg, session_id, candidate_ids)
+    return {"session_id": session_id, "skipped": skipped}
+
+
+@guarded
+def research_exclude(
+    targets: list[str], session_id: int | None = None, reason: str | None = None
+) -> ToolResult:
+    """Never propose these chats again, in any research session (offline); their approvals are
+    voided. `targets` are candidate ids (with `session_id`), `@usernames`, t.me links or marked
+    chat ids; `reason` is kept for later. Needs no confirmation: it only narrows. Returns
+    `excluded`: each identity with how many candidates it set aside."""
+    state = _app()
+    cfg = state.config()
+    rdb = state.research_store(cfg)
+    excluded = research.exclude(rdb, cfg, targets, session_id=session_id, reason=reason)
+    return {
+        "excluded": [
+            {"identity": identity, "candidates_set_aside": moved}
+            for identity, moved in excluded.items()
+        ],
+        "hint": UNEXCLUDE_HINT,
+    }
+
+
+@guarded_async
+async def research_run(session_id: int) -> ToolResult:
+    """Carry out what the user approved for a research session — joins, admission requests, new
+    sources and their history — within the session's time and message budgets, then look one hop
+    further from what it fetched and only propose. Every signed-in account connects (a chat
+    another account reaches is fetched through it when the session's account is refused); one
+    that cannot is in `accounts_skipped`. Returns the run report: `admitted`, `joined`,
+    `pending_admission`, `sources_added`, `fetched`, `partial`, `unavailable`, `failed`
+    (candidate ids), `messages`, `stopped_by` (the budget, a flood wait, a busy sync — run it
+    again to go on), `discovery` and `warnings`. Then analyse with `search`, `thread` and
+    `context`.
+    """
+    state = _app()
+    cfg = state.config()
+    rdb = state.research_store(cfg)
+    session = research.active_session(rdb, session_id)
+    embedder = await asyncio.to_thread(state.embedder)
+    async with state.sync_lock, state.telegrams() as accounts:
+        report = await research.run(
+            rdb, state.conn, cfg, state.paths, accounts.clients, session.id, embedder=embedder
+        )
+    document = research.report_document(report)
+    return {
+        **document,
+        "warnings": [*accounts.warnings(), *document["warnings"]],
+        "accounts_skipped": accounts.skipped_list(),
+    }
+
+
+@guarded
+def research_status(session_id: int | None = None) -> ToolResult:
+    """Every research session in brief (`sessions`: id, question, account, state, candidates,
+    runs), or one in full (offline): the `session` with its limits, progress and `horizon`,
+    `candidates` counted by status, `pending_grants` (approved, not carried out yet) and
+    `pending_admission` (admission requests a chat's admins have not answered)."""
+    state = _app()
+    cfg = state.config()
+    rdb = state.research_store(cfg)
+    return research.status_document(rdb, cfg, session_id)
+
+
+@guarded
+def research_stop(session_id: int) -> ToolResult:
+    """Stop a research session (offline): it explores no further and approvals it has not used
+    are voided. Every source its runs added stays configured and searched; `sources_remove`
+    drops one. Returns `grants_voided`."""
+    state = _app()
+    cfg = state.config()
+    rdb = state.research_store(cfg)
+    voided = research.stop(rdb, cfg, session_id)
+    return {"session_id": session_id, "stopped": True, "grants_voided": voided, "hint": STOP_HINT}
+
+
 TOOLS: tuple[Callable[..., Any], ...] = (
     search,
     thread,
@@ -1006,6 +1338,15 @@ TOOLS: tuple[Callable[..., Any], ...] = (
     sources_add,
     sources_remove,
     accounts,
+    research_start,
+    research_discover,
+    research_candidates,
+    research_approve,
+    research_skip,
+    research_exclude,
+    research_run,
+    research_status,
+    research_stop,
 )
 
 
@@ -1013,7 +1354,7 @@ TOOLS: tuple[Callable[..., Any], ...] = (
 
 
 def build_server() -> FastMCP[Any]:
-    """A ``grepogram`` FastMCP server with the nine tools; docstrings are the descriptions."""
+    """A ``grepogram`` FastMCP server with the eighteen tools; docstrings are the descriptions."""
     server: FastMCP[Any] = FastMCP(SERVER_NAME, instructions=INSTRUCTIONS)
     for tool in TOOLS:
         server.add_tool(tool, description=inspect.cleandoc(tool.__doc__ or ""))

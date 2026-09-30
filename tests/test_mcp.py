@@ -12,16 +12,20 @@ import threading
 import time
 from collections.abc import Callable, Iterator
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
+from mcp import types as mcp_types
+from mcp.server.elicitation import AcceptedElicitation, CancelledElicitation, DeclinedElicitation
 from mcp.server.fastmcp import FastMCP
+from mcp.shared.exceptions import McpError
 from mcp.shared.memory import create_connected_server_and_client_session
 from telethon import errors
 from telethon.tl import functions, types
 from telethon.tl.types import messages as tl_messages
 
-from grepogram import config, db, embed, filters, index, units
+from grepogram import config, db, embed, filters, index, research, research_db, units
 from grepogram import mcp as tools
 from grepogram import rerank as reranking
 from grepogram import search as retrieval
@@ -32,9 +36,11 @@ from grepogram.filters import InvalidDate, UnknownChat
 from grepogram.models import (
     DEFAULT_ACCOUNT,
     AccountCfg,
+    ApprovalItem,
     ChatRow,
     Config,
     MessageRow,
+    ResearchCfg,
     Source,
     SyncReport,
     TelegramCfg,
@@ -45,7 +51,15 @@ from grepogram.search import UnknownMessage
 from grepogram.sources import AmbiguousTarget
 from grepogram.sync import SyncInProgress, SyncLock
 from grepogram.tg import AuthRequired, SessionError, SessionMissing
-from tests.fakes import FakeClient, FakeWorld, make_channel, make_dialog, make_folder, make_user
+from tests.fakes import (
+    FakeClient,
+    FakeWorld,
+    make_channel,
+    make_dialog,
+    make_folder,
+    make_user,
+    no_discussion,
+)
 from tests.fixtures import chat_ru, tl, two_accounts
 
 ARG = chat_ru.ARG_ID
@@ -1447,15 +1461,21 @@ def test_instructions_carry_the_playbook() -> None:
     assert "say so rather than guess" in text
     assert "`sources`" in text and "`dialogs`" in text and "`sources_add`" in text
     assert "`accounts`" in text and "signs it in" in text
+    assert "`research_start`" in text and "`research_approve`" in text
+    assert "only their own confirmation grants anything" in text
+    assert "never run it for them" in text
+    assert "forwards and copies of one post are one source" in text
+    assert "not independent confirmation" in text
+    assert "Name the account a claim came through" in text
 
 
-async def test_server_lists_the_nine_tools_over_a_session(state: tools.AppState) -> None:
+async def test_server_lists_the_eighteen_tools_over_a_session(state: tools.AppState) -> None:
     server = tools.build_server()
     assert server.name == "grepogram" and server.instructions == tools.INSTRUCTIONS
     async with create_connected_server_and_client_session(server) as session:
         listed = await session.list_tools()
         by_name = {tool.name: tool for tool in listed.tools}
-        assert len(by_name) == 9
+        assert len(by_name) == 18
         assert sorted(by_name) == sorted(tool.__name__ for tool in tools.TOOLS)
         search_tool = by_name["search"]
         assert search_tool.description is not None
@@ -1640,3 +1660,392 @@ def test_readers_follow_a_synthetic_row_and_report_its_peer(
         (two_accounts.BOB, 8, ["default"]),
     ]
     assert capsys.readouterr().out == ""
+
+
+# --- research --------------------------------------------------------------------------------
+
+RESEARCH_CFG = Config(telegram=KEYS, research=ResearchCfg(enabled=True))
+RENT_PEER = -1000000000100
+FLATS = make_channel(3001, "Tbilisi flats", username="tb_flats")
+FLATS_PEER = -1000000003001
+FORM = mcp_types.ClientCapabilities(elicitation=mcp_types.ElicitationCapability())
+TERMINAL = "grepogram research approve 1 1:fetch,add_source"
+RESEARCH_TOOLS = [tool for tool in tools.TOOLS if tool.__name__.startswith("research_")]
+
+
+@dataclasses.dataclass
+class FakeContext:
+    """The part of FastMCP's ``Context`` ``research_approve`` uses: the client's declared
+    capabilities and ``elicit``, which records what the user was asked and answers ``answer``
+    (raised when it is an exception)."""
+
+    capabilities: mcp_types.ClientCapabilities | None = dataclasses.field(
+        default_factory=lambda: FORM
+    )
+    answer: object = dataclasses.field(default_factory=DeclinedElicitation)
+    asked: list[tuple[str, type]] = dataclasses.field(default_factory=list)
+
+    @property
+    def session(self) -> SimpleNamespace:
+        params = (
+            None if self.capabilities is None else SimpleNamespace(capabilities=self.capabilities)
+        )
+        return SimpleNamespace(client_params=params)
+
+    async def elicit(self, message: str, schema: type) -> object:
+        self.asked.append((message, schema))
+        if isinstance(self.answer, BaseException):
+            raise self.answer
+        return self.answer
+
+
+def _accept(approve: bool = True) -> AcceptedElicitation[tools.Confirm]:
+    return AcceptedElicitation(data=tools.Confirm(approve=approve))
+
+
+@pytest.fixture
+def researching(
+    bind: Callable[..., tools.AppState], paths: Paths, conn: sqlite3.Connection
+) -> FakeClient:
+    """Research switched on over one indexed channel, ``@tbrent``, whose only message mentions
+    ``@tb_flats`` — a public channel of two posts the default account is not in."""
+    config.save(RESEARCH_CFG, paths)
+    db.upsert_chat(
+        conn, ChatRow(id=RENT_PEER, type="channel", title="Tbilisi rent", username="tbrent")
+    )
+    db.upsert_messages(
+        conn,
+        [
+            MessageRow(
+                chat_id=RENT_PEER,
+                msg_id=1,
+                date=1_735_689_600,
+                text="flats at @tb_flats",
+                links=(("mention", "@tb_flats"),),
+            )
+        ],
+    )
+    world = FakeWorld(
+        entities=[FLATS],
+        messages={FLATS_PEER: [tl.message(FLATS_PEER, i, f"flat {i}") for i in (1, 2)]},
+    )
+    client = world.client(
+        me=make_user(9, "Me"), responses={functions.channels.GetFullChannelRequest: no_discussion}
+    )
+    bind(RESEARCH_CFG, client)
+    return client
+
+
+async def _discovered() -> None:
+    """Session 1 from ``@tbrent``, discovered and probed: candidate 1 is ``@tb_flats``."""
+    started = tools.research_start("who rents flats", ["@tbrent"], since_days=3650)
+    assert "error" not in started, started
+    discovered = await tools.research_discover(started["id"])
+    assert "error" not in discovered, discovered
+    assert discovered["new_candidates"] == [1]
+
+
+def _grants(paths: Paths) -> list[Any]:
+    rdb = research_db.open_store(paths)
+    try:
+        return research_db.list_grants(rdb, 1)
+    finally:
+        rdb.close()
+
+
+async def test_research_tools_refuse_while_research_is_disabled(
+    bind: Callable[..., tools.AppState], paths: Paths
+) -> None:
+    bind()
+    ctx = FakeContext(answer=_accept())
+    results = [
+        tools.research_start("who rents flats", ["@tbrent"]),
+        await tools.research_discover(1),
+        tools.research_candidates(1),
+        await tools.research_approve(1, ["1"], ctx),  # type: ignore[arg-type]
+        tools.research_skip(1, [1]),
+        tools.research_exclude(["@tb_flats"]),
+        await tools.research_run(1),
+        tools.research_status(),
+        tools.research_stop(1),
+    ]
+    assert len(results) == len(RESEARCH_TOOLS)
+    for result in results:
+        assert result == {"error": "research is disabled", "hint": research.ENABLE_HINT}
+    assert ctx.asked == [], "a refusal asks the user nothing"
+    assert not paths.research_db_file.exists(), "a refusal opens no research store"
+
+
+async def test_research_loop_through_the_tools(
+    researching: FakeClient, paths: Paths, conn: sqlite3.Connection
+) -> None:
+    started = tools.research_start("who rents flats", ["@tbrent"], since_days=3650)
+    assert (started["id"], started["account"], list(started["seeds"])) == (
+        1,
+        "default",
+        [RENT_PEER],
+    )
+    assert started["limits"]["since_days"] == 3650 and started["horizon"]
+    discovered = await tools.research_discover(1)
+    assert discovered["new_candidates"] == [1] and discovered["probe"]["probed"] == [1]
+    assert [n for n, _ in researching.calls if n in ("iter_messages", "get_messages")] == []
+    listed = tools.research_candidates(1)
+    (candidate,) = listed["candidates"]
+    assert (candidate["identity"], candidate["title"], candidate["status"]) == (
+        "@tb_flats",
+        "Tbilisi flats",
+        "proposed",
+    )
+    assert (candidate["member"], candidate["cached"], candidate["authorized"]) == (False, False, [])
+    assert "access_hash" not in candidate
+    assert candidate["evidence"][0]["snippet"] == "flats at @tb_flats"
+
+    rdb = research_db.open_store(paths)
+    try:
+        item = ApprovalItem(candidate_id=1, actions=("fetch", "add_source"))
+        summary = research.approval_summary(rdb, conn, RESEARCH_CFG, 1, [item])
+    finally:
+        rdb.close()
+    ctx = FakeContext(answer=_accept())
+    approved = await tools.research_approve(1, ["1"], ctx)  # type: ignore[arg-type]
+    assert ctx.asked == [(summary, tools.Confirm)], "the user is asked with exactly the summary"
+    assert approved["approved"] is True and approved["summary"] == summary
+    assert approved["items"] == ["1:fetch,add_source"]
+    assert approved["grants"] == [
+        {"id": 1, "candidate_id": 1, "account": "default", "actions": ("fetch", "add_source")}
+    ]
+    (grant,) = _grants(paths)
+    assert (grant.via, grant.summary) == ("elicitation", summary)
+
+    status = tools.research_status(1)
+    assert [g["actions"] for g in status["pending_grants"]] == [["fetch", "add_source"]]
+    assert tools.research_status()["sessions"][0]["state"] == "active"
+
+    ran = await tools.research_run(1)
+    assert (ran["sources_added"], ran["fetched"], ran["messages"]) == ([1], [1], 2)
+    assert ran["accounts_skipped"] == []
+    assert [source.id for source in config.load(paths).sources] == ["chat:@tb_flats"]
+    after = tools.research_candidates(1, status=["fetched"])["candidates"]
+    assert [(c["status"], c["cached"]) for c in after] == [("fetched", True)]
+
+    stopped = tools.research_stop(1)
+    assert stopped == {
+        "session_id": 1,
+        "stopped": True,
+        "grants_voided": 0,
+        "hint": tools.STOP_HINT,
+    }
+    assert [source.id for source in config.load(paths).sources] == ["chat:@tb_flats"]
+    again = await tools.research_run(1)
+    assert again["error"] == "research session 1 is stopped"
+
+
+@pytest.mark.parametrize(
+    ("answer", "said"),
+    [
+        (DeclinedElicitation(), "decline"),
+        (CancelledElicitation(), "cancel"),
+        (_accept(approve=False), "accept"),
+    ],
+)
+async def test_research_approve_grants_nothing_unless_the_user_approves(
+    researching: FakeClient, paths: Paths, answer: object, said: str
+) -> None:
+    await _discovered()
+    ctx = FakeContext(answer=answer)
+
+    result = await tools.research_approve(1, ["1:fetch,add_source"], ctx)  # type: ignore[arg-type]
+
+    assert len(ctx.asked) == 1
+    assert result["approved"] is False and result["answer"] == said
+    assert result["hint"] == tools.DECLINED_HINT and "grants" not in result
+    assert _grants(paths) == []
+    listed = tools.research_candidates(1)["candidates"]
+    assert [(c["status"], c["authorized"]) for c in listed] == [("proposed", [])]
+
+
+@pytest.mark.parametrize(
+    "failure", [TimeoutError("no answer"), McpError(mcp_types.ErrorData(code=-1, message="gone"))]
+)
+async def test_research_approve_that_cannot_ask_grants_nothing(
+    researching: FakeClient, paths: Paths, failure: Exception
+) -> None:
+    await _discovered()
+    ctx = FakeContext(answer=failure)
+
+    result = await tools.research_approve(1, ["1"], ctx)  # type: ignore[arg-type]
+
+    assert result["approved"] is False
+    assert result["error"].startswith("the confirmation could not be asked")
+    assert result["hint"].endswith(TERMINAL)
+    assert _grants(paths) == []
+
+
+@pytest.mark.parametrize(
+    "capabilities",
+    [
+        None,
+        mcp_types.ClientCapabilities(),
+        mcp_types.ClientCapabilities(
+            elicitation=mcp_types.ElicitationCapability(url=mcp_types.UrlElicitationCapability())
+        ),
+    ],
+)
+async def test_research_approve_without_elicitation_names_the_terminal_command(
+    researching: FakeClient, paths: Paths, capabilities: mcp_types.ClientCapabilities | None
+) -> None:
+    await _discovered()
+    ctx = FakeContext(capabilities=capabilities, answer=_accept())
+
+    result = await tools.research_approve(1, ["1"], ctx)  # type: ignore[arg-type]
+
+    assert ctx.asked == [], "a client that cannot ask the user is never asked"
+    assert result["approved"] is False and result["error"] == tools.NO_ELICITATION
+    assert result["hint"] == f"ask the user to run this in their own terminal: {TERMINAL}"
+    assert result["summary"].startswith("Research session 1")
+    assert _grants(paths) == []
+
+
+async def test_research_approve_refuses_an_invalid_approval_before_asking(
+    researching: FakeClient, paths: Paths
+) -> None:
+    await _discovered()
+    ctx = FakeContext(answer=_accept())
+
+    fetch_only = await tools.research_approve(1, ["1:fetch"], ctx)  # type: ignore[arg-type]
+    malformed = await tools.research_approve(1, ["flats"], ctx)  # type: ignore[arg-type]
+
+    assert "approve `add_source` together with `fetch`" in fetch_only["error"]
+    assert "'flats' is not an approval item" in malformed["error"]
+    assert ctx.asked == [] and _grants(paths) == []
+
+
+async def test_research_approve_elicits_over_a_real_session(
+    researching: FakeClient, paths: Paths
+) -> None:
+    await _discovered()
+    answers = [
+        mcp_types.ElicitResult(action="accept", content={"approve": "true"}),
+        mcp_types.ElicitResult(action="decline"),
+        mcp_types.ElicitResult(action="accept", content={"approve": True}),
+    ]
+    asked: list[str] = []
+
+    async def elicitation(context: object, params: Any) -> mcp_types.ElicitResult:
+        asked.append(params.message)
+        assert params.requestedSchema["properties"]["approve"]["type"] == "boolean"
+        return answers.pop(0)
+
+    server = tools.build_server()
+    async with create_connected_server_and_client_session(
+        server, elicitation_callback=elicitation
+    ) as session:
+        coerced = await session.call_tool("research_approve", {"session_id": 1, "items": ["1"]})
+        declined = await session.call_tool("research_approve", {"session_id": 1, "items": ["1"]})
+        assert _grants(paths) == [], "only a JSON true approves"
+        accepted = await session.call_tool("research_approve", {"session_id": 1, "items": ["1"]})
+    for result in (coerced, declined, accepted):
+        assert not result.isError and result.structuredContent is not None
+    assert coerced.structuredContent is not None and declined.structuredContent is not None
+    assert coerced.structuredContent["approved"] is False
+    assert declined.structuredContent["answer"] == "decline"
+    assert accepted.structuredContent is not None
+    assert accepted.structuredContent["approved"] is True
+    (grant,) = _grants(paths)
+    assert grant.via == "elicitation" and asked == [grant.summary] * 3
+
+
+async def test_research_approve_over_a_session_without_elicitation_asks_nobody(
+    researching: FakeClient, paths: Paths
+) -> None:
+    await _discovered()
+    async with create_connected_server_and_client_session(tools.build_server()) as session:
+        result = await session.call_tool("research_approve", {"session_id": 1, "items": ["1"]})
+    assert result.structuredContent is not None
+    assert result.structuredContent["error"] == tools.NO_ELICITATION
+    assert result.structuredContent["hint"].endswith(TERMINAL)
+    assert _grants(paths) == []
+
+
+async def test_no_research_tool_takes_a_consent_parameter(state: tools.AppState) -> None:
+    async with create_connected_server_and_client_session(tools.build_server()) as session:
+        listed = {tool.name: tool for tool in (await session.list_tools()).tools}
+    approve = listed["research_approve"].inputSchema
+    assert set(approve["properties"]) == {"session_id", "items"}
+    assert approve["required"] == ["session_id", "items"]
+    consent = {"approve", "approved", "confirm", "confirmed", "yes", "force", "consent"}
+    for tool in RESEARCH_TOOLS:
+        assert not consent & set(listed[tool.__name__].inputSchema["properties"]), tool.__name__
+
+
+async def test_research_skip_and_exclude_need_no_approval(researching: FakeClient) -> None:
+    await _discovered()
+
+    skipped = tools.research_skip(1, [1])
+    excluded = tools.research_exclude(["@tb_flats"], reason="spam")
+    unknown = tools.research_skip(1, [9])
+
+    assert skipped == {"session_id": 1, "skipped": [1]}
+    assert excluded == {
+        "excluded": [{"identity": "@tb_flats", "candidates_set_aside": 1}],
+        "hint": tools.UNEXCLUDE_HINT,
+    }
+    assert unknown["error"] == "no candidate 9 in research session 1"
+    assert tools.research_candidates(1)["candidates"][0]["status"] == "excluded"
+
+
+async def test_research_start_refuses_bad_limits_and_unknown_accounts(
+    researching: FakeClient,
+) -> None:
+    zero = tools.research_start("who rents flats", ["@tbrent"], max_depth=0)
+    stranger = tools.research_start("who rents flats", ["@tbrent"], account="work")
+    nowhere = tools.research_start("who rents flats", ["@nowhere"])
+
+    assert zero["error"] == "max_depth must be a positive number"
+    assert stranger["error"].startswith("unknown account 'work'")
+    assert "grepogram auth --account work" in stranger["hint"]
+    assert nowhere["error"] and nowhere["hint"]
+    assert tools.research_status() == {"sessions": []}
+
+
+async def test_research_discover_without_a_session_offers_the_offline_read(
+    researching: FakeClient, paths: Paths
+) -> None:
+    assert "error" not in tools.research_start("who rents flats", ["@tbrent"])
+    paths.session_file.unlink()
+
+    online = await tools.research_discover(1)
+    offline = await tools.research_discover(1, offline=True)
+
+    assert "research_discover with offline=true" in online["hint"]
+    assert online["hint"].startswith(tools.AUTH_HINT)
+    assert offline["new_candidates"] == [1] and offline["probe"] is None
+
+
+async def test_research_tools_never_write_to_stdout(
+    researching: FakeClient, monkeypatch: pytest.MonkeyPatch, capfd: pytest.CaptureFixture[str]
+) -> None:
+    real_discover = research.discover
+    real_run = research.run
+
+    async def noisy_discover(*args: object, **kwargs: object) -> object:
+        print("discover noise")
+        return await real_discover(*args, **kwargs)  # type: ignore[arg-type]
+
+    async def noisy_run(*args: object, **kwargs: object) -> object:
+        print("run noise")
+        return await real_run(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(research, "discover", noisy_discover)
+    monkeypatch.setattr(research, "run", noisy_run)
+    await _discovered()
+    approved = await tools.research_approve(1, ["1"], FakeContext(answer=_accept()))  # type: ignore[arg-type]
+    assert approved["approved"] is True
+    assert (await tools.research_run(1))["fetched"] == [1]
+    assert tools.research_status(1)["session"]["id"] == 1
+    captured = capfd.readouterr()
+    assert captured.out == ""
+    assert [line for line in captured.err.splitlines() if line.endswith("noise")] == [
+        "discover noise",
+        "run noise",
+    ]

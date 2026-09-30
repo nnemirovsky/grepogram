@@ -377,6 +377,15 @@ advisory; the data next to them is valid.
 | `sources_add` | `target`, `since=null`, `comments=false`, `account=null` | `{source, kind, title, chats, hint}` after saving the config; the source belongs to `account`, else to the account an `<account>/` prefix on `target` names, else to the default one |
 | `sources_remove` | `target` | `{source_id, removed_chat_ids, kept_chat_ids, config_updated}` after deleting the data of the chats no other source covers; `target` is a source id from `sources` (`folder:<name>`, `chat:<value>`, `<account>/chat:<value>`), a folder name, a chat id, `@username` or a fuzzy title; `error` while a sync is running |
 | `accounts` | — | `{accounts, hint}`: every account (offline) with `name`, `label`, `session` (`missing` / `present` / `authorized`), `user_id`, `display_name`, `sources`, `chats` and, for a missing session, the `hint` that signs it in; accounts are signed in and removed from a terminal only |
+| `research_start` | `question`, `seeds: list[str]`, `account=null`, `max_depth`, `max_candidates`, `probe_limit`, `since_days`, `max_messages_per_run`, `run_budget_s` (each `null` = the `[research]` default) | the session, as `grepogram research start --json` prints it: `id`, `question`, `account`, `seeds` (chat ids), `limits`, `state`, `progress`, `horizon` (the date the sources a run adds start from) |
+| `research_discover` | `session_id`, `offline=false` | the discover report: `leads`, `new_candidates`, `updated_candidates`, what was left out (`beyond_depth`, `excluded`, `over_cap`), `probe` (read-only metadata of the best candidates, as the session's account) and `searches` (the global searches the user approved); `offline` asks Telegram nothing |
+| `research_candidates` | `session_id`, `status: list[str] \| null` | `{session_id, question, account, state, candidates}`, best corroborated first; each candidate keeps three facts apart — `member`, `cached` (with `cached_accounts`) and `authorized` — next to `corroboration` (distinct origins: forwards of one post count once), `overlap` and every piece of `evidence` |
+| `research_approve` | `session_id`, `items: list[str]` (`ID:join,fetch,…`, a bare `ID`, `global_search`, `paid_search`) | asks the user through MCP elicitation with the exact approval `summary`; `{approved: true, grants, …}` only when they accept and tick approve, `{approved: false, answer, …}` otherwise; a client without elicitation gets `error` and a `hint` naming the `grepogram research approve …` command to run in a terminal |
+| `research_skip` | `session_id`, `candidate_ids: list[int]` | `{session_id, skipped}`; approvals they held are voided — narrowing needs no approval |
+| `research_exclude` | `targets: list[str]`, `session_id=null`, `reason=null` | `{excluded, hint}`: never proposed again in any session; lifting an exclusion is `grepogram research unexclude`, in a terminal |
+| `research_run` | `session_id` | the run report as `grepogram research run --json` prints it (`admitted`, `joined`, `pending_admission`, `sources_added`, `fetched`, `partial`, `unavailable`, `failed`, `messages`, `stopped_by`, `discovery`, `warnings`) plus `accounts_skipped` |
+| `research_status` | `session_id=null` | `{sessions}` in brief, or one session in full: `session`, `candidates` by status, `pending_grants`, `pending_admission` |
+| `research_stop` | `session_id` | `{session_id, stopped, grants_voided, hint}`; the sources its runs added stay |
 
 Messages in `thread` and `context` have `chat_id`, `peer_id`, `msg_id`, `date`, `from_name`,
 `text` (a `[photo]`-style placeholder for media without a caption, followed by whatever
@@ -384,6 +393,14 @@ Messages in `thread` and `context` have `chat_id`, `peer_id`, `msg_id`, `date`, 
 need not be: a channel post's comments come back under the discussion group's id, and comment
 ids collide with the channel's post ids (both number from 1), so pass a message's own `chat_id`
 back to `context` alongside its `msg_id`.
+
+The `research_*` tools refuse with `error` and `hint` while `[research] enabled` is `false`.
+Consent is the user's alone and no tool argument can stand in for it: `research_approve` shows
+the user the same summary `grepogram research approve` prints on a terminal, through the MCP
+client's elicitation, and grants only on an accepted answer whose `approve` box is ticked —
+a decline, a cancel, an unticked box or a failed request grants nothing. A client that cannot
+elicit is answered with the exact terminal command instead, which asks on the controlling
+terminal and nowhere else.
 
 Four CLI commands have **no tool here, deliberately**: `sources prune` and `prune-deleted` delete
 indexed history, `extract` is a long flood-exposed network pass, and `import` reads a directory
@@ -397,7 +414,11 @@ The server's `instructions` tell the agent how to use the tools: run two or thre
 tokens such as bank names or IDs, prefer recent hits for anything regulatory or price-related and
 state the date of the evidence, call `thread` or `context` before concluding from a snippet, cite
 the hit's `url` per claim, say so when nothing relevant comes back, and use `sources` / `dialogs`
-/ `sources_add` / `sync` when the user names a chat that is not indexed yet.
+/ `sources_add` / `sync` when the user names a chat that is not indexed yet. For research they lay
+out the loop — start, discover, read the evidence, ask the user to approve, run, analyse with
+`search` / `thread` / `context`, stop — say that forwards and copies of one post are one source
+rather than independent corroboration, and name the account a claim came through when
+accounts differ.
 
 The server re-reads `config.toml` when the file changes, so a source added with the CLI while
 an agent session runs is picked up by the next tool call. Every change to the file — by the server or
