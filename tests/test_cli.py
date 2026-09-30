@@ -34,6 +34,7 @@ from grepogram.config import TEMPLATE
 from grepogram.embed import ModelUnavailable
 from grepogram.models import (
     DEFAULT_ACCOUNT,
+    AccountRow,
     ApprovalItem,
     ChatRow,
     Config,
@@ -1177,7 +1178,7 @@ def test_auth_signs_in_a_second_account_and_records_it(
     fake = FakeClient(authorized=False, me=make_user(43, "Worker", "Bee"))
     seen: list[str] = []
 
-    def login_client(cfg: Config, paths: Paths, account: str) -> FakeClient:
+    def login_client(cfg: Config, paths: Paths, account: str, **_: object) -> FakeClient:
         seen.append(account)
         return fake
 
@@ -1242,11 +1243,136 @@ def test_auth_of_a_failed_second_account_adds_no_entry(
         raise tg_errors.PhoneNumberInvalidError(request=None)
 
     monkeypatch.setattr(fake, "start", failing_start)
-    monkeypatch.setattr(tg, "make_login_client", lambda *_: fake)
+    monkeypatch.setattr(tg, "make_login_client", lambda *_, **__: fake)
     result = runner.invoke(cli.app, ["auth", "--account", WORK], input="+1\n")
     assert result.exit_code == 1
     assert "sign-in failed" in result.stderr
     assert config.load(Paths.from_env()).accounts == []
+
+
+def _signing_in_as(
+    monkeypatch: pytest.MonkeyPatch, user: Any, writes: bytes = b"new sign-in"
+) -> list[Path]:
+    """Sign-ins answer as ``user`` and write ``writes`` into the session file they were handed;
+    returns the files, each checked private while the sign-in writes it."""
+    staged: list[Path] = []
+
+    def login_client(
+        cfg: Config, paths: Paths, account: str, *, path: Path | None = None
+    ) -> FakeClient:
+        assert path is not None and path != paths.session_file_for(account)
+        assert path.parent == paths.session_file_for(account).parent
+        assert file_mode(path) == 0o600
+        path.write_bytes(writes)
+        staged.append(path)
+        return FakeClient(authorized=False, me=user)
+
+    monkeypatch.setattr(tg, "make_login_client", login_client)
+    return staged
+
+
+def _recorded(name: str) -> AccountRow | None:
+    conn = db.connect(Paths.from_env())
+    try:
+        db.migrate(conn)
+        return db.get_account(conn, name)
+    finally:
+        conn.close()
+
+
+def _record(name: str, user_id: int | None, display_name: str | None = None) -> None:
+    conn = db.connect(Paths.from_env())
+    try:
+        db.migrate(conn)
+        db.upsert_account(conn, AccountRow(name=name, user_id=user_id, display_name=display_name))
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize("account", [DEFAULT_ACCOUNT, WORK])
+def test_auth_as_another_telegram_user_under_a_recorded_name_changes_nothing(
+    tmp_home: Path, monkeypatch: pytest.MonkeyPatch, account: str
+) -> None:
+    accounts = "" if account == DEFAULT_ACCOUNT else f'\n[[accounts]]\nname = "{account}"\n'
+    (tmp_home / "config.toml").write_text(EXTRACT_KEYS + accounts, encoding="utf-8")
+    paths = Paths.from_env()
+    tg.prepare_session(paths, account).write_bytes(b"the earlier sign-in")
+    _record(account, 43, "Worker Bee")
+    staged = _signing_in_as(monkeypatch, make_user(44, "Someone", "Else"))
+    args = ["auth"] if account == DEFAULT_ACCOUNT else ["auth", "--account", account]
+
+    result = runner.invoke(cli.app, args, input="+15550002222\n4242\n")
+
+    assert result.exit_code == 1
+    assert "Worker Bee (Telegram user 43)" in result.stderr
+    assert "Someone Else (user 44)" in result.stderr and "nothing was changed" in result.stderr
+    assert f"grepogram accounts rm {account}" in result.stderr
+    assert "grepogram auth --account <name>" in result.stderr
+    session = paths.session_file_for(account)
+    assert session.read_bytes() == b"the earlier sign-in" and file_mode(session) == 0o600
+    assert len(staged) == 1 and not staged[0].exists(), "the staged sign-in is deleted"
+    assert sorted(p.name for p in session.parent.iterdir() if "login" in p.name) == []
+    assert _recorded(account) == AccountRow(name=account, user_id=43, display_name="Worker Bee")
+
+
+def test_auth_as_the_recorded_user_replaces_the_session(
+    tmp_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (tmp_home / "config.toml").write_text(EXTRACT_KEYS, encoding="utf-8")
+    paths = Paths.from_env()
+    tg.prepare_session(paths).write_bytes(b"a revoked sign-in")
+    _record(DEFAULT_ACCOUNT, 43, "Worker Bee")
+    staged = _signing_in_as(monkeypatch, make_user(43, "Worker", "Bee"))
+
+    result = runner.invoke(cli.app, ["auth"], input="+15550001111\n4242\n")
+
+    assert result.exit_code == 0, result.output
+    assert paths.session_file.read_bytes() == b"new sign-in"
+    assert file_mode(paths.session_file) == 0o600 and not staged[0].exists()
+    assert _recorded(DEFAULT_ACCOUNT) == AccountRow(
+        name=DEFAULT_ACCOUNT, user_id=43, display_name="Worker Bee"
+    )
+
+
+@pytest.mark.parametrize("recorded", [False, True], ids=["no-row", "no-user"])
+def test_auth_records_whoever_signs_in_under_a_name_with_no_user_yet(
+    tmp_home: Path, monkeypatch: pytest.MonkeyPatch, recorded: bool
+) -> None:
+    """A v0.2.0 ``default`` has a session and no recorded user until its first sign-in or sync
+    after the upgrade: that first record must go through."""
+    (tmp_home / "config.toml").write_text(EXTRACT_KEYS, encoding="utf-8")
+    paths = Paths.from_env()
+    tg.prepare_session(paths).write_bytes(b"a v0.2.0 session")
+    if recorded:
+        _record(DEFAULT_ACCOUNT, None)
+    _signing_in_as(monkeypatch, make_user(45, "New", "Owner"))
+
+    result = runner.invoke(cli.app, ["auth"], input="+15550003333\n4242\n")
+
+    assert result.exit_code == 0, result.output
+    assert paths.session_file.read_bytes() == b"new sign-in"
+    assert _recorded(DEFAULT_ACCOUNT) == AccountRow(
+        name=DEFAULT_ACCOUNT, user_id=45, display_name="New Owner"
+    )
+
+
+def test_a_failed_sign_in_leaves_the_session_and_no_staged_copy(
+    tmp_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (tmp_home / "config.toml").write_text(EXTRACT_KEYS, encoding="utf-8")
+    paths = Paths.from_env()
+    tg.prepare_session(paths).write_bytes(b"the earlier sign-in")
+    fake = FakeClient(authorized=False)
+
+    async def failing_start(*_: object, **__: object) -> FakeClient:
+        raise tg_errors.PhoneNumberInvalidError(request=None)
+
+    monkeypatch.setattr(fake, "start", failing_start)
+    monkeypatch.setattr(tg, "make_login_client", lambda *_, **__: fake)
+    result = runner.invoke(cli.app, ["auth"], input="+1\n")
+    assert result.exit_code == 1 and "sign-in failed" in result.stderr
+    assert paths.session_file.read_bytes() == b"the earlier sign-in"
+    assert [p.name for p in paths.session_file.parent.iterdir() if "login" in p.name] == []
 
 
 def test_sync_uses_every_signed_in_account(tmp_home: Path, monkeypatch: pytest.MonkeyPatch) -> None:

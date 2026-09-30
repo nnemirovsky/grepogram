@@ -18,8 +18,10 @@ number on stdin; :func:`connected` connects without prompting and turns dead-ses
 """
 
 import os
+import shutil
 import sqlite3
 import stat
+import tempfile
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Mapping
 from contextlib import AsyncExitStack, asynccontextmanager
 from dataclasses import dataclass, field
@@ -187,15 +189,52 @@ def make_clients(
     return Accounts(clients, skipped)
 
 
-def make_login_client(cfg: Config, paths: Paths, account: str = DEFAULT_ACCOUNT) -> TelegramClient:
+def make_login_client(
+    cfg: Config, paths: Paths, account: str = DEFAULT_ACCOUNT, *, path: Path | None = None
+) -> TelegramClient:
     """Build the client ``grepogram auth`` signs ``account`` in with: the one client that writes
-    that account's session file. Does not connect. Raises :class:`SessionError` when the file
-    exists but SQLite cannot read it — Telethon opens it in the constructor."""
-    path = paths.session_file_for(account)
+    a session file — ``path``, the staged copy :func:`stage_login` made, or else the account's
+    own. Does not connect. Raises :class:`SessionError` naming the account's file when SQLite
+    cannot read it — Telethon opens it in the constructor."""
+    own = paths.session_file_for(account)
     try:
-        return _client(str(path), cfg)
+        return _client(str(own if path is None else path), cfg)
     except sqlite3.Error as exc:
-        raise SessionError(path, exc, account) from exc
+        raise SessionError(own, exc, account) from exc
+
+
+def stage_login(paths: Paths, account: str = DEFAULT_ACCOUNT) -> Path:
+    """A private (0600) copy of ``account``'s session file, next to it, for a sign-in to write
+    into — an empty one when the account has none yet.
+
+    A sign-in may turn out to be another Telegram user than the one the index recorded under the
+    account's name, and Telethon writes the file it signs in with as it goes: signing in on the
+    copy leaves the account's own session untouched until :func:`commit_login` puts the copy in
+    its place, and a refused sign-in only deletes the copy. A session still signed in is copied
+    whole, so signing in again asks nothing."""
+    paths.ensure_dirs()
+    own = paths.session_file_for(account)
+    own.parent.mkdir(mode=DIR_MODE, parents=True, exist_ok=True)
+    fd, name = tempfile.mkstemp(prefix=f".{own.stem}-login-", suffix=".session", dir=own.parent)
+    os.close(fd)
+    staged = Path(name)
+    try:
+        os.chmod(staged, PRIVATE_FILE_MODE)
+        if own.exists():
+            shutil.copyfile(own, staged)  # into the 0600 file mkstemp made: the mode stays
+    except OSError:
+        staged.unlink(missing_ok=True)
+        raise
+    return staged
+
+
+def commit_login(paths: Paths, account: str, staged: Path) -> Path:
+    """Put the session :func:`stage_login` staged and a sign-in wrote in the place of
+    ``account``'s own, atomically and 0600; returns the account's session file."""
+    own = paths.session_file_for(account)
+    os.chmod(staged, PRIVATE_FILE_MODE)
+    os.replace(staged, own)
+    return own
 
 
 def _client(session: MemorySession | str, cfg: Config) -> TelegramClient:

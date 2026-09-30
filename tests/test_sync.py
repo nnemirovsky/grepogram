@@ -24,6 +24,7 @@ from grepogram import cli, db, index, search, sources, sync, tg, units
 from grepogram.config import ConfigError
 from grepogram.models import (
     DEFAULT_ACCOUNT,
+    AccountRow,
     ChatRow,
     Config,
     Filters,
@@ -3556,6 +3557,31 @@ async def test_two_accounts_sync_concurrently_into_one_index(
         (WORK, 43),
     ]
     assert db.unindexed_message_ids(conn, work_alice.id) == []
+
+
+async def test_a_session_of_another_telegram_user_than_recorded_sits_the_run_out(
+    conn: sqlite3.Connection, paths: Paths
+) -> None:
+    """A work session swapped for another user's never stores that user's chats over the
+    recorded one's: the account is left out with a warning and its record stays."""
+    db.upsert_account(conn, AccountRow(name=WORK, user_id=99, display_name="Earlier"))
+    world = _world()
+    home, work = _home(world), _work(world)
+    cfg = _cfg(Source(chat="@news"), Source(chat="@alice", account=WORK))
+
+    report = await _run_accounts({DEFAULT_ACCOUNT: home, WORK: work}, conn, paths, cfg)
+
+    assert [c for c in work.calls if c[0] == "iter_messages"] == []
+    assert db.get_chat_by_peer(conn, ALICE_ID, WORK) is None
+    assert any(
+        "work" in warning and "not user 99" in warning and "accounts rm work" in warning
+        for warning in report.warnings
+    ), report.warnings
+    assert _texts(conn, NEWS_ID) == {1: "news 1", 2: "news 2"}
+    assert [(a.name, a.user_id) for a in db.list_accounts(conn)] == [
+        (DEFAULT_ACCOUNT, 42),
+        (WORK, 99),
+    ]
 
 
 async def test_a_refused_primary_account_falls_back_to_another_that_reaches_the_chat(

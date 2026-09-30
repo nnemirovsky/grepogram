@@ -185,7 +185,8 @@ def auth(
     """Sign in to Telegram (phone, login code, optional 2FA password) and store the session.
 
     Every account keeps its own session file; several can be signed in at once, and `sync`
-    fetches every account's sources.
+    fetches every account's sources. An account name is one Telegram user: signing in under it
+    as another user than the one recorded is refused and leaves its session as it was.
     """
     paths = Paths.from_env()
     cfg = _load_config(paths)
@@ -197,23 +198,30 @@ def auth(
             fail(str(exc), hint=exc.hint)
     elif label is not None:
         fail("the default account has no [[accounts]] entry to label; label a named account")
-    tg.prepare_session(paths, account)
     again = "grepogram " + " ".join(_auth_args(account))
+    # the sign-in writes a staged copy of the session: the account's own file is replaced only
+    # once the user it signed in as is known to be the one the index recorded under this name
+    staged = tg.stage_login(paths, account)
     try:
-        client = tg.make_login_client(cfg, paths, account)
-        who = asyncio.run(
-            tg.login(client, phone=_ask_phone, code=_ask_code, password=_ask_password)
-        )
-    except tg.SessionError as exc:
-        fail(f"{exc}; if the file is damaged, delete it and run {again} again")
-    except (
-        tg.AuthRequired,
-        tg_errors.RPCError,
-        ConnectionError,
-        RuntimeError,
-        sqlite3.Error,
-    ) as exc:
-        fail(f"sign-in failed: {exc}")
+        try:
+            client = tg.make_login_client(cfg, paths, account, path=staged)
+            who = asyncio.run(
+                tg.login(client, phone=_ask_phone, code=_ask_code, password=_ask_password)
+            )
+        except tg.SessionError as exc:
+            fail(f"{exc}; if the file is damaged, delete it and run {again} again")
+        except (
+            tg.AuthRequired,
+            tg_errors.RPCError,
+            ConnectionError,
+            RuntimeError,
+            sqlite3.Error,
+        ) as exc:
+            fail(f"sign-in failed: {exc}")
+        _refuse_another_user(paths, account, who)
+        tg.commit_login(paths, account, staged)
+    finally:
+        staged.unlink(missing_ok=True)
     tg.ensure_session_mode(paths, account)
     if account != DEFAULT_ACCOUNT:
         try:
@@ -240,6 +248,35 @@ def _with_account(cfg: Config, name: str, label: str | None) -> Config:
         return cfg
     accounts = [entry if known.name == name else known for known in cfg.accounts]
     return dataclasses.replace(cfg, accounts=accounts)
+
+
+def _refuse_another_user(paths: Paths, account: str, who: tg.SignedIn) -> None:
+    """Refuse a sign-in under ``account`` as a Telegram user other than the one the index
+    recorded for it. Everything tied to the name — its private chats, the access hashes it
+    stored, its research approvals — belongs to that user, and the new one must not inherit it.
+    A name with no user recorded yet (a ``default`` from before accounts existed, one never
+    synced) takes whoever signs in; an index that cannot be read cannot object."""
+    try:
+        conn = _open_db(paths)
+        try:
+            recorded = db.other_user(conn, account, who.user_id)
+        finally:
+            conn.close()
+    except (db.SchemaError, db.ExtensionsUnsupported, sqlite3.Error) as exc:
+        typer.echo(f"warning: the index could not say who account {account} was: {exc}", err=True)
+        return
+    if recorded is None:
+        return
+    before = f"{recorded.display_name} " if recorded.display_name else ""
+    fail(
+        f"account {account} is {before}(Telegram user {recorded.user_id}) in this index, but "
+        f"this sign-in is {who.name} (user {who.user_id}); nothing was changed and its session "
+        "file still holds the earlier sign-in",
+        hint=(
+            "sign the other user in under a name of its own (`grepogram auth --account <name>`), "
+            f"or remove this account first with `grepogram accounts rm {account}`"
+        ),
+    )
 
 
 def _remember_account(paths: Paths, account: str, who: tg.SignedIn) -> None:

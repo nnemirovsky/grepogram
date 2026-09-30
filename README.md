@@ -412,7 +412,10 @@ The account `grepogram auth` signs in without `--account` is `default`. It keeps
 `session.session` and needs no `[[accounts]]` entry, so an install from before accounts existed
 simply is its `default` account. Every other account keeps its session in
 `sessions/<name>.session`. All of them share the one `[telegram]` app, and a source belongs to
-the account named by its `account` key. Its id carries the name, `work/chat:@team_channel` or
+the account named by its `account` key. An account name stays one Telegram user: once a sign-in
+or a sync has recorded who it is, `grepogram auth` under that name as someone else is refused and
+leaves the earlier session as it was, and a sync leaves such a session out with a warning. Sign
+the other user in under a name of its own, or `grepogram accounts rm <name>` first. Its id carries the name, `work/chat:@team_channel` or
 `work/folder:Payroll`, so two accounts can each list `chat = 12345` and mean two different
 private chats.
 
@@ -449,7 +452,7 @@ one account, `default` unless `--account` names another.
 folder and a `chat` entry both list) is deleted only when the last of them goes. Until then,
 `sources rm` hands it to a remaining source and says which chats it kept. `accounts rm <name>`
 removes that account's sources under the same rule, all of it or nothing. It also forgets which
-chats the account reached, stops its research sessions so no approval outlives it, and deletes its
+chats the account reached and the peers its syncs cached, stops its research sessions so no approval outlives it, and deletes its
 session file, after asking on the terminal. The only account left cannot be removed. `default`
 can be removed while another account exists: that deletes `session.session` and the `default`
 sources, and `accounts ls` still lists `default` with its session `missing` until

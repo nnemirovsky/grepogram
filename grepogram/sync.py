@@ -2076,7 +2076,8 @@ async def _sync_chats(
             stopped.add(account)
             continue
         lanes[account].me = _self_row(me)
-        _record_account(conn, lanes[account])
+        if not _record_account(conn, lanes[account], tally):
+            del lanes[account]
     usable = {account: lane.client for account, lane in lanes.items() if account not in stopped}
     resolution = await resolve_sources(cfg, usable, conn)
     stopped |= set(resolution.flooded)
@@ -2121,10 +2122,32 @@ async def _sync_chats(
     return run.tally.report()
 
 
-def _record_account(conn: sqlite3.Connection, lane: _Lane) -> None:
-    """Remember who ``lane.account`` turned out to be, when Telegram said."""
+def _record_account(conn: sqlite3.Connection, lane: _Lane, tally: _Tally) -> bool:
+    """Remember who ``lane.account`` turned out to be, when Telegram said; ``False`` — with a
+    warning, and the account left out of the run — when its session is a Telegram user other
+    than the one recorded under that name.
+
+    ``grepogram auth`` refuses such a sign-in, so only a session file swapped by hand gets here;
+    fetching with it would store another user's private chats over the recorded user's, under
+    the same scoped rows, and address peers with access hashes that are not its own."""
     if lane.me is None:
-        return
+        return True
+    recorded = db.other_user(conn, lane.account, lane.me.id)
+    if recorded is not None:
+        log.warning(
+            "account %s is signed in as Telegram user %d, not user %d the index recorded; "
+            "it sits this run out",
+            lane.account,
+            lane.me.id,
+            recorded.user_id,
+        )
+        tally.warn(
+            lane.account,
+            f"its session is Telegram user {lane.me.id}, not user {recorded.user_id} this index "
+            f"recorded for it; nothing was fetched for it — `grepogram accounts rm "
+            f"{lane.account}` and sign it in again if the change is meant",
+        )
+        return False
     db.upsert_account(
         conn,
         AccountRow(
@@ -2133,6 +2156,7 @@ def _record_account(conn: sqlite3.Connection, lane: _Lane) -> None:
             display_name=lane.me.display_name,
         ),
     )
+    return True
 
 
 def _only(

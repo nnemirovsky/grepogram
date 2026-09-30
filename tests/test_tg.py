@@ -610,9 +610,12 @@ def test_auth_signs_in_with_prompts_and_stores_a_private_session(
     fake = FakeClient(authorized=False, two_factor=True, me=make_user(1, "Ann", "Lee"))
     seen: dict[str, object] = {}
 
-    def make_login_client(cfg: Config, paths: Paths, account: str) -> FakeClient:
+    def make_login_client(
+        cfg: Config, paths: Paths, account: str, *, path: Path | None = None
+    ) -> FakeClient:
         seen["cfg"] = cfg
         seen["paths"] = paths
+        seen["path"] = path
         return fake
 
     monkeypatch.setattr(tg, "make_login_client", make_login_client)
@@ -623,7 +626,9 @@ def test_auth_signs_in_with_prompts_and_stores_a_private_session(
     assert fake.start_inputs == {"phone": "+15551234567", "code": "12345", "password": "hunter2"}
     assert seen["cfg"].telegram == TelegramCfg(api_id=12345, api_hash="fakehash")  # type: ignore[attr-defined]
     assert seen["paths"] == Paths.from_env()
+    assert seen["path"] != tmp_home / "session.session", "the sign-in writes a staged copy"
     assert file_mode(tmp_home / "session.session") == 0o600
+    assert [p.name for p in tmp_home.iterdir() if "login" in p.name] == []
     assert not fake.is_connected()
 
 
@@ -632,7 +637,7 @@ def test_auth_without_prompts_when_already_signed_in(
 ) -> None:
     (tmp_home / "config.toml").write_text(CONFIG_WITH_KEYS, encoding="utf-8")
     fake = FakeClient(me=make_user(1, "Ann"))
-    monkeypatch.setattr(tg, "make_login_client", lambda *_: fake)
+    monkeypatch.setattr(tg, "make_login_client", lambda *_, **__: fake)
     result = runner.invoke(cli.app, ["auth"], input="")
     assert result.exit_code == 0, result.output
     assert "signed in as Ann" in result.stdout
@@ -648,7 +653,7 @@ def test_auth_reports_a_failed_sign_in(tmp_home: Path, monkeypatch: pytest.Monke
         raise errors.PhoneNumberInvalidError(request=None)
 
     monkeypatch.setattr(fake, "start", failing_start)
-    monkeypatch.setattr(tg, "make_login_client", lambda *_: fake)
+    monkeypatch.setattr(tg, "make_login_client", lambda *_, **__: fake)
     result = runner.invoke(cli.app, ["auth"], input="+1\n")
     assert result.exit_code == 1
     assert "sign-in failed" in result.stderr
@@ -924,3 +929,29 @@ def _CHAT_FULL_WITH(*chats: types.Channel) -> types.messages.ChatFull:
         chats=list(chats),
         users=[],
     )
+
+
+def test_stage_login_copies_the_session_privately_and_commit_puts_it_back(tmp_path: Path) -> None:
+    paths = Paths.under(tmp_path / "home")
+    fresh = tg.stage_login(paths, "work")
+    assert fresh.parent == paths.sessions_dir and fresh.read_bytes() == b""
+    assert file_mode(fresh) == 0o600
+    fresh.unlink()
+    tg.prepare_session(paths, "work").write_bytes(b"signed in")
+    staged = tg.stage_login(paths, "work")
+    assert staged.read_bytes() == b"signed in" and file_mode(staged) == 0o600
+    staged.write_bytes(b"signed in again")
+    assert paths.session_file_for("work").read_bytes() == b"signed in", "untouched until commit"
+    assert tg.commit_login(paths, "work", staged) == paths.session_file_for("work")
+    assert paths.session_file_for("work").read_bytes() == b"signed in again"
+    assert file_mode(paths.session_file_for("work")) == 0o600 and not staged.exists()
+
+
+def test_make_login_client_writes_the_staged_file_it_is_given(tmp_path: Path) -> None:
+    paths = Paths.under(tmp_path / "home")
+    staged = tg.stage_login(paths)
+    client = tg.make_login_client(
+        Config(telegram=TelegramCfg(api_id=1, api_hash="h")), paths, path=staged
+    )
+    client.session.close()
+    assert staged.stat().st_size > 0 and not paths.session_file.exists()

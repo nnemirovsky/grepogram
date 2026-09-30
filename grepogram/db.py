@@ -1191,6 +1191,21 @@ def upsert_account(conn: sqlite3.Connection, account: AccountRow) -> AccountRow:
         return _account_row(row)
 
 
+def get_account(conn: sqlite3.Connection, name: str) -> AccountRow | None:
+    """Who ``name`` was recorded as, if it ever was."""
+    row = conn.execute("SELECT * FROM accounts WHERE name = ?", (name,)).fetchone()
+    return None if row is None else _account_row(row)
+
+
+def other_user(conn: sqlite3.Connection, name: str, user_id: int) -> AccountRow | None:
+    """The row recording ``name`` as a Telegram user other than ``user_id``, or ``None`` — none
+    recorded, or one with no user yet (a ``default`` account from before accounts existed)."""
+    found = get_account(conn, name)
+    if found is None or found.user_id is None or found.user_id == user_id:
+        return None
+    return found
+
+
 def list_accounts(conn: sqlite3.Connection) -> list[AccountRow]:
     """Every recorded account, :data:`DEFAULT_ACCOUNT` first, then by name."""
     rows = conn.execute("SELECT * FROM accounts ORDER BY name != ?, name", (DEFAULT_ACCOUNT,))
@@ -1204,8 +1219,9 @@ def account_chat_counts(conn: sqlite3.Connection) -> dict[str, int]:
 
 
 def forget_account(conn: sqlite3.Connection, account: str) -> int:
-    """Drop every ``chat_access`` row of ``account`` and its ``accounts`` row; returns how many
-    chats it was recorded as reaching.
+    """Drop every ``chat_access`` row of ``account``, the peers its syncs cached
+    (``peer_cache`` — access hashes only that Telegram user can address anything with) and its
+    ``accounts`` row; returns how many chats it was recorded as reaching.
 
     Nothing else goes: which chats stay indexed is decided by the sources that cover them
     (:func:`grepogram.sources.remove_source`), and a chat another account reaches keeps that
@@ -1213,6 +1229,7 @@ def forget_account(conn: sqlite3.Connection, account: str) -> int:
     """
     with transaction(conn):
         dropped = conn.execute("DELETE FROM chat_access WHERE account = ?", (account,)).rowcount
+        conn.execute("DELETE FROM peer_cache WHERE account = ?", (account,))
         conn.execute("DELETE FROM accounts WHERE name = ?", (account,))
     return int(dropped)
 

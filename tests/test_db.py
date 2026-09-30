@@ -1047,6 +1047,12 @@ def test_accounts_are_recorded_once_and_listed_default_first(conn: sqlite3.Conne
     again = db.upsert_account(conn, AccountRow(name="work", user_id=8, display_name="Work"))
     assert again == AccountRow(name="work", user_id=8, display_name="Work")
     assert [row.name for row in db.list_accounts(conn)] == ["default", "work"]
+    assert db.get_account(conn, "work") == again and db.get_account(conn, "nobody") is None
+    assert db.other_user(conn, "work", 8) is None
+    assert db.other_user(conn, "work", 9) == again
+    db.upsert_account(conn, AccountRow(name="old", user_id=None))
+    assert db.other_user(conn, "old", 9) is None, "a name with no user recorded takes anyone"
+    assert db.other_user(conn, "nobody", 9) is None
 
 
 def test_forget_account_drops_its_access_and_its_row_only(conn: sqlite3.Connection) -> None:
@@ -1056,8 +1062,13 @@ def test_forget_account_drops_its_access_and_its_row_only(conn: sqlite3.Connecti
     db.set_chat_access(conn, -1001, "default", access_hash=1)
     db.upsert_account(conn, AccountRow(name="work", user_id=7))
     db.upsert_account(conn, AccountRow(name="default", user_id=5))
+    db.remember_peers(conn, "work", [(-1003, "origin", 77)])
+    db.remember_peers(conn, "default", [(-1003, "origin", 55)])
     assert db.account_chat_counts(conn) == {"default": 1, "work": 2}
     assert db.forget_account(conn, "work") == 2
+    # the hashes the work user cached address nothing for whoever signs in under the name next
+    assert db.cached_peer_hash(conn, -1003, "work") is None
+    assert db.cached_peer_hash(conn, -1003, "default") == 55
     assert db.account_chat_counts(conn) == {"default": 1}
     assert [row.name for row in db.list_accounts(conn)] == ["default"]
     assert [chat.id for chat in db.list_chats(conn)] == [-1002, -1001]

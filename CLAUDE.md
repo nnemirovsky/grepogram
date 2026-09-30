@@ -104,7 +104,14 @@ never change the git identity.
   a session file of its own (`paths.session_file_for`: `default` keeps `session.session`, any
   other account `sessions/<name>.session`) and every `tg` function takes the account, so an
   auth failure names whose session died (`tg.auth_hint(account)`). Only `grepogram auth` opens a
-  session file for writing (`tg.make_login_client`); every other client works on an in-memory
+  session file for writing (`tg.make_login_client`), and it signs in on a 0600 copy
+  (`tg.stage_login`) that replaces the account's file (`tg.commit_login`, an `os.replace`) only
+  once `db.other_user` says the index recorded no *other* Telegram user under that name: an
+  account name is one Telegram user, since its scoped private chats, `chat_access` /
+  `peer_cache` hashes and research grants are that user's. A name with no user recorded yet (a
+  v0.2.0 `default`) takes whoever signs in; a refused sign-in leaves the old session and deletes
+  the copy. `sync._record_account` holds the same line for a session swapped by hand — that
+  account is left out of the run with a warning, its record untouched. Every other client works on an in-memory
   copy (`tg.make_client` → `tg.load_session`; `tg.make_clients` for every account, reporting a
   missing or unreadable session of an account that owns a source in `Accounts.skipped`
   instead of raising), because two Telethon clients on one session database block each other and fail
@@ -166,7 +173,7 @@ never change the git identity.
   (`discussion_source_id`), which is why channels are decided before groups — and never onto an
   `import:` tag, and `Removed.kept_chat_ids` names what stayed. `accounts rm` removes an
   account's sources through the same rule (`sources.remove_source_id`), `db.forget_account`
-  drops its `chat_access` rows and the config is saved, all inside one `db.transaction`, so a
+  drops its `chat_access`, `peer_cache` and `accounts` rows and the config is saved, all inside one `db.transaction`, so a
   failure deletes nothing; it first stops the account's active research sessions, voiding their
   unused grants. **Removing a source or an account never
   leaves a chat on Telegram**; `grepogram leave` is the one command that does, CLI-only. An
@@ -564,7 +571,7 @@ never change the git identity.
   in autocommit mode, so a bare statement never leaves an implicit transaction open.
 - `config.toml`, every session file, `research.db` and the lock files (`sync.lock`,
   `config.lock`) are written with `paths.PRIVATE_FILE_MODE` (0600) — `config.write_private`,
-  `tg.prepare_session`, `research_db.connect`, `paths.FileLock`; the directories grepogram
+  `tg.prepare_session`, `tg.stage_login`, `research_db.connect`, `paths.FileLock`; the directories grepogram
   creates, `sessions/` among them, get `paths.DIR_MODE` (0700) and an existing
   one (a user's own `GREPOGRAM_HOME`) is left as it is. Both cross-process locks derive from
   `paths.FileLock`: `SyncLock` sets `blocking = False` and its own `busy()`, `ConfigLock` blocks.
