@@ -55,7 +55,7 @@ import threading
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable, Coroutine, Iterator, Sequence
 from contextlib import asynccontextmanager, contextmanager
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict
 from pathlib import Path
 from types import TracebackType
 from typing import Any, TextIO, TypedDict
@@ -82,7 +82,7 @@ from grepogram.rerank import Reranker
 from grepogram.search import UnknownMessage
 from grepogram.sources import AmbiguousTarget, SourceError
 from grepogram.sync import SyncBudget, SyncInProgress, SyncLock
-from grepogram.tg import AuthRequired, SessionError, SessionMissing
+from grepogram.tg import AuthRequired, SessionError
 
 log = logging.getLogger(__name__)
 
@@ -134,10 +134,7 @@ advisory and the hits alongside them are valid.
 """
 
 ToolResult = dict[str, Any]
-ClientFactory = Callable[[Config, Paths, str], Any]
-"""Builds the (unconnected) client of an account: ``(config, paths, account)``."""
 
-AUTH_HINT = "sign in from a terminal with `grepogram auth`, then retry"
 SETUP_HINT = (
     "create an application at https://my.telegram.org/apps, run `grepogram config init`, fill "
     "in [telegram] api_id and api_hash, then `grepogram auth`"
@@ -146,10 +143,6 @@ LOCK_HINT = "another grepogram process (the CLI or a second server) is syncing; 
 SYNC_RUNNING = (
     "a sync started by another tool call is still running; the hits come from the index as it "
     "is — search again when it ends"
-)
-SESSION_HINT = (
-    "another grepogram process is writing the session file (a `grepogram auth` in progress); "
-    "retry when it ends — if the file is damaged, delete it and sign in again with `grepogram auth`"
 )
 MODEL_HINT = (
     "install the dense extra (`uv sync --extra dense`) and restart the MCP server, or search "
@@ -233,18 +226,22 @@ class UnknownAccount(ConfigError):
 
 
 def auth_hint(account: str = DEFAULT_ACCOUNT) -> str:
-    """What to do about ``account``'s missing or rejected session: :data:`AUTH_HINT` itself for
-    the default account, the ``--account`` sign-in for any other."""
-    if account == DEFAULT_ACCOUNT:
-        return AUTH_HINT
-    return f"sign in from a terminal with `grepogram auth --account {account}`, then retry"
+    """What to do about ``account``'s missing or rejected session: sign it in from a terminal
+    with its own command (:func:`grepogram.tg.auth_command`)."""
+    return f"sign in from a terminal with `{tg.auth_command(account)}`, then retry"
 
 
 def session_hint(account: str = DEFAULT_ACCOUNT) -> str:
-    """:data:`SESSION_HINT` for ``account``: its own sign-in command when it is not the default."""
-    if account == DEFAULT_ACCOUNT:
-        return SESSION_HINT
-    return SESSION_HINT.replace("`grepogram auth`", f"`grepogram auth --account {account}`")
+    """What to do about ``account``'s session file that cannot be read."""
+    return (
+        "another grepogram process is writing the session file (a `grepogram auth` in "
+        "progress); retry when it ends — if the file is damaged, delete it and sign in again "
+        f"with `{tg.auth_command(account)}`"
+    )
+
+
+AUTH_HINT = auth_hint()
+SESSION_HINT = session_hint()
 
 
 class SkippedAccount(TypedDict):
@@ -255,29 +252,22 @@ class SkippedAccount(TypedDict):
     hint: str | None
 
 
-@dataclass(frozen=True, slots=True)
-class Accounts:
-    """What :meth:`AppState.telegrams` connected: a client per signed-in account, and the
-    reason each account that could not take part was left out — a missing or unreadable
-    session file of an account that owns a source, or a session Telegram does not accept."""
+def skipped_list(accounts: tg.Accounts) -> list[SkippedAccount]:
+    """Each account a multi-account block went on without, with its error and the hint that
+    names its sign-in."""
+    return [
+        {"account": name, "error": _reason(exc), "hint": _account_hint(name, exc)}
+        for name, exc in accounts.skipped.items()
+    ]
 
-    clients: dict[str, Any] = field(default_factory=dict)
-    skipped: dict[str, Exception] = field(default_factory=dict)
 
-    def skipped_list(self) -> list[SkippedAccount]:
-        """Each left-out account with its error and the hint that names its sign-in."""
-        return [
-            {"account": name, "error": _reason(exc), "hint": _account_hint(name, exc)}
-            for name, exc in self.skipped.items()
-        ]
-
-    def warnings(self) -> list[str]:
-        """One warning per left-out account: its name, why, and how to sign it in."""
-        return [
-            f"account {item['account']} skipped: {item['error']}"
-            + (f"; {item['hint']}" if item["hint"] else "")
-            for item in self.skipped_list()
-        ]
+def skipped_warnings(accounts: tg.Accounts) -> list[str]:
+    """One warning per left-out account: its name, why, and how to sign it in."""
+    return [
+        f"account {item['account']} skipped: {item['error']}"
+        + (f"; {item['hint']}" if item["hint"] else "")
+        for item in skipped_list(accounts)
+    ]
 
 
 def _reason(exc: Exception) -> str:
@@ -357,7 +347,7 @@ class AppState:
         cfg: Config,
         conn: sqlite3.Connection,
         *,
-        client_factory: ClientFactory = tg.make_client,
+        client_factory: tg.ClientFactory = tg.make_client,
     ) -> None:
         self.paths = paths
         self.cfg = cfg
@@ -463,36 +453,23 @@ class AppState:
             yield connected
 
     @asynccontextmanager
-    async def telegrams(self) -> AsyncIterator[Accounts]:
+    async def telegrams(self) -> AsyncIterator[tg.Accounts]:
         """A connected client of every signed-in account for the block — each built for it, on
         its own copy of its session, and all disconnected on exit — as :meth:`telegram` builds
-        one; the same rules as ``grepogram sync``.
+        one; the same rules as ``grepogram sync`` (:func:`grepogram.tg.make_clients`,
+        :func:`grepogram.tg.connected_all`).
 
         An account whose session file is missing or unreadable is left out, and reported in
-        :attr:`Accounts.skipped` when it owns a configured source (an install that signed in
-        only named accounts never had a default session to miss); an account Telegram refuses
-        is left out and reported (:func:`grepogram.tg.connected_all`). One account's failure
-        never stops the others. Only when no account can connect at all is a reason raised —
-        a source owner's first, so a single-account install reads what it always did.
+        :attr:`~grepogram.tg.Accounts.skipped` when it owns a configured source; an account
+        Telegram refuses is left out and reported too. One account's failure never stops the
+        others. Only when no account can connect at all is a reason raised — a source owner's
+        first, so a single-account install reads what it always did.
         """
         cfg = self.config()
         self._require_keys(cfg)
-        owners = {source.account for source in cfg.sources}
-        clients: dict[str, Any] = {}
-        unavailable: dict[str, Exception] = {}
-        for name in cfg.account_names():
-            try:
-                tg.ensure_session_mode(self.paths, name)
-                clients[name] = self.client_factory(cfg, self.paths, name)
-            except (SessionMissing, SessionError) as exc:
-                unavailable[name] = exc
-        if not clients:
-            first = next(iter(unavailable.values()))
-            raise next((exc for name, exc in unavailable.items() if name in owners), first)
-        skipped = {name: exc for name, exc in unavailable.items() if name in owners}
-        async with tg.connected_all(clients) as live:
-            skipped.update(live.refused)
-            yield Accounts(live.clients, skipped)
+        built = tg.make_clients(cfg, self.paths, factory=self.client_factory)
+        async with tg.connected_all(built.clients, built.skipped) as live:
+            yield live
 
     def load_embedder(self, cfg: Config) -> Embedder:
         """The embedding model, loaded once and kept (a :data:`grepogram.search.EmbedderLoader`).
@@ -746,7 +723,9 @@ async def _auto_sync(state: AppState, cfg: Config) -> tuple[bool, list[str]]:
         return False, [f"auto-sync skipped: {describe(exc)}"]
     finally:
         state.sync_lock.release()
-    warnings = [f"auto-sync: {warning}" for warning in [*accounts.warnings(), *report.warnings]]
+    warnings = [
+        f"auto-sync: {warning}" for warning in [*skipped_warnings(accounts), *report.warnings]
+    ]
     if report.chats_remaining:
         warnings.append(
             f"auto-sync stopped after {budget_s}s with {len(report.chats_remaining)} chats "
@@ -867,13 +846,13 @@ async def sync(budget_s: int = 45) -> ToolResult:
             SyncBudget(budget_s),
             embedder,
         )
-    warnings = [*accounts.warnings(), *report.warnings]
+    warnings = [*skipped_warnings(accounts), *report.warnings]
     if embedder is None:
         warnings.append(f"dense index not updated: {state.embed_error}")
     return {
         **asdict(report),
         "warnings": warnings,
-        "accounts_skipped": accounts.skipped_list(),
+        "accounts_skipped": skipped_list(accounts),
         "index_age_min": retrieval.index_age_min(state.conn),
     }
 
@@ -1318,8 +1297,8 @@ async def research_run(session_id: int) -> ToolResult:
     document = research.report_document(report)
     return {
         **document,
-        "warnings": [*accounts.warnings(), *document["warnings"]],
-        "accounts_skipped": accounts.skipped_list(),
+        "warnings": [*skipped_warnings(accounts), *document["warnings"]],
+        "accounts_skipped": skipped_list(accounts),
     }
 
 

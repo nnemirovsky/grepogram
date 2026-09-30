@@ -1,3 +1,4 @@
+import dataclasses
 import datetime as dt
 import sqlite3
 import time
@@ -12,7 +13,7 @@ from telethon.tl import functions, types
 from typer.testing import CliRunner
 
 from grepogram import cli, tg
-from grepogram.models import AccountCfg, Config, SyncCfg, TelegramCfg
+from grepogram.models import AccountCfg, Config, Source, SyncCfg, TelegramCfg
 from grepogram.paths import Paths
 from tests.conftest import file_mode
 from tests.fakes import (
@@ -225,6 +226,9 @@ WORK_KEY = AuthKey(bytes(reversed(range(256))))
 TWO_ACCOUNTS = Config(
     telegram=TelegramCfg(api_id=777, api_hash="hash"), accounts=[AccountCfg(name="work")]
 )
+WORK_OWNS_A_SOURCE = dataclasses.replace(
+    TWO_ACCOUNTS, sources=[Source(chat=1), Source(chat=1, account="work")]
+)
 
 
 def test_a_named_account_keeps_its_session_under_sessions(tmp_path: Path) -> None:
@@ -305,19 +309,21 @@ def test_make_clients_builds_one_client_per_signed_in_account(tmp_path: Path) ->
     (paths.sessions_dir / "work.session").chmod(0o644)
     built = tg.make_clients(TWO_ACCOUNTS, paths)
     assert list(built.clients) == ["default", "work"]
-    assert built.unavailable == {}
+    assert built.skipped == {}
     work_key = built.clients["work"].session.auth_key
     assert work_key is not None and work_key.key == WORK_KEY.key
     assert file_mode(paths.sessions_dir / "work.session") == 0o600
 
 
 def test_make_clients_reports_an_account_without_a_session(tmp_path: Path) -> None:
-    """A second account that was never signed in costs itself and nothing else."""
+    """A second account that was never signed in costs itself and nothing else; it is reported
+    when it owns a source, and an account that owns none is simply not there."""
     paths = _paths(tmp_path)
     _signed_in(paths).close()
-    built = tg.make_clients(TWO_ACCOUNTS, paths)
+    assert tg.make_clients(TWO_ACCOUNTS, paths).skipped == {}, "work owns no source"
+    built = tg.make_clients(WORK_OWNS_A_SOURCE, paths)
     assert list(built.clients) == ["default"]
-    missing = built.unavailable["work"]
+    missing = built.skipped["work"]
     assert isinstance(missing, tg.SessionMissing)
     assert missing.path == paths.sessions_dir / "work.session"
     assert missing.hint == "run: grepogram auth --account work"
@@ -327,9 +333,9 @@ def test_make_clients_reports_a_damaged_session_and_keeps_the_rest(tmp_path: Pat
     paths = _paths(tmp_path)
     tg.prepare_session(paths).write_bytes(b"not a database, not at all, just some bytes " * 4)
     _signed_in(paths, "work", WORK_KEY).close()
-    built = tg.make_clients(TWO_ACCOUNTS, paths)
+    built = tg.make_clients(WORK_OWNS_A_SOURCE, paths)
     assert list(built.clients) == ["work"]
-    damaged = built.unavailable["default"]
+    damaged = built.skipped["default"]
     assert isinstance(damaged, tg.SessionError)
     assert damaged.path == paths.session_file and damaged.account == "default"
 
@@ -339,8 +345,8 @@ def test_a_damaged_named_session_names_its_account(tmp_path: Path) -> None:
     paths = _paths(tmp_path)
     _signed_in(paths).close()
     tg.prepare_session(paths, "work").write_bytes(b"not a database, not at all, just bytes " * 4)
-    built = tg.make_clients(TWO_ACCOUNTS, paths)
-    damaged = built.unavailable["work"]
+    built = tg.make_clients(WORK_OWNS_A_SOURCE, paths)
+    damaged = built.skipped["work"]
     assert isinstance(damaged, tg.SessionError) and damaged.account == "work"
 
 
@@ -350,9 +356,31 @@ def test_make_clients_builds_only_the_accounts_asked_for(tmp_path: Path) -> None
     _signed_in(paths, "work", WORK_KEY).close()
     built = tg.make_clients(TWO_ACCOUNTS, paths, ["work", "work"])
     assert list(built.clients) == ["work"]
-    assert built.unavailable == {}
+    assert built.skipped == {}
     none = tg.make_clients(TWO_ACCOUNTS, paths, [])
-    assert (none.clients, none.unavailable) == ({}, {})
+    assert (none.clients, none.skipped) == ({}, {})
+
+
+def test_make_clients_raises_a_source_owner_s_reason_when_no_account_has_a_session(
+    tmp_path: Path,
+) -> None:
+    """With no client at all there is nothing to go on with: the reason of an account that owns
+    a source comes first, so the hint names the account whose sources would have been fetched."""
+    paths = _paths(tmp_path)
+    only_work = dataclasses.replace(WORK_OWNS_A_SOURCE, sources=[Source(chat=1, account="work")])
+    with pytest.raises(tg.SessionMissing) as raised:
+        tg.make_clients(only_work, paths)
+    assert raised.value.account == "work"
+    with pytest.raises(tg.SessionMissing) as first:
+        tg.make_clients(TWO_ACCOUNTS, paths)
+    assert first.value.account == "default", "no owner: the first account's reason"
+
+
+def test_make_clients_builds_through_the_factory_it_is_given(tmp_path: Path) -> None:
+    paths = _paths(tmp_path)
+    _signed_in(paths).close()
+    built = tg.make_clients(TWO_ACCOUNTS, paths, factory=lambda cfg, p, name: f"client of {name}")
+    assert built.clients == {"default": "client of default"}
 
 
 # --- wrap_auth_errors ------------------------------------------------------------------------
@@ -479,8 +507,10 @@ async def test_connected_all_leaves_out_a_signed_out_account() -> None:
     home, work = FakeClient(), FakeClient(authorized=False)
     async with tg.connected_all({"default": home, "work": work}) as live:
         assert live.clients == {"default": home}
-        assert list(live.refused) == ["work"]
-        assert live.refused["work"].hint == "run: grepogram auth --account work"
+        assert list(live.skipped) == ["work"]
+        refused = live.skipped["work"]
+        assert isinstance(refused, tg.AuthRequired)
+        assert refused.hint == "run: grepogram auth --account work"
         assert home.is_connected() and not work.is_connected()
     assert not home.is_connected()
 

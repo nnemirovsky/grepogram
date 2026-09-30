@@ -44,7 +44,7 @@ import logging
 import secrets
 import sqlite3
 import time
-from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
+from collections.abc import AsyncIterator, Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import asdict
 from enum import StrEnum
 from pathlib import Path
@@ -351,10 +351,10 @@ def sync_cmd(
         conn.close()
         fail("no sources configured; add one with: grepogram sources add <target>")
     try:
-        clients = _signed_in_clients(cfg, paths)
+        accounts = tg.make_clients(cfg, paths)
         embedder = _optional_embedder(cfg)
         current = functools.partial(config.load, paths)
-        report = asyncio.run(_run_sync(clients, conn, current, paths, budget, embedder))
+        report = asyncio.run(_run_sync(accounts, conn, current, paths, budget, embedder))
     except (tg.AuthRequired, tg.SessionError, sync.SyncInProgress, ConfigError) as exc:
         fail(str(exc), hint=getattr(exc, "hint", None))
     except (tg_errors.RPCError, ConnectionError) as exc:
@@ -364,37 +364,14 @@ def sync_cmd(
     _print_report(report)
 
 
-def _signed_in_clients(
-    cfg: Config, paths: Paths, accounts: Iterable[str] | None = None
-) -> dict[str, TelegramClient]:
-    """A client for every one of ``accounts`` (every configured account when ``None``) that
-    has a session file (:func:`grepogram.tg.make_clients`).
-
-    An account without one is a warning when it owns a configured source — that source is
-    skipped this run — and nothing at all otherwise: an install that signs in only named
-    accounts never had a default session to miss. With no client at all, the reason of an
-    account that owns sources (else the first one's) is raised, so a single-account install
-    reads exactly the "run: grepogram auth" it always did.
-    """
-    built = tg.make_clients(cfg, paths, accounts)
-    owners = {source.account for source in cfg.sources}
-    if not built.clients:
-        reasons = built.unavailable
-        if not reasons:
-            return {}
-        first = next(iter(reasons.values()))
-        raise next((exc for name, exc in reasons.items() if name in owners), first)
-    for name, exc in built.unavailable.items():
-        if name in owners:
-            typer.echo(f"warning: account {name}: {exc}; its sources are skipped", err=True)
-    return built.clients
-
-
-def _warn_refused(refused: Mapping[str, tg.AuthRequired]) -> None:
-    """Report the accounts :func:`grepogram.tg.connected_all` left out: signed out, while
-    another account carries on."""
-    for name, exc in refused.items():
-        typer.echo(f"warning: account {name}: {exc}; skipped this run", err=True)
+@contextlib.asynccontextmanager
+async def _connected(accounts: tg.Accounts) -> AsyncIterator[dict[str, TelegramClient]]:
+    """Connect every account of ``accounts`` (:func:`grepogram.tg.connected_all`) and warn about
+    each one left out — no session, or one Telegram refuses — while the others carry on."""
+    async with tg.connected_all(accounts.clients, accounts.skipped) as live:
+        for name, exc in live.skipped.items():
+            typer.echo(f"warning: account {name}: {exc}; skipped this run", err=True)
+        yield live.clients
 
 
 def _optional_embedder(cfg: Config) -> Embedder | None:
@@ -407,7 +384,7 @@ def _optional_embedder(cfg: Config) -> Embedder | None:
 
 
 async def _run_sync(
-    clients: Mapping[str, TelegramClient],
+    accounts: tg.Accounts,
     conn: sqlite3.Connection,
     cfg: sync.ConfigSource,
     paths: Paths,
@@ -417,11 +394,8 @@ async def _run_sync(
     """Connect every account and run :func:`grepogram.sync.sync_all`; ``cfg`` is the config
     loader so the sources come from the file as it is once the sync lock is held, not from the
     snapshot the command started with (a ``sources rm`` may have run while the model loaded)."""
-    async with tg.connected_all(clients) as live:
-        _warn_refused(live.refused)
-        return await sync.sync_all(
-            live.clients, conn, cfg, paths, sync.SyncBudget(budget), embedder
-        )
+    async with _connected(accounts) as live:
+        return await sync.sync_all(live, conn, cfg, paths, sync.SyncBudget(budget), embedder)
 
 
 def _print_report(report: SyncReport) -> None:
@@ -465,9 +439,9 @@ def extract_cmd(
     paths, cfg, conn = _load()
     _require_api_keys(cfg, paths)
     try:
-        clients = _signed_in_clients(cfg, paths)
+        accounts = tg.make_clients(cfg, paths)
         with sync.SyncLock(paths):
-            report = asyncio.run(_run_extract(clients, conn, cfg, budget, retry_failed))
+            report = asyncio.run(_run_extract(accounts, conn, cfg, budget, retry_failed))
     except (tg.AuthRequired, tg.SessionError, sync.SyncInProgress, ConfigError) as exc:
         fail(str(exc), hint=getattr(exc, "hint", None))
     except (tg_errors.RPCError, ConnectionError) as exc:
@@ -478,7 +452,7 @@ def extract_cmd(
 
 
 async def _run_extract(
-    clients: Mapping[str, TelegramClient],
+    accounts: tg.Accounts,
     conn: sqlite3.Connection,
     cfg: Config,
     budget: int | None,
@@ -486,11 +460,10 @@ async def _run_extract(
 ) -> MediaReport:
     """Connect every account and run :func:`grepogram.media.run` under the sync lock the caller
     holds; each chat is read through an account that reaches it."""
-    async with tg.connected_all(clients) as live:
-        _warn_refused(live.refused)
+    async with _connected(accounts) as live:
         return await media.run(
             conn,
-            live.clients,
+            live,
             cfg,
             sync.SyncBudget(budget),
             retry_failed=retry_failed,
@@ -551,8 +524,8 @@ def prune_deleted_cmd(
     _require_api_keys(cfg, paths)
     try:
         chat_id = None if chat is None else filters.resolve_chat(conn, cfg, chat)
-        clients = _signed_in_clients(cfg, paths)
-        report = asyncio.run(_run_prune(clients, conn, cfg, paths, budget, chat_id))
+        accounts = tg.make_clients(cfg, paths)
+        report = asyncio.run(_run_prune(accounts, conn, cfg, paths, budget, chat_id))
     except FilterError as exc:
         fail(str(exc))
     except (tg.AuthRequired, tg.SessionError, sync.SyncInProgress, ConfigError) as exc:
@@ -565,7 +538,7 @@ def prune_deleted_cmd(
 
 
 async def _run_prune(
-    clients: Mapping[str, TelegramClient],
+    accounts: tg.Accounts,
     conn: sqlite3.Connection,
     cfg: Config,
     paths: Paths,
@@ -574,10 +547,9 @@ async def _run_prune(
 ) -> PruneReport:
     """Connect every account and run :func:`grepogram.sync.prune_deleted`, which takes the sync
     lock itself."""
-    async with tg.connected_all(clients) as live:
-        _warn_refused(live.refused)
+    async with _connected(accounts) as live:
         return await sync.prune_deleted(
-            live.clients, conn, cfg, paths, sync.SyncBudget(budget), chat_id=chat_id
+            live, conn, cfg, paths, sync.SyncBudget(budget), chat_id=chat_id
         )
 
 
@@ -630,8 +602,8 @@ def recapture_links_cmd(
     _require_api_keys(cfg, paths)
     try:
         chat_id = None if chat is None else filters.resolve_chat(conn, cfg, chat)
-        clients = _signed_in_clients(cfg, paths)
-        report = asyncio.run(_run_recapture(clients, conn, cfg, paths, budget, chat_id))
+        accounts = tg.make_clients(cfg, paths)
+        report = asyncio.run(_run_recapture(accounts, conn, cfg, paths, budget, chat_id))
     except FilterError as exc:
         fail(str(exc))
     except (tg.AuthRequired, tg.SessionError, sync.SyncInProgress, ConfigError) as exc:
@@ -644,7 +616,7 @@ def recapture_links_cmd(
 
 
 async def _run_recapture(
-    clients: Mapping[str, TelegramClient],
+    accounts: tg.Accounts,
     conn: sqlite3.Connection,
     cfg: Config,
     paths: Paths,
@@ -653,10 +625,9 @@ async def _run_recapture(
 ) -> RecaptureReport:
     """Connect every account and run :func:`grepogram.sync.recapture_links`, which takes the
     sync lock itself."""
-    async with tg.connected_all(clients) as live:
-        _warn_refused(live.refused)
+    async with _connected(accounts) as live:
         return await sync.recapture_links(
-            live.clients, conn, cfg, paths, sync.SyncBudget(budget), chat_id=chat_id
+            live, conn, cfg, paths, sync.SyncBudget(budget), chat_id=chat_id
         )
 
 
@@ -1241,8 +1212,8 @@ def sources_prune(
         fail("no sources configured; add one with: grepogram sources add <target>")
     try:
         folder_accounts = {source.account for source in cfg.sources if source.folder is not None}
-        clients = _signed_in_clients(cfg, paths, sorted(folder_accounts))
-        scan = sources.prunable(cfg, conn, asyncio.run(_folder_membership(clients, cfg)))
+        accounts = tg.make_clients(cfg, paths, sorted(folder_accounts))
+        scan = sources.prunable(cfg, conn, asyncio.run(_folder_membership(accounts, cfg)))
         for candidate in scan.kept:
             typer.echo(f"kept {_chat_label(candidate.chat)}: {candidate.reason}")
         if scan.unresolved:
@@ -1281,16 +1252,13 @@ def sources_prune(
         conn.close()
 
 
-async def _folder_membership(
-    clients: Mapping[str, TelegramClient], cfg: Config
-) -> sources.FolderMembership:
+async def _folder_membership(accounts: tg.Accounts, cfg: Config) -> sources.FolderMembership:
     """Connect every account that owns a folder source and read what each of its folders lists
     right now; the folder of an account that is not connected is recorded as unchecked."""
-    if not clients:
+    if not accounts.clients:
         return await sources.folder_membership(cfg, {})
-    async with tg.connected_all(clients) as live:
-        _warn_refused(live.refused)
-        catalogs = {name: dialogs.DialogCatalog(client) for name, client in live.clients.items()}
+    async with _connected(accounts) as live:
+        catalogs = {name: dialogs.DialogCatalog(client) for name, client in live.items()}
         return await sources.folder_membership(cfg, catalogs)
 
 
@@ -1896,9 +1864,9 @@ def research_run(session_id: SessionArg, as_json: JsonOption = False) -> None:
         try:
             session = research.active_session(rdb, session_id)
             _require_api_keys(cfg, paths)
-            clients = _signed_in_clients(cfg, paths)
+            accounts = tg.make_clients(cfg, paths)
             embedder = _optional_embedder(cfg)
-            report = asyncio.run(_research_run(clients, rdb, conn, cfg, paths, session, embedder))
+            report = asyncio.run(_research_run(accounts, rdb, conn, cfg, paths, session, embedder))
         except (tg.AuthRequired, tg.SessionError) as exc:
             fail(str(exc), hint=getattr(exc, "hint", None))
         except (tg_errors.RPCError, ConnectionError) as exc:
@@ -1912,7 +1880,7 @@ def research_run(session_id: SessionArg, as_json: JsonOption = False) -> None:
 
 
 async def _research_run(
-    clients: Mapping[str, TelegramClient],
+    accounts: tg.Accounts,
     rdb: sqlite3.Connection,
     conn: sqlite3.Connection,
     cfg: Config,
@@ -1920,11 +1888,8 @@ async def _research_run(
     session: ResearchSession,
     embedder: Embedder | None,
 ) -> RunReport:
-    async with tg.connected_all(clients) as live:
-        _warn_refused(live.refused)
-        return await research.run(
-            rdb, conn, cfg, paths, live.clients, session.id, embedder=embedder
-        )
+    async with _connected(accounts) as live:
+        return await research.run(rdb, conn, cfg, paths, live, session.id, embedder=embedder)
 
 
 def _print_run(report: RunReport) -> None:

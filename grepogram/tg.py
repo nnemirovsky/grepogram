@@ -24,7 +24,7 @@ from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Mappin
 from contextlib import AsyncExitStack, asynccontextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import NoReturn
+from typing import Any, NoReturn
 
 from telethon import TelegramClient, errors, utils
 from telethon.sessions import MemorySession, SQLiteSession
@@ -51,13 +51,20 @@ the sign-in flow."""
 Prompt = Callable[[], str | Awaitable[str]]
 
 
+def auth_command(account: str = DEFAULT_ACCOUNT) -> str:
+    """The command that signs ``account`` in: ``grepogram auth``, with ``--account <name>`` for
+    any account but the default one. Every sign-in hint, the CLI's and the MCP server's, is
+    worded around it."""
+    if account == DEFAULT_ACCOUNT:
+        return "grepogram auth"
+    return f"grepogram auth --account {account}"
+
+
 def auth_hint(account: str = DEFAULT_ACCOUNT) -> str:
-    """The command that signs ``account`` in: :data:`AUTH_HINT` itself for the default account,
+    """The CLI's sign-in hint for ``account``: :data:`AUTH_HINT` itself for the default account,
     so a single-account install reads exactly what it always did, and
     ``run: grepogram auth --account <name>`` for any other."""
-    if account == DEFAULT_ACCOUNT:
-        return AUTH_HINT
-    return f"{AUTH_HINT} --account {account}"
+    return f"run: {auth_command(account)}"
 
 
 class AuthRequired(Exception):
@@ -124,36 +131,60 @@ def make_client(cfg: Config, paths: Paths, account: str = DEFAULT_ACCOUNT) -> Te
     return _client(load_session(paths, account), cfg)
 
 
-@dataclass(frozen=True, slots=True)
-class AccountClients:
-    """What :func:`make_clients` built: a client per account that has a session file, and why
-    each of the others has none.
+ClientFactory = Callable[[Config, Paths, str], Any]
+"""Builds the (unconnected) client of an account: ``(config, paths, account)``."""
 
-    ``unavailable`` holds a :class:`SessionMissing` for an account never signed in and a
-    :class:`SessionError` for one whose file cannot be read; both carry the path, and the first
-    the ``grepogram auth --account`` hint. Neither stops the other accounts.
+
+@dataclass(frozen=True, slots=True)
+class Accounts:
+    """The accounts a multi-account pass works with: a client per account that takes part, and
+    why each account that owns a configured source was left out.
+
+    :func:`make_clients` fills ``skipped`` with a :class:`SessionMissing` for an account never
+    signed in and a :class:`SessionError` for one whose file cannot be read;
+    :func:`connected_all` adds the :class:`AuthRequired` of each session Telegram refuses. Every
+    one of them names its account, and none stops the other accounts.
     """
 
-    clients: dict[str, TelegramClient] = field(default_factory=dict)
-    unavailable: dict[str, SessionMissing | SessionError] = field(default_factory=dict)
+    clients: dict[str, Any] = field(default_factory=dict)
+    skipped: dict[str, Exception] = field(default_factory=dict)
 
 
 def make_clients(
-    cfg: Config, paths: Paths, accounts: Iterable[str] | None = None
-) -> AccountClients:
-    """Build a client (:func:`make_client`) for every one of ``accounts`` — every account the
-    config knows (:meth:`~grepogram.models.Config.account_names`) when ``None`` — that has a
-    readable session file, after :func:`ensure_session_mode` has checked it. An account without
-    one is reported in :attr:`AccountClients.unavailable` rather than raised: a second account
-    that was never signed in must not keep the first from syncing. Does not connect."""
-    built = AccountClients()
+    cfg: Config,
+    paths: Paths,
+    accounts: Iterable[str] | None = None,
+    *,
+    factory: ClientFactory | None = None,
+) -> Accounts:
+    """Build a client (``factory``, :func:`make_client` by default — looked up when called) for
+    every one of
+    ``accounts`` — every account the config knows (:meth:`~grepogram.models.Config.account_names`)
+    when ``None`` — that has a readable session file, after :func:`ensure_session_mode` has
+    checked it. Does not connect.
+
+    An account without one is left out rather than raised — a second account that was never
+    signed in must not keep the first from syncing — and reported in :attr:`Accounts.skipped`
+    when it owns a configured source; an install that signs in only named accounts never had a
+    default session to miss. With no client at all, the reason of an account that owns sources
+    (else the first one's) is raised, so a single-account install reads exactly the "run:
+    grepogram auth" it always did.
+    """
+    build = make_client if factory is None else factory
+    clients: dict[str, Any] = {}
+    unavailable: dict[str, Exception] = {}
     for account in dict.fromkeys(cfg.account_names() if accounts is None else accounts):
         try:
             ensure_session_mode(paths, account)
-            built.clients[account] = make_client(cfg, paths, account)
+            clients[account] = build(cfg, paths, account)
         except (SessionMissing, SessionError) as exc:
-            built.unavailable[account] = exc
-    return built
+            unavailable[account] = exc
+    owners = {source.account for source in cfg.sources}
+    if not clients and unavailable:
+        first = next(iter(unavailable.values()))
+        raise next((exc for name, exc in unavailable.items() if name in owners), first)
+    skipped = {name: exc for name, exc in unavailable.items() if name in owners}
+    return Accounts(clients, skipped)
 
 
 def make_login_client(cfg: Config, paths: Paths, account: str = DEFAULT_ACCOUNT) -> TelegramClient:
@@ -229,7 +260,7 @@ async def wrap_auth_errors(
             raise AuthRequired(account=account)
         yield
     except AUTH_ERRORS as exc:
-        raise AuthRequired(f"Telegram rejected the session: {exc}", account) from exc
+        reraise_unauthorized(exc, account)
 
 
 @asynccontextmanager
@@ -251,36 +282,32 @@ async def connected(
         await client.disconnect()
 
 
-@dataclass(frozen=True, slots=True)
-class Live:
-    """What :func:`connected_all` connected: a client per account that is signed in, and the
-    :class:`AuthRequired` of each account whose session Telegram does not accept."""
-
-    clients: dict[str, TelegramClient] = field(default_factory=dict)
-    refused: dict[str, AuthRequired] = field(default_factory=dict)
-
-
 @asynccontextmanager
-async def connected_all(clients: Mapping[str, TelegramClient]) -> AsyncIterator[Live]:
+async def connected_all(
+    clients: Mapping[str, Any], skipped: Mapping[str, Exception] | None = None
+) -> AsyncIterator[Accounts]:
     """:func:`connected` for every account of ``clients`` at once; all of them are disconnected
-    on the way out.
+    on the way out. ``skipped`` are the accounts already left out (:func:`make_clients`).
 
-    An account whose session is not authorized is left out and reported in
-    :attr:`Live.refused` rather than raised — one signed-out account must not keep the others
-    from syncing — unless it leaves no account connected at all, when its :class:`AuthRequired`
-    is raised as :func:`connected` would. Any other failure (the network) is raised.
+    An account whose session is not authorized is left out and added to
+    :attr:`Accounts.skipped` rather than raised — one signed-out account must not keep the
+    others from syncing — unless it leaves no account connected at all, when its
+    :class:`AuthRequired` is raised as :func:`connected` would. Any other failure (the network)
+    is raised.
     """
-    live = Live()
+    live = Accounts(skipped=dict(skipped or {}))
+    refused: list[AuthRequired] = []
     async with AsyncExitStack() as stack:
         for account, client in clients.items():
             try:
                 await stack.enter_async_context(connected(client, account))
             except AuthRequired as exc:
-                live.refused[account] = exc
+                live.skipped[account] = exc
+                refused.append(exc)
                 continue
             live.clients[account] = client
-        if not live.clients and live.refused:
-            raise next(iter(live.refused.values()))
+        if not live.clients and refused:
+            raise refused[0]
         yield live
 
 

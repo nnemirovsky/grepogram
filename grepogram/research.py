@@ -988,7 +988,7 @@ async def read_pins(
             )
             break
         except errors.UnauthorizedError as exc:
-            _raise_auth(exc, session.account)
+            tg.reraise_unauthorized(exc, session.account)
         except (errors.RPCError, ValueError) as exc:
             report.warnings.append(f"the pinned posts of chat {chat.id} could not be read: {exc}")
             done.append(target)
@@ -1058,13 +1058,6 @@ UNRESOLVABLE_NOTE = (
 
 def _stamp(now: int | None) -> int:
     return int(time.time()) if now is None else now
-
-
-def _raise_auth(exc: errors.UnauthorizedError, account: str) -> NoReturn:
-    """A dead session becomes :class:`~grepogram.tg.AuthRequired` naming ``account``."""
-    if isinstance(exc, tg.AUTH_ERRORS):
-        raise tg.AuthRequired(f"Telegram rejected the session: {exc}", account) from exc
-    raise exc
 
 
 def _flood_seconds(exc: errors.FloodError) -> int | None:
@@ -1229,7 +1222,7 @@ async def probe(
     except errors.FloodError:
         raise
     except errors.UnauthorizedError as exc:
-        _raise_auth(exc, session.account)
+        tg.reraise_unauthorized(exc, session.account)
     except errors.RPCError as exc:
         refused = _settle(rdb, candidate, "unavailable", stamp, note=f"Telegram refused: {exc}")
         return ProbeOutcome(candidate=refused, result="unavailable")
@@ -1592,7 +1585,7 @@ async def global_search(
             _record_search(rdb, report, stamp)
             break
         except errors.UnauthorizedError as exc:
-            _raise_auth(exc, session.account)
+            tg.reraise_unauthorized(exc, session.account)
         except errors.RPCError as exc:
             report.warnings.append(f"{kind}: Telegram refused the search: {exc}")
         _record_search(rdb, report, stamp)
@@ -2748,7 +2741,7 @@ async def _join_one(
     except errors.FloodError:
         raise
     except errors.UnauthorizedError as exc:
-        _raise_auth(exc, account)
+        tg.reraise_unauthorized(exc, account)
     except errors.UserAlreadyParticipantError:
         joined = _mark_joined(
             rdb, session, candidate, None, report, "the account was already a member"
@@ -2818,7 +2811,7 @@ async def _join_folder(
     except errors.FloodError:
         raise
     except errors.UnauthorizedError as exc:
-        _raise_auth(exc, account)
+        tg.reraise_unauthorized(exc, account)
     except errors.RPCError as exc:
         for child in children:
             note = f"its shared folder t.me/addlist/{slug} is refused: {exc}"
@@ -2860,7 +2853,7 @@ async def _join_folder(
     except errors.FloodError:
         raise
     except errors.UnauthorizedError as exc:
-        _raise_auth(exc, account)
+        tg.reraise_unauthorized(exc, account)
     except errors.ChannelsTooMuchError:
         for child, _ in to_join:
             note = (
@@ -2987,7 +2980,7 @@ async def _confirm_public(
             _flood_note(report, exc, "checking the chats to read")
             return True
         except errors.UnauthorizedError as exc:
-            _raise_auth(exc, session.account)
+            tg.reraise_unauthorized(exc, session.account)
         except _OtherChat as exc:
             note = f"{exc}; nothing was added or fetched"
             _refuse_candidate(rdb, session, current, "unavailable", note, report)

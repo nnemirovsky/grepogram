@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from telethon import TelegramClient, errors
+from telethon import errors
 from typer.testing import CliRunner
 
 from grepogram import cli, config, db, sources, sync, tg
@@ -1540,11 +1540,11 @@ def test_cli_sources_prune_resolves_before_it_takes_the_sync_lock(
     order: list[str] = []
 
     async def membership_without_the_lock(
-        clients: Mapping[str, TelegramClient], cfg: Config
+        accounts: tg.Accounts, cfg: Config
     ) -> sources.FolderMembership:
         with sync.SyncLock(paths):  # free while the network is being read
             order.append("resolved")
-        return await real_membership(clients, cfg)
+        return await real_membership(accounts, cfg)
 
     def prune_under_the_lock(
         conn: sqlite3.Connection, candidates: Sequence[sources.PruneCandidate]
