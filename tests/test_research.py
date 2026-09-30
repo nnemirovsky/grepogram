@@ -1242,7 +1242,7 @@ async def test_a_cancelled_discover_joins_its_offline_pass_first(
         landed.append("offline")
         return report
 
-    monkeypatch.setattr(research, "discover_offline", slow)
+    monkeypatch.setattr(research.discovery, "discover_offline", slow)
 
     async def call() -> None:
         try:
@@ -2764,7 +2764,7 @@ def test_a_source_planned_before_its_account_went_away_is_never_saved(
     flats = _flats(rdb, session, peer_id=_marked(FLATS), access_hash=77)
     _approve(rdb, conn, session, _item(flats, "add_source"), cfg=cfg)
     approved = _status(rdb, flats).status
-    plan = research._planned_source
+    plan = research.running._planned_source
 
     def plan_then_remove(*args: Any, **kwargs: Any) -> Source | None:
         planned = plan(*args, **kwargs)
@@ -2776,10 +2776,10 @@ def test_a_source_planned_before_its_account_went_away_is_never_saved(
             config.update(paths, lambda current: dataclasses.replace(current, accounts=[]))
         return planned
 
-    monkeypatch.setattr(research, "_planned_source", plan_then_remove)
+    monkeypatch.setattr(research.running, "_planned_source", plan_then_remove)
     report = RunReport(session_id=session.id)
 
-    research._add_sources(rdb, conn, paths, session, [flats], report)
+    research.running._add_sources(rdb, conn, paths, session, [flats], report)
 
     assert config.load(paths).sources == [] and report.sources_added == []
     assert conn.execute("SELECT COUNT(*) FROM peer_cache").fetchone()[0] == 0
@@ -3129,7 +3129,7 @@ def test_an_exclusion_covers_every_spelling_of_the_chat(
     # a peer candidate a probe ties to the excluded chat later is excluded then
     later = research_db.add_candidate(rdb, other.id, "peer:-1000000009999", "peer", 1)
     assert later is not None
-    tied = research._settle(rdb, later, "probed", 3, {"username": "tb_flats"})
+    tied = research.probing._settle(rdb, later, "probed", 3, {"username": "tb_flats"})
     assert tied.status == "excluded"
 
     assert research.unexclude(rdb, CFG, ["+FlatsLink"]) == ["+FlatsLink"]
@@ -3214,13 +3214,13 @@ def test_validation_and_the_grant_are_one_transaction(
     items = [_item(flats, "join", "fetch", "add_source")]
     summary = research.approval_summary(rdb, conn, CFG, session.id, items)
     validated_inside: list[bool] = []
-    prepare = research._prepare
+    prepare = research.approval._prepare
 
     def watched(*args: Any) -> Any:
         validated_inside.append(rdb.in_transaction)
         return prepare(*args)
 
-    monkeypatch.setattr(research, "_prepare", watched)
+    monkeypatch.setattr(research.approval, "_prepare", watched)
     research.grant(rdb, conn, CFG, session.id, items, via="cli", summary=summary)
 
     assert validated_inside == [True], "a skip landing in between cannot be overwritten"
@@ -3308,7 +3308,7 @@ async def test_a_paid_approval_another_search_used_meanwhile_pays_nothing(
     session = _asking(rdb, conn, "apartment")
     _approve(rdb, conn, session, _item(None, "global_search", "paid_search"), cfg=PAYING)
     client = _posts_world().client("default", search_flood=SPENT)
-    refusal = research._paid_refusal
+    refusal = research.searching._paid_refusal
 
     def racing(*args: Any) -> str | None:
         """A second discover call passes the same check and spends the grant first."""
@@ -3318,7 +3318,7 @@ async def test_a_paid_approval_another_search_used_meanwhile_pays_nothing(
                 research_db.consume_grant(rdb, grant.id)
         return answer
 
-    monkeypatch.setattr(research, "_paid_refusal", racing)
+    monkeypatch.setattr(research.searching, "_paid_refusal", racing)
 
     (report,) = await _search(client, rdb, conn, PAYING, session.id)
 
@@ -3614,7 +3614,7 @@ async def test_discovery_reads_the_index_off_the_event_loop(
         seen.append(threading.current_thread().name)
         return offline(*args, **kwargs)
 
-    monkeypatch.setattr(research, "discover_offline", recorded)
+    monkeypatch.setattr(research.discovery, "discover_offline", recorded)
     session = _start(rdb, conn)
     await research.discover(rdb, conn, CFG, session.id, _world().client("default"), now=3)
     assert seen and seen[0] != threading.main_thread().name

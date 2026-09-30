@@ -195,7 +195,7 @@ RESEARCH_LIMIT_MAX: Mapping[str, int] = MappingProxyType(
 
 class LimitOverrides(TypedDict, total=False):
     """The :class:`ResearchLimits` a session is started with instead of the config's, by field;
-    ``None`` keeps the config's (:func:`grepogram.research.session_limits`)."""
+    ``None`` keeps the config's (:func:`grepogram.research.sessions.session_limits`)."""
 
     max_depth: int | None
     max_candidates: int | None
