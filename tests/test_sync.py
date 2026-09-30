@@ -1578,6 +1578,56 @@ async def test_budget_expiry_stops_after_the_current_batch(conn: sqlite3.Connect
     assert [c["min_id"] for c in incremental] == [0, sync.BATCH_SIZE]
 
 
+def test_a_message_allowance_is_counted_apart_from_the_clock() -> None:
+    budget = SyncBudget(messages=3)
+    assert (budget.messages_left, budget.exhausted, budget.halted) == (3, False, False)
+    budget.spend(2)
+    budget.spend(-5)  # nothing negative is ever counted
+    assert budget.messages_left == 1 and not budget.halted
+    budget.spend(4)
+    assert (budget.messages_left, budget.exhausted, budget.halted) == (0, True, True)
+    assert not budget.expired, "indexing and embedding are paced by the clock alone"
+    assert SyncBudget().messages_left is None and not SyncBudget().exhausted
+    with pytest.raises(ValueError, match="negative"):
+        SyncBudget(messages=-1)
+
+
+async def test_a_message_allowance_stops_the_fetch_at_its_cap_and_the_next_run_resumes(
+    conn: sqlite3.Connection,
+) -> None:
+    client = _client(
+        messages={ARG_ID: [tl.message(ARG_ID, i, f"m{i}", sender=1) for i in range(1, 8)]}
+    )
+    chat = db.upsert_chat(conn, ChatRow(id=ARG_ID, type="supergroup"))
+    budget = SyncBudget(messages=3)
+    partial = await sync.sync_chat(client, conn, chat, ARG_SOURCE, budget)
+    assert not partial.complete and partial.new == 3 and budget.spent == 3
+    assert partial.chat.last_msg_id == 3 and partial.chat.last_sync_at is None
+    assert db.message_counts(conn) == {ARG_ID: 3}
+    resumed = await sync.sync_chat(client, conn, partial.chat, ARG_SOURCE, SyncBudget(messages=10))
+    assert resumed.complete and resumed.new == 4
+    assert resumed.chat.last_msg_id == 7 and resumed.chat.last_sync_at is not None
+
+
+async def test_a_spent_message_allowance_leaves_the_next_chats_for_later(
+    conn: sqlite3.Connection, paths: Paths
+) -> None:
+    client = _client(
+        messages={
+            ARG_ID: [tl.message(ARG_ID, 1, "a1", sender=1)],
+            ALICE_ID: [tl.message(ALICE_ID, i, f"b{i}", sender=1) for i in range(1, 6)],
+        }
+    )
+    budget = SyncBudget(messages=3)
+    report = await sync.sync_all(
+        {DEFAULT_ACCOUNT: client}, conn, _cfg(ARG_SOURCE, ALICE_SOURCE), paths, budget
+    )
+    # whichever chat goes first, the run stores three messages and leaves Alice's unfinished
+    assert report.new == 3 and budget.exhausted
+    assert ALICE_ID in report.chats_remaining
+    assert sum(db.message_counts(conn).values()) == 3
+
+
 async def test_private_chat_is_marked_unavailable_and_recovers(conn: sqlite3.Connection) -> None:
     client = _client(
         messages={ARG_ID: [tl.message(ARG_ID, 1, "m1", sender=1)]},

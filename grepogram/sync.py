@@ -439,16 +439,53 @@ class SyncInProgress(Exception):
 class SyncBudget:
     """Wall-clock allowance for one sync run; ``seconds=None`` never expires on its own.
 
+    ``messages`` is an optional allowance of newly stored messages (comments included), which a
+    research run sets from ``max_messages_per_run``: once :meth:`spend` has counted that many,
+    :attr:`exhausted` is true and the fetch stops at its next batch boundary exactly as it does
+    when the clock runs out — the batch it is on is committed and the chat resumes next time.
+    It stops *fetching* only: :attr:`expired` ignores it, so indexing, the re-cut and embedding,
+    which store no message, are paced by the clock alone.
+
     ``clock`` defaults to :func:`time.monotonic` and is injectable for tests.
     """
 
     def __init__(
-        self, seconds: float | None = None, *, clock: Callable[[], float] = time.monotonic
+        self,
+        seconds: float | None = None,
+        *,
+        messages: int | None = None,
+        clock: Callable[[], float] = time.monotonic,
     ) -> None:
+        if messages is not None and messages < 0:
+            raise ValueError(f"a message allowance cannot be negative: {messages}")
         self.seconds = seconds
+        self.messages = messages
+        self.spent = 0
         self._clock = clock
         self.deadline: float | None = None if seconds is None else clock() + seconds
         self._cancelled = False
+
+    def spend(self, count: int) -> None:
+        """Count ``count`` newly stored messages against the allowance."""
+        self.spent += max(0, count)
+
+    @property
+    def messages_left(self) -> int | None:
+        """Messages the allowance still admits, ``None`` without one, never negative."""
+        if self.messages is None:
+            return None
+        return max(0, self.messages - self.spent)
+
+    @property
+    def exhausted(self) -> bool:
+        """Whether the message allowance is used up; never, without one."""
+        return self.messages is not None and self.spent >= self.messages
+
+    @property
+    def halted(self) -> bool:
+        """Whether fetching must stop: the clock ran out, the run was cancelled, or the message
+        allowance is used up. What the fetch loops check; :attr:`expired` is the clock alone."""
+        return self.expired or self.exhausted
 
     @property
     def expired(self) -> bool:
@@ -643,6 +680,7 @@ class _Run:
         ids = await _joined_to_thread(write, self.budget.cancel) if stale else write()
         fresh = sum(1 for row in rows if row.msg_id not in known)
         self.inserted[chat_id] = self.inserted.get(chat_id, 0) + fresh
+        self.budget.spend(fresh)
         return ids
 
     def _write(self, chat_id: int, rows: list[MessageRow], stale: Sequence[int]) -> list[int]:
@@ -861,17 +899,25 @@ async def _fetch_new(run: _Run) -> _Fetched:
             batch.append(row)
             if discussion is not None:
                 run.replies[row.msg_id] = replies_count(msg)
-        if len(batch) < BATCH_SIZE:
+        if len(batch) < _batch_size(run.budget):
             continue
         progress = await _store_batch(run, batch, progress, seen_up_to)
         batch = []
-        if run.budget.expired:
+        if run.budget.halted:
             complete = False
             break
     if complete and (batch or seen_up_to > progress):
         progress = await _store_batch(run, batch, progress, seen_up_to)
         complete = progress >= seen_up_to
     return _Fetched(progress=progress, complete=complete, discussion=discussion)
+
+
+def _batch_size(budget: SyncBudget) -> int:
+    """How many rows :func:`_fetch_new` gathers before storing them: :data:`BATCH_SIZE`, or
+    fewer when a message allowance has less left, so a run stops close to its cap rather than
+    up to a whole batch past it."""
+    left = budget.messages_left
+    return BATCH_SIZE if left is None else max(1, min(BATCH_SIZE, left))
 
 
 async def _store_batch(run: _Run, batch: list[MessageRow], progress: int, seen_up_to: int) -> int:
@@ -906,7 +952,7 @@ async def _store_batch(run: _Run, batch: list[MessageRow], progress: int, seen_u
     )
     try:
         for row in batch:
-            if run.budget.expired:
+            if run.budget.halted:
                 break
             if run.discussion is None:
                 progress = seen_up_to
@@ -1997,7 +2043,7 @@ async def _run_lane(run: _SyncPass, lane: _Lane) -> None:
             log.warning("%s; skipped", foreign)
             tally.warn(lane.account, foreign)
             continue
-        if lane.stopped or run.budget.expired:
+        if lane.stopped or run.budget.halted:
             tally.remaining.append(chat.id)
             run.deferred.append(chat)
             continue
@@ -2063,7 +2109,7 @@ async def _fetch_chat(run: _SyncPass, lane: _Lane, chat: ChatRow, source: Source
         refused, reason, current = synced, "Telegram refused it", synced.chat
     for account in _fallback_accounts(run, lane, chat):
         other = run.lanes[account]
-        if run.budget.expired:
+        if run.budget.halted:
             break
         log.info(
             "chat %s (%s): %s through account %s; trying account %s",
