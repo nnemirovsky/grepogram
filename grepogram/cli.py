@@ -1989,8 +1989,9 @@ def _print_run(report: RunReport) -> None:
             typer.echo(f"{label}: {_ids(ids)}")
     if report.stopped_by is not None:
         typer.echo(f"stopped by: {report.stopped_by}; run it again to go on")
-    if report.pins is not None and report.pins.new_candidates:
-        typer.echo(f"proposed from pinned posts: {len(report.pins.new_candidates)}")
+    if report.pins is not None:
+        if report.pins.new_candidates:
+            typer.echo(f"proposed from pinned posts: {len(report.pins.new_candidates)}")
         _warn_all(report.pins.warnings)
     if report.discovery is not None:
         typer.echo(f"new candidates proposed: {len(report.discovery.new_candidates)}")

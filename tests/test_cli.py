@@ -40,8 +40,10 @@ from grepogram.models import (
     Config,
     MediaReport,
     MessageRow,
+    PinReport,
     PruneReport,
     RecaptureReport,
+    RunReport,
     SearchMode,
 )
 from grepogram.paths import Paths
@@ -2472,3 +2474,17 @@ def test_research_discover_without_a_session_points_at_offline(tmp_home: Path) -
     assert result.exit_code == 1
     assert "run: grepogram auth" in result.stderr
     assert "grepogram research discover 1 --offline" in result.stderr
+
+
+def test_a_run_prints_its_pin_read_warnings_even_when_the_pins_proposed_nothing(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A flood wait or a refused chat while reading pinned posts is worth saying whether or not
+    another pinned post proposed something, as ``research discover`` already says it."""
+    pins = PinReport(session_id=1, warnings=["the pinned posts of chat 5 could not be read: no"])
+
+    cli._print_run(RunReport(session_id=1, pins=pins))
+
+    captured = capsys.readouterr()
+    assert "warning: the pinned posts of chat 5 could not be read: no" in captured.err
+    assert "proposed from pinned posts" not in captured.out
