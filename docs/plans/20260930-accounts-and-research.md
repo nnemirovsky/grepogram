@@ -709,21 +709,48 @@ voided_at)`, `exclusions(identity PRIMARY KEY, reason, created_at)`,
 ### Task 14: Probing and global discovery
 
 **Files:**
-- Modify: `grepogram/research.py`, `tests/fakes.py`, `tests/test_research.py`
+- Modify: `grepogram/research.py`, `grepogram/models.py` (`ProbeResult`, `ProbeOutcome`,
+  `ProbeReport`, `GlobalSearchReport`, `DiscoverReport.probe` / `.searches`), `tests/fakes.py`,
+  `tests/test_research.py`
 
-- [ ] reverify `messages.checkChatInvite`, `messageFwdHeader`, `chatlists`, `channels.searchPosts`
+- [x] reverify `messages.checkChatInvite`, `messageFwdHeader`, `chatlists`, `channels.searchPosts`
   / `checkSearchPostsFlood` and `contacts.search` semantics against core.telegram.org and record
   what the code relies on in the module docstring
-- [ ] `probe(client, rdb, candidate)`: username → entity (title, type, participants, member,
+- [x] `probe(client, rdb, candidate)`: username → entity (title, type, participants, member,
   access hash stored per account); invite → `ChatInvite` (title, `request_needed`, member count) /
   `ChatInviteAlready` (member) / `ChatInvitePeek`; `addlist` → peers become child candidates
   (`via=shared_folder`); `probe_limit` per call; `FloodWaitError` stops probing with a warning
-- [ ] `global_search(client, rdb, session, query)`: only with the config switch and a live
+  ➕ signature `probe(client, rdb, conn, candidate)`: a `peer:` candidate is looked up through
+  `channels.getChannels` with the access hash the index stored for the session's account
+  (`chat_access`) or `messages.getChats` for a legacy group; with no hash nothing is sent and the
+  candidate is `unresolvable` (status unchanged, a note says why) — a private forward origin is
+  never guessed. A refusal (`RPCError`, a `*Forbidden` entity, a username nobody holds) moves a
+  `proposed` candidate to `unavailable` with the reason in its note. `probe_candidates(client,
+  rdb, conn, cfg, session_id, limit=None)` probes unprobed `proposed` / `approved` candidates in
+  ranking order, up to `probe_limit`; `FloodError` stops it (`ProbeReport.flood_wait_s`,
+  warning). Folder children take the folder's depth and `parent_id`, the folder's slug as origin
+  key, and are capped at `max_candidates` per folder; a chat the session reads and people are
+  left out
+- [x] `global_search(client, rdb, session, query)`: only with the config switch and a live
   `global_search` grant; `checkSearchPostsFlood` first, no `allow_paid_stars` unless
   `paid_stars_max > 0` and a `paid_search` grant; results → candidates + evidence only
-- [ ] tests: every invite shape, private/hidden forward origins recorded honestly as
+  ➕ signature `global_search(client, rdb, conn, cfg, session_id, query, kinds=None)` →
+  `list[GlobalSearchReport]`; refuses (`ResearchError` with a hint) while a requested kind is
+  switched off or no `global_search` grant is live. Results are depth-1 candidates with probe
+  facts; a post keeps origin key `post:<peer>/<msg>`. A paid search also needs the price within
+  `paid_stars_max`, and consumes the `paid_search` grant *before* sending (one approval pays
+  once); `global_search` grants are reused. Every search is recorded in `searches`, run or not.
+  ➕ `discover(rdb, conn, cfg, session_id, client=None)` composes offline discovery, the granted
+  global searches not yet run for the session's question, and a probing pass (skipped after a
+  search flood wait)
+- [x] tests: every invite shape, private/hidden forward origins recorded honestly as
   unresolvable, quota exhausted, paid path refused by default, no `messages` row written
-- [ ] run checks — must pass before task 15
+  ➕ `FakeWorld` gains `invites` (`FakeInvite`) and `chatlists` (`FakeChatlist`) and marks a
+  channel or group an account is not in `left`; `FakeClient` answers `checkChatInvite`,
+  `checkChatlistInvite` (`chatlists_joined`), `getChannels` (only with this account's hash),
+  `getChats` (members only), `contacts.search`, `checkSearchPostsFlood` / `searchPosts`
+  (`search_flood`) from the world and learns `chat` / `chats` / `users` off every raw answer
+- [x] run checks — must pass before task 15
 
 ### Task 15: Grants and approval enforcement
 

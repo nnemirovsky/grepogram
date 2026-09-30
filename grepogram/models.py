@@ -71,6 +71,10 @@ GrantChannel = Literal["elicitation", "cli"]
 the controlling terminal. Nothing else can produce one — there is no third channel."""
 SearchKind = Literal["chat_search", "post_search"]
 """A Telegram-side search research ran (``searches.kind``)."""
+ProbeResult = Literal["probed", "unavailable", "unresolvable"]
+"""What probing one candidate came to: its metadata was read; Telegram refused it (an expired
+invite, a banned account, no such username); or this account holds nothing that addresses it
+(a private chat known only by its id), so nothing was asked and nothing is guessed."""
 
 
 DEFAULT_ACCOUNT = "default"
@@ -745,3 +749,70 @@ class DiscoverReport:
     excluded: int = 0
     over_cap: int = 0
     truncated: bool = False
+    probe: "ProbeReport | None" = None
+    """What probing found, when :func:`grepogram.research.discover` had a client to probe with."""
+    searches: "tuple[GlobalSearchReport, ...]" = ()
+    """The global searches that call ran (:func:`grepogram.research.global_search`)."""
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class ProbeOutcome:
+    """Probing one candidate: what it came to, the candidate as now stored, and for a shared
+    folder the candidates its chats became (``children``) and the peers left out of them."""
+
+    candidate: Candidate
+    result: ProbeResult
+    children: tuple[int, ...] = ()
+    people: int = 0
+    excluded: int = 0
+    in_session: int = 0
+    over_cap: int = 0
+
+
+@dataclass(slots=True, kw_only=True)
+class ProbeReport:
+    """One bounded probing pass (:func:`grepogram.research.probe_candidates`).
+
+    ``probed``, ``unavailable`` and ``unresolvable`` split the candidates asked about by
+    :data:`ProbeResult`; ``children`` are the candidates shared folders led to; ``remaining``
+    how many unprobed candidates wait for the next call; ``flood_wait_s`` is set when Telegram
+    asked to wait and probing stopped there.
+    """
+
+    session_id: int
+    probed: list[int] = field(default_factory=list)
+    unavailable: list[int] = field(default_factory=list)
+    unresolvable: list[int] = field(default_factory=list)
+    children: list[int] = field(default_factory=list)
+    remaining: int = 0
+    flood_wait_s: int | None = None
+    warnings: list[str] = field(default_factory=list)
+
+
+@dataclass(slots=True, kw_only=True)
+class GlobalSearchReport:
+    """One Telegram-side search (:func:`grepogram.research.global_search`). Its results became
+    candidates and evidence in ``research.db`` and nothing else.
+
+    ``ran`` is false when the search was not sent (quota spent with paying not allowed, a flood
+    wait, ``flood_wait_s``); ``warnings`` say why. ``quota_*`` and ``wait_till`` are what
+    ``channels.checkSearchPostsFlood`` reported for a post search; ``paid_stars`` what was paid.
+    """
+
+    session_id: int
+    kind: SearchKind
+    query: str
+    ran: bool = False
+    results: int = 0
+    new_candidates: list[int] = field(default_factory=list)
+    updated_candidates: list[int] = field(default_factory=list)
+    people: int = 0
+    in_session: int = 0
+    excluded: int = 0
+    over_cap: int = 0
+    paid_stars: int = 0
+    quota_total: int | None = None
+    quota_remains: int | None = None
+    wait_till: int | None = None
+    flood_wait_s: int | None = None
+    warnings: list[str] = field(default_factory=list)
