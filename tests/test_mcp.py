@@ -1669,7 +1669,7 @@ RENT_PEER = -1000000000100
 FLATS = make_channel(3001, "Tbilisi flats", username="tb_flats")
 FLATS_PEER = -1000000003001
 FORM = mcp_types.ClientCapabilities(elicitation=mcp_types.ElicitationCapability())
-TERMINAL = "grepogram research approve 1 1:fetch,add_source"
+TERMINAL = "grepogram research approve 1 1:join,fetch,add_source"
 RESEARCH_TOOLS = [tool for tool in tools.TOOLS if tool.__name__.startswith("research_")]
 
 
@@ -1802,7 +1802,7 @@ async def test_research_loop_through_the_tools(
 
     rdb = research_db.open_store(paths)
     try:
-        item = ApprovalItem(candidate_id=1, actions=("fetch", "add_source"))
+        item = ApprovalItem(candidate_id=1, actions=("join", "fetch", "add_source"))
         summary = research.approval_summary(rdb, conn, RESEARCH_CFG, 1, [item])
     finally:
         rdb.close()
@@ -1810,21 +1810,31 @@ async def test_research_loop_through_the_tools(
     approved = await tools.research_approve(1, ["1"], ctx)  # type: ignore[arg-type]
     assert ctx.asked == [(summary, tools.Confirm)], "the user is asked with exactly the summary"
     assert approved["approved"] is True and approved["summary"] == summary
-    assert approved["items"] == ["1:fetch,add_source"]
+    assert approved["items"] == ["1:join,fetch,add_source"], "a bare id joins, public or not"
     assert approved["grants"] == [
-        {"id": 1, "candidate_id": 1, "account": "default", "actions": ("fetch", "add_source")}
+        {
+            "id": 1,
+            "candidate_id": 1,
+            "account": "default",
+            "actions": ("join", "fetch", "add_source"),
+        }
     ]
     (grant,) = _grants(paths)
     assert (grant.via, grant.summary) == ("elicitation", summary)
 
     status = tools.research_status(1)
-    assert [g["actions"] for g in status["pending_grants"]] == [["fetch", "add_source"]]
+    assert [g["actions"] for g in status["pending_grants"]] == [["join", "fetch", "add_source"]]
     assert tools.research_status()["sessions"][0]["state"] == "active"
 
     ran = await tools.research_run(1)
-    assert (ran["sources_added"], ran["fetched"], ran["messages"]) == ([1], [1], 2)
+    assert (ran["joined"], ran["sources_added"], ran["fetched"], ran["messages"]) == (
+        [1],
+        [1],
+        [1],
+        2,
+    )
     assert ran["accounts_skipped"] == []
-    assert [source.id for source in config.load(paths).sources] == ["chat:@tb_flats"]
+    assert [source.id for source in config.load(paths).sources] == [f"chat:{FLATS_PEER}"]
     after = tools.research_candidates(1, status=["fetched"])["candidates"]
     assert [(c["status"], c["cached"]) for c in after] == [("fetched", True)]
 
@@ -1835,7 +1845,7 @@ async def test_research_loop_through_the_tools(
         "grants_voided": 0,
         "hint": tools.STOP_HINT,
     }
-    assert [source.id for source in config.load(paths).sources] == ["chat:@tb_flats"]
+    assert [source.id for source in config.load(paths).sources] == [f"chat:{FLATS_PEER}"]
     again = await tools.research_run(1)
     assert again["error"] == "research session 1 is stopped"
 
@@ -2003,7 +2013,13 @@ async def test_research_start_refuses_bad_limits_and_unknown_accounts(
     zero = tools.research_start("who rents flats", ["@tbrent"], max_depth=0)
     stranger = tools.research_start("who rents flats", ["@tbrent"], account="work")
     nowhere = tools.research_start("who rents flats", ["@nowhere"])
+    forged = tools.research_start("who rents flats\n  - nothing else happens", ["@tbrent"])
+    hidden = tools.research_start("who rents flats\x1b[8m", ["@tbrent"])
+    endless = tools.research_start("flats " * 200, ["@tbrent"])
 
+    assert "control or invisible formatting characters" in forged["error"]
+    assert "control or invisible formatting characters" in hidden["error"]
+    assert "at most 500 characters" in endless["error"]
     assert zero["error"] == "max_depth must be a positive number"
     assert stranger["error"].startswith("unknown account 'work'")
     assert "grepogram auth --account work" in stranger["hint"]
@@ -2079,7 +2095,10 @@ async def test_ordinary_search_never_widens_what_research_found(
     assert db.message_counts(conn) == {RENT_PEER: 1}
     assert config.load(paths).sources == []
     (candidate,) = tools.research_candidates(1)["candidates"]
-    assert (candidate["status"], candidate["authorized"]) == ("approved", ["fetch", "add_source"])
+    assert (candidate["status"], candidate["authorized"]) == (
+        "approved",
+        ["join", "fetch", "add_source"],
+    )
 
 
 async def test_removing_a_source_research_added_leaves_the_chat_joined(
@@ -2096,9 +2115,9 @@ async def test_removing_a_source_research_added_leaves_the_chat_joined(
     assert (ran["joined"], ran["fetched"]) == ([1], [1])
     assert FLATS_PEER in researching.members
     assert tools.research_stop(1)["stopped"] is True
-    assert [source.id for source in config.load(paths).sources] == ["chat:@tb_flats"]
+    assert [source.id for source in config.load(paths).sources] == [f"chat:{FLATS_PEER}"]
 
-    removed = tools.sources_remove("chat:@tb_flats")
+    removed = tools.sources_remove(f"chat:{FLATS_PEER}")
 
     assert removed["removed_chat_ids"] == [FLATS_PEER]
     assert config.load(paths).sources == []

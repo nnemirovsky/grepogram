@@ -705,7 +705,8 @@ class FakeClient:
 
     def _join_channel(self, request: Any) -> Any:
         """``channels.joinChannel``: a public chat anyone joins, one whose admins approve joins
-        (``join_requests``) answers with the request sent, and a private one refuses — a join
+        (``join_requests``, or the channel's own ``join_request`` flag, as Telegram sets it)
+        answers with the request sent, and a private one refuses — a join
         by id reaches only what is public. The access hash must be this account's."""
         wanted = request.channel
         marked = int(utils.get_peer_id(types.PeerChannel(wanted.channel_id)))
@@ -716,7 +717,7 @@ class FakeClient:
             return self._joined(entity)
         if not getattr(entity, "username", None):
             raise errors.ChannelPrivateError(request=request)
-        if marked in self.join_requests:
+        if marked in self.join_requests or getattr(entity, "join_request", False):
             self.requested.add(marked)
             raise errors.InviteRequestSentError(request=request)
         return self._joined(entity)

@@ -180,7 +180,8 @@ _CHANNELS: frozenset[str] = frozenset(get_args(GrantChannel))
 _SEARCH_KINDS: frozenset[str] = frozenset(get_args(SearchKind))
 _EXCLUDABLE = ("proposed", "approved", "skipped")
 """Statuses an exclusion moves to ``excluded``: decisions not acted on yet. A chat already
-joined or fetched stays what it is — excluding it narrows future discovery, it undoes nothing."""
+joined or fetched keeps its status — excluding it undoes nothing on Telegram — but loses every
+approval still pending for it (:func:`add_exclusion`)."""
 
 _CANDIDATE_FIELDS = frozenset(
     {
@@ -469,15 +470,40 @@ def add_candidate(
     """The session's candidate for ``identity``, created ``proposed`` when it is new.
 
     An identity already present keeps its row, status included; it takes the smaller depth and
-    fills fields it did not know yet. An excluded identity gets no row at all and answers
-    ``None`` — exclusions are global, so no session proposes one again.
+    fills fields it did not know yet. So does a chat the session already holds under another
+    spelling — ``@name``, ``peer:<id>`` and an invite are one chat once a probe tied them
+    together, and ``peer_id`` / ``username`` name that chat here (:func:`candidate_for`). An
+    excluded chat, under any spelling it is known by (:func:`excluded_by`), gets no row at all
+    and answers ``None`` — exclusions are global, so no session proposes one again.
     """
     _check(kind, _KINDS, "candidate kind")
     if depth < 0:
         raise ValueError(f"a candidate's depth cannot be negative: {depth}")
     with db.transaction(conn):
-        if is_excluded(conn, identity):
+        if excluded_by(conn, identity, peer_id=peer_id, username=username) is not None:
             return None
+        known = candidate_for(
+            conn,
+            session_id,
+            identity,
+            peer_id=peer_id,
+            username=username,
+            invite_hash=invite_hash,
+        )
+        if known is not None and known.identity != identity:
+            # the chat is already a candidate under another spelling: that row is the one
+            row = conn.execute(
+                """UPDATE candidates SET
+                       depth = MIN(depth, ?),
+                       peer_id = COALESCE(peer_id, ?),
+                       username = COALESCE(username, ?),
+                       invite_hash = COALESCE(invite_hash, ?),
+                       addlist_slug = COALESCE(addlist_slug, ?),
+                       parent_id = COALESCE(parent_id, ?)
+                   WHERE id = ? RETURNING *""",
+                (depth, peer_id, username, invite_hash, addlist_slug, parent_id, known.id),
+            ).fetchone()
+            return _candidate(row)
         row = conn.execute(
             """INSERT INTO candidates(session_id, identity, kind, depth, peer_id, username,
                    invite_hash, addlist_slug, parent_id, created_at)
@@ -518,6 +544,124 @@ def candidate_by_identity(
         "SELECT * FROM candidates WHERE session_id = ? AND identity = ?", (session_id, identity)
     ).fetchone()
     return None if row is None else _candidate(row)
+
+
+def candidate_for(
+    conn: sqlite3.Connection,
+    session_id: int,
+    identity: str,
+    *,
+    peer_id: int | None = None,
+    username: str | None = None,
+    invite_hash: str | None = None,
+) -> Candidate | None:
+    """The session's candidate for the chat ``identity`` names: the row of that identity, else
+    the oldest one a probe tied to the same ``peer_id``, ``username`` or ``invite_hash``."""
+    found = candidate_by_identity(conn, session_id, identity)
+    if found is not None:
+        return found
+    clauses, params = _same_chat(peer_id, username, invite_hash)
+    if not clauses:
+        return None
+    row = conn.execute(
+        f"SELECT * FROM candidates WHERE session_id = ? AND ({' OR '.join(clauses)}) "
+        "ORDER BY id LIMIT 1",
+        (session_id, *params),
+    ).fetchone()
+    return None if row is None else _candidate(row)
+
+
+def _same_chat(
+    peer_id: int | None, username: str | None, invite_hash: str | None = None
+) -> tuple[list[str], list[Any]]:
+    """The ``candidates`` conditions naming the chat ``peer_id`` / ``username`` / an invite
+    identify."""
+    clauses: list[str] = []
+    params: list[Any] = []
+    if peer_id is not None:
+        clauses.append("peer_id = ?")
+        params.append(peer_id)
+    if username:
+        clauses.append("username = ?")
+        params.append(username.lower())
+    if invite_hash:
+        clauses.append("invite_hash = ?")
+        params.append(invite_hash)
+    return clauses, params
+
+
+def same_chat_candidates(conn: sqlite3.Connection, candidate: Candidate) -> list[Candidate]:
+    """The other candidates of ``candidate``'s session a probe has tied to the same chat."""
+    clauses, params = _same_chat(candidate.peer_id, candidate.username)
+    if not clauses:
+        return []
+    rows = conn.execute(
+        f"SELECT * FROM candidates WHERE session_id = ? AND id <> ? AND ({' OR '.join(clauses)}) "
+        "ORDER BY id",
+        (candidate.session_id, candidate.id, *params),
+    ).fetchall()
+    return [_candidate(row) for row in rows]
+
+
+def has_grants(conn: sqlite3.Connection, candidate_id: int) -> bool:
+    """Whether any grant — live, consumed or voided — ever named ``candidate_id``."""
+    row = conn.execute("SELECT 1 FROM grants WHERE candidate_id = ?", (candidate_id,)).fetchone()
+    return row is not None
+
+
+_MERGED_FIELDS = (
+    "peer_id",
+    "username",
+    "invite_hash",
+    "addlist_slug",
+    "title",
+    "type",
+    "participants",
+    "member",
+    "access_hash",
+    "request_needed",
+    "probed_at",
+)
+
+
+def merge_candidate(conn: sqlite3.Connection, keep_id: int, drop_id: int) -> Candidate:
+    """Fold candidate ``drop_id`` into ``keep_id`` — the same chat reached by two spellings —
+    and return what is kept.
+
+    Every piece of evidence moves over (a path both hold counts once), the kept row fills what
+    it did not know and takes the smaller depth, the dropped row's folder children follow it,
+    and the dropped row goes. Only a candidate no human decided on may be dropped: one with a
+    grant, ever, or with any status but ``proposed`` raises :class:`ValueError`, since its
+    history is a decision someone made.
+    """
+    with db.transaction(conn):
+        keep = get_candidate(conn, keep_id)
+        drop = get_candidate(conn, drop_id)
+        if keep is None or drop is None or keep.session_id != drop.session_id or keep.id == drop.id:
+            raise KeyError(f"cannot merge candidate {drop_id} into {keep_id}")
+        if drop.status != "proposed" or has_grants(conn, drop.id):
+            raise ValueError(f"candidate {drop_id} carries a decision and is not merged away")
+        conn.execute(
+            """INSERT INTO evidence(candidate_id, via, chat_id, msg_id, origin_key, snippet,
+                   found_at)
+               SELECT ?, via, chat_id, msg_id, origin_key, snippet, found_at
+               FROM evidence WHERE candidate_id = ? ORDER BY id
+               ON CONFLICT DO NOTHING""",
+            (keep.id, drop.id),
+        )
+        conn.execute(
+            "UPDATE candidates SET parent_id = ? WHERE parent_id = ? AND id <> ?",
+            (keep.id, drop.id, keep.id),
+        )
+        conn.execute("DELETE FROM candidates WHERE id = ?", (drop.id,))
+        filled = {
+            name: getattr(drop, name)
+            for name in _MERGED_FIELDS
+            if getattr(keep, name) is None and getattr(drop, name) is not None
+        }
+        if drop.depth < keep.depth:
+            conn.execute("UPDATE candidates SET depth = ? WHERE id = ?", (drop.depth, keep.id))
+        return update_candidate(conn, keep.id, **filled)
 
 
 def list_candidates(
@@ -787,8 +931,101 @@ def void_grants(
 
 
 def is_excluded(conn: sqlite3.Connection, identity: str) -> bool:
+    """Whether ``identity`` itself is excluded; :func:`excluded_by` also asks every other
+    spelling the chat is known by."""
     row = conn.execute("SELECT 1 FROM exclusions WHERE identity = ?", (identity,)).fetchone()
     return row is not None
+
+
+def _spelled(identity: str) -> tuple[int | None, str | None, str | None]:
+    """The peer id, username or invite hash an identity names outright: ``peer:<id>``,
+    ``@name``, ``+hash``."""
+    if identity.startswith("@"):
+        return None, identity[1:].lower() or None, None
+    if identity.startswith("+"):
+        return None, None, identity[1:] or None
+    if identity.startswith("peer:"):
+        try:
+            return int(identity.removeprefix("peer:")), None, None
+        except ValueError:
+            return None, None, None
+    return None, None, None
+
+
+def excluded_by(
+    conn: sqlite3.Connection,
+    identity: str,
+    *,
+    peer_id: int | None = None,
+    username: str | None = None,
+) -> str | None:
+    """The exclusion covering the chat ``identity`` names, or ``None``.
+
+    A chat has several spellings — ``@name``, ``peer:<id>``, an invite — and an exclusion
+    names one of them. It covers the chat under all of them: the identity itself, the
+    ``@username`` and ``peer:<id>`` forms of what is known about it (``peer_id``, ``username``,
+    or what ``identity`` spells out), and every spelling of the candidates, in any session, a
+    probe tied to the same peer id or username.
+    """
+    spelled_peer, spelled_name, spelled_invite = _spelled(identity)
+    peer_id = peer_id if peer_id is not None else spelled_peer
+    username = (username or spelled_name or "").lower() or None
+    names = {identity}
+    peers: set[int | None] = {peer_id}
+    usernames: set[str | None] = {username}
+    invites: set[str | None] = {spelled_invite}
+    clauses, params = _same_chat(peer_id, username, spelled_invite)
+    if clauses:
+        for row in conn.execute(
+            "SELECT identity, peer_id, username, invite_hash FROM candidates "
+            f"WHERE {' OR '.join(clauses)}",
+            params,
+        ):
+            names.add(row["identity"])
+            peers.add(row["peer_id"])
+            usernames.add(row["username"])
+            invites.add(row["invite_hash"])
+    names.update(f"@{name}" for name in usernames if name)
+    names.update(f"peer:{peer}" for peer in peers if peer is not None)
+    names.update(f"+{invite}" for invite in invites if invite)
+    wanted = sorted(names)
+    row = conn.execute(
+        f"SELECT identity FROM exclusions WHERE identity IN ({_placeholders(len(wanted))}) "
+        "ORDER BY created_at LIMIT 1",
+        wanted,
+    ).fetchone()
+    return None if row is None else str(row["identity"])
+
+
+def candidate_excluded(conn: sqlite3.Connection, candidate: Candidate) -> bool:
+    """Whether an exclusion covers ``candidate``'s chat under any spelling (:func:`excluded_by`)."""
+    found = excluded_by(
+        conn, candidate.identity, peer_id=candidate.peer_id, username=candidate.username
+    )
+    return found is not None
+
+
+def _covered(conn: sqlite3.Connection, identity: str) -> list[sqlite3.Row]:
+    """Every candidate, in any session, of the chat ``identity`` names: that identity, and the
+    candidates sharing a peer id, username or invite with it or with a candidate of that
+    identity."""
+    spelled_peer, spelled_name, spelled_invite = _spelled(identity)
+    rows = conn.execute(
+        """WITH named(peer_id, username, invite_hash) AS (
+               SELECT peer_id, username, invite_hash FROM candidates WHERE identity = ?
+               UNION ALL SELECT ?, ?, ?
+           )
+           SELECT id, session_id, status FROM candidates
+           WHERE identity = ? OR EXISTS (
+               SELECT 1 FROM named
+               WHERE (named.peer_id IS NOT NULL AND named.peer_id = candidates.peer_id)
+                  OR (named.username IS NOT NULL AND named.username = candidates.username)
+                  OR (named.invite_hash IS NOT NULL AND named.invite_hash = candidates.invite_hash)
+           )
+           ORDER BY id""",
+        (identity, spelled_peer, spelled_name, spelled_invite, identity),
+    ).fetchall()
+    return list(rows)
 
 
 def list_exclusions(conn: sqlite3.Connection) -> list[Exclusion]:
@@ -803,11 +1040,15 @@ def add_exclusion(
     conn: sqlite3.Connection, identity: str, reason: str | None = None, now: int | None = None
 ) -> int:
     """Exclude ``identity`` from every session, present and future; returns how many existing
-    candidates it moved to ``excluded``.
+    candidates it set aside.
 
-    Those are the candidates no run has acted on yet (:data:`_EXCLUDABLE`), in every session,
-    and their live grants are voided in the same transaction — excluding narrows, so it needs no
-    consent and must leave nothing authorized behind. Excluding again keeps the first record.
+    It covers the chat under every spelling it is known by (:func:`_covered`, the same rule
+    :func:`excluded_by` asks with). Candidates no run has acted on yet (:data:`_EXCLUDABLE`) move
+    to ``excluded``; a joined one or one waiting for an admission keeps its status, since that
+    already happened on Telegram. Either way every live grant of theirs is voided in the same
+    transaction — excluding narrows, so it needs no consent and must leave nothing authorized
+    behind, not the fetch or source still pending for a chat a run already joined. Excluding
+    again keeps the first record.
     """
     if not identity:
         raise ValueError("an exclusion needs an identity")
@@ -818,28 +1059,30 @@ def add_exclusion(
             "ON CONFLICT(identity) DO NOTHING",
             (identity, reason, stamp),
         )
-        rows = conn.execute(
-            f"""UPDATE candidates SET status = 'excluded'
-                WHERE identity = ? AND status IN ({_placeholders(len(_EXCLUDABLE))})
-                RETURNING id, session_id""",
-            (identity, *_EXCLUDABLE),
-        ).fetchall()
-        for row in rows:
-            void_grants(conn, row["session_id"], candidate_ids=[row["id"]], now=stamp)
-    return len(rows)
+        set_aside = 0
+        for row in _covered(conn, identity):
+            moved = row["status"] in _EXCLUDABLE
+            if moved:
+                update_candidate(conn, row["id"], status="excluded")
+            voided = void_grants(conn, row["session_id"], candidate_ids=[row["id"]], now=stamp)
+            set_aside += bool(moved or voided)
+    return set_aside
 
 
 def remove_exclusion(conn: sqlite3.Connection, identity: str) -> bool:
     """Lift an exclusion; the candidates it moved to ``excluded`` go back to ``proposed`` (their
-    voided grants stay void). ``False`` when ``identity`` was not excluded."""
+    voided grants stay void) unless another exclusion still covers them. ``False`` when
+    ``identity`` was not excluded."""
     with db.transaction(conn):
         cursor = conn.execute("DELETE FROM exclusions WHERE identity = ?", (identity,))
         if cursor.rowcount == 0:
             return False
-        conn.execute(
-            "UPDATE candidates SET status = 'proposed' WHERE identity = ? AND status = 'excluded'",
-            (identity,),
-        )
+        for row in _covered(conn, identity):
+            candidate = get_candidate(conn, row["id"])
+            if candidate is None or candidate.status != "excluded":
+                continue
+            if not candidate_excluded(conn, candidate):
+                update_candidate(conn, candidate.id, status="proposed")
     return True
 
 

@@ -1,3 +1,5 @@
+import asyncio
+import copy
 import dataclasses
 import logging
 import re
@@ -92,6 +94,11 @@ def _start(
     return research.start_session(
         rdb, conn, CFG, QUESTION, list(seeds), "default", ResearchLimits(**limits), now=1
     )
+
+
+def _asking(rdb: sqlite3.Connection, conn: sqlite3.Connection, question: str) -> ResearchSession:
+    """A session whose question is ``question``: the one query its global search may send."""
+    return research.start_session(rdb, conn, CFG, question, [str(SEED)], "default", now=1)
 
 
 def _by_identity(
@@ -920,7 +927,7 @@ def _posts_world(**kwargs: Any) -> FakeWorld:
 async def test_global_search_needs_the_switch_and_a_grant(
     rdb: sqlite3.Connection, conn: sqlite3.Connection
 ) -> None:
-    session = _start(rdb, conn)
+    session = _asking(rdb, conn, "tbilisi")
     client = _world().client("default")
     with pytest.raises(research.ResearchError) as off:
         await research.global_search(client, rdb, conn, CFG, session.id, "tbilisi")
@@ -940,7 +947,7 @@ async def test_global_search_needs_the_switch_and_a_grant(
 async def test_chat_search_proposes_public_chats_as_evidence_only(
     rdb: sqlite3.Connection, conn: sqlite3.Connection
 ) -> None:
-    session = _start(rdb, conn)
+    session = _asking(rdb, conn, "tbilisi")
     _grant(rdb, session, "global_search")
     client = _world().client("default")
     before = _counts(conn)
@@ -966,7 +973,7 @@ async def test_chat_search_proposes_public_chats_as_evidence_only(
 async def test_post_search_asks_the_quota_first_and_records_posts_as_evidence(
     rdb: sqlite3.Connection, conn: sqlite3.Connection
 ) -> None:
-    session = _start(rdb, conn)
+    session = _asking(rdb, conn, "apartment")
     _grant(rdb, session, "global_search")
     client = _posts_world().client("default")
     before = _counts(conn)
@@ -994,7 +1001,7 @@ async def test_post_search_asks_the_quota_first_and_records_posts_as_evidence(
 async def test_a_spent_quota_is_never_paid_for_by_default(
     rdb: sqlite3.Connection, conn: sqlite3.Connection
 ) -> None:
-    session = _start(rdb, conn)
+    session = _asking(rdb, conn, "apartment")
     _grant(rdb, session, "global_search", "paid_search")
     spent = types.SearchPostsFlood(total_daily=10, remains=0, stars_amount=50, wait_till=99)
     client = _posts_world().client("default", search_flood=spent)
@@ -1014,7 +1021,7 @@ async def test_a_spent_quota_is_never_paid_for_by_default(
 async def test_paying_needs_the_ceiling_and_a_separate_paid_grant_used_once(
     rdb: sqlite3.Connection, conn: sqlite3.Connection
 ) -> None:
-    session = _start(rdb, conn)
+    session = _asking(rdb, conn, "apartment")
     _grant(rdb, session, "global_search")
     spent = types.SearchPostsFlood(total_daily=10, remains=0, stars_amount=50)
     paying = Config(research=ResearchCfg(enabled=True, post_search=True, paid_stars_max=100))
@@ -1042,7 +1049,7 @@ async def test_paying_needs_the_ceiling_and_a_separate_paid_grant_used_once(
 async def test_a_flood_wait_on_search_is_recorded_and_stops_the_searches(
     rdb: sqlite3.Connection, conn: sqlite3.Connection
 ) -> None:
-    session = _start(rdb, conn)
+    session = _asking(rdb, conn, "tbilisi")
     _grant(rdb, session, "global_search")
     flood = errors.FloodWaitError(request=None, capture=60)
     client = _world().client("default", responses={functions.contacts.SearchRequest: flood})
@@ -1059,7 +1066,7 @@ async def test_a_flood_wait_on_search_is_recorded_and_stops_the_searches(
 async def test_an_excluded_search_result_is_never_proposed(
     rdb: sqlite3.Connection, conn: sqlite3.Connection
 ) -> None:
-    session = _start(rdb, conn)
+    session = _asking(rdb, conn, "flats")
     _grant(rdb, session, "global_search")
     research_db.add_exclusion(rdb, "@tb_flats")
 
@@ -1200,9 +1207,9 @@ def test_the_summary_names_target_account_membership_and_every_action(
             "a member, visible to its admins",
             "  - fetch its history since 1969-01-01 with the comments of its discussion group as "
             "default into the local index",
-            "  - add it as an ongoing source of account default (since 1969-01-01): regular sync "
-            "and search will include it from now on, and stopping this research session does "
-            "not remove it",
+            "  - add it as an ongoing source of account default (since 1969-01-01, with the "
+            "comments of its discussion group): regular sync and search will include it from "
+            "now on, and stopping this research session does not remove it",
             "",
             research.DESCENDANTS_NOTE,
         ]
@@ -1724,10 +1731,10 @@ async def test_a_run_joins_fetches_and_only_proposes_what_it_finds(
     assert _stored(conn, _marked(FLATS)) == [1, 2, 3]
     (source,) = config.load(paths).sources
     assert source == Source(
-        chat="@tb_flats", since=research.horizon(session), comments=True, account="default"
-    )
+        chat=_marked(FLATS), since=research.horizon(session), comments=True, account="default"
+    ), "a joined chat's source names the probed peer, not a username that could move"
     done = _status(rdb, flats)
-    assert (done.status, done.member, done.source_id) == ("fetched", True, "chat:@tb_flats")
+    assert (done.status, done.member, done.source_id) == ("fetched", True, source.id)
     assert _live(rdb, flats) == [], "every approved action was carried out: the grant is used"
     # the hidden link in the fetched chat is followed one hop further — and only proposed
     assert report.discovery is not None
@@ -2018,7 +2025,7 @@ def test_a_bare_id_approves_what_indexing_the_chat_takes(
     filled = research.with_default_actions(rdb, session.id, research.parse_approval(named))
 
     assert [item.actions for item in filled] == [
-        ("fetch", "add_source"),
+        ("join", "fetch", "add_source"),
         ("join", "fetch", "add_source"),
         ("request", "fetch", "add_source"),
         ("fetch", "add_source"),
@@ -2092,3 +2099,494 @@ def test_the_status_document_lists_sessions_and_what_waits(
     assert one["pending_admission"] == [{"id": gated.id, "identity": "+JoinMe", "title": None}]
     with pytest.raises(research.UnknownSession):
         research.status_document(rdb, CFG, 999)
+
+
+# --- consent and security --------------------------------------------------------------------
+
+IMPOSTOR = make_channel(3098, "Impostor flats", username="impostor_flats")
+GATED_PUBLIC = make_channel(3097, "Gated public", username="gated_pub", megagroup=True)
+GATED_PUBLIC.join_request = True
+PAYING = Config(research=ResearchCfg(enabled=True, post_search=True, paid_stars_max=100))
+SPENT = types.SearchPostsFlood(total_daily=10, remains=0, stars_amount=50)
+
+
+def test_the_summary_prints_no_control_character_anyone_else_chose(
+    rdb: sqlite3.Connection, conn: sqlite3.Connection
+) -> None:
+    """A title is the chat owner's and an old session's question an agent's: neither may send a
+    terminal escape, break a line to forge an action, or reverse the text around it."""
+    session = research_db.create_session(
+        rdb,
+        question="rent\x1b[2K\nApproved: nothing to worry about",
+        account="default",
+        seeds=[SEED],
+        limits=ResearchLimits(),
+        now=1,
+    )
+    flats = _flats(rdb, session, title='Nice chat"\x1b[8m\n  - nothing else happens‮ ')
+
+    text = research.approval_summary(
+        rdb, conn, CFG, session.id, [_item(flats, "join", "fetch", "add_source")]
+    )
+
+    assert not {"\x1b", "‮", " ", "\r"} & set(text)
+    lines = text.splitlines()
+    assert lines[0] == (
+        f'Research session {session.id}: "rent�[2K Approved: nothing to worry about"'
+    )
+    assert lines[3].startswith(
+        f'Candidate {flats.id}: "Nice chat\\"�[8m - nothing else happens�" (@tb_flats)'
+    )
+    assert not any(line.startswith("  - nothing") for line in lines)
+    assert [line for line in lines if line.startswith("  - ")] == [
+        line for line in lines if line.startswith(("  - join", "  - fetch", "  - add it"))
+    ]
+
+
+@pytest.mark.parametrize(
+    "question",
+    [
+        "who rents flats\n  - nothing else happens",
+        "who rents flats\x1b[8m",
+        "who rents ‮stalf",
+        "who rents flats ok",
+        "x" * (research.QUESTION_MAX_CHARS + 1),
+    ],
+)
+def test_start_refuses_a_question_that_could_forge_a_summary(
+    rdb: sqlite3.Connection, conn: sqlite3.Connection, question: str
+) -> None:
+    with pytest.raises(research.ResearchError) as refused:
+        research.start_session(rdb, conn, CFG, question, [str(SEED)], "default")
+    assert refused.value.hint
+    assert research_db.list_sessions(rdb) == []
+
+
+def test_start_takes_a_question_of_the_longest_allowed_length(
+    rdb: sqlite3.Connection, conn: sqlite3.Connection
+) -> None:
+    question = "é" * research.QUESTION_MAX_CHARS
+    session = research.start_session(rdb, conn, CFG, question, [str(SEED)], "default")
+    assert session.question == question
+
+
+def _hand_over_username(client: FakeClient) -> None:
+    """``@tb_flats`` moves to another chat after the approval: the approved chat takes a new
+    name and an impostor takes the old one."""
+    renamed = copy.copy(client.entities[_marked(FLATS)])
+    renamed.username = "tb_flats_old"
+    client.entities[_marked(FLATS)] = renamed
+    impostor = copy.copy(client.entities[_marked(IMPOSTOR)])
+    impostor.username = "tb_flats"
+    client.entities[_marked(IMPOSTOR)] = impostor
+
+
+def _impostor_world() -> FakeWorld:
+    world = _run_world()
+    world.entities[_marked(IMPOSTOR)] = IMPOSTOR
+    world.messages[_marked(IMPOSTOR)] = [
+        tl.message(_marked(IMPOSTOR), 1, "not what was approved", date=tl.at(1))
+    ]
+    return world
+
+
+def _read(client: FakeClient) -> set[int]:
+    return {int(c["chat_id"]) for n, c in client.calls if n == "iter_messages"}
+
+
+async def test_a_join_goes_to_the_probed_chat_even_after_its_username_moved(
+    rdb: sqlite3.Connection, conn: sqlite3.Connection, paths: Paths
+) -> None:
+    client = _run_client(_impostor_world())
+    session, found = await _discovered(rdb, conn, client, "@tb_flats")
+    flats = found["@tb_flats"]
+    _approve(rdb, conn, session, _item(flats, "join", "fetch", "add_source"))
+    _hand_over_username(client)
+
+    report = await _run(rdb, conn, paths, client, session)
+
+    assert report.joined == report.fetched == [flats.id]
+    assert _marked(FLATS) in client.members and _marked(IMPOSTOR) not in client.members
+    (join,) = [r for r in client.requests if isinstance(r, functions.channels.JoinChannelRequest)]
+    assert join.channel.channel_id == FLATS.id, "joined by the probed peer, not the username"
+    (source,) = config.load(paths).sources
+    assert source.chat == _marked(FLATS)
+    assert _marked(IMPOSTOR) not in _read(client) and _stored(conn, _marked(IMPOSTOR)) == []
+    assert _status(rdb, flats).peer_id == _marked(FLATS)
+
+
+async def test_a_username_that_now_names_another_chat_is_never_joined(
+    rdb: sqlite3.Connection, conn: sqlite3.Connection, paths: Paths
+) -> None:
+    """With no access hash to address the probed peer, the join resolves the username — and
+    refuses when it no longer names that peer."""
+    client = _run_client(_impostor_world())
+    session, found = await _discovered(rdb, conn, client, "@tb_flats")
+    flats = research_db.update_candidate(rdb, found["@tb_flats"].id, access_hash=None)
+    _approve(rdb, conn, session, _item(flats, "join", "fetch", "add_source"))
+    _hand_over_username(client)
+
+    report = await _run(rdb, conn, paths, client, session)
+
+    assert report.unavailable == [flats.id] and report.joined == []
+    stored = _status(rdb, flats)
+    assert stored.status == "unavailable" and stored.peer_id == _marked(FLATS)
+    assert "now names a different chat" in (stored.note or "")
+    assert not [r for r in client.requests if isinstance(r, functions.channels.JoinChannelRequest)]
+    assert config.load(paths).sources == [] and _live(rdb, flats) == []
+    assert _read(client) == set()
+
+
+async def test_a_public_chat_read_without_joining_is_checked_before_it_is_added(
+    rdb: sqlite3.Connection, conn: sqlite3.Connection, paths: Paths
+) -> None:
+    client = _run_client(_impostor_world())
+    session, found = await _discovered(rdb, conn, client, "@tb_flats")
+    flats = found["@tb_flats"]
+    _approve(rdb, conn, session, _item(flats, "fetch", "add_source"))
+    _hand_over_username(client)
+
+    report = await _run(rdb, conn, paths, client, session)
+
+    assert report.unavailable == [flats.id] and report.sources_added == []
+    assert "now names a different chat" in (_status(rdb, flats).note or "")
+    assert config.load(paths).sources == [] and _read(client) == set()
+
+
+async def test_an_unmoved_public_chat_read_without_joining_is_added_by_its_username(
+    rdb: sqlite3.Connection, conn: sqlite3.Connection, paths: Paths
+) -> None:
+    client = _run_client(_impostor_world())
+    session, found = await _discovered(rdb, conn, client, "@tb_flats")
+    flats = found["@tb_flats"]
+    _approve(rdb, conn, session, _item(flats, "fetch", "add_source"))
+
+    report = await _run(rdb, conn, paths, client, session)
+
+    assert report.fetched == [flats.id] and report.joined == []
+    (source,) = config.load(paths).sources
+    assert source.chat == "@tb_flats" and _marked(FLATS) not in client.members
+
+
+async def test_an_invite_that_now_leads_elsewhere_is_not_taken_for_the_approved_chat(
+    rdb: sqlite3.Connection, conn: sqlite3.Connection, paths: Paths
+) -> None:
+    world = _run_world()
+    client = _run_client(world)
+    session, found = await _discovered(rdb, conn, client, "https://t.me/+PeekIn")
+    peek = found["+PeekIn"]
+    assert peek.peer_id == _marked(PEEK)
+    (bare,) = research.with_default_actions(
+        rdb, session.id, [ApprovalItem(candidate_id=peek.id, actions=())]
+    )
+    assert bare.actions == ("join", "fetch", "add_source")
+    _approve(rdb, conn, session, bare)
+    world.invites["PeekIn"] = FakeInvite(OPEN)  # the link was handed to another group since
+
+    report = await _run(rdb, conn, paths, client, session)
+
+    assert report.failed == [peek.id] and report.joined == []
+    stored = _status(rdb, peek)
+    assert stored.status == "failed" and stored.peer_id == _marked(PEEK), "never overwritten"
+    assert f'different chat "Open door" (id {_marked(OPEN)})' in (stored.note or "")
+    assert f"grepogram leave --account default -- {_marked(OPEN)}" in (stored.note or "")
+    assert config.load(paths).sources == [] and _live(rdb, peek) == []
+    assert _read(client) == set()
+
+
+async def test_an_exclusion_withdraws_what_is_still_approved_for_a_joined_chat(
+    rdb: sqlite3.Connection, conn: sqlite3.Connection, paths: Paths
+) -> None:
+    client = _run_client(_run_world())
+    session, found = await _discovered(rdb, conn, client, "@tb_flats")
+    flats = found["@tb_flats"]
+    _approve(rdb, conn, session, _item(flats, "join", "fetch", "add_source"))
+    # a run joined, then stopped (a flood wait, the clock) before adding and fetching
+    client.join(FLATS)
+    research_db.update_candidate(rdb, flats.id, status="joined", member=True)
+    assert research.authorized(rdb, flats, "fetch")
+
+    excluded = research.exclude(rdb, CFG, [str(_marked(FLATS))])  # its id, not its @name
+
+    assert excluded == {f"peer:{_marked(FLATS)}": 1}
+    assert _live(rdb, flats) == [] and not research.authorized(rdb, flats, "fetch")
+    assert _status(rdb, flats).status == "joined", "what happened on Telegram stays recorded"
+    report = await _run(rdb, conn, paths, client, session)
+    assert report.sources_added == report.fetched == []
+    assert config.load(paths).sources == [] and _stored(conn, _marked(FLATS)) == []
+
+
+async def test_skipping_a_joined_chat_withdraws_its_pending_fetch(
+    rdb: sqlite3.Connection, conn: sqlite3.Connection, paths: Paths
+) -> None:
+    client = _run_client(_run_world())
+    session, found = await _discovered(rdb, conn, client, "@tb_flats")
+    flats = found["@tb_flats"]
+    _approve(rdb, conn, session, _item(flats, "join", "fetch", "add_source"))
+    client.join(FLATS)
+    research_db.update_candidate(rdb, flats.id, status="joined", member=True)
+
+    assert research.skip(rdb, CFG, session.id, [flats.id]) == [flats.id]
+
+    assert _live(rdb, flats) == [] and _status(rdb, flats).member is True
+    report = await _run(rdb, conn, paths, client, session)
+    assert report.sources_added == report.fetched == [] and config.load(paths).sources == []
+    # set aside, it can still be approved again: the account is in, so only the fetch is asked
+    (again,) = research.with_default_actions(
+        rdb, session.id, [ApprovalItem(candidate_id=flats.id, actions=())]
+    )
+    assert again.actions == ("fetch", "add_source")
+
+
+def test_an_exclusion_under_any_spelling_denies_authorization(
+    rdb: sqlite3.Connection, conn: sqlite3.Connection
+) -> None:
+    session = _start(rdb, conn)
+    flats = _flats(rdb, session, peer_id=_marked(FLATS))
+    _approve(rdb, conn, session, _item(flats, "join", "fetch", "add_source"))
+    # written behind research_db's back, so no grant was voided: authorized asks itself
+    rdb.execute(
+        "INSERT INTO exclusions(identity, created_at) VALUES (?, 1)", (f"peer:{_marked(FLATS)}",)
+    )
+
+    assert _live(rdb, flats) and not research.authorized(rdb, flats, "fetch")
+
+
+async def test_one_chat_reached_by_three_spellings_is_one_candidate(
+    rdb: sqlite3.Connection, conn: sqlite3.Connection
+) -> None:
+    world = _world()
+    world.invites["FlatsLink"] = FakeInvite(FLATS, peek=True)
+    client = world.client("default")
+    _links(conn, "@tb_flats")
+    session = _start(rdb, conn)
+    await research.discover(rdb, conn, CFG, session.id, client, now=3)
+    (flats,) = research_db.list_candidates(rdb, session.id)
+    assert flats.peer_id == _marked(FLATS)
+
+    # the same chat by its id (a private post link) and by an invite link
+    _store(conn, SEED, 10, "see", links=(("link", "https://t.me/c/3001/5"),))
+    _store(conn, SEED, 11, "join", links=(("link", "https://t.me/+FlatsLink"),))
+    report = await research.discover(rdb, conn, CFG, session.id, client, now=4)
+
+    (merged,) = research_db.list_candidates(rdb, session.id)
+    assert merged.id == flats.id and merged.identity == "@tb_flats"
+    assert merged.invite_hash == "FlatsLink" and merged.peer_id == _marked(FLATS)
+    assert research_db.corroboration(rdb, [merged.id]) == {merged.id: 3}
+    assert report.updated_candidates == [flats.id]
+    assert report.probe is not None and report.probe.probed == [flats.id]
+
+    again = await research.discover(rdb, conn, CFG, session.id, client, now=5)
+    assert again.new_candidates == [] and len(research_db.list_candidates(rdb, session.id)) == 1
+
+
+def test_an_exclusion_covers_every_spelling_of_the_chat(
+    rdb: sqlite3.Connection, conn: sqlite3.Connection
+) -> None:
+    session = _start(rdb, conn)
+    flats = _flats(rdb, session, peer_id=_marked(FLATS))
+    research_db.update_candidate(rdb, flats.id, invite_hash="FlatsLink")
+    other = _start(rdb, conn)
+
+    assert research.exclude(rdb, CFG, ["https://t.me/+FlatsLink"]) == {"+FlatsLink": 1}
+
+    assert _status(rdb, flats).status == "excluded"
+    spellings: list[tuple[str, Any, dict[str, Any]]] = [
+        ("@tb_flats", "username", {"username": "tb_flats"}),
+        (f"peer:{_marked(FLATS)}", "peer", {"peer_id": _marked(FLATS)}),
+        ("+FlatsLink", "invite", {"invite_hash": "FlatsLink"}),
+    ]
+    for identity, kind, known in spellings:
+        assert research_db.add_candidate(rdb, other.id, identity, kind, 1, **known) is None
+    # a peer candidate a probe ties to the excluded chat later is excluded then
+    later = research_db.add_candidate(rdb, other.id, "peer:-1000000009999", "peer", 1)
+    assert later is not None
+    tied = research._settle(rdb, later, "probed", 3, {"username": "tb_flats"})
+    assert tied.status == "excluded"
+
+    assert research.unexclude(rdb, CFG, ["+FlatsLink"]) == ["+FlatsLink"]
+    assert _status(rdb, flats).status == "proposed"
+
+
+async def test_a_public_chat_whose_admins_approve_joins_is_approved_as_a_request(
+    rdb: sqlite3.Connection, conn: sqlite3.Connection, paths: Paths
+) -> None:
+    world = _run_world()
+    world.entities[_marked(GATED_PUBLIC)] = GATED_PUBLIC
+    client = _run_client(world)
+    session, found = await _discovered(rdb, conn, client, "@gated_pub")
+    gated = found["@gated_pub"]
+    assert gated.request_needed is True, "the channel's join_request flag is read"
+
+    (bare,) = research.with_default_actions(
+        rdb, session.id, [ApprovalItem(candidate_id=gated.id, actions=())]
+    )
+    assert bare.actions == ("request", "fetch", "add_source")
+    with pytest.raises(research.ResearchError, match="approve `request` instead of `join`"):
+        research.approval_summary(rdb, conn, CFG, session.id, [_item(gated, "join")])
+    text = research.approval_summary(rdb, conn, CFG, session.id, [bare])
+    assert "its admins approve who joins" in text and "send a request to join it" in text
+    _approve(rdb, conn, session, bare)
+
+    report = await _run(rdb, conn, paths, client, session)
+
+    assert report.pending_admission == [gated.id] and report.joined == []
+    assert _marked(GATED_PUBLIC) in client.requested
+
+
+def test_the_summary_says_when_the_chat_is_already_covered_by_a_source(
+    rdb: sqlite3.Connection, conn: sqlite3.Connection
+) -> None:
+    session = _start(rdb, conn)
+    work_source = Source(chat="@cachedchan", since="2024-01-01", account="work")
+    db.upsert_chat(
+        conn,
+        ChatRow(
+            id=CACHED,
+            type="channel",
+            title="Already here",
+            username="CachedChan",
+            source_id=work_source.id,
+        ),
+    )
+    cached = _probed(rdb, session, "@cachedchan", title="Already here", type="channel")
+    cached = research_db.update_candidate(rdb, cached.id, peer_id=CACHED, member=False)
+    items = [_item(cached, "fetch", "add_source")]
+
+    elsewhere = Config(research=ResearchCfg(enabled=True), sources=[work_source])
+    text = research.approval_summary(rdb, conn, elsewhere, session.id, items)
+    assert (
+        "  - fetch its history into the local index through work/chat:@cachedchan, the source "
+        "that already covers it: as account work, since 2024-01-01, without the comments of "
+        "its discussion group"
+    ) in text
+    assert "  - add it as an ongoing source of account default (since 1969-01-01, with the " in text
+
+    own = Source(chat="@CachedChan", since="2025-05-05", comments=True)
+    mine = Config(research=ResearchCfg(enabled=True), sources=[work_source, own])
+    text = research.approval_summary(rdb, conn, mine, session.id, items)
+    assert (
+        "  - it is already chat:@CachedChan, a source of account default: that source is kept "
+        "as it is and nothing is added to the config"
+    ) in text
+
+    fresh = _probed(rdb, session, "@tb_fresh", title="Fresh", type="supergroup", member=False)
+    text = research.approval_summary(
+        rdb, conn, CFG, session.id, [_item(fresh, "fetch", "add_source")]
+    )
+    assert "into the local index, reading it as a public chat without joining it" in text
+    assert "discussion group" not in text.split(f"Candidate {fresh.id}")[1]
+
+
+def test_validation_and_the_grant_are_one_transaction(
+    rdb: sqlite3.Connection, conn: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    session = _start(rdb, conn)
+    flats = _flats(rdb, session)
+    items = [_item(flats, "join", "fetch", "add_source")]
+    summary = research.approval_summary(rdb, conn, CFG, session.id, items)
+    validated_inside: list[bool] = []
+    prepare = research._prepare
+
+    def watched(*args: Any) -> Any:
+        validated_inside.append(rdb.in_transaction)
+        return prepare(*args)
+
+    monkeypatch.setattr(research, "_prepare", watched)
+    research.grant(rdb, conn, CFG, session.id, items, via="cli", summary=summary)
+
+    assert validated_inside == [True], "a skip landing in between cannot be overwritten"
+
+
+async def test_global_search_sends_only_the_session_s_question(
+    rdb: sqlite3.Connection, conn: sqlite3.Connection
+) -> None:
+    session = _asking(rdb, conn, "tbilisi")
+    _grant(rdb, session, "global_search")
+    client = _world().client("default")
+
+    with pytest.raises(research.ResearchError, match="only the session's question"):
+        await research.global_search(client, rdb, conn, SEARCH_CFG, session.id, "passwords")
+    assert client.requests == [] and research_db.list_searches(rdb, session.id) == []
+
+    (report,) = await research.global_search(
+        client, rdb, conn, SEARCH_CFG, session.id, "  tbilisi ", kinds=["chat_search"]
+    )
+    assert report.ran and report.query == "tbilisi"
+
+
+async def test_approving_both_searches_leaves_global_search_after_one_paid_search(
+    rdb: sqlite3.Connection, conn: sqlite3.Connection
+) -> None:
+    session = _asking(rdb, conn, "apartment")
+    granted = _approve(rdb, conn, session, _item(None, "global_search", "paid_search"), cfg=PAYING)
+    assert [g.actions for g in granted] == [("global_search",), ("paid_search",)]
+    client = _posts_world().client("default", search_flood=SPENT)
+
+    (paid,) = await research.global_search(client, rdb, conn, PAYING, session.id, "apartment")
+
+    assert paid.ran and paid.paid_stars == 50
+    assert research.search_granted(rdb, session.id, "global_search"), "reused, not burned"
+    assert not research.search_granted(rdb, session.id, "paid_search")
+
+
+async def test_a_paid_approval_another_search_used_meanwhile_pays_nothing(
+    rdb: sqlite3.Connection, conn: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    session = _asking(rdb, conn, "apartment")
+    _approve(rdb, conn, session, _item(None, "global_search", "paid_search"), cfg=PAYING)
+    client = _posts_world().client("default", search_flood=SPENT)
+    refusal = research._paid_refusal
+
+    def racing(*args: Any) -> str | None:
+        """A second discover call passes the same check and spends the grant first."""
+        answer = refusal(*args)
+        for grant in research_db.live_grants(rdb, session.id, None):
+            if "paid_search" in grant.actions:
+                research_db.consume_grant(rdb, grant.id)
+        return answer
+
+    monkeypatch.setattr(research, "_paid_refusal", racing)
+
+    (report,) = await research.global_search(client, rdb, conn, PAYING, session.id, "apartment")
+
+    assert not report.ran and report.paid_stars == 0
+    assert "used by another search meanwhile; nothing was paid" in report.warnings[0]
+    assert not any(isinstance(r, functions.channels.SearchPostsRequest) for r in client.requests)
+
+
+async def test_concurrent_searches_pay_once_for_one_approval(
+    rdb: sqlite3.Connection, conn: sqlite3.Connection
+) -> None:
+    session = _asking(rdb, conn, "apartment")
+    _approve(rdb, conn, session, _item(None, "global_search", "paid_search"), cfg=PAYING)
+    client = _posts_world().client("default", search_flood=SPENT)
+
+    reports = await asyncio.gather(
+        *(
+            research.global_search(client, rdb, conn, PAYING, session.id, "apartment")
+            for _ in range(3)
+        )
+    )
+
+    paid = [r for r in client.requests if isinstance(r, functions.channels.SearchPostsRequest)]
+    assert [r.allow_paid_stars for r in paid] == [50]
+    assert sum(report.paid_stars for (report,) in reports) == 50
+
+
+async def test_a_paid_search_telegram_refuses_says_its_approval_is_spent(
+    rdb: sqlite3.Connection, conn: sqlite3.Connection
+) -> None:
+    session = _asking(rdb, conn, "apartment")
+    _approve(rdb, conn, session, _item(None, "global_search", "paid_search"), cfg=PAYING)
+    refused = errors.BadRequestError(None, "STARS_INSUFFICIENT", 400)
+    client = _posts_world().client(
+        "default", search_flood=SPENT, responses={functions.channels.SearchPostsRequest: refused}
+    )
+
+    (report,) = await research.global_search(client, rdb, conn, PAYING, session.id, "apartment")
+
+    assert not report.ran
+    assert "the paid search failed and its paid_search approval is spent" in report.warnings[0]
+    assert "Telegram refused the search" in report.warnings[1]
+    assert not research.search_granted(rdb, session.id, "paid_search")

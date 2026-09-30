@@ -1675,7 +1675,7 @@ def test_research_loop_through_the_cli(tmp_home: Path, monkeypatch: pytest.Monke
     terminal = _answer(monkeypatch, YES)
     conn, rdb = _stores(paths)
     try:
-        item = ApprovalItem(candidate_id=1, actions=("fetch", "add_source"))
+        item = ApprovalItem(candidate_id=1, actions=("join", "fetch", "add_source"))
         cfg = config.load(paths)
         summary = research.approval_summary(rdb, conn, cfg, session_id, [item])
     finally:
@@ -1685,11 +1685,11 @@ def test_research_loop_through_the_cli(tmp_home: Path, monkeypatch: pytest.Monke
     assert approved.exit_code == 0, approved.output
     assert terminal.asked[0] == f"{summary}\n\n", "the terminal shows exactly the summary"
     assert terminal.asked[1] == _question("approve all of the above?")
-    assert "approved for candidate 1: fetch, add_source" in approved.stdout
+    assert "approved for candidate 1: join, fetch, add_source" in approved.stdout
 
     status = runner.invoke(cli.app, ["research", "status", str(session_id)])
     assert status.exit_code == 0, status.output
-    assert "approved, not carried out yet: candidate 1 (@tb_flats): fetch, add_source" in (
+    assert "approved, not carried out yet: candidate 1 (@tb_flats): join, fetch, add_source" in (
         status.stdout
     )
 
@@ -1697,7 +1697,8 @@ def test_research_loop_through_the_cli(tmp_home: Path, monkeypatch: pytest.Monke
     assert ran.exit_code == 0, ran.output
     report = json.loads(ran.stdout)
     assert (report["sources_added"], report["fetched"], report["messages"]) == ([1], [1], 2)
-    assert [source.id for source in config.load(paths).sources] == ["chat:@tb_flats"]
+    assert report["joined"] == [1], "a bare id joins the chat, public or not"
+    assert [source.id for source in config.load(paths).sources] == [f"chat:{FLATS_PEER}"]
 
     listed_json = runner.invoke(cli.app, ["research", "candidates", "1", "--json"])
     (candidate,) = json.loads(listed_json.stdout)["candidates"]
@@ -1710,7 +1711,7 @@ def test_research_loop_through_the_cli(tmp_home: Path, monkeypatch: pytest.Monke
     ended = runner.invoke(cli.app, ["research", "stop", str(session_id)])
     assert ended.exit_code == 0, ended.output
     assert "stopped research session 1; 0 unused approvals voided" in ended.stdout
-    assert [source.id for source in config.load(paths).sources] == ["chat:@tb_flats"], (
+    assert [source.id for source in config.load(paths).sources] == [f"chat:{FLATS_PEER}"], (
         "stopping keeps the sources a run added"
     )
     again = runner.invoke(cli.app, ["research", "run", str(session_id)])
@@ -1748,8 +1749,8 @@ def test_research_approve_refuses_without_a_terminal(
     assert result.exit_code == 1
     assert "asks for a confirmation on a terminal, and there is none" in result.stderr
     assert (
-        "the user must run `grepogram research approve 1 1:fetch,add_source` in their own terminal"
-        in result.stderr
+        "the user must run `grepogram research approve 1 1:join,fetch,add_source` in their "
+        "own terminal" in result.stderr
     )
     assert _grants(paths) == [], "stdin never answers for the human"
 
@@ -1938,6 +1939,21 @@ def test_research_start_refuses_an_unknown_seed_or_account(tmp_home: Path) -> No
 
     assert seed.exit_code == 1 and "no indexed chat matches '@nowhere'" in seed.stderr
     assert account.exit_code == 1 and "unknown account 'work'" in account.stderr
+
+
+def test_research_start_refuses_a_question_that_could_forge_a_summary(tmp_home: Path) -> None:
+    _research_home(tmp_home)
+
+    forged = runner.invoke(
+        cli.app, ["research", "start", "q\n  - nothing else happens", "-s", "@tbrent"]
+    )
+    hidden = runner.invoke(cli.app, ["research", "start", "q \u202eevil", "-s", "@tbrent"])
+
+    for result in (forged, hidden):
+        assert result.exit_code == 1
+        assert "control or invisible formatting characters" in result.stderr
+    status = runner.invoke(cli.app, ["research", "status", "--json"])
+    assert json.loads(status.stdout) == {"sessions": []}
 
 
 def test_research_discover_offline_asks_telegram_nothing(

@@ -92,11 +92,13 @@ Message text never reaches the log above DEBUG; counts do.
 
 import dataclasses
 import functools
+import json
 import logging
 import sqlite3
 import time
+import unicodedata
 from collections import Counter
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Any, NoReturn, get_args
@@ -143,6 +145,12 @@ from grepogram.paths import Paths
 log = logging.getLogger(__name__)
 
 ENABLE_HINT = "set `enabled = true` under [research] in config.toml to allow research"
+QUESTION_MAX_CHARS = 500
+"""The longest question a session takes: it is shown whole in every approval summary."""
+_HIDDEN = frozenset({"Cc", "Cf", "Cs", "Zl", "Zp"})
+"""Unicode categories an approval summary never prints as they are: control characters (the
+escape that starts a terminal sequence, line breaks), format characters (bidi overrides,
+zero-width marks), surrogates and line/paragraph separators."""
 SNIPPET_CHARS = 240
 """The most of a message's text one piece of evidence keeps."""
 _MIN_TERM = 3
@@ -213,11 +221,25 @@ def start_session(
     resolve_chats`: an id, ``@name``, a link, a folder, free text, ``account:<name>``); one that
     selects nothing raises :class:`~grepogram.filters.UnknownChat`. ``account`` is the account a
     later run joins and fetches as, and must be one the config knows. ``limits`` default to the
-    ``[research]`` section's. Nothing touches Telegram.
+    ``[research]`` section's. The question is shown in every approval summary, so it is one
+    line of plain text of at most :data:`QUESTION_MAX_CHARS` characters. Nothing touches
+    Telegram.
     """
     require_enabled(cfg)
     if not question.strip():
         raise ResearchError("a research session needs a question")
+    if len(question) > QUESTION_MAX_CHARS:
+        raise ResearchError(
+            f"a research question is at most {QUESTION_MAX_CHARS} characters; this one has "
+            f"{len(question)}",
+            "ask it in fewer words",
+        )
+    if any(unicodedata.category(ch) in _HIDDEN for ch in question):
+        raise ResearchError(
+            "the question holds control or invisible formatting characters (a line break, a "
+            "terminal escape, a direction override)",
+            "write it as one line of plain text",
+        )
     known = cfg.account_names()
     if account not in known:
         raise ResearchError(
@@ -252,6 +274,27 @@ def active_session(rdb: sqlite3.Connection, session_id: int) -> ResearchSession:
     if session.state != "active":
         raise SessionStopped(session_id)
     return session
+
+
+def shown(text: str) -> str:
+    """``text`` as an approval summary prints it: one line, with every control or invisible
+    formatting character (:data:`_HIDDEN`) made visible as U+FFFD and whitespace collapsed.
+
+    A title, a username or a question comes from someone else — a chat's owner, an agent — and
+    reaches a terminal or a consent dialog; a terminal escape or a line break could otherwise
+    hide the real action lines or forge new ones.
+    """
+    cleaned = "".join(
+        (" " if ch.isspace() else "\ufffd") if unicodedata.category(ch) in _HIDDEN else ch
+        for ch in text
+    )
+    return " ".join(cleaned.split())
+
+
+def _quoted(text: str) -> str:
+    """``text`` :func:`shown` and in double quotes, a quote inside it escaped, so it cannot
+    close the quote early and pass what follows off as grepogram's own words."""
+    return json.dumps(shown(text), ensure_ascii=False)
 
 
 # --- leads -----------------------------------------------------------------------------------
@@ -579,13 +622,23 @@ def discover_offline(
     beyond_depth = excluded = 0
     with db.transaction(rdb):
         for identity, entry in found.items():
-            existing = research_db.candidate_by_identity(rdb, session.id, identity)
+            chat = entry.first.chat
+            existing = research_db.candidate_for(
+                rdb,
+                session.id,
+                identity,
+                peer_id=chat.peer_id,
+                username=chat.username,
+                invite_hash=chat.invite_hash,
+            )
             if existing is not None:
-                if _record(rdb, existing, entry, stamp):
+                if _record(rdb, existing, entry, stamp) and existing.id not in updated:
                     updated.append(existing.id)
             elif entry.depth > limits.max_depth:
                 beyond_depth += 1
-            elif research_db.is_excluded(rdb, identity):
+            elif research_db.excluded_by(
+                rdb, identity, peer_id=chat.peer_id, username=chat.username
+            ):
                 excluded += 1
             else:
                 fresh.append(entry)
@@ -694,8 +747,10 @@ def entity_facts(entity: Any) -> dict[str, Any]:
     :func:`grepogram.research_db.update_candidate` fields; unknown facts are left out so a
     probe never erases what an earlier one learned.
 
-    ``member`` comes from the ``left`` flag (``deactivated`` too for a legacy group); a
-    ``*Forbidden`` entity is a chat the account was banned or kicked from. A ``min`` entity's
+    ``member`` comes from the ``left`` flag (``deactivated`` too for a legacy group), and
+    ``request_needed`` from a channel's ``join_request`` flag — its admins approve who joins, so
+    ``channels.joinChannel`` sends an admission request rather than joining; a ``*Forbidden``
+    entity is a chat the account was banned or kicked from. A ``min`` entity's
     access hash cannot address anything and is not kept.
     """
     facts: dict[str, Any] = {
@@ -711,6 +766,7 @@ def entity_facts(entity: Any) -> dict[str, Any]:
         facts["participants"] = participants
     if isinstance(entity, types.Channel):
         facts["member"] = not entity.left
+        facts["request_needed"] = bool(entity.join_request)
     elif isinstance(entity, types.Chat):
         facts["member"] = not (entity.left or entity.deactivated)
     elif isinstance(entity, types.ChannelForbidden | types.ChatForbidden):
@@ -772,7 +828,41 @@ def _settle(
     fields["note"] = note
     if result == "unavailable" and candidate.status == "proposed":
         fields["status"] = "unavailable"
-    return research_db.update_candidate(rdb, candidate.id, **fields)
+    with db.transaction(rdb):
+        stored = research_db.update_candidate(rdb, candidate.id, **fields)
+        return _reconcile(rdb, stored)
+
+
+def _reconcile(rdb: sqlite3.Connection, candidate: Candidate) -> Candidate:
+    """What a probe that tied ``candidate`` to a peer id or username means for the session.
+
+    Another candidate of the session already tied to the same chat is the same chat under
+    another spelling (``@name``, ``peer:<id>``, an invite): the two become one, so
+    corroboration is not split between them — the undecided one of them (``proposed``, never
+    granted anything, the newer when both are) is folded into the other
+    (:func:`grepogram.research_db.merge_candidate`), and two that both carry a decision stay
+    apart. An exclusion naming the chat under any of its spellings then covers the result: an
+    undecided one turns ``excluded`` and nothing stays authorized for it. Returns the candidate
+    that stands for the chat afterwards.
+    """
+    current = candidate
+    for other in research_db.same_chat_candidates(rdb, current):
+        droppable = [
+            c
+            for c in (current, other)
+            if c.status == "proposed" and not research_db.has_grants(rdb, c.id)
+        ]
+        if not droppable:
+            continue
+        drop = max(droppable, key=lambda c: c.id)
+        keep = other if drop.id == current.id else current
+        current = research_db.merge_candidate(rdb, keep.id, drop.id)
+        log.info("research candidate %d is the same chat as %d; merged", drop.id, keep.id)
+    if research_db.candidate_excluded(rdb, current):
+        if current.status in ("proposed", "approved", "skipped"):
+            current = research_db.update_candidate(rdb, current.id, status="excluded")
+        research_db.void_grants(rdb, current.session_id, candidate_ids=[current.id])
+    return current
 
 
 async def probe(
@@ -825,6 +915,10 @@ def _entity_outcome(
     facts = entity_facts(entity)
     if member is not None:
         facts["member"] = member
+    if candidate.kind == "invite":
+        # an invite link says itself whether it needs the admins' approval (_probe_invite);
+        # the chat's join_request flag is about joining by its username, not through this link
+        facts.pop("request_needed", None)
     if _forbidden(entity):
         note = "Telegram refuses this chat to the account: banned or removed from it"
         stored = _settle(rdb, candidate, "unavailable", stamp, facts, note)
@@ -956,7 +1050,9 @@ async def _probe_addlist(
             target = entity_target(entity)
             if target is None:
                 continue
-            existing = research_db.candidate_by_identity(rdb, session.id, target.target)
+            existing = research_db.candidate_for(
+                rdb, session.id, target.target, peer_id=marked, username=facts.get("username")
+            )
             if existing is None and len(children) >= session.limits.max_candidates:
                 over_cap += 1
                 continue
@@ -974,7 +1070,8 @@ async def _probe_addlist(
             if child is None:
                 excluded += 1
                 continue
-            research_db.update_candidate(rdb, child.id, probed_at=stamp, **facts)
+            child = research_db.update_candidate(rdb, child.id, probed_at=stamp, **facts)
+            child = _reconcile(rdb, child)
             research_db.add_evidence(
                 rdb,
                 child.id,
@@ -1041,7 +1138,7 @@ async def probe_candidates(
             "probed": report.probed,
             "unavailable": report.unavailable,
             "unresolvable": report.unresolvable,
-        }[outcome.result].append(candidate.id)
+        }[outcome.result].append(outcome.candidate.id)
         report.children.extend(outcome.children)
     report.remaining = sum(
         1 for c in research_db.list_candidates(rdb, session.id, _PROBED) if c.probed_at is None
@@ -1092,15 +1189,17 @@ async def global_search(
 ) -> list[GlobalSearchReport]:
     """Search Telegram itself for ``query``: public chats by name (``contacts.search``) and
     public channel posts (``channels.searchPosts``), each only while ``[research]`` switches it
-    on, and both only while the session holds a live ``global_search`` grant.
+    on, and both only while the session holds a live ``global_search`` grant. ``query`` must be
+    the session's question — the one query that grant's summary names — or nothing is sent.
 
     Every chat found becomes a candidate one hop from the question (depth 1) with its result as
     evidence — a post keeps the origin key ``post:<peer>/<msg>`` discovery gives an indexed
     copy of it. Nothing is written to ``index.db``. A post search asks
     ``channels.checkSearchPostsFlood`` first and sends ``allow_paid_stars`` only when the free
     quota is spent, ``paid_stars_max`` covers the price and a ``paid_search`` grant is live —
-    consumed before the request goes out, so one approval never pays twice. Each search is
-    recorded in ``research.db``, run or not.
+    consumed atomically before the request goes out, so one approval never pays twice, not even
+    for two discover calls running at once; a request Telegram refuses after that leaves the
+    approval spent and says so. Each search is recorded in ``research.db``, run or not.
     """
     require_enabled(cfg)
     session = active_session(rdb, session_id)
@@ -1116,6 +1215,12 @@ async def global_search(
     text = " ".join(query.split())
     if not text:
         raise ResearchError("a global search needs a query")
+    if text != " ".join(session.question.split()):
+        raise ResearchError(
+            "a global search sends only the session's question: that is the query its approval "
+            "named",
+            "start a session with this question to search for it",
+        )
     stamp = _stamp(now)
     reports: list[GlobalSearchReport] = []
     for kind in wanted:
@@ -1188,7 +1293,9 @@ def _found_chat(
     target = entity_target(entity)
     if target is None:
         return
-    existing = research_db.candidate_by_identity(rdb, session.id, target.target)
+    existing = research_db.candidate_for(
+        rdb, session.id, target.target, peer_id=marked, username=facts.get("username")
+    )
     if existing is None and len(report.new_candidates) >= session.limits.max_candidates:
         report.over_cap += 1
         return
@@ -1205,7 +1312,9 @@ def _found_chat(
     if candidate is None:
         report.excluded += 1
         return
-    research_db.update_candidate(rdb, candidate.id, probed_at=stamp, **facts)
+    candidate = _reconcile(
+        rdb, research_db.update_candidate(rdb, candidate.id, probed_at=stamp, **facts)
+    )
     added = research_db.add_evidence(
         rdb,
         candidate.id,
@@ -1277,21 +1386,31 @@ async def _post_search(
         if refusal is not None:
             report.warnings.append(f"post_search: free searches are used up; {refusal}")
             return
-        grant = next(
-            g for g in research_db.live_grants(rdb, session.id, None) if "paid_search" in g.actions
-        )
-        research_db.consume_grant(rdb, grant.id, now=stamp)
+        if not _consume_paid_grant(rdb, session, stamp):
+            report.warnings.append(
+                "post_search: free searches are used up and the paid_search approval was used "
+                "by another search meanwhile; nothing was paid"
+            )
+            return
         paid = price
-    answer = await client(
-        functions.channels.SearchPostsRequest(
-            offset_rate=0,
-            offset_peer=types.InputPeerEmpty(),
-            offset_id=0,
-            limit=_search_limit(session),
-            query=report.query,
-            allow_paid_stars=paid,
+    try:
+        answer = await client(
+            functions.channels.SearchPostsRequest(
+                offset_rate=0,
+                offset_peer=types.InputPeerEmpty(),
+                offset_id=0,
+                limit=_search_limit(session),
+                query=report.query,
+                allow_paid_stars=paid,
+            )
         )
-    )
+    except errors.RPCError:
+        if paid is not None:
+            report.warnings.append(
+                "post_search: the paid search failed and its paid_search approval is spent; "
+                "approve paid_search again to try once more"
+            )
+        raise
     report.ran = True
     report.paid_stars = paid or 0
     entities = {dialogs.peer_id(e): e for e in (*answer.chats, *answer.users)}
@@ -1316,6 +1435,18 @@ async def _post_search(
                 snippet_text=snippet(post.message or "", report.query),
                 stamp=stamp,
             )
+
+
+def _consume_paid_grant(rdb: sqlite3.Connection, session: ResearchSession, stamp: int) -> bool:
+    """Use up one live ``paid_search`` grant of ``session``; ``False`` when none is left.
+
+    :func:`grepogram.research_db.consume_grant` is one conditional ``UPDATE``, so of two
+    searches racing for the same grant exactly one gets it, and only that one may pay.
+    """
+    for grant in research_db.live_grants(rdb, session.id, None):
+        if "paid_search" in grant.actions and research_db.consume_grant(rdb, grant.id, now=stamp):
+            return True
+    return False
 
 
 def _paid_refusal(
@@ -1394,8 +1525,10 @@ _REFUSED: dict[str, str] = {
 _TO_APPROVED: frozenset[CandidateStatus] = frozenset({"proposed", "skipped", "failed"})
 """Statuses a grant moves to ``approved``; a joined or waiting candidate keeps what it is."""
 _SKIPPABLE: frozenset[CandidateStatus] = frozenset(
-    {"proposed", "approved", "failed", "unavailable", "pending_admission"}
+    {"proposed", "approved", "skipped", "failed", "unavailable", "joined", "pending_admission"}
 )
+"""Statuses skip takes: all but the settled ones. A joined or waiting candidate stays in the chat
+on Telegram, but what is still approved for it — its fetch, its source — is withdrawn."""
 _PEOPLE: tuple[ChatType, ...] = ("user", "bot")
 APPROVE_HINT = "review the summary and approve again"
 DESCENDANTS_NOTE = (
@@ -1427,13 +1560,15 @@ def authorized(
 
     Only a grant naming ``target`` itself counts: approving a folder or a chat authorizes
     nothing found inside it. The session must be active (stopping voids its grants), the grant
-    must be the session's own account's, and a candidate skipped or excluded since is not
-    authorized whatever its grants say.
+    must be the session's own account's, and a candidate skipped since, or a chat an exclusion
+    covers under any of its spellings, is not authorized whatever its grants say.
     """
     if isinstance(target, Candidate):
         session = research_db.get_session(rdb, target.session_id)
         current = research_db.get_candidate(rdb, target.id)
         if current is None or current.status in ("skipped", "excluded"):
+            return False
+        if research_db.candidate_excluded(rdb, current):
             return False
         candidate_id: int | None = current.id
     else:
@@ -1478,14 +1613,14 @@ def _live_actions(
 def _join_route(candidate: Candidate, parent: Candidate | None) -> str | None:
     """How a run would get ``candidate``'s account in, in words; ``None`` when it has no way."""
     if candidate.kind == "invite" and candidate.invite_hash:
-        return f"through the invite link t.me/+{candidate.invite_hash}"
+        return f"through the invite link t.me/+{shown(candidate.invite_hash)}"
     if candidate.username:
-        return f"through its public username @{candidate.username}"
+        return f"through its public username @{shown(candidate.username)}"
     if parent is not None and parent.kind == "addlist" and parent.addlist_slug:
-        folder = f'"{parent.title}" ' if parent.title else ""
+        folder = f"{_quoted(parent.title)} " if parent.title else ""
         return (
-            f"through the shared folder {folder}(t.me/addlist/{parent.addlist_slug}); Telegram "
-            "also adds that folder to the account's chat folders"
+            f"through the shared folder {folder}(t.me/addlist/{shown(parent.addlist_slug)}); "
+            "Telegram also adds that folder to the account's chat folders"
         )
     if candidate.type in ("channel", "supergroup") and candidate.access_hash is not None:
         return "by its id"
@@ -1599,15 +1734,15 @@ def _session_entry(
 
 def _target_line(conn: sqlite3.Connection, session: ResearchSession, c: Candidate) -> list[str]:
     handle = (
-        f"@{c.username}"
+        f"@{shown(c.username)}"
         if c.username
-        else f"invite link t.me/+{c.invite_hash}"
+        else f"invite link t.me/+{shown(c.invite_hash)}"
         if c.kind == "invite" and c.invite_hash
         else f"id {c.peer_id}"
         if c.peer_id is not None
-        else c.identity
+        else shown(c.identity)
     )
-    name = f'"{c.title}" ({handle})' if c.title else handle
+    name = f"{_quoted(c.title)} ({handle})" if c.title else handle
     facts: list[str] = [c.type or "chat of unknown type"]
     if c.participants is not None:
         facts.append(f"{c.participants:,} members")
@@ -1632,9 +1767,42 @@ def _target_line(conn: sqlite3.Connection, session: ResearchSession, c: Candidat
     ]
 
 
+def _covering_source(
+    conn: sqlite3.Connection, cfg: Config, session: ResearchSession, c: Candidate
+) -> Source | None:
+    """The configured source a run's fetch of ``c`` would actually go through, if one already
+    covers the chat: the source the index files the chat under (its primary — a narrowed sync
+    reads a chat through its primary source's account, ``since`` and ``comments``), else a chat
+    source of the session's account that names it. ``None`` when the fetch goes through the
+    source the run adds."""
+    by_id = {source.id: source for source in cfg.sources}
+    chat_ids, _ = cached_in(conn, c)
+    for chat_id in chat_ids:
+        row = db.get_chat(conn, chat_id)
+        if row is None or row.scope not in ("", session.account):
+            continue
+        if row.source_id in by_id:
+            return by_id[row.source_id]
+    return _configured(cfg, session.account, c)
+
+
+def _discussion(c: Candidate, comments: bool) -> str:
+    if c.type != "channel":
+        return ""
+    return f"{'with' if comments else 'without'} the comments of its discussion group"
+
+
 def _action_line(
-    rdb: sqlite3.Connection, session: ResearchSession, c: Candidate, action: str
+    rdb: sqlite3.Connection,
+    conn: sqlite3.Connection,
+    cfg: Config,
+    session: ResearchSession,
+    c: Candidate,
+    action: str,
+    approved: Collection[str],
 ) -> str:
+    """One action in words, as the run will carry it out; ``approved`` is every action the
+    candidate holds once this approval is granted, the ones already live included."""
     account = session.account
     since = horizon(session)
     if action == "join":
@@ -1646,13 +1814,36 @@ def _action_line(
             f"send a request to join it as {account}; its admins see the request and decide, "
             "and the account joins only once they admit it"
         )
+    covering = _covering_source(conn, cfg, session, c)
     if action == "fetch":
+        if covering is not None:
+            comments = _discussion(c, covering.comments)
+            return (
+                f"fetch its history into the local index through {covering.id}, the source that "
+                f"already covers it: as account {covering.account}, since "
+                f"{covering.since or 'its first message'}{', ' + comments if comments else ''}"
+            )
         comments = " with the comments of its discussion group" if c.type == "channel" else ""
-        return f"fetch its history since {since}{comments} as {account} into the local index"
+        inside = c.member is True or c.status in ("joined", "pending_admission")
+        outside = (
+            ""
+            if inside or {"join", "request"} & set(approved)
+            else (", reading it as a public chat without joining it")
+        )
+        return (
+            f"fetch its history since {since}{comments} as {account} into the local index{outside}"
+        )
+    existing = _configured(cfg, account, c)
+    if existing is not None:
+        return (
+            f"it is already {existing.id}, a source of account {account}: that source is kept as "
+            "it is and nothing is added to the config"
+        )
+    comments = _discussion(c, True)
     return (
-        f"add it as an ongoing source of account {account} (since {since}): regular sync and "
-        "search will include it from now on, and stopping this research session does not "
-        "remove it"
+        f"add it as an ongoing source of account {account} (since {since}"
+        f"{', ' + comments if comments else ''}): regular sync and search will include it from "
+        "now on, and stopping this research session does not remove it"
     )
 
 
@@ -1665,8 +1856,8 @@ def _session_line(cfg: Config, session: ResearchSession, action: str) -> str:
         }
         kinds = " and ".join(where[kind] for kind in search_kinds(cfg))
         return (
-            f'send this session\'s question "{session.question}" as {account} to {kinds}: the '
-            "query leaves this computer and reaches Telegram, and the results may include "
+            f"send this session's question {_quoted(session.question)} as {account} to {kinds}: "
+            "the query leaves this computer and reaches Telegram, and the results may include "
             "snippets from channels and groups you have never joined or indexed; they are kept "
             "as evidence in research.db only, and later discover calls reuse this approval "
             "until the session stops"
@@ -1684,8 +1875,10 @@ def _summary(
     session: ResearchSession,
     entries: Sequence[_Entry],
 ) -> str:
+    """The approval text. Every value someone else chose — the question, a title, a username —
+    goes through :func:`shown`, so it cannot break a line or send a terminal escape."""
     lines = [
-        f'Research session {session.id}: "{session.question}"',
+        f"Research session {session.id}: {_quoted(session.question)}",
         f"Acting account: {session.account}",
     ]
     repeats: list[str] = []
@@ -1699,8 +1892,12 @@ def _summary(
             lines.append(f"Session {session.id} (every discover call of it)")
             lines.extend(f"  - {_session_line(cfg, session, a)}" for a in entry.actions)
         else:
+            approved = {*entry.actions, *entry.already}
             lines.extend(_target_line(conn, session, c))
-            lines.extend(f"  - {_action_line(rdb, session, c, a)}" for a in entry.actions)
+            lines.extend(
+                f"  - {_action_line(rdb, conn, cfg, session, c, a, approved)}"
+                for a in entry.actions
+            )
         if entry.already:
             lines.append(f"  (already approved, not asked again: {', '.join(entry.already)})")
     if repeats:
@@ -1779,35 +1976,42 @@ def grant(
     (``cli``) and the MCP server after an accepted elicitation (``elicitation``) — and ``via``
     has no default. The approval is validated again and its summary rebuilt: when it no longer
     matches the text the human saw (a probe changed what a candidate is, another approval landed
-    meanwhile) nothing is granted. One grant per target holds the actions not already live; a
-    ``proposed``, ``skipped`` or ``failed`` candidate becomes ``approved``. All of it is one
-    transaction.
+    meanwhile) nothing is granted. One grant per candidate holds the actions not already live,
+    and one per session action; a ``proposed``, ``skipped`` or ``failed`` candidate becomes
+    ``approved``. The validation and the writing are one ``research.db`` transaction.
     """
-    approval = _prepare(rdb, conn, cfg, session_id, items)
-    if approval.summary != summary:
-        raise ResearchError(
-            "what this approval covers changed since its summary was shown; nothing was granted",
-            APPROVE_HINT,
-        )
     stamp = _stamp(now)
     granted: list[Grant] = []
     with db.transaction(rdb):
+        # validated inside the writing transaction: a skip or an exclusion landing between the
+        # check and the write would otherwise be overwritten with a live grant
+        approval = _prepare(rdb, conn, cfg, session_id, items)
+        if approval.summary != summary:
+            raise ResearchError(
+                "what this approval covers changed since its summary was shown; nothing was "
+                "granted",
+                APPROVE_HINT,
+            )
         for entry in approval.entries:
             if not entry.actions:
                 continue
             candidate = entry.candidate
-            granted.append(
-                research_db.add_grant(
-                    rdb,
-                    session_id=approval.session.id,
-                    candidate_id=None if candidate is None else candidate.id,
-                    account=approval.session.account,
-                    actions=entry.actions,
-                    via=via,
-                    summary=summary,
-                    now=stamp,
+            # a session action is a grant of its own: paying for one search consumes the
+            # paid_search grant and must leave the global_search approval standing
+            groups = [entry.actions] if candidate is not None else [(a,) for a in entry.actions]
+            for actions in groups:
+                granted.append(
+                    research_db.add_grant(
+                        rdb,
+                        session_id=approval.session.id,
+                        candidate_id=None if candidate is None else candidate.id,
+                        account=approval.session.account,
+                        actions=actions,
+                        via=via,
+                        summary=summary,
+                        now=stamp,
+                    )
                 )
-            )
             if candidate is not None and candidate.status in _TO_APPROVED:
                 research_db.update_candidate(rdb, candidate.id, status="approved")
     log.info(
@@ -1822,8 +2026,10 @@ def grant(
 def skip(
     rdb: sqlite3.Connection, cfg: Config, session_id: int, candidate_ids: Sequence[int]
 ) -> list[int]:
-    """Set candidates aside: ``skipped``, with any live grant of theirs voided. Skipping only
-    narrows, so it needs no consent; a later approval can take a skipped candidate back."""
+    """Set candidates aside: ``skipped``, with any live grant of theirs voided — a chat a run
+    already joined or asked to join included, so its pending fetch and source never happen (the
+    account stays in it; ``grepogram leave`` leaves). Skipping only narrows, so it needs no
+    consent; a later approval can take a skipped candidate back."""
     require_enabled(cfg)
     session = active_session(rdb, session_id)
     wanted = list(dict.fromkeys(candidate_ids))
@@ -1831,7 +2037,7 @@ def skip(
         candidate = research_db.get_candidate(rdb, candidate_id)
         if candidate is None or candidate.session_id != session.id:
             raise UnknownCandidate(session.id, candidate_id)
-        if candidate.status not in _SKIPPABLE and candidate.status != "skipped":
+        if candidate.status not in _SKIPPABLE:
             raise ResearchError(
                 f"candidate {candidate_id} is {candidate.status}; skipping it would undo nothing",
                 "leave a joined chat with `grepogram leave`, drop a source with `sources rm`",
@@ -1973,14 +2179,35 @@ def _refuse_candidate(
     log.info("research candidate %d is %s: %s", candidate.id, status, note)
 
 
+class _OtherChat(ValueError):
+    """Telegram named a different chat than the one a human approved: a username moved to
+    another chat since the probe, or an invite now leads elsewhere."""
+
+
 def _mark_joined(
     rdb: sqlite3.Connection,
+    session: ResearchSession,
     candidate: Candidate,
     entity: Any,
     report: RunReport,
     note: str | None = None,
-) -> Candidate:
+) -> Candidate | None:
+    """Record that the account is in ``candidate``'s chat; ``entity`` is what the join answered
+    with. An answer naming a chat other than the one probed and approved is not taken for it —
+    the candidate's peer id is never overwritten — and the candidate is ``failed`` instead, with
+    a note naming the chat the account is now in; ``None`` then."""
     facts = entity_facts(entity) if entity is not None else {}
+    landed = facts.get("peer_id")
+    if candidate.peer_id is not None and landed is not None and landed != candidate.peer_id:
+        where = f" {_quoted(facts['title'])}" if facts.get("title") else ""
+        wrong = (
+            f"Telegram answered the join with a different chat{where} (id {landed}) than the one "
+            f"approved (id {candidate.peer_id}); nothing was fetched or added — leave it with "
+            f"`grepogram leave --account {session.account} -- {landed}` if the account should "
+            "not be there"
+        )
+        _refuse_candidate(rdb, session, candidate, "failed", wrong, report)
+        return None
     facts["member"] = True
     joined = research_db.update_candidate(rdb, candidate.id, status="joined", note=note, **facts)
     report.joined.append(candidate.id)
@@ -1988,8 +2215,9 @@ def _mark_joined(
 
 
 def _joined_entity(answer: Any, candidate: Candidate) -> Any:
-    """The chat a join answered with: the candidate's own when its peer id is known, else the
-    first group or channel of the answer."""
+    """The chat a join answered with: the candidate's own when its peer id is known and the
+    answer holds it, else the first group or channel of the answer — which
+    :func:`_mark_joined` refuses to take for a candidate whose peer id it is not."""
     chats = [
         chat
         for chat in getattr(answer, "chats", None) or ()
@@ -2092,12 +2320,29 @@ async def _join_all(
 
 
 async def _input_channel(client: Any, candidate: Candidate) -> Any:
+    """The chat a join addresses: the very peer the probe saw, by its id and the access hash
+    this account holds for it, whenever both are known — a username is resolved only when they
+    are not, and then must still name the probed peer (:func:`_resolve_approved`)."""
+    if candidate.peer_id is not None and candidate.access_hash is not None:
+        bare, kind = utils.resolve_id(candidate.peer_id)
+        if kind is types.PeerChannel:
+            return types.InputChannel(bare, candidate.access_hash)
     if candidate.username:
-        entity = await client.get_entity(f"@{candidate.username}")
-        return utils.get_input_channel(entity)
-    if candidate.peer_id is None or candidate.access_hash is None:
-        raise ValueError("nothing addresses this chat: no username and no access hash")
-    return types.InputChannel(utils.resolve_id(candidate.peer_id)[0], candidate.access_hash)
+        return utils.get_input_channel(await _resolve_approved(client, candidate))
+    raise ValueError("nothing addresses this chat: no username and no access hash")
+
+
+async def _resolve_approved(client: Any, candidate: Candidate) -> Any:
+    """``candidate``'s ``@username`` resolved, refused with :class:`_OtherChat` when it now
+    names a chat other than the one probed and approved."""
+    entity = await client.get_entity(f"@{candidate.username}")
+    found = dialogs.peer_id(entity)
+    if candidate.peer_id is not None and found != candidate.peer_id:
+        raise _OtherChat(
+            f"@{candidate.username} now names a different chat (id {found}) than the one "
+            f"approved (id {candidate.peer_id})"
+        )
+    return entity
 
 
 async def _join_one(
@@ -2132,8 +2377,10 @@ async def _join_one(
     except errors.UnauthorizedError as exc:
         _raise_auth(exc, account)
     except errors.UserAlreadyParticipantError:
-        joined = _mark_joined(rdb, candidate, None, report, "the account was already a member")
-        if joined.peer_id is None:
+        joined = _mark_joined(
+            rdb, session, candidate, None, report, "the account was already a member"
+        )
+        if joined is not None and joined.peer_id is None:
             await probe(client, rdb, conn, joined, now=stamp)
         return
     except errors.InviteRequestSentError:
@@ -2152,6 +2399,10 @@ async def _join_one(
         )
         _refuse_candidate(rdb, session, candidate, "failed", note, report)
         return
+    except _OtherChat as exc:
+        note = f"{exc}; nothing was joined"
+        _refuse_candidate(rdb, session, candidate, "unavailable", note, report)
+        return
     except _JOIN_UNREACHABLE as exc:
         note = f"Telegram refused the join: {exc}"
         _refuse_candidate(rdb, session, candidate, "unavailable", note, report)
@@ -2159,8 +2410,10 @@ async def _join_one(
     except errors.RPCError as exc:
         _refuse_candidate(rdb, session, candidate, "failed", f"the join failed: {exc}", report)
         return
-    _mark_joined(rdb, candidate, _joined_entity(answer, candidate), report)
-    log.info("research session %d: joined candidate %d as %s", session.id, candidate.id, account)
+    if _mark_joined(rdb, session, candidate, _joined_entity(answer, candidate), report):
+        log.info(
+            "research session %d: joined candidate %d as %s", session.id, candidate.id, account
+        )
 
 
 async def _join_folder(
@@ -2208,7 +2461,7 @@ async def _join_folder(
             continue
         entity = None if child.peer_id is None else entities.get(child.peer_id)
         if child.peer_id in already:
-            _mark_joined(rdb, child, entity, report, "the account was already a member")
+            _mark_joined(rdb, session, child, entity, report, "the account was already a member")
         elif child.peer_id not in offered or entity is None:
             note = f"the shared folder t.me/addlist/{slug} no longer lists it"
             _refuse_candidate(rdb, session, child, "unavailable", note, report)
@@ -2244,7 +2497,7 @@ async def _join_folder(
             _refuse_candidate(rdb, session, child, "failed", note, report)
         return
     for child, entity in to_join:
-        _mark_joined(rdb, child, _joined_entity(result, child) or entity, report)
+        _mark_joined(rdb, session, child, _joined_entity(result, child) or entity, report)
     log.info(
         "research session %d: joined %d chat(s) of a shared folder as %s",
         session.id,
@@ -2284,6 +2537,8 @@ def _planned_source(
     Only with a live ``add_source`` grant, once the account can read the chat — a member, or a
     public chat anyone reads — and never over a chat the index holds as a Telegram Desktop
     import (:func:`grepogram.sources.imported_tag`), whose history a live source would take over.
+    A member's source names the chat by its peer id, so it is the chat that was approved
+    whatever its username does later; comments come along for a channel and nothing else.
     """
     if candidate.source_id is not None or not authorized(rdb, candidate, "add_source"):
         return None
@@ -2295,24 +2550,73 @@ def _planned_source(
         note = "nothing names the chat well enough to add it as a source"
         _refuse_candidate(rdb, session, candidate, "failed", note, report)
         return None
-    kind: ChatType = candidate.type or "channel"
     if candidate.peer_id is not None:
-        held = sources.imported_tag(
-            conn, candidate.peer_id, scope=chat_scope(kind, session.account)
+        # an unknown type is looked up in both scopes rather than guessed
+        kinds: tuple[ChatType, ...] = (
+            (candidate.type,) if candidate.type is not None else ("channel", "group")
         )
-        if held is not None:
-            note = (
-                f"the index holds this chat as {held}, a Telegram Desktop import; a live source "
-                f"would take it over, so none was added — `grepogram sources rm {held}` first"
+        for kind in kinds:
+            held = sources.imported_tag(
+                conn, candidate.peer_id, scope=chat_scope(kind, session.account)
             )
-            _refuse_candidate(rdb, session, candidate, "failed", note, report)
-            return None
+            if held is not None:
+                note = (
+                    f"the index holds this chat as {held}, a Telegram Desktop import; a live "
+                    f"source would take it over, so none was added — `grepogram sources rm "
+                    f"{held}` first"
+                )
+                _refuse_candidate(rdb, session, candidate, "failed", note, report)
+                return None
+    # a member reaches the chat through its dialogs, so the source names the very peer that was
+    # probed and approved; a public chat read without joining is named by its username, which
+    # _confirm_public checked still names that peer before this run adds and fetches it
+    pinned = _is_member(candidate) and candidate.peer_id is not None
     return Source(
-        chat=f"@{candidate.username}" if candidate.username else candidate.peer_id,
+        chat=candidate.peer_id if pinned or not candidate.username else f"@{candidate.username}",
         since=horizon(session),
-        comments=kind == "channel",
+        comments=candidate.type == "channel",
         account=session.account,
     )
+
+
+async def _confirm_public(
+    client: Any,
+    rdb: sqlite3.Connection,
+    session: ResearchSession,
+    work: Sequence[Candidate],
+    report: RunReport,
+) -> bool:
+    """Check that the username of every public chat this run reads without joining still names
+    the chat that was probed and approved; ``True`` when a flood wait stopped the run.
+
+    Such a chat's source is its ``@username`` (a member's is its peer id), so a username that
+    moved to another chat since the probe would add and fetch a chat no one approved: that
+    candidate is ``unavailable`` instead, and its grants are voided.
+    """
+    for candidate in work:
+        current = _fresh(rdb, candidate)
+        if current.peer_id is None or not current.username or _is_member(current):
+            continue
+        if current.status == "pending_admission" or current.status not in _ACTIONABLE:
+            continue
+        if current.source_id is None and not authorized(rdb, current, "add_source"):
+            continue
+        if current.source_id is not None and not authorized(rdb, current, "fetch"):
+            continue
+        try:
+            await _resolve_approved(client, current)
+        except errors.FloodError as exc:
+            _flood_note(report, exc, "checking the chats to read")
+            return True
+        except errors.UnauthorizedError as exc:
+            _raise_auth(exc, session.account)
+        except _OtherChat as exc:
+            note = f"{exc}; nothing was added or fetched"
+            _refuse_candidate(rdb, session, current, "unavailable", note, report)
+        except (ValueError, errors.RPCError) as exc:
+            note = f"its username no longer resolves: {exc}"
+            _refuse_candidate(rdb, session, current, "unavailable", note, report)
+    return False
 
 
 def _add_sources(
@@ -2389,13 +2693,15 @@ def _to_fetch(
 
 
 def _fetched_chat(conn: sqlite3.Connection, candidate: Candidate) -> ChatRow | None:
-    """The index row of the chat ``candidate``'s source covers."""
+    """The index row of the chat ``candidate``'s source covers: the approved peer when its id is
+    known — a row of any other peer is not it, whatever its username — else the row its
+    username names, or the source's only row."""
     assert candidate.source_id is not None
     rows = [db.get_chat(conn, chat_id) for chat_id in db.source_chat_ids(conn, candidate.source_id)]
     stored = [row for row in rows if row is not None]
+    if candidate.peer_id is not None:
+        return next((row for row in stored if row.peer_id == candidate.peer_id), None)
     for row in stored:
-        if candidate.peer_id is not None and row.peer_id == candidate.peer_id:
-            return row
         if candidate.username and (row.username or "").lower() == candidate.username.lower():
             return row
     return stored[0] if len(stored) == 1 else None
@@ -2557,6 +2863,8 @@ async def run(
     ]
     if not flooded:
         flooded = await _join_all(client, rdb, conn, session, work, report, budget, stamp)
+    if not flooded and not budget.expired:
+        flooded = await _confirm_public(client, rdb, session, work, report)
     registered = 0
     if not flooded and not budget.expired:
         try:
@@ -2606,7 +2914,8 @@ async def run(
 APPROVE_COMMAND = "grepogram research approve"
 APPROVAL_GRAMMAR = (
     "name each target as ID:action,action (actions: join, request, fetch, add_source; a bare ID "
-    "approves what indexing it needs) or a session action (global_search, paid_search)"
+    "approves joining it, or asking to, and fetching it as a source; ID:fetch,add_source reads "
+    "a public chat without joining) or a session action (global_search, paid_search)"
 )
 _STATUS_NAMES: tuple[CandidateStatus, ...] = get_args(CandidateStatus)
 
@@ -2654,11 +2963,12 @@ def approve_command(session_id: int, items: Sequence[ApprovalItem]) -> str:
 
 
 def default_actions(candidate: Candidate) -> tuple[CandidateAction, ...]:
-    """What indexing ``candidate`` takes: fetching it and adding it as a source, and — for a
-    private chat the account is not in — the one way in it offers (``request`` where its admins
-    approve who joins, ``join`` otherwise). A public chat is read without joining it."""
+    """What a bare candidate id approves: fetching the chat and adding it as an ongoing source,
+    and — for any chat the account is not in, a public one included — the one way in it offers
+    (``request`` where its admins approve who joins, ``join`` otherwise). Reading a public chat
+    without joining it is a choice made explicitly, as ``ID:fetch,add_source``."""
     inside = candidate.member is True or candidate.status in ("joined", "pending_admission")
-    if inside or candidate.username:
+    if inside:
         return ("fetch", "add_source")
     if candidate.request_needed:
         return ("request", "fetch", "add_source")
