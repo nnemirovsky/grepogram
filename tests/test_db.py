@@ -25,6 +25,7 @@ TABLES = {
     "chat_access",
     "chat_sources",
     "message_links",
+    "peer_cache",
 }
 INDEXES = {
     "messages_chat_date",
@@ -37,6 +38,7 @@ INDEXES = {
     "chats_scope_peer",
     "messages_fwd_origin",
     "message_links_target",
+    "messages_lead_seq",
 }
 
 
@@ -177,11 +179,13 @@ def test_connection_usable_from_second_thread(conn: sqlite3.Connection) -> None:
 def test_fresh_migrate_creates_schema() -> None:
     connection = db.connect(":memory:")
     assert db.schema_version(connection) == 0
-    assert db.migrate(connection) == db.SCHEMA_VERSION == 8
+    assert db.migrate(connection) == db.SCHEMA_VERSION == 9
     assert TABLES <= _names(connection, "table")
     assert INDEXES <= _names(connection, "index")
-    assert db.schema_version(connection) == 8
-    assert db.get_meta(connection, "schema_version") == "8"
+    assert db.schema_version(connection) == 9
+    assert db.get_meta(connection, "schema_version") == "9"
+    assert {"links_read", "lead_seq"} <= _columns(connection, "messages")
+    assert db.lead_clock(connection) == 1 and len(db.index_id(connection)) == 16
     assert {"peer_id", "scope"} <= _columns(connection, "chats")
     assert {"fwd_peer_id", "fwd_msg_id", "fwd_date"} <= _columns(connection, "messages")
     assert db.links_captured_from(connection) == 1
@@ -261,8 +265,8 @@ def test_fresh_migrate_adds_the_v6_columns_exactly_once() -> None:
     connection.close()
 
 
-_V8_COLUMNS = frozenset({"fwd_peer_id", "fwd_msg_id", "fwd_date"})
-"""The columns step 8 adds to ``messages``, left out of a dump compared across it."""
+_V8_COLUMNS = frozenset({"fwd_peer_id", "fwd_msg_id", "fwd_date", "links_read", "lead_seq"})
+"""The columns steps 8 and 9 add to ``messages``, left out of a dump compared across them."""
 
 
 def _identity_dump(conn: sqlite3.Connection) -> dict[str, list[tuple[object, ...]]]:
@@ -335,7 +339,7 @@ def test_migrate_upgrades_a_v6_index_and_fills_chat_identity(v6_conn: sqlite3.Co
         )
     before = _identity_dump(connection)
 
-    assert db.migrate(connection) == db.SCHEMA_VERSION == 8
+    assert db.migrate(connection) == db.SCHEMA_VERSION == 9
 
     assert _identity_dump(connection) == before
     stored = {chat.id: chat for chat in db.list_chats(connection)}
@@ -399,7 +403,7 @@ def test_migrate_upgrades_a_v7_index_and_marks_where_link_capture_starts(
         )
     before = _identity_dump(connection)
 
-    assert db.migrate(connection) == db.SCHEMA_VERSION == 8
+    assert db.migrate(connection) == db.SCHEMA_VERSION == 9
 
     assert _identity_dump(connection) == before
     stored = db.get_messages(connection, -1001)
@@ -411,6 +415,41 @@ def test_migrate_upgrades_a_v7_index_and_marks_where_link_capture_starts(
     assert db.links_captured_from(connection) == last + 1
     (fresh,) = db.upsert_messages(connection, [_message(-1001, 4, links=(("link", "@news"),))])
     assert fresh >= db.links_captured_from(connection)
+    read = dict(connection.execute("SELECT msg_id, links_read FROM messages").fetchall())
+    assert read == {1: 0, 2: 0, 3: 0, 4: 1}, "step 9: only what was stored with links is read"
+
+
+def test_step_nine_marks_read_rows_from_what_was_stored(v6_conn: sqlite3.Connection) -> None:
+    """``links_read`` comes from step 8's mark, a stored link or forward origin — and never for
+    an import, whose rows at or above the mark were stored with no links at all."""
+    connection = v6_conn
+    for step in (7, 8):
+        for statement in db.MIGRATIONS[step]:
+            connection.execute(statement)
+    db.set_meta(connection, db.META_SCHEMA_VERSION, "8")
+    connection.execute("UPDATE meta SET value = '3' WHERE key = 'links_captured_from'")
+    synthetic = db.SYNTHETIC_BASE + 4
+    connection.execute(
+        "INSERT INTO chats(id, peer_id, type, title, source_id, scope) VALUES "
+        "(-1001, -1001, 'channel', 'c', 'chat:-1001', ''), "
+        "(-1002, -1002, 'channel', 'i', 'import:old', ''), "
+        f"({synthetic}, 5, 'user', 'u', 'work/chat:5', 'work')"
+    )
+    rows = [(1, -1001, 1, None), (2, -1001, 2, -1009), (3, -1001, 3, None), (4, -1002, 1, None)]
+    for row_id, chat_id, msg_id, fwd in rows:
+        connection.execute(
+            "INSERT INTO messages(id, chat_id, msg_id, date, text, fwd_peer_id) "
+            "VALUES (?, ?, ?, 100, 't', ?)",
+            (row_id, chat_id, msg_id, fwd),
+        )
+    connection.execute("INSERT INTO message_links VALUES (1, 'link', '@x')")
+
+    assert db.migrate(connection) == 9
+
+    read = dict(connection.execute("SELECT id, links_read FROM messages").fetchall())
+    assert read == {1: 1, 2: 1, 3: 1, 4: 0}
+    assert db.get_meta(connection, db.META_SYNTHETIC_NEXT) == str(synthetic + 1)
+    assert db.count_unread_links(connection) == 1
 
 
 def test_fresh_migrate_adds_the_v8_columns_exactly_once() -> None:
@@ -2066,11 +2105,84 @@ def test_lead_messages_are_the_rows_that_may_name_another_chat(conn: sqlite3.Con
             _message(1, 7, text="plain"),
         ],
     )
-    captured = db.links_captured_from(conn)
-    assert [m.msg_id for m in db.lead_messages(conn, 1, 0, captured)] == [1, 3, 5, 6]
-    assert [m.msg_id for m in db.lead_messages(conn, 1, 3, captured)] == [5, 6]
-    assert db.newest_msg_id(conn, 1) == 7
-    assert db.newest_msg_id(conn, 2) == 0
+    upto = db.newest_lead_seq(conn, 1)
+    found = db.lead_messages(conn, 1, 0, upto)
+    assert [(m.msg_id, read) for m, read in found] == [
+        (1, False),
+        (3, False),
+        (5, True),
+        (6, False),
+    ]
+    first_batch = found[0][0]
+    assert [m.msg_id for m, _ in db.lead_messages(conn, 1, 2, upto)] == [5, 6]
+    assert db.newest_lead_seq(conn, 2) == 0
+    # an old row re-stored with its links read leaves the fallback and moves up the clock
+    db.upsert_messages(conn, [_message(1, 1, text="old t.me/a_chat", links=(("link", "@a_chat"),))])
+    after = db.newest_lead_seq(conn, 1)
+    assert after > upto
+    assert [(m.msg_id, r) for m, r in db.lead_messages(conn, 1, upto, after)] == [(1, True)]
+    assert first_batch.id == db.lead_messages(conn, 1, upto, after)[0][0].id, "same row"
+
+
+def test_the_lead_clock_sees_a_row_stored_below_the_newest_msg_id(
+    conn: sqlite3.Connection,
+) -> None:
+    """A comment reaches its discussion group after later ones did; a msg_id cursor would pass
+    over it for good, the clock does not."""
+    db.upsert_chat(conn, _chat(1))
+    db.upsert_messages(conn, [_message(1, 9, links=(("link", "@late"),))])
+    cursor = db.newest_lead_seq(conn, 1)
+    db.upsert_messages(conn, [_message(1, 4, links=(("link", "@early"),))])
+    found = db.lead_messages(conn, 1, cursor, db.newest_lead_seq(conn, 1))
+    assert [m.msg_id for m, _ in found] == [4]
+
+
+def test_captured_links_touch_nothing_else_of_a_row(conn: sqlite3.Connection) -> None:
+    db.upsert_chat(conn, _chat(1))
+    db.upsert_messages(conn, [_message(1, 3, text="see here", links=None)])
+    db.mark_indexed(conn, [row.id for row in db.get_messages(conn, 1) if row.id is not None])
+    assert db.unread_link_ids(conn, 1, 0, 10) == [3]
+    before = db.get_messages(conn, 1)[0]
+    fresh = MessageRow(
+        chat_id=1,
+        msg_id=3,
+        date=1,
+        text="edited meanwhile",
+        fwd_peer_id=-1005,
+        fwd_msg_id=8,
+        links=(("text_url", "@hidden"),),
+    )
+    assert db.set_captured_links(conn, 1, [fresh, dataclasses.replace(fresh, msg_id=99)], 3) == 1
+    after = db.get_messages(conn, 1)[0]
+    assert (after.text, after.date, after.fwd_peer_id, after.fwd_msg_id) == (
+        before.text,
+        before.date,
+        -1005,
+        8,
+    )
+    assert db.message_links(conn, [after.id or 0]) == {after.id: (("text_url", "@hidden"),)}
+    assert db.unread_link_ids(conn, 1, 0, 10) == [] and db.recapture_cursor(conn, 1) == 3
+    assert db.unindexed_message_ids(conn, 1) == [], "no rebuild: a unit renders none of it"
+
+
+def test_a_synthetic_id_is_never_handed_out_twice(conn: sqlite3.Connection) -> None:
+    db.upsert_chat(conn, ChatRow(id=5, type="user", title="Bob"))
+    work = db.upsert_chat(conn, ChatRow(id=5, type="user", title="Bob", scope="work"), "work")
+    assert work.id == db.SYNTHETIC_BASE
+    db.delete_chat(conn, work.id)
+    again = db.upsert_chat(conn, ChatRow(id=5, type="user", title="Bob", scope="home"), "home")
+    assert again.id == db.SYNTHETIC_BASE + 1
+
+
+def test_forward_origins_are_remembered_per_account(conn: sqlite3.Connection) -> None:
+    db.remember_peers(conn, "default", [(-1007, "Origin_Chan", 111)], now=1)
+    db.remember_peers(conn, "work", [(-1007, None, 222)], now=2)
+    db.remember_peers(conn, "default", [(-1007, None, None)], now=3)
+    assert db.cached_peer_hash(conn, -1007, "default") == 111
+    assert db.cached_peer_hash(conn, -1007, "work") == 222
+    assert db.cached_peer_hash(conn, -1007, "other") is None
+    assert db.cached_peer_username(conn, -1007) == "origin_chan"
+    assert db.cached_peer_username(conn, -1008) is None
 
 
 def test_chats_for_username_ignores_case_and_the_at_sign(conn: sqlite3.Connection) -> None:

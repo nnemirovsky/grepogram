@@ -607,13 +607,50 @@ class SyncedChat:
     warnings: list[str] = field(default_factory=list)
 
 
-class _PeerBook:
-    """Users met during a fetch: display names for the mapper, pending rows for the upsert."""
+def forward_peers(messages: Iterable[Any]) -> list[tuple[int, str | None, int | None]]:
+    """``(peer_id, username, access_hash)`` of the channels and supergroups ``messages`` were
+    forwarded from, as Telegram handed them along with the messages (``msg.forward.chat``, bound
+    from the answer's ``chats`` at no cost).
 
-    def __init__(self) -> None:
+    That is the only moment grepogram learns how to reach a forward's origin: the message
+    carries its id alone, and an id is no address — a channel is asked about with this
+    account's access hash, or found by its username. A ``min`` entity's access hash addresses
+    nothing and is left out; its username is kept. An origin that brings neither is dropped.
+    """
+    found: dict[int, tuple[int, str | None, int | None]] = {}
+    for msg in messages:
+        forward = getattr(msg, "forward", None)
+        chat = getattr(forward, "chat", None) if forward is not None else None
+        if not isinstance(chat, types.Channel):
+            continue
+        username = entity_username(chat)
+        access_hash = None if chat.min else chat.access_hash
+        if username or access_hash is not None:
+            marked = dialogs.peer_id(chat)
+            found[marked] = (marked, username, access_hash)
+    return list(found.values())
+
+
+def remember_forward_peers(
+    conn: sqlite3.Connection, account: str, messages: Iterable[Any], now: int | None = None
+) -> None:
+    """Record in ``peer_cache`` what ``account`` was handed about the origins of the forwards
+    among ``messages`` (:func:`forward_peers`), so research can probe and join them."""
+    peers = forward_peers(messages)
+    if peers:
+        db.remember_peers(conn, account, peers, int(time.time()) if now is None else now)
+
+
+class _PeerBook:
+    """Peers met during a fetch: display names for the mapper, pending user rows for the upsert,
+    and the forward origins ``account`` was handed (:func:`forward_peers`)."""
+
+    def __init__(self, account: str = DEFAULT_ACCOUNT) -> None:
+        self.account = account
         self.users: dict[int, UserRow] = {}
         self.names: dict[int, str] = {}
         self._pending: dict[int, UserRow] = {}
+        self._origins: dict[int, tuple[int, str | None, int | None]] = {}
 
     def add(self, msg: Any) -> None:
         for user_id, user in collect_users(peers_of(msg)).items():
@@ -623,11 +660,16 @@ class _PeerBook:
             self._pending[user_id] = user
             if user.display_name:
                 self.names[user_id] = user.display_name
+        for origin in forward_peers([msg]):
+            self._origins[origin[0]] = origin
 
     def flush(self, conn: sqlite3.Connection) -> None:
         if self._pending:
             db.upsert_users(conn, self._pending.values())
             self._pending = {}
+        if self._origins:
+            db.remember_peers(conn, self.account, self._origins.values(), int(time.time()))
+            self._origins = {}
 
 
 @dataclass(slots=True, kw_only=True)
@@ -655,6 +697,7 @@ class _Run:
     me: UserRow | None
     discussion: ChatRow | None = None
     peers: _PeerBook = field(default_factory=_PeerBook)
+    """Given the acting account by :func:`sync_chat`, whose forward origins it records."""
     changes: dict[int, None] = field(default_factory=dict)
     comment_ids: dict[int, None] = field(default_factory=dict)
     inserted: dict[int, int] = field(default_factory=dict)
@@ -848,6 +891,7 @@ async def sync_chat(
         budget=budget,
         cfg=cfg or Config(),
         me=me,
+        peers=_PeerBook(acting),
     )
     try:
         migrated = (
@@ -1208,8 +1252,8 @@ def _differs(stored: MessageRow, fresh: MessageRow) -> bool:
     links with exactly what the re-stored row carries — never with less than a comparison saw.
     The first sync after schema step 8 therefore re-stores, once, the rows of each chat's
     ``edit_refetch`` window that name a Telegram destination or were forwarded, which is how
-    those rows gain what step 8 captures; rows outside the window keep none, and discovery reads
-    their text instead (:func:`grepogram.db.links_captured_from`).
+    those rows gain what step 8 captures; rows outside the window keep none — discovery reads
+    their text instead (``messages.links_read``).
     """
     kept = {
         field: getattr(stored, field) if getattr(fresh, field) is None else getattr(fresh, field)
@@ -2554,11 +2598,16 @@ class StoredPass:
     async def visit[T](self, chat: ChatRow, act: Callable[[Any], Awaitable[T]]) -> T | None:
         """``act(client)`` for the first account that answers about ``chat``; ``None`` when none
         did — a flood wait, a refusal, an error or the budget ended its turn."""
-        route = self.routes.get(chat.id, [])
 
         async def through(account: str, client: Any) -> T:
             return await act(client)
 
+        return await self.visit_as(chat, through)
+
+    async def visit_as[T](self, chat: ChatRow, act: Callable[[str, Any], Awaitable[T]]) -> T | None:
+        """:meth:`visit` for a pass that needs to know which account answered:
+        ``act(account, client)``."""
+        route = self.routes.get(chat.id, [])
         outcome = await through_accounts(
             self.conn,
             self.clients,
@@ -2567,7 +2616,7 @@ class StoredPass:
             self.sync_cfg,
             self.budget,
             self.stopped,
-            through,
+            act,
             warmed=route[:1],
         )
         for account, seconds in outcome.flooded:

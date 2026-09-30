@@ -1801,12 +1801,15 @@ async def test_research_loop_through_the_tools(
     assert (started["id"], started["account"], list(started["seeds"])) == (
         1,
         "default",
-        [RENT_PEER],
+        [{"scope": "", "peer_id": RENT_PEER}],
     )
     assert started["limits"]["since_days"] == 3650 and started["horizon"]
     discovered = await tools.research_discover(1)
     assert discovered["new_candidates"] == [1] and discovered["probe"]["probed"] == [1]
-    assert [n for n, _ in researching.calls if n in ("iter_messages", "get_messages")] == []
+    history = [kw for n, kw in researching.calls if n in ("iter_messages", "get_messages")]
+    assert [kw for kw in history if kw["filter"] is not types.InputMessagesFilterPinned] == [], (
+        "at most a seed's pinned posts are read, and nothing of any candidate"
+    )
     listed = tools.research_candidates(1)
     (candidate,) = listed["candidates"]
     assert (candidate["identity"], candidate["title"], candidate["status"]) == (
@@ -1816,7 +1819,13 @@ async def test_research_loop_through_the_tools(
     )
     assert (candidate["member"], candidate["cached"], candidate["authorized"]) == (False, False, [])
     assert "access_hash" not in candidate
-    assert candidate["evidence"][0]["snippet"] == "flats at @tb_flats"
+    (evidence,) = candidate["evidence"]
+    assert evidence["snippet"] == "flats at @tb_flats"
+    assert (evidence["scope"], evidence["peer_id"], evidence["chat_id"]) == (
+        "",
+        RENT_PEER,
+        RENT_PEER,
+    )
 
     rdb = research_db.open_store(paths)
     try:

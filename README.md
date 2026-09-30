@@ -650,10 +650,12 @@ post_search = false                    # channels.searchPosts (public posts)
 paid_stars_max = 0                     # 0 = never pay for post search
 max_depth = 2                          # hops from a seed chat a candidate may be
 max_candidates = 50                    # per discover call
+max_session_candidates = 500           # per session, over every discover call and run
 probe_limit = 20                       # username / invite / addlist probes per discover call
 since_days = 365                       # horizon given to sources a research run adds
 max_messages_per_run = 5000
 run_budget_s = 300
+admission_timeout_days = 30            # an unanswered admission request is given up after this
 
 # The account `grepogram auth` signs in is "default" and needs no entry. Every other account
 # signed in at the same time is listed here; all of them share the [telegram] app:
@@ -704,9 +706,11 @@ run_budget_s = 300
 | `research.paid_stars_max` | the most Telegram Stars one post search may spend once the free quota is gone; `0` never pays, and paying needs its own `paid_search` approval |
 | `research.max_depth` | how many hops from a seed chat a candidate may be: leads in the seeds are depth 1, leads in a chat fetched from a depth-1 candidate depth 2 |
 | `research.max_candidates` | the most candidates one discover call proposes |
+| `research.max_session_candidates` | the most candidates one session holds in all, over every discover call and run; past it, discovery proposes nothing new and reports what the ceiling held back |
 | `research.probe_limit` | how many usernames, invite links and shared-folder links one discover call looks up on Telegram (metadata only, no history) |
 | `research.since_days` | how far back a source added by a research run fetches history |
 | `research.max_messages_per_run`, `research.run_budget_s` | the message and time budget of one research run; a run stopped by either resumes next time |
+| `research.admission_timeout_days` | how long a run keeps asking about an admission request no admin answered; after that the candidate is `failed` with a note, and a new approval may send the request again |
 | `accounts[].name` | an account signed in besides the implicit `default` one: 1 to 32 of `a-z`, `0-9`, `_` and `-`, unique, and never `default`; its session lives in `sessions/<name>.session` next to the config, while `default` keeps `session.session` |
 | `accounts[].label` | optional free text describing the account, for your own reference |
 | `sources[].folder` | a Telegram folder by name; its membership (included and pinned chats minus excluded ones, plus category flags) is re-resolved on every sync |

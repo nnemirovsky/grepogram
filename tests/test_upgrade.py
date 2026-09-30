@@ -36,8 +36,15 @@ POSTS = {
 }
 V6_TABLES = ("chats", "messages", "units", "msg_fts", "unit_fts", "unit_vec")
 """Every table v0.2.0 wrote rows to; step 7 and step 8 add columns and tables, none of these."""
-LATER_META = (db.META_SCHEMA_VERSION, db.META_LINKS_CAPTURED_FROM)
-"""The meta keys a v0.2.0 index cannot hold: its version, and step 8's capture marker."""
+LATER_META = (
+    db.META_SCHEMA_VERSION,
+    db.META_LINKS_CAPTURED_FROM,
+    db.META_LEAD_CLOCK,
+    db.META_INDEX_ID,
+    db.META_SYNTHETIC_NEXT,
+)
+"""The meta keys a v0.2.0 index cannot hold: its version, step 8's capture marker and step 9's
+lead clock, index name and synthetic-id mark."""
 
 
 def _client(posts: int) -> FakeClient:

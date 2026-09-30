@@ -115,8 +115,10 @@ through when the accounts differ.
 - Research finds chats the user does not index yet; its tools refuse until the user sets \
 `[research] enabled = true`. The playbook: `research_start` with the question, indexed seed \
 chats and the `account` that will join and fetch (what a run adds is reached through it); \
-`research_discover`; `research_candidates`, reading each candidate's `evidence` and its \
-three separate facts — `member`, `cached` (and through which accounts), `authorized`; tell the \
+`research_discover`; `research_candidates`, reading each candidate's `evidence` (a message \
+it came from is read with `thread` / `context` by the evidence's `chat_id`; `null` means the \
+index does not hold that chat) and its three separate facts — `member`, `cached` (and through \
+which accounts), `authorized`; tell the \
 user what was found and why, and ask which to approve; `research_approve` shows the user the \
 exact summary and only their own confirmation grants anything — when it answers with a `hint` \
 naming a terminal command, hand the user that command unchanged for them to type in their own \
@@ -1109,9 +1111,11 @@ def research_start(
     that later joins and fetches (the default one when omitted). The limits default to the
     config's [research] section: `max_depth` hops from a seed, `max_candidates` new candidates
     and `probe_limit` probes per discover call, `since_days` of history for every source a run
-    adds, `max_messages_per_run` and `run_budget_s` per run. Returns the session (`id`, `seeds`
-    as chat ids, `limits`, `state`, `horizon` — the date added sources start from). Next:
-    `research_discover`.
+    adds, `max_messages_per_run` and `run_budget_s` per run (the session's own ceiling,
+    `max_session_candidates`, and `admission_timeout_days` come from the config). Returns the
+    session (`id`, `seeds` as `{scope, peer_id}` — each chat as Telegram names it, so the
+    session outlives a rebuilt index —, `limits`, `state`, `horizon` — the date added sources
+    start from). Next: `research_discover`.
     """
     state = _app()
     cfg = state.config()
@@ -1137,12 +1141,15 @@ def research_start(
 @guarded_async
 async def research_discover(session_id: int, offline: bool = False) -> ToolResult:
     """Find the chats a research session's chats lead to — links, hidden hyperlinks, mentions,
-    buttons, forward origins, shared folders — and propose them as candidates; then, unless
-    `offline`, probe the best of them on Telegram as the session's account (title, type, size,
-    membership, whether admins approve joins — never their history) and run the global searches
-    the user approved. Nothing is joined or fetched: every find is only proposed. Returns the
-    report: `leads`, `new_candidates`, `updated_candidates`, what was left out (`beyond_depth`,
-    `excluded`, `over_cap`), `probe` and `searches`. Next: `research_candidates`.
+    buttons, forward origins, shared folders — and propose them as candidates, marking a chat
+    that lists many others a directory (`directories`; its finds carry a `directory` path); then,
+    unless `offline`, read the pinned posts of the session's own chats once (`pins`: their leads
+    are evidence only, never indexed messages), probe the best candidates on Telegram as the
+    session's account (title, type, size, membership, whether admins approve joins — never their
+    history) and run the global searches the user approved. Nothing is joined or fetched: every
+    find is only proposed. Returns the report: `leads`, `new_candidates`, `updated_candidates`,
+    what was left out (`beyond_depth`, `excluded`, `over_cap`, `session_full` when the session's
+    ceiling is reached), `pins`, `probe` and `searches`. Next: `research_candidates`.
     """
     state = _app()
     cfg = state.config()
@@ -1174,7 +1181,10 @@ def research_candidates(session_id: int, status: list[str] | None = None) -> Too
     facts: `member` (the session's account is in it; null before a probe), `cached` (the index
     already holds it, through `cached_accounts`) and `authorized` (the actions the user
     approved and no run has carried out yet). `evidence` lists every path that led to it:
-    `via`, the `chat_id` / `msg_id` it was found in, `origin_key` and a `snippet`.
+    `via` (a `pinned` post, a `directory`, a link kind, a forward, a search…), the chat it was
+    found in as Telegram names it (`scope`, `peer_id`) and as the index holds it now (`chat_id`,
+    what `thread` and `context` take; `null` for a chat the index does not hold, such as a
+    search result), `msg_id`, `origin_key` and a `snippet`.
     """
     state = _app()
     cfg = state.config()
@@ -1291,9 +1301,10 @@ async def research_run(session_id: int) -> ToolResult:
     another account reaches is fetched through it when the session's account is refused); one
     that cannot is in `accounts_skipped`. Returns the run report: `admitted`, `joined`,
     `pending_admission`, `sources_added`, `fetched`, `partial`, `unavailable`, `failed`
-    (candidate ids), `messages`, `stopped_by` (the budget, a flood wait, a busy sync — run it
-    again to go on), `discovery` and `warnings`. Then analyse with `search`, `thread` and
-    `context`.
+    (candidate ids; an admission request no admin answered in time is `failed`), `messages`,
+    `stopped_by` (the budget, a flood wait, a busy sync — run it again to go on), `pins` (the
+    pinned posts of what it fetched, read for leads), `discovery` and `warnings`. Then analyse
+    with `search`, `thread` and `context`.
     """
     state = _app()
     cfg = state.config()

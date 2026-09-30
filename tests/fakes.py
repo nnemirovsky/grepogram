@@ -506,6 +506,7 @@ class FakeClient:
         ids: int | list[int] | None = None,
         reverse: bool = False,
         reply_to: int | None = None,
+        filter: Any = None,
         **_: Any,
     ) -> AsyncIterator[types.Message | None]:
         chat_id = self._peer_id(entity)
@@ -522,6 +523,7 @@ class FakeClient:
                     "ids": ids,
                     "reverse": reverse,
                     "reply_to": reply_to,
+                    "filter": filter,
                 },
             )
         )
@@ -543,11 +545,20 @@ class FakeClient:
         if ids is not None:
             by_id = {m.id: m for m in pool}
             for wanted in [ids] if isinstance(ids, int) else ids:
-                yield by_id.get(wanted)
+                found = by_id.get(wanted)
+                if found is not None:
+                    self._attach_peers(found)
+                yield found
             return
         selected = [
             m for m in pool if (not min_id or m.id > min_id) and (not max_id or m.id < max_id)
         ]
+        if filter is not None:
+            # messages.search with a filter; the only one grepogram sends is the pinned one
+            kind = filter if isinstance(filter, type) else type(filter)
+            if kind is not types.InputMessagesFilterPinned:
+                raise NotImplementedError(f"FakeClient has no search filter {kind.__name__}")
+            selected = [m for m in selected if getattr(m, "pinned", False)]
         # offset_id (and min_id, which Telethon turns into one) takes priority over offset_date.
         # Reversed, the date bound is inclusive: Telethon 1.44 passes offset_date to
         # GetHistoryRequest untouched and filters nothing by date, so the chunk is the complement
@@ -619,15 +630,25 @@ class FakeClient:
         return str(path)
 
     def _attach_peers(self, message: types.Message) -> None:
-        """Bind the sender and chat entities the way Telethon's ``_finish_init`` does.
+        """Bind the sender, chat and forward-origin entities the way Telethon's
+        ``_finish_init`` does.
 
         The real client fills ``message.sender`` / ``message.chat`` from the ``users`` and
-        ``chats`` lists Telegram returns with each history chunk; here they come from the
-        entities this client knows. Forward origins stay unbound (``Forward`` needs a client).
+        ``chats`` lists Telegram returns with each history chunk, and ``message.forward`` — a
+        ``custom.Forward`` — with the origin from the same lists; here they come from the
+        entities this client knows, which carry this account's access hashes. Those lists teach
+        the session the peers they hold, so an origin bound here is learned too.
         """
         if message.sender_id is not None:
             message._sender = self.entities.get(message.sender_id)
         message._chat = self.entities.get(message.chat_id)
+        fwd = message.fwd_from
+        if fwd is not None and fwd.from_id is not None:
+            origin = self.entities.get(int(utils.get_peer_id(fwd.from_id)))
+            known = {} if origin is None else {int(utils.get_peer_id(origin)): origin}
+            message._forward = custom.Forward(_ENTITY_CACHE, fwd, known)
+            if origin is not None:
+                self._learn([origin])
 
     # --- raw requests ----------------------------------------------------------------------
 
@@ -1020,6 +1041,16 @@ class FakeSession:
         for entity in entities:
             if isinstance(entity, types.InputPeerUser | types.InputPeerChannel):
                 self._client.seeded[int(utils.get_peer_id(entity))] = int(entity.access_hash)
+
+
+class _NoCache:
+    """What ``custom.Forward`` asks a client for: an entity cache that knows nothing, so the
+    origin comes from the answer's own lists, as it does for a fresh client."""
+
+    _mb_entity_cache: dict[int, Any] = {}
+
+
+_ENTITY_CACHE = _NoCache()
 
 
 def _by_id(messages: Iterable[types.Message]) -> list[types.Message]:

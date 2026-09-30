@@ -1,9 +1,12 @@
 import asyncio
 import copy
 import dataclasses
+import datetime as dt
+import functools
 import logging
 import re
 import sqlite3
+import threading
 from collections.abc import Callable, Iterator
 from typing import Any
 
@@ -14,9 +17,11 @@ from telethon.tl import functions, types
 from grepogram import config, db, leads, research, research_db, sync, tg
 from grepogram.filters import UnknownChat
 from grepogram.models import (
+    AccountCfg,
     ApprovalItem,
     Candidate,
     CandidateView,
+    ChatKey,
     ChatRow,
     Config,
     Grant,
@@ -39,7 +44,7 @@ from tests.fakes import (
     make_user,
     no_discussion,
 )
-from tests.fixtures import tl
+from tests.fixtures import tl, two_accounts
 
 SEED = -1000000000100
 SEED_TWO = -1000000000101
@@ -107,6 +112,22 @@ def _by_identity(
     return {v.candidate.identity: v for v in research.candidate_views(rdb, conn, session)}
 
 
+def _register(
+    rdb: sqlite3.Connection,
+    conn: sqlite3.Connection,
+    session: ResearchSession,
+    chat_id: int,
+    depth: int,
+) -> None:
+    """Register an indexed chat as one the session reads, at ``depth`` — what a run does for a
+    chat it fetched."""
+    chat = db.get_chat(conn, chat_id)
+    assert chat is not None
+    research_db.set_scan_cursor(
+        rdb, session.id, research.chat_key(chat), depth=depth, index_id=db.index_id(conn)
+    )
+
+
 # --- sessions --------------------------------------------------------------------------------
 
 
@@ -131,7 +152,7 @@ def test_start_resolves_seeds_through_chat_specs(
     rdb: sqlite3.Connection, conn: sqlite3.Connection
 ) -> None:
     session = _start(rdb, conn, seeds=("@tbrent", "Tbilisi chat"))
-    assert session.seeds == tuple(sorted((SEED, SEED_TWO)))
+    assert session.seeds == (ChatKey("", SEED_TWO), ChatKey("", SEED))
     assert session.account == "default"
     assert research_db.get_session(rdb, session.id) == session
 
@@ -214,7 +235,7 @@ def test_every_kind_of_link_becomes_a_candidate_with_its_path(
     assert found["peer:-1000000002000"].candidate.peer_id == -1000000002000
     assert found["@alpha_rent"].candidate.username == "alpha_rent"
     evidence = found["@hidden_rent"].evidence[0]
-    assert (evidence.chat_id, evidence.msg_id, evidence.snippet) == (SEED, 2, "look here")
+    assert (evidence.chat, evidence.msg_id, evidence.snippet) == (ChatKey("", SEED), 2, "look here")
     assert evidence.origin_key == f"post:{SEED}/2"
     assert report.chats_scanned == 1 and report.messages_scanned == 6 and report.leads == 6
     assert sorted(report.new_candidates) == sorted(v.candidate.id for v in found.values())
@@ -364,32 +385,6 @@ def test_an_imported_chat_is_cached_through_no_account(
 # --- depth, cursors and the cap --------------------------------------------------------------
 
 
-def test_a_forward_chain_is_followed_one_hop_per_fetched_chat_up_to_the_depth_cap(
-    rdb: sqlite3.Connection, conn: sqlite3.Connection
-) -> None:
-    _store(conn, SEED, 1, "from hop", fwd_peer_id=HOP, fwd_msg_id=1)
-    session = _start(rdb, conn, max_depth=2)
-    research.discover_offline(rdb, conn, CFG, session.id)
-    assert [v.candidate.depth for v in research.candidate_views(rdb, conn, session)] == [1]
-
-    # a run fetched the hop at the depth it was found at (task 16 records this cursor)
-    db.upsert_chat(conn, ChatRow(id=HOP, type="channel", title="Hop"))
-    _store(conn, HOP, 1, "from further", fwd_peer_id=HOP_ORIGIN, fwd_msg_id=1)
-    research_db.set_scan_cursor(rdb, session.id, HOP, depth=1, msg_id=0)
-    research.discover_offline(rdb, conn, CFG, session.id)
-    found = _by_identity(rdb, conn, session)
-    assert found[f"peer:{HOP_ORIGIN}"].candidate.depth == 2
-    assert f"peer:{HOP}" in found, "the fetched chat stays a candidate"
-
-    # the next hop would be depth 3: beyond max_depth, so never proposed
-    db.upsert_chat(conn, ChatRow(id=HOP_ORIGIN, type="channel", title="Hop origin"))
-    _store(conn, HOP_ORIGIN, 1, "from the deep", fwd_peer_id=DEEP_ORIGIN, fwd_msg_id=1)
-    research_db.set_scan_cursor(rdb, session.id, HOP_ORIGIN, depth=2, msg_id=0)
-    report = research.discover_offline(rdb, conn, CFG, session.id)
-    assert f"peer:{DEEP_ORIGIN}" not in _by_identity(rdb, conn, session)
-    assert report.beyond_depth == 1 and report.new_candidates == []
-
-
 def test_a_deeper_path_adds_evidence_to_an_existing_candidate(
     rdb: sqlite3.Connection, conn: sqlite3.Connection
 ) -> None:
@@ -398,7 +393,7 @@ def test_a_deeper_path_adds_evidence_to_an_existing_candidate(
     research.discover_offline(rdb, conn, CFG, session.id)
     db.upsert_chat(conn, ChatRow(id=HOP, type="channel", title="Hop"))
     _store(conn, HOP, 4, "t.me/alpha_rent again", links=(("link", "@alpha_rent"),))
-    research_db.set_scan_cursor(rdb, session.id, HOP, depth=1, msg_id=0)
+    _register(rdb, conn, session, HOP, 1)
 
     report = research.discover_offline(rdb, conn, CFG, session.id)
 
@@ -413,8 +408,13 @@ def test_discovery_resumes_from_its_cursor(
     _store(conn, SEED, 1, "t.me/alpha_rent", links=(("link", "@alpha_rent"),))
     session = _start(rdb, conn)
     research.discover_offline(rdb, conn, CFG, session.id)
-    cursor = research_db.scan_cursor(rdb, session.id, SEED)
-    assert cursor is not None and (cursor.depth, cursor.msg_id) == (0, 1)
+    cursor = research_db.scan_cursor(rdb, session.id, ChatKey("", SEED))
+    assert cursor is not None
+    assert (cursor.depth, cursor.lead_seq, cursor.index_id) == (
+        0,
+        db.newest_lead_seq(conn, SEED),
+        db.index_id(conn),
+    )
 
     again = research.discover_offline(rdb, conn, CFG, session.id)
     assert (again.messages_scanned, again.leads, again.new_candidates) == (0, 0, [])
@@ -437,7 +437,7 @@ def test_the_cap_keeps_the_best_corroborated_and_rereads_the_rest_next_time(
 
     assert set(_by_identity(rdb, conn, session)) == {"@strong_chan"}
     assert first.over_cap == 1 and first.truncated
-    assert research_db.scan_cursor(rdb, session.id, SEED) is None, "held back for the next call"
+    assert research_db.scan_cursor(rdb, session.id, ChatKey("", SEED)) is None, "held back"
 
     second = research.discover_offline(rdb, conn, CFG, session.id)
     assert set(_by_identity(rdb, conn, session)) == {"@strong_chan", "@weak_chan"}
@@ -569,8 +569,24 @@ def _world(**kwargs: Any) -> FakeWorld:
     )
 
 
+def _pinned(kwargs: dict[str, Any]) -> bool:
+    return kwargs.get("filter") is types.InputMessagesFilterPinned
+
+
 def _history_calls(client: FakeClient) -> list[str]:
-    return [name for name, _ in client.calls if name in ("iter_messages", "get_messages")]
+    """History reads, the pinned posts of the session's own chats aside (:func:`_pin_reads`)."""
+    return [
+        name
+        for name, kwargs in client.calls
+        if name in ("iter_messages", "get_messages") and not _pinned(kwargs)
+    ]
+
+
+def _pin_reads(client: FakeClient) -> list[int]:
+    """The chats whose pinned posts were read, in order."""
+    return [
+        int(kw["chat_id"]) for name, kw in client.calls if name == "iter_messages" and _pinned(kw)
+    ]
 
 
 def _counts(conn: sqlite3.Connection) -> tuple[int, int]:
@@ -992,7 +1008,7 @@ async def test_post_search_asks_the_quota_first_and_records_posts_as_evidence(
     assert set(found) == {"@tb_flats", "@folder_chan"}, "a private channel's posts are not public"
     (evidence,) = research_db.list_evidence(rdb, found["@tb_flats"].id)
     assert evidence.via == "post_search"
-    assert (evidence.chat_id, evidence.msg_id) == (_marked(FLATS), 11)
+    assert (evidence.chat, evidence.msg_id) == (ChatKey("", _marked(FLATS)), 11)
     assert evidence.origin_key == f"post:{_marked(FLATS)}/11"
     assert evidence.snippet == "Apartment in Vake for rent"
     assert _history_calls(client) == []
@@ -1425,7 +1441,7 @@ def test_descendants_of_an_approved_directory_stay_unauthorized(
     directory = _probed(rdb, session, "@tb_dir", title="Directory", type="channel", member=False)
     _approve(rdb, conn, session, _item(directory, "join", "fetch", "add_source"))
     # the run fetched the directory: discovery now reads it one hop further out
-    research_db.set_scan_cursor(rdb, session.id, HOP, depth=1, msg_id=0)
+    _register(rdb, conn, session, HOP, 1)
     research.discover_offline(rdb, conn, CFG, session.id)
 
     child = _by_identity(rdb, conn, session)["@tb_deep"].candidate
@@ -1575,7 +1591,7 @@ def test_skip_and_exclude_narrow_without_consent_and_void_grants(
 
 def test_targets_are_named_by_candidate_id_link_or_peer(rdb: sqlite3.Connection) -> None:
     session = research_db.create_session(
-        rdb, question="q", account="default", seeds=[SEED], limits=ResearchLimits()
+        rdb, question="q", account="default", seeds=[ChatKey("", SEED)], limits=ResearchLimits()
     )
     found = research_db.add_candidate(rdb, session.id, "+JoinMe", "invite", 1)
     assert found is not None
@@ -2119,7 +2135,7 @@ def test_the_summary_prints_no_control_character_anyone_else_chose(
         rdb,
         question="rent\x1b[2K\nApproved: nothing to worry about",
         account="default",
-        seeds=[SEED],
+        seeds=[ChatKey("", SEED)],
         limits=ResearchLimits(),
         now=1,
     )
@@ -2191,7 +2207,7 @@ def _impostor_world() -> FakeWorld:
 
 
 def _read(client: FakeClient) -> set[int]:
-    return {int(c["chat_id"]) for n, c in client.calls if n == "iter_messages"}
+    return {int(c["chat_id"]) for n, c in client.calls if n == "iter_messages" and not _pinned(c)}
 
 
 async def test_a_join_goes_to_the_probed_chat_even_after_its_username_moved(
@@ -2590,3 +2606,503 @@ async def test_a_paid_search_telegram_refuses_says_its_approval_is_spent(
     assert "the paid search failed and its paid_search approval is spent" in report.warnings[0]
     assert "Telegram refused the search" in report.warnings[1]
     assert not research.search_granted(rdb, session.id, "paid_search")
+
+
+# --- review phase 1c: discovery completeness -------------------------------------------------
+
+HOP_CHAN = make_channel(500, "Hop", username="hop_chan")
+HOP_ORIGIN_CHAN = make_channel(600, "Hop origin", username="hop_origin")
+DEEP_ORIGIN_CHAN = make_channel(700, "Deep origin", username="deep_origin")
+WORK_CFG = Config(accounts=[AccountCfg(name="work")], research=ResearchCfg(enabled=True))
+
+
+def _channel_full(channel: Any, group: Any) -> Callable[[Any], Any]:
+    """``channels.getFullChannel`` of ``channel`` linking ``group`` as its discussion group."""
+
+    def answer(request: Any) -> Any:
+        full = no_discussion(request)
+        full.full_chat.linked_chat_id = group.id
+        full.chats = [channel, group]
+        return full
+
+    return answer
+
+
+async def test_a_forward_chain_is_followed_one_hop_per_fetched_chat_up_to_the_depth_cap(
+    rdb: sqlite3.Connection, conn: sqlite3.Connection, paths: Paths
+) -> None:
+    """Nothing is stored by hand: the seed is synced, each forward's origin is known only by what
+    the sync was handed with it — its username and this account's access hash — and each hop is
+    probed, approved and fetched by a real run before the next one is even proposed."""
+    hop, hop_origin = _marked(HOP_CHAN), _marked(HOP_ORIGIN_CHAN)
+    world = FakeWorld(
+        entities=[SEED_CHANNEL, HOP_CHAN, HOP_ORIGIN_CHAN, DEEP_ORIGIN_CHAN],
+        messages={
+            SEED: [tl.channel_forward(SEED, 1, "from hop", channel=HOP_CHAN, post=1)],
+            hop: [tl.channel_forward(hop, 1, "from further", channel=HOP_ORIGIN_CHAN, post=1)],
+            hop_origin: [
+                tl.channel_forward(hop_origin, 1, "from the deep", channel=DEEP_ORIGIN_CHAN, post=1)
+            ],
+        },
+    )
+    client = _run_client(world, members=[SEED_CHANNEL])
+    config.save(dataclasses.replace(CFG, sources=[Source(chat="@TbRent")]), paths)
+    await sync.sync_all(
+        {"default": client}, conn, functools.partial(config.load, paths), paths, sync.SyncBudget()
+    )
+    assert db.get_chat(conn, hop) is None, "the origin is no chat of the index"
+    assert db.cached_peer_username(conn, hop) == "hop_chan"
+    session = _start(rdb, conn, max_depth=2)
+
+    first = await research.discover(rdb, conn, CFG, session.id, client, now=3)
+
+    (candidate_id,) = first.new_candidates
+    found = research_db.get_candidate(rdb, candidate_id)
+    assert found is not None and (found.identity, found.depth, found.username) == (
+        f"peer:{hop}",
+        1,
+        "hop_chan",
+    )
+    assert first.probe is not None and first.probe.probed == [found.id], "not a dead end"
+    found = _status(rdb, found)
+    assert (found.title, found.member) == ("Hop", False)
+    _approve(rdb, conn, session, _item(found, "join", "fetch", "add_source"))
+
+    ran = await _run(rdb, conn, paths, client, session)
+
+    assert ran.joined == ran.fetched == [found.id] and _stored(conn, hop) == [1]
+    assert ran.discovery is not None
+    (next_id,) = ran.discovery.new_candidates
+    further = research_db.get_candidate(rdb, next_id)
+    assert further is not None and (further.identity, further.depth, further.status) == (
+        f"peer:{hop_origin}",
+        2,
+        "proposed",
+    )
+    await research.discover(rdb, conn, CFG, session.id, client, now=21)
+    _approve(rdb, conn, session, _item(_status(rdb, further), "join", "fetch", "add_source"))
+
+    last = await _run(rdb, conn, paths, client, session)
+
+    assert last.fetched == [further.id] and last.discovery is not None
+    assert last.discovery.new_candidates == [] and last.discovery.beyond_depth == 1
+    assert f"peer:{_marked(DEEP_ORIGIN_CHAN)}" not in _by_identity(rdb, conn, session)
+
+
+async def test_the_pinned_posts_of_a_seed_are_read_for_leads_and_stored_nowhere(
+    rdb: sqlite3.Connection, conn: sqlite3.Connection
+) -> None:
+    """A directory keeps its index in an old pin, long before any ``since``: discover reads the
+    seeds' pins once, keeps their leads as evidence and writes no message and no cursor."""
+    ancient = tl.EPOCH - dt.timedelta(days=3000)
+    pin = tl.mention_message(SEED, 1, "our list: @tb_flats @folder_chan", date=ancient, pinned=True)
+    world = _world(messages={SEED: [pin, tl.mention_message(SEED, 2, "loose @banned_from")]})
+    client = world.client("default", members=[SEED_CHANNEL])
+    _store(conn, SEED, 2, "loose")
+    session = _start(rdb, conn)
+    before, chat = _counts(conn), db.get_chat(conn, SEED)
+
+    report = await research.discover(rdb, conn, CFG, session.id, client, now=3)
+
+    assert report.pins is not None
+    assert (report.pins.chats, report.pins.messages, report.pins.remaining) == ([SEED], 1, 0)
+    found = _by_identity(rdb, conn, session)
+    assert {identity: [e.via for e in v.evidence] for identity, v in found.items()} == {
+        "@tb_flats": ["pinned"],
+        "@folder_chan": ["pinned"],
+    }
+    evidence = found["@tb_flats"].evidence[0]
+    assert (evidence.chat, evidence.msg_id) == (ChatKey("", SEED), 1)
+    assert _counts(conn) == before and db.get_chat(conn, SEED) == chat, "stored nowhere"
+    assert _pin_reads(client) == [SEED]
+
+    again = await research.discover(rdb, conn, CFG, session.id, client, now=4)
+    assert again.pins is not None and again.pins.chats == [] and _pin_reads(client) == [SEED]
+    with pytest.raises(research.ResearchDisabled):
+        await research.read_pins(client, rdb, conn, Config(), session.id)
+
+
+async def test_a_run_reads_the_pinned_posts_of_what_it_fetched_whatever_their_age(
+    rdb: sqlite3.Connection, conn: sqlite3.Connection, paths: Paths
+) -> None:
+    flats = _marked(FLATS)
+    world = _world(
+        messages={
+            flats: [
+                tl.mention_message(
+                    flats,
+                    1,
+                    "index: @deep_chan",
+                    date=tl.EPOCH - dt.timedelta(days=900),
+                    pinned=True,
+                ),
+                tl.message(flats, 2, "flat in Vake", date=tl.at(2)),
+            ],
+            _marked(DEEP): [tl.message(_marked(DEEP), 1, "deep", date=tl.at(1))],
+        }
+    )
+    world.entities[_marked(DEEP)] = DEEP
+    client = _run_client(world)
+    _links(conn, "@tb_flats")
+    started = int(tl.EPOCH.timestamp())
+    session = research.start_session(
+        rdb, conn, CFG, QUESTION, [str(SEED)], "default", ResearchLimits(since_days=1), now=started
+    )
+    await research.discover(rdb, conn, CFG, session.id, client, now=started)
+    candidate = _by_identity(rdb, conn, session)["@tb_flats"].candidate
+    _approve(rdb, conn, session, _item(candidate, "fetch", "add_source"))
+
+    report = await research.run(rdb, conn, CFG, paths, {"default": client}, session.id, now=started)
+
+    assert report.fetched == [candidate.id]
+    assert _stored(conn, flats) == [2], "the pin is older than the source's since"
+    assert report.pins is not None and report.pins.chats == [flats]
+    (deep_id,) = report.pins.new_candidates
+    deep = research_db.get_candidate(rdb, deep_id)
+    assert deep is not None and (deep.identity, deep.depth, deep.status) == (
+        "@deep_chan",
+        2,
+        "proposed",
+    )
+    assert [e.via for e in research_db.list_evidence(rdb, deep_id)] == ["pinned"]
+    assert not research.authorized(rdb, deep, "fetch")
+
+
+def test_a_chat_that_lists_many_chats_is_a_directory_and_says_so_on_its_leads(
+    rdb: sqlite3.Connection, conn: sqlite3.Connection
+) -> None:
+    names = [f"@listed_{n:02d}" for n in range(research.DIRECTORY_MIN_CHATS)]
+    for msg_id, name in enumerate(names, start=1):
+        _store(conn, SEED, msg_id, f"see {name}", links=(("mention", name),))
+    _store(conn, SEED_TWO, 1, "just @one_chat", links=(("mention", "@one_chat"),))
+    session = _start(rdb, conn, seeds=(str(SEED), str(SEED_TWO)))
+
+    report = research.discover_offline(rdb, conn, CFG, session.id)
+
+    assert report.directories == [SEED]
+    found = _by_identity(rdb, conn, session)
+    for name in names:
+        view = found[name]
+        assert sorted(e.via for e in view.evidence) == ["directory", "mention"]
+        assert view.corroboration == 1, "the directory path is no second origin"
+    assert [e.via for e in found["@one_chat"].evidence] == ["mention"]
+    cursor = research_db.scan_cursor(rdb, session.id, ChatKey("", SEED))
+    assert cursor is not None and cursor.directory
+
+
+def test_comments_stored_out_of_order_and_a_seed_channel_s_group_are_read(
+    rdb: sqlite3.Connection, conn: sqlite3.Connection
+) -> None:
+    """A channel seed's comments are part of what it says (depth 0), and a comment the group
+    stores after later ones — its id below the newest — is read all the same."""
+    group = -1000000000150
+    db.upsert_chat(
+        conn, ChatRow(id=group, type="supergroup", title="Rent chat", discussion_of=SEED)
+    )
+    db.set_discussion_chat(conn, SEED, group)
+    _store(conn, group, 9, "late @late_chan", links=(("mention", "@late_chan"),))
+    session = _start(rdb, conn)
+
+    first = research.discover_offline(rdb, conn, CFG, session.id)
+
+    assert first.chats_scanned == 2
+    late = _by_identity(rdb, conn, session)["@late_chan"]
+    assert late.candidate.depth == 1, "the group reads at its channel's depth"
+    assert late.evidence[0].chat == ChatKey("", group)
+    _store(conn, group, 4, "early @early_chan", links=(("mention", "@early_chan"),))
+
+    second = research.discover_offline(rdb, conn, CFG, session.id)
+
+    assert [research_db.get_candidate(rdb, c).identity for c in second.new_candidates] == [  # type: ignore[union-attr]
+        "@early_chan"
+    ]
+
+
+def test_rows_whose_links_were_never_read_are_read_by_their_text_whatever_their_id(
+    rdb: sqlite3.Connection, conn: sqlite3.Connection
+) -> None:
+    """An import stored after link capture began still has no links: its rows are read by their
+    visible text, which the id threshold never allowed."""
+    _store(conn, SEED, 1, "captured t.me/seen_chan", links=(("link", "@seen_chan"),))
+    _store(conn, SEED, 2, "imported: t.me/import_chan", links=None)
+    session = _start(rdb, conn)
+    report = research.discover_offline(rdb, conn, CFG, session.id)
+    assert set(_by_identity(rdb, conn, session)) == {"@seen_chan", "@import_chan"}
+    assert report.text_fallback == 1
+
+
+def test_the_session_ceiling_bounds_every_call_together(
+    rdb: sqlite3.Connection, conn: sqlite3.Connection
+) -> None:
+    for msg_id, name in enumerate(("@one_chan", "@two_chan", "@three_chan"), start=1):
+        _store(conn, SEED, msg_id, name, links=(("mention", name),))
+    session = _start(rdb, conn, max_session_candidates=2)
+
+    first = research.discover_offline(rdb, conn, CFG, session.id)
+
+    assert len(first.new_candidates) == 2 and first.over_cap == 1
+    assert first.session_full and not first.truncated
+    assert research_db.scan_cursor(rdb, session.id, ChatKey("", SEED)) is not None, (
+        "nothing held back could ever be proposed: the cursor moves on"
+    )
+    _store(conn, SEED, 4, "@four_chan", links=(("mention", "@four_chan"),))
+    second = research.discover_offline(rdb, conn, CFG, session.id)
+    assert second.new_candidates == [] and second.session_full
+    assert research_db.count_candidates(rdb, session.id) == 2
+
+
+async def test_discovery_reads_the_index_off_the_event_loop(
+    rdb: sqlite3.Connection, conn: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seen: list[str] = []
+    offline = research.discover_offline
+
+    def recorded(*args: Any, **kwargs: Any) -> Any:
+        seen.append(threading.current_thread().name)
+        return offline(*args, **kwargs)
+
+    monkeypatch.setattr(research, "discover_offline", recorded)
+    session = _start(rdb, conn)
+    await research.discover(rdb, conn, CFG, session.id, _world().client("default"), now=3)
+    assert seen and seen[0] != threading.main_thread().name
+
+
+async def test_an_admission_request_nobody_answers_times_out(
+    rdb: sqlite3.Connection, conn: sqlite3.Connection, paths: Paths
+) -> None:
+    client = _run_client(_run_world())
+    session, found = await _discovered(rdb, conn, client, "https://t.me/+JoinMe")
+    gated = found["+JoinMe"]
+    _approve(rdb, conn, session, _item(gated, "request", "fetch", "add_source"))
+    await _run(rdb, conn, paths, client, session)
+    assert _status(rdb, gated).requested_at == 20
+    days = session.limits.admission_timeout_days
+
+    within = await research.run(
+        rdb, conn, CFG, paths, {"default": client}, session.id, now=20 + days * 86400 - 1
+    )
+    assert within.failed == [] and _status(rdb, gated).status == "pending_admission"
+    late = await research.run(
+        rdb, conn, CFG, paths, {"default": client}, session.id, now=20 + days * 86400
+    )
+
+    assert late.failed == [gated.id]
+    given_up = _status(rdb, gated)
+    assert given_up.status == "failed" and "no answer" in (given_up.note or "")
+    assert _live(rdb, gated) == [], "a new approval may send the request again"
+
+
+def test_evidence_names_its_chat_one_way_and_the_row_to_read_it_by(
+    rdb: sqlite3.Connection, conn: sqlite3.Connection
+) -> None:
+    _store(conn, SEED, 3, "see @tb_flats", links=(("mention", "@tb_flats"),))
+    session = _start(rdb, conn)
+    research.discover_offline(rdb, conn, CFG, session.id)
+    (candidate,) = research_db.list_candidates(rdb, session.id)
+    research_db.add_evidence(
+        rdb, candidate.id, "post_search", "post:-1000000009999/4", chat=ChatKey("", -1000000009999)
+    )
+    document = research.candidates_document(rdb, conn, CFG, session.id)
+    indexed, searched = document["candidates"][0]["evidence"]
+    assert (indexed["scope"], indexed["peer_id"], indexed["chat_id"], indexed["msg_id"]) == (
+        "",
+        SEED,
+        SEED,
+        3,
+    )
+    assert (searched["peer_id"], searched["chat_id"]) == (-1000000009999, None)
+    assert "chat" not in indexed
+
+
+async def test_a_busy_sync_leaves_the_approved_sources_for_the_next_run(
+    rdb: sqlite3.Connection,
+    conn: sqlite3.Connection,
+    paths: Paths,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = _run_client(_run_world())
+    session, found = await _discovered(rdb, conn, client, "@tb_flats")
+    flats = found["@tb_flats"]
+    _approve(rdb, conn, session, _item(flats, "join", "fetch", "add_source"))
+
+    with sync.SyncLock(paths):
+        held = await _run(rdb, conn, paths, client, session)
+
+    assert held.stopped_by == "sync_busy" and held.joined == [flats.id]
+    assert held.sources_added == [] and config.load(paths).sources == []
+    assert _live(rdb, flats), "nothing is lost: the source and the fetch wait"
+    real = sync.sync_all
+
+    async def taken_meanwhile(*args: Any, **kwargs: Any) -> Any:
+        with sync.SyncLock(paths):  # another process wins the lock after the config write
+            return await real(*args, **kwargs)
+
+    monkeypatch.setattr(sync, "sync_all", taken_meanwhile)
+    between = await _run(rdb, conn, paths, client, session)
+
+    assert between.stopped_by == "sync_busy" and between.sources_added == [flats.id]
+    assert between.fetched == [] and _stored(conn, _marked(FLATS)) == []
+    assert len(config.load(paths).sources) == 1 and _live(rdb, flats)
+    monkeypatch.setattr(sync, "sync_all", real)
+
+    resumed = await _run(rdb, conn, paths, client, session)
+
+    assert resumed.stopped_by is None and resumed.fetched == [flats.id]
+    assert resumed.sources_added == [] and len(config.load(paths).sources) == 1
+    assert _stored(conn, _marked(FLATS)) == [1, 2, 3] and _live(rdb, flats) == []
+
+
+async def test_a_run_reads_a_fetched_channel_s_comments_one_hop_further(
+    rdb: sqlite3.Connection, conn: sqlite3.Connection, paths: Paths
+) -> None:
+    flats = _marked(FLATS)
+    group = make_channel(3050, "Flats chat", megagroup=True)
+    world = _run_world()
+    world.entities[_marked(group)] = group
+    world.messages[flats] = [tl.channel_post(flats, 1, "a flat", replies=1, date=tl.at(1))]
+    world.comments[(flats, 1)] = [
+        tl.hyperlink_message(
+            _marked(group), 5, "ask here", anchor="here", url="https://t.me/deep_chan", sender=1
+        )
+    ]
+    client = _run_client(
+        world, responses={functions.channels.GetFullChannelRequest: _channel_full(FLATS, group)}
+    )
+    session, found = await _discovered(rdb, conn, client, "@tb_flats")
+    candidate = found["@tb_flats"]
+    _approve(rdb, conn, session, _item(candidate, "join", "fetch", "add_source"))
+
+    report = await _run(rdb, conn, paths, client, session)
+
+    assert report.fetched == [candidate.id]
+    assert _stored(conn, _marked(group)) == [5]
+    cursor = research_db.scan_cursor(rdb, session.id, ChatKey("", _marked(group)))
+    assert cursor is not None and cursor.depth == 1, "registered at the channel's depth"
+    assert report.discovery is not None
+    (deep_id,) = report.discovery.new_candidates
+    deep = research_db.get_candidate(rdb, deep_id)
+    assert deep is not None and (deep.identity, deep.depth) == ("@deep_chan", 2)
+    (evidence,) = research_db.list_evidence(rdb, deep_id)
+    assert evidence.chat == ChatKey("", _marked(group))
+
+
+async def test_a_run_as_another_account_joins_and_adds_sources_as_that_account(
+    rdb: sqlite3.Connection, conn: sqlite3.Connection, paths: Paths
+) -> None:
+    config.save(WORK_CFG, paths)
+    world = _run_world()
+    home = _run_client(world)
+    work = world.client(
+        "work",
+        me=make_user(8, "Work"),
+        responses={functions.channels.GetFullChannelRequest: no_discussion},
+    )
+    _links(conn, "@tb_flats")
+    session = research.start_session(rdb, conn, WORK_CFG, QUESTION, [str(SEED)], "work", now=1)
+    await research.discover(rdb, conn, WORK_CFG, session.id, work, now=3)
+    flats = _by_identity(rdb, conn, session)["@tb_flats"].candidate
+    assert flats.access_hash == FakeWorld.access_hash("work", _marked(FLATS))
+    _approve(rdb, conn, session, _item(flats, "join", "fetch", "add_source"), cfg=WORK_CFG)
+
+    report = await research.run(
+        rdb, conn, WORK_CFG, paths, {"default": home, "work": work}, session.id, now=20
+    )
+
+    assert report.joined == report.fetched == [flats.id]
+    (join,) = [r for r in work.requests if isinstance(r, functions.channels.JoinChannelRequest)]
+    assert join.channel.access_hash == FakeWorld.access_hash("work", _marked(FLATS))
+    assert home.requests == [] and _history_calls(home) == [], "the default account is not asked"
+    (source,) = config.load(paths).sources
+    assert (source.account, source.chat) == ("work", _marked(FLATS))
+    assert db.chat_reach(conn, _marked(FLATS)) == ["work"]
+    cursor = research_db.scan_cursor(rdb, session.id, ChatKey("", _marked(FLATS)))
+    assert cursor is not None and cursor.depth == 1
+
+
+async def test_a_seed_is_the_same_conversation_after_its_rows_are_stored_again(
+    rdb: sqlite3.Connection, conn: sqlite3.Connection
+) -> None:
+    """Work's chat with Bob sits under a synthetic id; the session names it ``(work, Bob)``, so
+    re-adding both accounts' rows the other way round — work's now under Bob's own id — or
+    rebuilding the index leaves the session reading work's conversation and nobody else's."""
+    cfg = dataclasses.replace(two_accounts.CFG, research=ResearchCfg(enabled=True))
+    two = two_accounts.load(conn)
+    assert two.work_bob.id >= db.SYNTHETIC_BASE
+    _store(conn, two.work_bob.id, 20, "try @work_lead", links=(("mention", "@work_lead"),))
+    _store(conn, two.default_bob.id, 20, "try @home_lead", links=(("mention", "@home_lead"),))
+    session = research.start_session(
+        rdb, conn, cfg, QUESTION, [f"work/{two_accounts.BOB}"], "work", now=1
+    )
+    assert session.seeds == (ChatKey("work", two_accounts.BOB),)
+    research.discover_offline(rdb, conn, cfg, session.id)
+    assert set(_by_identity(rdb, conn, session)) == {"@work_lead"}
+    (row,) = research.candidates_document(rdb, conn, cfg, session.id)["candidates"][0]["evidence"]
+    assert row["chat_id"] == two.work_bob.id
+
+    for chat in (two.default_bob, two.work_bob):
+        db.delete_chat(conn, chat.id)
+    work_bob = db.upsert_chat(conn, dataclasses.replace(two.work_bob, id=two_accounts.BOB), "work")
+    home_bob = db.upsert_chat(conn, two.default_bob, "default")
+    assert work_bob.id == two_accounts.BOB and home_bob.id > two.work_bob.id, "never reused"
+    _store(conn, work_bob.id, 21, "and @work_again", links=(("mention", "@work_again"),))
+    _store(conn, home_bob.id, 21, "and @home_again", links=(("mention", "@home_again"),))
+
+    research.discover_offline(rdb, conn, cfg, session.id)
+
+    assert set(_by_identity(rdb, conn, session)) == {"@work_lead", "@work_again"}
+    again = research_db.list_evidence(
+        rdb, _by_identity(rdb, conn, session)["@work_again"].candidate.id
+    )
+    assert again[0].chat == ChatKey("work", two_accounts.BOB)
+
+    rebuilt = db.connect(":memory:")
+    try:
+        db.migrate(rebuilt)
+        fresh = db.upsert_chat(rebuilt, dataclasses.replace(two.work_bob, id=2), "work")
+        _store(rebuilt, fresh.id, 1, "fresh @work_fresh", links=(("mention", "@work_fresh"),))
+        research.discover_offline(rdb, rebuilt, cfg, session.id)
+        assert "@work_fresh" in _by_identity(rdb, rebuilt, session), "another index: read afresh"
+    finally:
+        rebuilt.close()
+
+
+async def test_another_account_s_private_seed_is_never_asked_about(
+    rdb: sqlite3.Connection, conn: sqlite3.Connection
+) -> None:
+    cfg = dataclasses.replace(two_accounts.CFG, research=ResearchCfg(enabled=True))
+    two_accounts.load(conn)
+    session = research.start_session(
+        rdb, conn, cfg, QUESTION, [f"work/{two_accounts.BOB}"], "default", now=1
+    )
+    client = _world().client("default")
+
+    pins = await research.read_pins(client, rdb, conn, cfg, session.id, now=2)
+
+    assert pins.chats == [] and _pin_reads(client) == [] and client.calls == []
+    assert "account work's own" in pins.warnings[0]
+    assert (await research.read_pins(client, rdb, conn, cfg, session.id, now=3)).warnings == []
+
+
+async def test_a_forward_origin_known_by_its_username_alone_is_probed_by_it(
+    rdb: sqlite3.Connection, conn: sqlite3.Connection
+) -> None:
+    """A ``min`` origin brings no usable access hash, only its username: the probe resolves the
+    name and takes the answer only when it is that very peer."""
+    flats, secret = _marked(FLATS), _marked(SECRET)
+    db.remember_peers(conn, "default", [(flats, "tb_flats", None), (secret, "tb_flats", None)])
+    _store(conn, SEED, 1, "repost", fwd_peer_id=flats, fwd_msg_id=3)
+    _store(conn, SEED, 2, "another", fwd_peer_id=secret, fwd_msg_id=4)
+    session = _start(rdb, conn)
+    research.discover_offline(rdb, conn, CFG, session.id)
+    client = _world().client("default")
+
+    report = await research.probe_candidates(client, rdb, conn, CFG, session.id)
+
+    found = _by_identity(rdb, conn, session)
+    named = found[f"peer:{flats}"].candidate
+    assert named.id in report.probed and (named.username, named.title) == (
+        "tb_flats",
+        "Tbilisi flats",
+    )
+    stale = found[f"peer:{secret}"].candidate
+    assert stale.id in report.unresolvable and "no longer names it" in (stale.note or "")

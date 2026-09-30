@@ -83,10 +83,12 @@ post_search = false                    # channels.searchPosts (public posts)
 paid_stars_max = 0                     # 0 = never pay for post search
 max_depth = 2                          # hops from a seed chat a candidate may be
 max_candidates = 50                    # per discover call
+max_session_candidates = 500           # per session, over every discover call and run
 probe_limit = 20                       # username / invite / addlist probes per discover call
 since_days = 365                       # horizon given to sources a research run adds
 max_messages_per_run = 5000
 run_budget_s = 300
+admission_timeout_days = 30            # an unanswered admission request is given up after this
 
 # The account `grepogram auth` signs in is "default" and needs no entry. Every other account
 # signed in at the same time is listed here; all of them share the [telegram] app:
@@ -120,6 +122,8 @@ _POSITIVE_KEYS = frozenset(
         "research.since_days",
         "research.max_messages_per_run",
         "research.run_budget_s",
+        "research.max_session_candidates",
+        "research.admission_timeout_days",
     }
 )
 """Integer settings a zero or a negative value is meaningless for, checked after the type."""

@@ -1,5 +1,6 @@
 import asyncio
 import contextlib
+import copy
 import dataclasses
 import datetime as dt
 import logging
@@ -5045,3 +5046,30 @@ async def test_the_sweep_leaves_a_chat_no_connected_account_reaches(
     assert report.chats_done == [home_alice.id] and report.removed == 0
     assert sorted(report.chats_unreachable) == sorted([PRIV_ID, work_alice.id])
     assert report.warnings == [] and _swept(home) == [ALICE_ID]
+
+
+# --- forward origins and the link recapture pass ---------------------------------------------
+
+
+async def test_a_forward_origin_is_remembered_for_the_account_that_fetched_it(
+    conn: sqlite3.Connection, paths: Paths
+) -> None:
+    """The message names its origin by id alone; the chat Telegram hands along with it is the
+    one chance to learn how to reach it — its username, and this account's access hash unless
+    the entity is ``min``."""
+    hidden = copy.copy(make_channel(205, "Min origin", username="min_origin"))
+    hidden.min = True
+    posts = [
+        tl.channel_forward(ARG_ID, 101, "from other", channel=OTHER, post=7, sender=1),
+        tl.channel_forward(ARG_ID, 102, "from min", channel=hidden, post=3, sender=1),
+    ]
+    client = _client(messages={ARG_ID: posts}, entities=[DISC, OTHER, hidden])
+
+    await _run(client, conn, paths, _cfg(ARG_SOURCE))
+
+    stored = {row.msg_id: row for row in db.get_messages(conn, ARG_ID)}
+    assert (stored[101].fwd_peer_id, stored[101].fwd_msg_id) == (OTHER_ID, 7)
+    assert db.cached_peer_username(conn, OTHER_ID) == "other_news"
+    assert db.cached_peer_hash(conn, OTHER_ID, DEFAULT_ACCOUNT) == OTHER.access_hash
+    assert db.cached_peer_username(conn, -1000000000205) == "min_origin"
+    assert db.cached_peer_hash(conn, -1000000000205, DEFAULT_ACCOUNT) is None, "min: no hash"

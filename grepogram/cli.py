@@ -1525,7 +1525,7 @@ def research_start(
         _echo_json(research.session_document(session))
         return
     typer.echo(f"started research session {session.id} as account {session.account}")
-    typer.echo(f"seed chats: {_ids(session.seeds)}")
+    typer.echo(f"seed chats: {_ids(seed.peer_id for seed in session.seeds)}")
     typer.echo(f"next: grepogram research discover {session.id}")
 
 
@@ -1588,15 +1588,27 @@ def _print_discover(report: DiscoverReport) -> None:
     )
     if report.text_fallback:
         typer.echo(
-            f"note: {report.text_fallback} messages stored before links were captured were read "
-            "by their visible text only; their hidden links and buttons were not seen"
+            f"note: {report.text_fallback} messages stored without their links were read by "
+            "their visible text only; their hidden links and buttons were not seen"
         )
+    if report.directories:
+        typer.echo(f"directories (chats that list many others): {_ids(report.directories)}")
     if report.beyond_depth or report.excluded or report.over_cap:
         more = "; the next discover reads the rest again" if report.truncated else ""
+        if report.session_full:
+            more = "; the session holds as many candidates as it may"
         typer.echo(
             f"left out: {report.beyond_depth} beyond the depth limit, {report.excluded} "
             f"excluded, {report.over_cap} over the candidate cap{more}"
         )
+    pins = report.pins
+    if pins is not None:
+        typer.echo(
+            f"pinned posts: {pins.messages} read in {len(pins.chats)} chats, "
+            f"{len(pins.new_candidates)} new candidates; {pins.remaining} chats left"
+        )
+        for warning in pins.warnings:
+            typer.echo(f"warning: {warning}", err=True)
     for search_report in report.searches:
         state = f"{search_report.results} results" if search_report.ran else "not run"
         typer.echo(
@@ -1678,7 +1690,8 @@ def _print_candidates(document: Mapping[str, Any], shown: int) -> None:
             typer.echo(f"   note: {c['note']}")
         found: list[dict[str, Any]] = c["evidence"]
         for item in found[:shown]:
-            where = "" if item["chat_id"] is None else f" {item['chat_id']}/{item['msg_id']}"
+            where = "" if item["peer_id"] is None else f" {item['peer_id']}"
+            where += "" if item["msg_id"] is None else f"/{item['msg_id']}"
             text = " ".join((item["snippet"] or "").split())
             typer.echo(f"   {item['via']}{where}: {text or '-'}")
         if len(found) > shown:
@@ -1847,6 +1860,10 @@ def _print_run(report: RunReport) -> None:
             typer.echo(f"{label}: {_ids(ids)}")
     if report.stopped_by is not None:
         typer.echo(f"stopped by: {report.stopped_by}; run it again to go on")
+    if report.pins is not None and report.pins.new_candidates:
+        typer.echo(f"proposed from pinned posts: {len(report.pins.new_candidates)}")
+        for warning in report.pins.warnings:
+            typer.echo(f"warning: {warning}", err=True)
     if report.discovery is not None:
         typer.echo(f"new candidates proposed: {len(report.discovery.new_candidates)}")
     for warning in report.warnings:
@@ -1902,7 +1919,8 @@ def _print_session_status(document: Mapping[str, Any]) -> None:
     limits = session["limits"]
     progress = session["progress"]
     typer.echo(f'research session {session["id"]} ({session["state"]}): "{session["question"]}"')
-    typer.echo(f"account: {session['account']}; seed chats: {_ids(session['seeds'])}")
+    seeds = _ids(seed["peer_id"] for seed in session["seeds"])
+    typer.echo(f"account: {session['account']}; seed chats: {seeds}")
     typer.echo(
         f"limits: depth {limits['max_depth']}, {limits['max_candidates']} candidates and "
         f"{limits['probe_limit']} probes per discover, sources since {session['horizon']}, "

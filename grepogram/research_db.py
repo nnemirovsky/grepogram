@@ -9,10 +9,13 @@ again" advice (:class:`SchemaError`).
 
 The tables:
 
-``sessions``
-    a question explored from seed chats (``chats.id`` of the index) by one account, under
+``sessions`` and ``session_seeds``
+    a question explored from seed chats by one account, under
     :class:`~grepogram.models.ResearchLimits` fixed at start; ``active`` until stopped, and
-    stopping voids every grant not consumed yet (:func:`stop_session`).
+    stopping voids every grant not consumed yet (:func:`stop_session`). A seed is named the way
+    Telegram names it, :class:`~grepogram.models.ChatKey` — ``(scope, peer_id)`` — and never by
+    an index row id: a rebuilt index numbers its rows afresh, and a private chat's synthetic
+    row id is handed to whichever account's row is stored second.
 ``candidates``
     one per ``(session, identity)`` — ``identity`` is a :mod:`grepogram.leads` target string —
     with its depth, status, what a probe learned, and the ``parent_id`` it was found inside.
@@ -20,7 +23,8 @@ The tables:
     stored here: the index can be rebuilt under this file.
 ``evidence``
     every path that led to a candidate; ``origin_key`` is what corroboration counts
-    (:func:`corroboration`), so ten forwards of one post are one piece of evidence.
+    (:func:`corroboration`), so ten forwards of one post are one piece of evidence. The chat a
+    path was found in is ``(scope, peer_id)`` too, indexed or not.
 ``grants``
     one human approval each: the concrete actions on one candidate, or session-wide search
     actions, by one account, **through one channel** — ``elicitation`` or ``cli``, enforced by
@@ -29,9 +33,17 @@ The tables:
     identities research never proposes again, in any session; global and persistent.
 ``searches``
     every Telegram-side search a session ran. Its results are evidence, never ``messages`` rows.
-``scans``
-    per session and indexed chat, the newest Telegram ``msg_id`` discovery has read and the
-    depth that chat's leads are found at, so a run resumes from this file alone.
+``chat_scans``
+    per session and chat it reads (by ``(scope, peer_id)``), the depth that chat's leads are
+    found at, how far discovery has read it — a tick of the index's lead clock
+    (:func:`grepogram.db.lead_clock`), valid only for the index ``index_id`` names — whether its
+    pinned posts were read and whether it is a directory, so a run resumes from this file alone
+    and an index rebuilt under it is simply read again from the start.
+
+Step 2 carried a v1 file (development builds only) over: ``chats.id`` values became
+``(scope, peer_id)`` — a marked channel id is shared, anything else was the session's account's
+— and the ids at or above the synthetic base, which named no peer, were dropped; scan cursors
+start again, which costs one re-read and duplicates nothing.
 
 Every writer runs inside :func:`grepogram.db.transaction` on a :class:`grepogram.db.Connection`,
 so the connection may be shared across threads exactly like the index's.
@@ -51,6 +63,7 @@ from grepogram.models import (
     CandidateAction,
     CandidateKind,
     CandidateStatus,
+    ChatKey,
     ChatType,
     Evidence,
     EvidenceVia,
@@ -166,7 +179,69 @@ _V1: tuple[str, ...] = (
     )""",
 )
 
-MIGRATIONS: dict[int, tuple[str, ...]] = {1: _V1}
+_LEGACY_SCOPE = """CASE WHEN {id} <= -1000000000000 THEN ''
+    ELSE (SELECT account FROM sessions WHERE sessions.id = {session}) END"""
+"""The scope of a v1 ``chats.id`` value: a channel's or supergroup's marked id names a shared
+row (scope ``''``); anything else was the session's own account's, the only account a v1 file's
+chats were stored through."""
+_SYNTHETIC = 1 << 62
+""":data:`grepogram.db.SYNTHETIC_BASE`: a v1 id at or above it was an index row id and names no
+peer at all, so step 2 cannot carry it over."""
+
+_V2: tuple[str, ...] = (
+    # a seed chat as Telegram names it — (scope, peer id) — rather than by an index row id,
+    # which a rebuilt index or a scoped row deleted and stored again hands to another chat
+    """CREATE TABLE session_seeds(
+        session_id INTEGER NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+        position INTEGER NOT NULL,
+        scope TEXT NOT NULL,
+        peer_id INTEGER NOT NULL,
+        PRIMARY KEY (session_id, scope, peer_id))""",
+    f"""INSERT OR IGNORE INTO session_seeds(session_id, position, scope, peer_id)
+        SELECT s.id, j.key, {_LEGACY_SCOPE.format(id="j.value", session="s.id")}, j.value
+        FROM sessions AS s, json_each(s.seeds) AS j WHERE j.value < {_SYNTHETIC}""",
+    "ALTER TABLE sessions DROP COLUMN seeds",
+    # scan cursors by the same identity, on the index's lead clock (grepogram.db.lead_clock) of
+    # the index named index_id — a cursor of another index, or none, reads the chat from the
+    # start; pins_read_at and directory are what the pinned-post and directory passes learned
+    """CREATE TABLE chat_scans(
+        session_id INTEGER NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+        scope TEXT NOT NULL,
+        peer_id INTEGER NOT NULL,
+        depth INTEGER NOT NULL,
+        index_id TEXT,
+        lead_seq INTEGER NOT NULL DEFAULT 0,
+        pins_read_at INTEGER,
+        directory INTEGER NOT NULL DEFAULT 0,
+        scanned_at INTEGER NOT NULL,
+        PRIMARY KEY (session_id, scope, peer_id))""",
+    f"""INSERT OR IGNORE INTO chat_scans(session_id, scope, peer_id, depth, scanned_at)
+        SELECT session_id, {_LEGACY_SCOPE.format(id="chat_id", session="session_id")}, chat_id,
+               depth, scanned_at
+        FROM scans WHERE chat_id < {_SYNTHETIC}""",
+    "DROP TABLE scans",
+    # evidence names the chat it was found in the same way: peer_id and scope, whether the chat
+    # is indexed (a message discovery read) or not (a global search's result)
+    "DROP INDEX evidence_path",
+    "ALTER TABLE evidence RENAME COLUMN chat_id TO peer_id",
+    "ALTER TABLE evidence ADD COLUMN scope TEXT",
+    f"""UPDATE evidence SET scope = CASE WHEN peer_id IS NULL OR peer_id >= {_SYNTHETIC} THEN NULL
+        WHEN peer_id <= -1000000000000 THEN ''
+        ELSE (SELECT s.account FROM candidates AS c JOIN sessions AS s ON s.id = c.session_id
+              WHERE c.id = evidence.candidate_id) END""",
+    f"UPDATE evidence SET peer_id = NULL WHERE peer_id >= {_SYNTHETIC}",
+    """DELETE FROM evidence WHERE id NOT IN (
+        SELECT MIN(id) FROM evidence GROUP BY candidate_id, via, origin_key,
+            IFNULL(scope, ''), IFNULL(peer_id, 0), IFNULL(msg_id, 0))""",
+    """CREATE UNIQUE INDEX evidence_path ON evidence(candidate_id, via, origin_key,
+        IFNULL(scope, ''), IFNULL(peer_id, 0), IFNULL(msg_id, 0))""",
+    # when an admission request was sent, so one no admin answers can time out
+    "ALTER TABLE candidates ADD COLUMN requested_at INTEGER",
+    """UPDATE candidates SET requested_at = COALESCE(probed_at, created_at)
+        WHERE status = 'pending_admission'""",
+)
+
+MIGRATIONS: dict[int, tuple[str, ...]] = {1: _V1, 2: _V2}
 """Schema version → the step that brings the file to it, from 1 without a gap; append-only."""
 SCHEMA_VERSION = max(MIGRATIONS)
 
@@ -198,6 +273,7 @@ _CANDIDATE_FIELDS = frozenset(
         "request_needed",
         "source_id",
         "probed_at",
+        "requested_at",
         "note",
     }
 )
@@ -328,14 +404,22 @@ def _placeholders(count: int) -> str:
 # --- sessions --------------------------------------------------------------------------------
 
 
-def _session(row: sqlite3.Row) -> ResearchSession:
+def _seeds(conn: sqlite3.Connection, session_id: int) -> tuple[ChatKey, ...]:
+    rows = conn.execute(
+        "SELECT scope, peer_id FROM session_seeds WHERE session_id = ? ORDER BY position",
+        (session_id,),
+    )
+    return tuple(ChatKey(str(row["scope"]), int(row["peer_id"])) for row in rows)
+
+
+def _session(conn: sqlite3.Connection, row: sqlite3.Row) -> ResearchSession:
     stored = json.loads(row["limits"])
     known = {field.name for field in dataclasses.fields(ResearchLimits)}
     return ResearchSession(
         id=row["id"],
         question=row["question"],
         account=row["account"],
-        seeds=tuple(json.loads(row["seeds"])),
+        seeds=_seeds(conn, row["id"]),
         limits=ResearchLimits(**{key: value for key, value in stored.items() if key in known}),
         state=row["state"],
         created_at=row["created_at"],
@@ -349,34 +433,33 @@ def create_session(
     *,
     question: str,
     account: str,
-    seeds: Iterable[int],
+    seeds: Iterable[ChatKey],
     limits: ResearchLimits,
     now: int | None = None,
 ) -> ResearchSession:
-    """Start a session; it is ``active`` until :func:`stop_session`."""
+    """Start a session from the chats ``seeds`` name; it is ``active`` until
+    :func:`stop_session`."""
     if not question.strip():
         raise ValueError("a research session needs a question")
     if not is_account_name(account):
         raise ValueError(f"invalid account name: {account!r}")
-    seed_ids = list(dict.fromkeys(int(seed) for seed in seeds))
+    keys = list(dict.fromkeys(ChatKey(str(scope), int(peer)) for scope, peer in seeds))
     with db.transaction(conn):
         row = conn.execute(
-            "INSERT INTO sessions(question, account, seeds, limits, created_at) "
-            "VALUES (?, ?, ?, ?, ?) RETURNING *",
-            (
-                question.strip(),
-                account,
-                json.dumps(seed_ids),
-                json.dumps(dataclasses.asdict(limits)),
-                _now(now),
-            ),
+            "INSERT INTO sessions(question, account, limits, created_at) "
+            "VALUES (?, ?, ?, ?) RETURNING *",
+            (question.strip(), account, json.dumps(dataclasses.asdict(limits)), _now(now)),
         ).fetchone()
-    return _session(row)
+        conn.executemany(
+            "INSERT INTO session_seeds(session_id, position, scope, peer_id) VALUES (?, ?, ?, ?)",
+            [(row["id"], position, key.scope, key.peer_id) for position, key in enumerate(keys)],
+        )
+        return _session(conn, row)
 
 
 def get_session(conn: sqlite3.Connection, session_id: int) -> ResearchSession | None:
     row = conn.execute("SELECT * FROM sessions WHERE id = ?", (session_id,)).fetchone()
-    return None if row is None else _session(row)
+    return None if row is None else _session(conn, row)
 
 
 def list_sessions(
@@ -390,7 +473,7 @@ def list_sessions(
         rows = conn.execute(
             "SELECT * FROM sessions WHERE state = ? ORDER BY id DESC", (state,)
         ).fetchall()
-    return [_session(row) for row in rows]
+    return [_session(conn, row) for row in rows]
 
 
 def set_session_progress(
@@ -448,6 +531,7 @@ def _candidate(row: sqlite3.Row) -> Candidate:
         parent_id=row["parent_id"],
         source_id=row["source_id"],
         probed_at=row["probed_at"],
+        requested_at=row["requested_at"],
         created_at=row["created_at"],
         note=row["note"],
     )
@@ -530,6 +614,15 @@ def add_candidate(
             ),
         ).fetchone()
     return _candidate(row)
+
+
+def count_candidates(conn: sqlite3.Connection, session_id: int) -> int:
+    """How many candidates the session holds, whatever their status — what its
+    ``max_session_candidates`` ceiling is counted against."""
+    row = conn.execute(
+        "SELECT COUNT(*) AS n FROM candidates WHERE session_id = ?", (session_id,)
+    ).fetchone()
+    return int(row["n"])
 
 
 def get_candidate(conn: sqlite3.Connection, candidate_id: int) -> Candidate | None:
@@ -642,9 +735,9 @@ def merge_candidate(conn: sqlite3.Connection, keep_id: int, drop_id: int) -> Can
         if drop.status != "proposed" or has_grants(conn, drop.id):
             raise ValueError(f"candidate {drop_id} carries a decision and is not merged away")
         conn.execute(
-            """INSERT INTO evidence(candidate_id, via, chat_id, msg_id, origin_key, snippet,
-                   found_at)
-               SELECT ?, via, chat_id, msg_id, origin_key, snippet, found_at
+            """INSERT INTO evidence(candidate_id, via, scope, peer_id, msg_id, origin_key,
+                   snippet, found_at)
+               SELECT ?, via, scope, peer_id, msg_id, origin_key, snippet, found_at
                FROM evidence WHERE candidate_id = ? ORDER BY id
                ON CONFLICT DO NOTHING""",
             (keep.id, drop.id),
@@ -729,12 +822,13 @@ def update_candidate(conn: sqlite3.Connection, candidate_id: int, **fields: Any)
 
 
 def _evidence(row: sqlite3.Row) -> Evidence:
+    scope, peer = row["scope"], row["peer_id"]
     return Evidence(
         id=row["id"],
         candidate_id=row["candidate_id"],
         via=row["via"],
         origin_key=row["origin_key"],
-        chat_id=row["chat_id"],
+        chat=None if scope is None or peer is None else ChatKey(str(scope), int(peer)),
         msg_id=row["msg_id"],
         snippet=row["snippet"],
         found_at=row["found_at"],
@@ -747,23 +841,35 @@ def add_evidence(
     via: EvidenceVia,
     origin_key: str,
     *,
-    chat_id: int | None = None,
+    chat: ChatKey | None = None,
     msg_id: int | None = None,
     snippet: str | None = None,
     now: int | None = None,
 ) -> bool:
-    """Record one path to a candidate; ``False`` when that exact path is already recorded."""
+    """Record one path to a candidate — found in the message ``msg_id`` of ``chat``, when it was
+    found in a message; ``False`` when that exact path is already recorded."""
     _check(via, _VIAS, "evidence path")
     if not origin_key:
         raise ValueError("evidence needs an origin key")
+    scope, peer = (None, None) if chat is None else (chat.scope, chat.peer_id)
     with db.transaction(conn):
         cursor = conn.execute(
-            """INSERT INTO evidence(candidate_id, via, chat_id, msg_id, origin_key, snippet,
-                   found_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT DO NOTHING""",
-            (candidate_id, via, chat_id, msg_id, origin_key, snippet, _now(now)),
+            """INSERT INTO evidence(candidate_id, via, scope, peer_id, msg_id, origin_key,
+                   snippet, found_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT DO NOTHING""",
+            (candidate_id, via, scope, peer, msg_id, origin_key, snippet, _now(now)),
         )
     return cursor.rowcount > 0
+
+
+def evidence_from(conn: sqlite3.Connection, session_id: int, chat: ChatKey) -> list[Evidence]:
+    """Every piece of evidence the session's candidates hold that was found in ``chat``."""
+    rows = conn.execute(
+        """SELECT e.* FROM evidence AS e JOIN candidates AS c ON c.id = e.candidate_id
+           WHERE c.session_id = ? AND e.scope = ? AND e.peer_id = ? ORDER BY e.id""",
+        (session_id, chat.scope, chat.peer_id),
+    ).fetchall()
+    return [_evidence(row) for row in rows]
 
 
 def list_evidence(conn: sqlite3.Connection, candidate_id: int) -> list[Evidence]:
@@ -1135,23 +1241,27 @@ def list_searches(conn: sqlite3.Connection, session_id: int) -> list[SearchRecor
 def _scan(row: sqlite3.Row) -> ScanCursor:
     return ScanCursor(
         session_id=row["session_id"],
-        chat_id=row["chat_id"],
+        chat=ChatKey(str(row["scope"]), int(row["peer_id"])),
         depth=row["depth"],
-        msg_id=row["msg_id"],
+        index_id=row["index_id"],
+        lead_seq=row["lead_seq"],
+        pins_read_at=row["pins_read_at"],
+        directory=bool(row["directory"]),
         scanned_at=row["scanned_at"],
     )
 
 
-def scan_cursor(conn: sqlite3.Connection, session_id: int, chat_id: int) -> ScanCursor | None:
+def scan_cursor(conn: sqlite3.Connection, session_id: int, chat: ChatKey) -> ScanCursor | None:
     row = conn.execute(
-        "SELECT * FROM scans WHERE session_id = ? AND chat_id = ?", (session_id, chat_id)
+        "SELECT * FROM chat_scans WHERE session_id = ? AND scope = ? AND peer_id = ?",
+        (session_id, chat.scope, chat.peer_id),
     ).fetchone()
     return None if row is None else _scan(row)
 
 
 def list_scan_cursors(conn: sqlite3.Connection, session_id: int) -> list[ScanCursor]:
     rows = conn.execute(
-        "SELECT * FROM scans WHERE session_id = ? ORDER BY chat_id", (session_id,)
+        "SELECT * FROM chat_scans WHERE session_id = ? ORDER BY scope, peer_id", (session_id,)
     ).fetchall()
     return [_scan(row) for row in rows]
 
@@ -1159,26 +1269,68 @@ def list_scan_cursors(conn: sqlite3.Connection, session_id: int) -> list[ScanCur
 def set_scan_cursor(
     conn: sqlite3.Connection,
     session_id: int,
-    chat_id: int,
+    chat: ChatKey,
     *,
     depth: int,
-    msg_id: int,
+    index_id: str,
+    lead_seq: int = 0,
     now: int | None = None,
 ) -> ScanCursor:
-    """Record that discovery read ``chat_id`` up to ``msg_id`` at ``depth``.
+    """Record that discovery read ``chat`` up to lead-clock tick ``lead_seq`` of the index
+    ``index_id``, at ``depth`` — or, with ``lead_seq`` 0, only that the session reads the chat.
 
-    The cursor never moves back and the depth never grows: a chat reached again by a longer
-    path is still as close to the seeds as the shortest one that reached it.
+    The depth never grows: a chat reached again by a longer path is still as close to the seeds
+    as the shortest one that reached it. The cursor never moves back on the same index; a cursor
+    of another index means nothing here and is replaced.
     """
     with db.transaction(conn):
         row = conn.execute(
-            """INSERT INTO scans(session_id, chat_id, depth, msg_id, scanned_at)
-               VALUES (?, ?, ?, ?, ?)
-               ON CONFLICT(session_id, chat_id) DO UPDATE SET
+            """INSERT INTO chat_scans(session_id, scope, peer_id, depth, index_id, lead_seq,
+                   scanned_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(session_id, scope, peer_id) DO UPDATE SET
                    depth = MIN(depth, excluded.depth),
-                   msg_id = MAX(msg_id, excluded.msg_id),
+                   lead_seq = CASE WHEN chat_scans.index_id IS excluded.index_id
+                       THEN MAX(chat_scans.lead_seq, excluded.lead_seq)
+                       ELSE excluded.lead_seq END,
+                   index_id = excluded.index_id,
                    scanned_at = excluded.scanned_at
                RETURNING *""",
-            (session_id, chat_id, depth, msg_id, _now(now)),
+            (session_id, chat.scope, chat.peer_id, depth, index_id, lead_seq, _now(now)),
+        ).fetchone()
+    return _scan(row)
+
+
+def mark_pins_read(
+    conn: sqlite3.Connection, session_id: int, chat: ChatKey, *, depth: int, now: int | None = None
+) -> ScanCursor:
+    """Record that ``chat``'s pinned posts were read for the session (at ``depth``, when the
+    session did not read the chat yet); its cursor is left where it is."""
+    stamp = _now(now)
+    with db.transaction(conn):
+        row = conn.execute(
+            """INSERT INTO chat_scans(session_id, scope, peer_id, depth, pins_read_at, scanned_at)
+               VALUES (?, ?, ?, ?, ?, ?)
+               ON CONFLICT(session_id, scope, peer_id) DO UPDATE SET
+                   depth = MIN(depth, excluded.depth),
+                   pins_read_at = excluded.pins_read_at
+               RETURNING *""",
+            (session_id, chat.scope, chat.peer_id, depth, stamp, stamp),
+        ).fetchone()
+    return _scan(row)
+
+
+def mark_directory(
+    conn: sqlite3.Connection, session_id: int, chat: ChatKey, *, depth: int, now: int | None = None
+) -> ScanCursor:
+    """Record that ``chat`` is a directory — its messages name many chats — for the session."""
+    stamp = _now(now)
+    with db.transaction(conn):
+        row = conn.execute(
+            """INSERT INTO chat_scans(session_id, scope, peer_id, depth, directory, scanned_at)
+               VALUES (?, ?, ?, ?, 1, ?)
+               ON CONFLICT(session_id, scope, peer_id) DO UPDATE SET directory = 1
+               RETURNING *""",
+            (session_id, chat.scope, chat.peer_id, depth, stamp),
         ).fetchone()
     return _scan(row)

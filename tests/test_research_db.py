@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 
 from grepogram import db, research_db
-from grepogram.models import Grant, ResearchLimits, ScanCursor
+from grepogram.models import ChatKey, Grant, ResearchLimits, ScanCursor
 from grepogram.paths import Paths
 from tests.conftest import file_mode
 
@@ -25,7 +25,12 @@ def rdb() -> Iterator[sqlite3.Connection]:
 
 def _session(rdb: sqlite3.Connection, question: str = "who sells apartments in Tbilisi") -> int:
     return research_db.create_session(
-        rdb, question=question, account="default", seeds=[10, 20], limits=ResearchLimits(), now=1
+        rdb,
+        question=question,
+        account="default",
+        seeds=[ChatKey("", -10), ChatKey("default", 20)],
+        limits=ResearchLimits(),
+        now=1,
     ).id
 
 
@@ -114,10 +119,15 @@ def test_migrations_run_from_one_without_a_gap() -> None:
 def test_a_session_round_trips(rdb: sqlite3.Connection) -> None:
     limits = ResearchLimits(max_depth=3, max_candidates=5)
     created = research_db.create_session(
-        rdb, question="  flats  ", account="work", seeds=[3, 1, 3], limits=limits, now=100
+        rdb,
+        question="  flats  ",
+        account="work",
+        seeds=[ChatKey("work", 3), ChatKey("", -1), ChatKey("work", 3)],
+        limits=limits,
+        now=100,
     )
     assert created.question == "flats" and created.account == "work"
-    assert created.seeds == (3, 1) and created.limits == limits
+    assert created.seeds == (ChatKey("work", 3), ChatKey("", -1)) and created.limits == limits
     assert created.state == "active" and created.stopped_at is None and created.progress == {}
     assert research_db.get_session(rdb, created.id) == created
     assert research_db.get_session(rdb, created.id + 1) is None
@@ -272,13 +282,17 @@ def test_forwards_of_one_post_corroborate_once(rdb: sqlite3.Connection) -> None:
     assert cand is not None and link is not None
     for chat in range(10):
         assert research_db.add_evidence(
-            rdb, cand.id, "forward", "fwd:-1005/77", chat_id=chat, msg_id=1, snippet="s"
+            rdb, cand.id, "forward", "fwd:-1005/77", chat=ChatKey("", -chat), msg_id=1, snippet="s"
         )
-    assert research_db.add_evidence(rdb, cand.id, "link", "msg:1/2", chat_id=1, msg_id=2)
-    assert not research_db.add_evidence(rdb, cand.id, "link", "msg:1/2", chat_id=1, msg_id=2)
+    at = ChatKey("default", 1)
+    assert research_db.add_evidence(rdb, cand.id, "link", "msg:default:1/2", chat=at, msg_id=2)
+    assert not research_db.add_evidence(rdb, cand.id, "link", "msg:default:1/2", chat=at, msg_id=2)
+    other = ChatKey("work", 1)
+    assert research_db.add_evidence(rdb, cand.id, "link", "msg:default:1/2", chat=other, msg_id=2)
+    assert research_db.list_evidence(rdb, cand.id)[-1].chat == other
     assert research_db.add_evidence(rdb, link.id, "post_search", "search:1:@linked")
     assert not research_db.add_evidence(rdb, link.id, "post_search", "search:1:@linked")
-    assert len(research_db.list_evidence(rdb, cand.id)) == 11
+    assert len(research_db.list_evidence(rdb, cand.id)) == 12
     assert research_db.corroboration(rdb, [cand.id, link.id, 999]) == {cand.id: 2, link.id: 1}
     with pytest.raises(ValueError):
         research_db.add_evidence(rdb, cand.id, "rumour", "k")  # type: ignore[arg-type]
@@ -490,13 +504,92 @@ def test_searches_are_recorded_per_session(rdb: sqlite3.Connection) -> None:
 
 def test_a_scan_cursor_never_moves_back_nor_deepens(rdb: sqlite3.Connection) -> None:
     sid = _session(rdb)
-    assert research_db.scan_cursor(rdb, sid, 10) is None
-    research_db.set_scan_cursor(rdb, sid, 10, depth=1, msg_id=50, now=1)
-    cursor = research_db.set_scan_cursor(rdb, sid, 10, depth=2, msg_id=40, now=2)
-    assert (cursor.depth, cursor.msg_id, cursor.scanned_at) == (1, 50, 2)
-    research_db.set_scan_cursor(rdb, sid, 10, depth=0, msg_id=90, now=3)
-    assert research_db.scan_cursor(rdb, sid, 10) == ScanCursor(
-        session_id=sid, chat_id=10, depth=0, msg_id=90, scanned_at=3
+    chat = ChatKey("", -10)
+    assert research_db.scan_cursor(rdb, sid, chat) is None
+    research_db.set_scan_cursor(rdb, sid, chat, depth=1, index_id="a", lead_seq=50, now=1)
+    cursor = research_db.set_scan_cursor(rdb, sid, chat, depth=2, index_id="a", lead_seq=40, now=2)
+    assert (cursor.depth, cursor.lead_seq, cursor.scanned_at) == (1, 50, 2)
+    research_db.set_scan_cursor(rdb, sid, chat, depth=0, index_id="a", lead_seq=90, now=3)
+    assert research_db.scan_cursor(rdb, sid, chat) == ScanCursor(
+        session_id=sid, chat=chat, depth=0, index_id="a", lead_seq=90, scanned_at=3
     )
-    research_db.set_scan_cursor(rdb, sid, 5, depth=1, msg_id=1, now=3)
-    assert [c.chat_id for c in research_db.list_scan_cursors(rdb, sid)] == [5, 10]
+    research_db.set_scan_cursor(rdb, sid, ChatKey("default", 5), depth=1, index_id="a", now=3)
+    assert [c.chat for c in research_db.list_scan_cursors(rdb, sid)] == [
+        chat,
+        ChatKey("default", 5),
+    ]
+
+
+def test_a_cursor_of_another_index_is_replaced_not_kept(rdb: sqlite3.Connection) -> None:
+    """A rebuilt index restarts its lead clock: the old cursor would skip its rows."""
+    sid = _session(rdb)
+    chat = ChatKey("", -10)
+    research_db.set_scan_cursor(rdb, sid, chat, depth=0, index_id="old", lead_seq=900, now=1)
+    cursor = research_db.set_scan_cursor(rdb, sid, chat, depth=0, index_id="new", lead_seq=3, now=2)
+    assert (cursor.index_id, cursor.lead_seq) == ("new", 3)
+
+
+def test_pins_and_directories_are_remembered_beside_the_cursor(rdb: sqlite3.Connection) -> None:
+    sid = _session(rdb)
+    chat = ChatKey("", -10)
+    research_db.set_scan_cursor(rdb, sid, chat, depth=1, index_id="a", lead_seq=7, now=1)
+    research_db.mark_pins_read(rdb, sid, chat, depth=2, now=5)
+    research_db.mark_directory(rdb, sid, chat, depth=2, now=6)
+    cursor = research_db.scan_cursor(rdb, sid, chat)
+    assert cursor is not None
+    assert (cursor.depth, cursor.lead_seq, cursor.pins_read_at, cursor.directory) == (1, 7, 5, True)
+    fresh = research_db.mark_pins_read(rdb, sid, ChatKey("work", 3), depth=0, now=8)
+    assert (fresh.depth, fresh.lead_seq, fresh.index_id, fresh.directory) == (0, 0, None, False)
+
+
+def test_step_two_names_v1_chats_by_scope_and_peer(rdb: sqlite3.Connection) -> None:
+    """A v1 file named chats by index row id; step 2 turns them into ``(scope, peer_id)`` and
+    drops the synthetic ids that named no peer."""
+    v1 = research_db.connect(":memory:")
+    try:
+        for statement in research_db.MIGRATIONS[1]:
+            v1.execute(statement)
+        v1.execute("INSERT INTO meta(key, value) VALUES ('schema_version', '1')")
+        synthetic = 1 << 62
+        v1.execute(
+            "INSERT INTO sessions(id, question, account, seeds, limits, created_at) "
+            "VALUES (1, 'q', 'work', ?, '{}', 1)",
+            (f"[-1000000000100, 42, {synthetic}]",),
+        )
+        v1.execute(
+            "INSERT INTO candidates(id, session_id, identity, kind, depth, status, created_at, "
+            "probed_at) VALUES (1, 1, '@x', 'username', 1, 'pending_admission', 1, 5)"
+        )
+        for chat_id, via in ((-1000000000100, "link"), (42, "link"), (synthetic, "mention")):
+            v1.execute(
+                "INSERT INTO evidence(candidate_id, via, chat_id, msg_id, origin_key, found_at) "
+                "VALUES (1, ?, ?, 3, 'k', 1)",
+                (via, chat_id),
+            )
+        v1.execute(
+            "INSERT INTO scans(session_id, chat_id, depth, msg_id, scanned_at) "
+            "VALUES (1, -1000000000100, 0, 77, 1), (1, ?, 1, 5, 1)",
+            (synthetic,),
+        )
+
+        assert research_db.migrate(v1) == research_db.SCHEMA_VERSION
+
+        session = research_db.get_session(v1, 1)
+        assert session is not None
+        assert session.seeds == (ChatKey("", -1000000000100), ChatKey("work", 42))
+        assert [e.chat for e in research_db.list_evidence(v1, 1)] == [
+            ChatKey("", -1000000000100),
+            ChatKey("work", 42),
+            None,
+        ]
+        (cursor,) = research_db.list_scan_cursors(v1, 1)
+        assert (cursor.chat, cursor.depth, cursor.lead_seq, cursor.index_id) == (
+            ChatKey("", -1000000000100),
+            0,
+            0,
+            None,
+        ), "a msg_id cursor means nothing on the lead clock: the chat is read again"
+        candidate = research_db.get_candidate(v1, 1)
+        assert candidate is not None and candidate.requested_at == 5
+    finally:
+        v1.close()

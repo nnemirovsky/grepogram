@@ -7,7 +7,7 @@ tools. Everything is an immutable, slotted dataclass so it serialises with ``dat
 
 import re
 from dataclasses import dataclass, field
-from typing import Literal
+from typing import Literal, NamedTuple
 
 ChatType = Literal["user", "bot", "group", "supergroup", "channel"]
 UnitKind = Literal["window", "thread", "post"]
@@ -162,8 +162,10 @@ class ResearchLimits:
     """The bounds a research session works within, fixed when it starts (``sessions.limits``).
 
     ``max_depth`` is how many hops from a seed a candidate may be; ``max_candidates`` and
-    ``probe_limit`` cap one discover call; ``since_days`` is the history horizon a source added
-    by a run gets; ``max_messages_per_run`` and ``run_budget_s`` bound one run.
+    ``probe_limit`` cap one discover call and ``max_session_candidates`` the whole session;
+    ``since_days`` is the history horizon a source added by a run gets;
+    ``max_messages_per_run`` and ``run_budget_s`` bound one run; an admission request no admin
+    answered within ``admission_timeout_days`` is given up (``failed``).
     """
 
     max_depth: int = 2
@@ -172,6 +174,8 @@ class ResearchLimits:
     since_days: int = 365
     max_messages_per_run: int = 5000
     run_budget_s: int = 300
+    max_session_candidates: int = 500
+    admission_timeout_days: int = 30
 
 
 @dataclass(frozen=True, slots=True)
@@ -195,6 +199,8 @@ class ResearchCfg:
     since_days: int = 365
     max_messages_per_run: int = 5000
     run_budget_s: int = 300
+    max_session_candidates: int = 500
+    admission_timeout_days: int = 30
 
     def limits(self) -> ResearchLimits:
         """The limits a session started under this config gets unless it overrides them."""
@@ -205,6 +211,8 @@ class ResearchCfg:
             since_days=self.since_days,
             max_messages_per_run=self.max_messages_per_run,
             run_budget_s=self.run_budget_s,
+            max_session_candidates=self.max_session_candidates,
+            admission_timeout_days=self.admission_timeout_days,
         )
 
 
@@ -580,16 +588,25 @@ class SourceStatus:
 # --- research.db rows ------------------------------------------------------------------------
 
 
+class ChatKey(NamedTuple):
+    """A chat as Telegram names it — ``(scope, peer_id)``, the identity
+    :func:`grepogram.db.upsert_chat` finds a row by — rather than by an index row id, which a
+    rebuilt index numbers afresh. What ``research.db`` names every chat by."""
+
+    scope: str
+    peer_id: int
+
+
 @dataclass(frozen=True, slots=True, kw_only=True)
 class ResearchSession:
     """One ``sessions`` row of ``research.db``: a question explored from seed chats by one
-    account. ``seeds`` are ``chats.id`` values of the index; ``progress`` is what the research
-    loop records about its runs."""
+    account. ``seeds`` name those chats as Telegram does (:class:`ChatKey`); ``progress`` is what
+    the research loop records about its runs."""
 
     id: int
     question: str
     account: str
-    seeds: tuple[int, ...]
+    seeds: tuple[ChatKey, ...]
     limits: ResearchLimits
     state: ResearchState
     created_at: int
@@ -628,21 +645,25 @@ class Candidate:
     parent_id: int | None = None
     source_id: str | None = None
     probed_at: int | None = None
+    requested_at: int | None = None
+    """When a run sent the admission request a ``pending_admission`` candidate waits on."""
     created_at: int = 0
     note: str | None = None
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class Evidence:
-    """One path that led to a candidate. ``chat_id`` / ``msg_id`` name the message it was found
-    in (index ids for an indexed chat, the peer and post for a search result); ``origin_key``
-    is what corroboration counts — every forward of one post shares it."""
+    """One path that led to a candidate. ``chat`` / ``msg_id`` name the message it was found in
+    — the chat as Telegram names it, :class:`ChatKey`, whether the index holds it (a message
+    discovery read) or not (a global search's result); ``None`` for a path that is no message (a
+    shared folder's listing, a chat search). ``origin_key`` is what corroboration counts — every
+    forward of one post shares it."""
 
     id: int
     candidate_id: int
     via: EvidenceVia
     origin_key: str
-    chat_id: int | None = None
+    chat: ChatKey | None = None
     msg_id: int | None = None
     snippet: str | None = None
     found_at: int = 0
@@ -703,14 +724,19 @@ class SearchRecord:
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class ScanCursor:
-    """How far a session's discovery has read one indexed chat: the Telegram ``msg_id`` of the
-    newest message scanned and the depth the chat's leads are found at."""
+    """What a session knows about one chat it reads: the depth the chat's leads are found at, how
+    far discovery has read it — tick ``lead_seq`` of the lead clock of the index ``index_id``
+    (:func:`grepogram.db.lead_clock`); any other index's cursor reads the chat from the start —
+    when its pinned posts were read, and whether it is a directory."""
 
     session_id: int
-    chat_id: int
+    chat: ChatKey
     depth: int
-    msg_id: int
-    scanned_at: int
+    index_id: str | None = None
+    lead_seq: int = 0
+    pins_read_at: int | None = None
+    directory: bool = False
+    scanned_at: int = 0
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -739,8 +765,9 @@ class DiscoverReport:
 
     ``leads`` counts the paths to a chat outside the session that were read; ``in_session`` those
     to a chat the session already reads, ``people`` those naming a person, and neither counts as
-    a lead. ``text_fallback`` is how many messages, stored before links were captured, were read
-    by their visible text alone — their hidden hyperlinks and buttons were never seen.
+    a lead. ``text_fallback`` is how many messages whose links were never read (stored before
+    links were captured, or imported without entities) were read by their visible text alone —
+    their hidden hyperlinks and buttons were never seen.
     ``beyond_depth``, ``excluded`` and ``over_cap`` count the new identities left out, and
     ``truncated`` says the cap held some back: their chats keep their cursor, so the next call
     reads them again.
@@ -759,10 +786,40 @@ class DiscoverReport:
     excluded: int = 0
     over_cap: int = 0
     truncated: bool = False
+    session_full: bool = False
+    """The session's ``max_session_candidates`` ceiling held back what ``over_cap`` counts: no
+    later call proposes those either, so their chats' cursors move on."""
+    directories: list[int] = field(default_factory=list)
+    """The chats read that are directories (:data:`grepogram.research.DIRECTORY_MIN_CHATS`):
+    every lead found in one also carries a ``directory`` path."""
+    pins: "PinReport | None" = None
+    """What reading the pinned posts of the session's chats found (with a client only)."""
     probe: "ProbeReport | None" = None
     """What probing found, when :func:`grepogram.research.discover` had a client to probe with."""
     searches: "tuple[GlobalSearchReport, ...]" = ()
     """The global searches that call ran (:func:`grepogram.research.global_search`)."""
+
+
+@dataclass(slots=True, kw_only=True)
+class PinReport:
+    """One pass over the pinned posts of a session's chats (:func:`grepogram.research.read_pins`).
+
+    ``chats`` are the index rows whose pinned posts were read, ``messages`` how many pinned posts
+    that was; their leads are evidence only — never stored as messages. ``remaining`` is how many
+    of the session's chats still wait for theirs; ``flood_wait_s`` is set when Telegram asked to
+    wait and the pass stopped there.
+    """
+
+    session_id: int
+    chats: list[int] = field(default_factory=list)
+    messages: int = 0
+    leads: int = 0
+    new_candidates: list[int] = field(default_factory=list)
+    updated_candidates: list[int] = field(default_factory=list)
+    over_cap: int = 0
+    remaining: int = 0
+    flood_wait_s: int | None = None
+    warnings: list[str] = field(default_factory=list)
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -857,6 +914,8 @@ class RunReport:
     unavailable: list[int] = field(default_factory=list)
     failed: list[int] = field(default_factory=list)
     messages: int = 0
+    pins: PinReport | None = None
+    """The pinned posts of the chats this run fetched, read for their leads."""
     discovery: DiscoverReport | None = None
     stopped_by: RunStop | None = None
     warnings: list[str] = field(default_factory=list)

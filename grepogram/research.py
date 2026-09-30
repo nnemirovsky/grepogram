@@ -6,15 +6,34 @@ refuses while ``[research] enabled`` is false (:func:`require_enabled`).
 
 **Offline discovery** (:func:`discover_offline`) talks to no one. It reads the messages the
 index already holds of a session's seed chats — and of any chat a later run fetched for it, at
-the depth that chat was found at — and turns every Telegram destination they name into a
-*candidate* one hop further out:
+the depth that chat was found at, a channel's discussion group always beside its channel — and
+turns every Telegram destination they name into a *candidate* one hop further out:
 
 - the links a message was stored with (``message_links``: visible URLs, hidden ``text_url``
   hyperlinks, ``@mentions``, URL buttons, link previews);
 - a forward's structured origin (``messages.fwd_peer_id``);
-- for a row stored before links were captured (``meta['links_captured_from']``), whatever
+- for a row whose links were never read (``messages.links_read``: stored before link capture,
+  or by an import whose export spelled no entities), whatever
   :func:`grepogram.leads.text_leads` finds in its text — visible URLs and mentions only, which
   the report counts as ``text_fallback`` so a caller can say that hidden links were not seen.
+
+Where it has read to is a cursor on the index's lead clock (:func:`grepogram.db.lead_clock`),
+not a message id: a discussion group stores comments out of ``msg_id`` order, and an edit or a
+recapture gives an old row links it did not have — both are rows whose leads changed since the
+cursor. Every chat is named in ``research.db`` as Telegram names it, ``(scope, peer_id)``
+(:class:`~grepogram.models.ChatKey`), and found in the index as it is now, so a rebuilt index
+or a private chat stored again under another row id is still the same conversation; a cursor
+taken on another index (:func:`grepogram.db.index_id`) reads the chat from the start.
+
+A chat whose messages name at least :data:`DIRECTORY_MIN_CHATS` distinct chats is a
+**directory**: every lead found in it also carries a ``directory`` path, which shares the
+lead's origin key and so adds no corroboration. Approving a directory approves nothing it lists.
+
+**Pinned posts** (:func:`read_pins`) of the chats a session reads — its seeds, the user's own
+indexed sources, and the chats runs fetched under a grant — are read once each, whatever their
+age: a directory often keeps its index in a post pinned long before any ``since``. Their leads
+are evidence (``via = pinned``) in ``research.db`` only; the posts are never stored as messages
+and no sync cursor moves.
 
 A candidate is a chat, not a post: ``@name/123`` and ``t.me/c/<id>/<post>`` lead to ``@name``
 and ``peer:<marked id>``, the post staying in the evidence. A user id (a mention by id, a
@@ -32,7 +51,8 @@ post itself where it is indexed and each forward of it, wherever it landed — s
 ``post:<peer>/<msg>``, so a post forwarded into ten chats is one piece of evidence rather than
 ten. Candidates rank by corroboration, then by how many of the question's terms their evidence
 snippets share, then by depth. ``max_candidates`` caps how many *new* candidates one call adds;
-a chat whose leads the cap cut keeps its scan cursor, so the next call reads them again.
+a chat whose leads that cap cut keeps its scan cursor, so the next call reads them again.
+``max_session_candidates`` caps the whole session; what it cuts no later call proposes either.
 
 **Probing** (:func:`probe`, :func:`probe_candidates`) asks Telegram what a candidate *is* —
 title, type, size, whether the acting account is a member, whether joining needs an admission
@@ -70,11 +90,17 @@ classes of Telethon 1.44 / layer 227 for the exact fields):
   ``chatlists.chatlistInviteAlready`` (``filter_id``, ``missing_peers`` not joined yet,
   ``already_peers``); a dead slug is an RPC error Telethon has no class for (``INVITE_SLUG_*``),
   hence the plain ``RPCError`` catch.
+- ``messages.search`` with ``inputMessagesFilterPinned`` (what ``iter_messages(filter=…)``
+  sends) answers a chat's pinned messages, newest first, whatever their date.
 - ``messageFwdHeader``: ``from_id`` + ``channel_post`` address a channel post; ``from_name``
   without ``from_id`` is an account hiding itself, which names no peer; ``saved_from_peer`` /
   ``saved_from_msg_id`` are set only for Saved Messages. :func:`grepogram.sync.forward_origin`
-  stores exactly that, and a forward origin a probe cannot address — no access hash for this
-  account, the usual case for a private channel — is recorded ``unresolvable``, never guessed.
+  stores exactly that, and the origin chat Telegram hands along with the message (in the
+  answer's ``chats``; ``min`` when the account may only see it, whose access hash addresses
+  nothing) leaves its username and this account's access hash in ``peer_cache``
+  (:func:`grepogram.sync.forward_peers`). A forward origin a probe cannot address even so — no
+  access hash for this account and no username, the usual case for a private channel — is
+  recorded ``unresolvable``, never guessed.
 - ``channels.checkSearchPostsFlood(query)`` → ``searchPostsFlood``: ``total_daily``,
   ``remains``, ``wait_till``, ``query_is_free``, ``stars_amount``; the page on search says to
   ask it before ``channels.searchPosts`` (``query``, ``offset_rate``, ``offset_peer``,
@@ -90,6 +116,7 @@ classes of Telethon 1.44 / layer 227 for the exact fields):
 Message text never reaches the log above DEBUG; counts do.
 """
 
+import asyncio
 import dataclasses
 import functools
 import json
@@ -117,10 +144,12 @@ from grepogram.models import (
     CandidateKind,
     CandidateStatus,
     CandidateView,
+    ChatKey,
     ChatRow,
     ChatType,
     Config,
     DiscoverReport,
+    Evidence,
     EvidenceVia,
     GlobalSearchReport,
     Grant,
@@ -128,12 +157,14 @@ from grepogram.models import (
     GrantChannel,
     LinkKind,
     MessageRow,
+    PinReport,
     ProbeOutcome,
     ProbeReport,
     ProbeResult,
     ResearchLimits,
     ResearchSession,
     RunReport,
+    ScanCursor,
     SearchKind,
     SessionAction,
     Source,
@@ -251,12 +282,12 @@ def start_session(
             "a research session needs at least one seed chat",
             "name indexed chats to start from, as `search --chat` takes them",
         )
-    chosen = sorted(resolve_chats(conn, cfg, seeds))
+    chosen = [db.get_chat(conn, chat_id) for chat_id in sorted(resolve_chats(conn, cfg, seeds))]
     session = research_db.create_session(
         rdb,
         question=question,
         account=account,
-        seeds=chosen,
+        seeds=[chat_key(chat) for chat in chosen if chat is not None],
         limits=limits or cfg.research.limits(),
         now=now,
     )
@@ -300,11 +331,22 @@ def _quoted(text: str) -> str:
 # --- leads -----------------------------------------------------------------------------------
 
 
+def chat_key(chat: ChatRow) -> ChatKey:
+    """``chat`` as ``research.db`` names it: ``(scope, peer_id)``, never its row id."""
+    return ChatKey(chat.scope, chat.peer_id)
+
+
+def chat_of(conn: sqlite3.Connection, key: ChatKey) -> ChatRow | None:
+    """The index row ``key`` names now, if the index holds that chat."""
+    return db.get_chat_by_peer(conn, key.peer_id, key.scope)
+
+
 @dataclass(frozen=True, slots=True, kw_only=True)
 class Lead:
     """One path from a stored message to a chat: the candidate ``identity`` it names (chat-level,
-    a :mod:`grepogram.leads` target), how (``via``), where (``chat_id`` — the index row — and
-    Telegram ``msg_id``), the ``origin_key`` corroboration counts, and a snippet of the text."""
+    a :mod:`grepogram.leads` target), how (``via``), where (``found_in`` — the chat as Telegram
+    names it — ``row_id``, its index row now, and Telegram ``msg_id``), the ``origin_key``
+    corroboration counts, and a snippet of the text."""
 
     identity: str
     kind: CandidateKind
@@ -313,7 +355,8 @@ class Lead:
     chat: LeadTarget
     """The chat ``target`` is in: ``target`` itself unless it names a post."""
     via: EvidenceVia
-    chat_id: int
+    found_in: ChatKey
+    row_id: int
     msg_id: int
     origin_key: str
     snippet: str | None = None
@@ -321,9 +364,9 @@ class Lead:
 
 @dataclass(slots=True, kw_only=True)
 class LeadScan:
-    """What :func:`collect_leads` read: the leads, the newest ``msg_id`` seen per chat (what a
-    scan cursor moves to), how many messages carried a lead and how many of those were read by
-    the text fallback alone."""
+    """What :func:`collect_leads` read: the leads, the lead-clock tick each chat was read to
+    (what a scan cursor moves to), how many messages carried a lead and how many of those were
+    read by the text fallback alone."""
 
     leads: list[Lead] = field(default_factory=list)
     newest: dict[int, int] = field(default_factory=dict)
@@ -360,7 +403,9 @@ def origin_key(message: MessageRow, chat: ChatRow) -> str:
 
     A forward of a post is ``post:<origin peer>/<origin msg>``, as is that post where it is
     itself indexed (a channel or supergroup, whose ``msg_id`` is global); a forward known only by
-    its author is ``fwd:<author>@<original date>``; any other message is ``msg:<chat row>/<msg>``.
+    its author is ``fwd:<author>@<original date>``; any other message is
+    ``msg:<scope>:<peer>/<msg>`` — the chat as Telegram names it, so the key outlives the index
+    row it was read from.
     """
     if message.fwd_peer_id is not None and message.fwd_msg_id is not None:
         return f"post:{message.fwd_peer_id}/{message.fwd_msg_id}"
@@ -368,7 +413,7 @@ def origin_key(message: MessageRow, chat: ChatRow) -> str:
         return f"fwd:{message.fwd_peer_id}@{message.fwd_date or 0}"
     if chat.is_shared:
         return f"post:{chat.peer_id}/{message.msg_id}"
-    return f"msg:{chat.id}/{message.msg_id}"
+    return f"msg:{chat.scope}:{chat.peer_id}/{message.msg_id}"
 
 
 def snippet(text: str, needle: str | None = None) -> str | None:
@@ -389,64 +434,66 @@ def _needle(target: LeadTarget) -> str | None:
     return target.username or target.invite_hash or target.slug
 
 
-def collect_leads(
-    conn: sqlite3.Connection, chat_ids: Iterable[int], since_msg_ids: Mapping[int, int]
-) -> LeadScan:
-    """Every lead the stored messages of ``chat_ids`` above ``since_msg_ids[chat]`` name.
+def _own(chat: ChatRow) -> set[str]:
+    """The identities that name ``chat`` itself: a lead to the chat it was found in is none."""
+    return {f"peer:{chat.peer_id}", *([f"@{chat.username.lower()}"] if chat.username else [])}
+
+
+def collect_leads(conn: sqlite3.Connection, after: Mapping[int, int]) -> LeadScan:
+    """Every lead the stored messages of the chats ``after`` names (index row → lead-clock tick
+    read so far) name, among the rows whose leads changed since that tick.
 
     Links come from ``message_links`` and forward origins from ``messages.fwd_peer_id``; a row
-    stored before capture (:func:`grepogram.db.links_captured_from`) that has neither is read by
+    whose links were never read (``messages.links_read``) and that has neither is read by
     :func:`grepogram.leads.text_leads`. A lead to the very chat it was found in is not one. Only
-    rows up to the newest ``msg_id`` seen when the chat was first asked are read, so a sync
-    storing rows meanwhile cannot slip a message past the cursor this returns.
+    rows up to the chat's newest tick when it was first asked are read, so a sync storing rows
+    meanwhile cannot slip a message past the cursor this returns.
     """
     scan = LeadScan()
-    captured_from = db.links_captured_from(conn)
-    for chat_id in dict.fromkeys(chat_ids):
+    for chat_id, since in after.items():
         chat = db.get_chat(conn, chat_id)
         if chat is None:
             continue
-        after = since_msg_ids.get(chat_id, 0)
-        newest = db.newest_msg_id(conn, chat_id)
-        scan.newest[chat_id] = max(after, newest)
-        rows = [
-            m for m in db.lead_messages(conn, chat_id, after, captured_from) if m.msg_id <= newest
-        ]
-        stored = db.message_links(conn, (m.id for m in rows if m.id is not None))
-        own = {f"peer:{chat.peer_id}", *([f"@{chat.username.lower()}"] if chat.username else [])}
-        for message in rows:
-            found = _message_leads(message, chat, stored.get(message.id or 0), captured_from, scan)
-            kept = [lead for lead in found if lead.identity not in own]
+        upto = db.newest_lead_seq(conn, chat_id)
+        scan.newest[chat_id] = max(since, upto)
+        rows = db.lead_messages(conn, chat_id, since, upto)
+        stored = db.message_links(conn, (m.id for m, _ in rows if m.id is not None))
+        own = _own(chat)
+        for message, read in rows:
+            links = stored.get(message.id or 0)
+            if links is None and not read:
+                links = leads.text_leads(message.text)
+                if links:
+                    scan.text_fallback += 1
+            found = message_leads(message, chat, links, scan)
             if found:
                 scan.messages += 1
-            scan.leads.extend(kept)
+            scan.leads.extend(lead for lead in found if lead.identity not in own)
     return scan
 
 
-def _message_leads(
+def message_leads(
     message: MessageRow,
     chat: ChatRow,
-    stored: tuple[tuple[LinkKind, str], ...] | None,
-    captured_from: int,
+    links: Iterable[tuple[LinkKind, str]] | None,
     scan: LeadScan,
+    *,
+    via: EvidenceVia | None = None,
 ) -> list[Lead]:
+    """The leads one message of ``chat`` carries — its ``links`` and its forward origin — each
+    found ``via`` its own kind of link, or ``via`` for all of them when given (a pinned post)."""
     key = origin_key(message, chat)
     named: list[tuple[EvidenceVia, LeadTarget]] = []
-    links = stored
-    if links is None and message.id is not None and message.id < captured_from:
-        links = leads.text_leads(message.text)
-        if links:
-            scan.text_fallback += 1
     for link_kind, value in links or ():
         target = leads.normalize(value)
         if target is not None:
-            named.append((_VIA_OF_LINK[link_kind], target))
+            named.append((via or _VIA_OF_LINK[link_kind], target))
     if message.fwd_peer_id is not None:
         origin = leads.peer(message.fwd_peer_id)
         if origin is not None:
-            named.append(("forward", origin))
+            named.append((via or "forward", origin))
     found: list[Lead] = []
-    for via, target in named:
+    for path, target in named:
         level = chat_level(target)
         if level is None:
             scan.people += 1
@@ -458,8 +505,9 @@ def _message_leads(
                 kind=kind,
                 target=target,
                 chat=chat_target,
-                via=via,
-                chat_id=chat.id,
+                via=path,
+                found_in=chat_key(chat),
+                row_id=chat.id,
                 msg_id=message.msg_id,
                 origin_key=key,
                 snippet=snippet(message.text, _needle(target)),
@@ -553,6 +601,12 @@ def candidate_views(
 
 # --- discovery -------------------------------------------------------------------------------
 
+DIRECTORY_MIN_CHATS = 10
+"""How many distinct chats a chat's messages must name before discovery calls it a *directory*
+— a channel or group that exists to list others — and records ``directory`` evidence on every
+lead found in it. The count is over its stored links and forward origins and, once read, its
+pinned posts' leads; the flag is kept for the session once it is set."""
+
 
 @dataclass(slots=True)
 class _Found:
@@ -570,14 +624,222 @@ class _Found:
         )
 
 
-def scan_targets(rdb: sqlite3.Connection, session: ResearchSession) -> dict[int, tuple[int, int]]:
-    """``chat_id → (depth, msg_id cursor)`` for every chat the session reads: its seeds at
-    depth 0 and every chat a run fetched for it, at the depth that chat was found at."""
-    targets = {seed: (0, 0) for seed in session.seeds}
-    for cursor in research_db.list_scan_cursors(rdb, session.id):
-        depth = min(cursor.depth, targets.get(cursor.chat_id, (cursor.depth, 0))[0])
-        targets[cursor.chat_id] = (depth, cursor.msg_id)
+@dataclass(frozen=True, slots=True)
+class ScanTarget:
+    """One chat a session reads: its index row now, the depth its leads are found at, and the
+    lead-clock tick discovery has read it to on this index (``0``: from the start)."""
+
+    chat: ChatRow
+    depth: int
+    after: int
+    cursor: ScanCursor | None
+
+
+def scan_targets(
+    rdb: sqlite3.Connection, conn: sqlite3.Connection, session: ResearchSession
+) -> dict[int, ScanTarget]:
+    """``chat row → ScanTarget`` for every chat the session reads: its seeds at depth 0 and
+    every chat a run fetched for it, at the depth that chat was found at — each with the
+    discussion group of a channel among them, at the channel's depth, since a channel's comments
+    are part of what it says. Chats are named by ``(scope, peer_id)`` in ``research.db`` and
+    found in the index as it is now; one the index does not hold (yet, or any more) is not read.
+    A cursor kept for another index (:func:`grepogram.db.index_id`) reads the chat from the
+    start."""
+    index = db.index_id(conn)
+    cursors = {cursor.chat: cursor for cursor in research_db.list_scan_cursors(rdb, session.id)}
+    depths: dict[ChatKey, int] = dict.fromkeys(session.seeds, 0)
+    for key, cursor in cursors.items():
+        depths[key] = min(cursor.depth, depths.get(key, cursor.depth))
+    targets: dict[int, ScanTarget] = {}
+
+    def add(chat: ChatRow, depth: int) -> None:
+        known = targets.get(chat.id)
+        if known is not None and known.depth <= depth:
+            return
+        cursor = cursors.get(chat_key(chat))
+        after = cursor.lead_seq if cursor is not None and cursor.index_id == index else 0
+        targets[chat.id] = ScanTarget(chat=chat, depth=depth, after=after, cursor=cursor)
+
+    for key, depth in sorted(depths.items(), key=lambda item: item[1]):
+        chat = chat_of(conn, key)
+        if chat is None:
+            continue
+        add(chat, depth)
+        if chat.type == "channel":
+            group = db.get_discussion_chat(conn, chat.id)
+            if group is not None:
+                add(group, depth)
     return targets
+
+
+@dataclass(slots=True)
+class _Proposal:
+    """What proposing one batch of leads did (:func:`_propose`)."""
+
+    new: list[int] = field(default_factory=list)
+    updated: list[int] = field(default_factory=list)
+    in_session: int = 0
+    beyond_depth: int = 0
+    excluded: int = 0
+    over_cap: int = 0
+    held_back: set[int] = field(default_factory=set)
+    """Chats (index rows) some of whose leads the per-call cap cut: their cursors stay."""
+    full: bool = False
+    """The session's ``max_session_candidates`` ceiling cut something."""
+
+
+def room(rdb: sqlite3.Connection, session: ResearchSession) -> int:
+    """How many new candidates one call may still add: ``max_candidates``, or fewer when the
+    session's ``max_session_candidates`` ceiling is closer."""
+    left = session.limits.max_session_candidates - research_db.count_candidates(rdb, session.id)
+    return max(0, min(session.limits.max_candidates, left))
+
+
+def _propose(
+    rdb: sqlite3.Connection,
+    conn: sqlite3.Connection,
+    session: ResearchSession,
+    targets: Mapping[int, ScanTarget],
+    found_leads: Iterable[Lead],
+    stamp: int,
+) -> _Proposal:
+    """Turn leads into candidates and evidence, inside the caller's ``research.db`` transaction.
+
+    A lead to a chat the session already reads is ``in_session``; a new identity becomes a
+    ``proposed`` candidate one hop deeper than the chat it was found in — never beyond
+    ``max_depth``, never an excluded one, at most :func:`room` of them, best corroborated first —
+    and every lead is kept as evidence, on an existing candidate as on a new one. A forward's
+    origin is proposed by its peer id alone even when a sync saw it under a username: that name
+    is a hint the probe checks (:func:`_probe_named_peer`), never an identity — a stale one
+    would fold two chats into one candidate.
+    """
+    limits = session.limits
+    proposal = _Proposal()
+    found: dict[str, _Found] = {}
+    for lead in found_leads:
+        if _cached_ids(conn, lead.chat) & targets.keys():
+            proposal.in_session += 1
+            continue
+        depth = targets[lead.row_id].depth + 1
+        entry = found.setdefault(lead.identity, _Found(first=lead, depth=depth))
+        entry.depth = min(entry.depth, depth)
+        entry.leads.append(lead)
+    terms = question_terms(session.question)
+    fresh: list[_Found] = []
+    for identity, entry in found.items():
+        chat = entry.first.chat
+        existing = research_db.candidate_for(
+            rdb,
+            session.id,
+            identity,
+            peer_id=chat.peer_id,
+            username=chat.username,
+            invite_hash=chat.invite_hash,
+        )
+        if existing is not None:
+            if _record(rdb, existing, entry, stamp) and existing.id not in proposal.updated:
+                proposal.updated.append(existing.id)
+        elif entry.depth > limits.max_depth:
+            proposal.beyond_depth += 1
+        elif research_db.excluded_by(rdb, identity, peer_id=chat.peer_id, username=chat.username):
+            proposal.excluded += 1
+        else:
+            fresh.append(entry)
+    fresh.sort(key=lambda entry: entry.rank(terms))
+    cap = room(rdb, session)
+    kept, over = fresh[:cap], fresh[cap:]
+    for entry in kept:
+        chat = entry.first.chat
+        candidate = research_db.add_candidate(
+            rdb,
+            session.id,
+            entry.first.identity,
+            entry.first.kind,
+            entry.depth,
+            peer_id=chat.peer_id,
+            username=chat.username,
+            invite_hash=chat.invite_hash,
+            addlist_slug=chat.slug,
+            now=stamp,
+        )
+        if candidate is not None:  # None only for an excluded identity, asked above
+            _record(rdb, candidate, entry, stamp)
+            proposal.new.append(candidate.id)
+    proposal.over_cap = len(over)
+    if over and cap < limits.max_candidates:
+        # the session's ceiling, not this call's cap: nothing held back could ever be proposed
+        proposal.full = True
+    else:
+        proposal.held_back = {lead.row_id for entry in over for lead in entry.leads}
+    return proposal
+
+
+def _record(rdb: sqlite3.Connection, candidate: Candidate, entry: _Found, now: int) -> bool:
+    """Add every lead of ``entry`` as evidence of ``candidate``; whether any path was new."""
+    added = False
+    for lead in entry.leads:
+        added |= research_db.add_evidence(
+            rdb,
+            candidate.id,
+            lead.via,
+            lead.origin_key,
+            chat=lead.found_in,
+            msg_id=lead.msg_id,
+            snippet=lead.snippet,
+            now=now,
+        )
+    return added
+
+
+def _directories(
+    rdb: sqlite3.Connection,
+    conn: sqlite3.Connection,
+    session: ResearchSession,
+    targets: Mapping[int, ScanTarget],
+    chats: Iterable[int],
+    extra: Mapping[int, set[str]],
+    stamp: int,
+) -> list[int]:
+    """Tell which of ``chats`` are directories (:data:`DIRECTORY_MIN_CHATS`) and put a
+    ``directory`` path beside every lead the session found in one; returns the directory rows.
+
+    ``extra`` adds identities read off messages the index does not store (pinned posts). The
+    ``directory`` path shares the lead's origin key, so it shows where a candidate came from
+    without counting as another piece of corroboration. Nothing is approved by it: a directory
+    grants nothing for what it lists, like every chat (:func:`authorized`).
+    """
+    found: list[int] = []
+    for chat_id in dict.fromkeys(chats):
+        target = targets.get(chat_id)
+        if target is None:
+            continue
+        key = chat_key(target.chat)
+        if not (target.cursor is not None and target.cursor.directory):
+            named = set(extra.get(chat_id, ()))
+            for value in db.chat_link_targets(conn, chat_id):
+                parsed = leads.normalize(value)
+                level = None if parsed is None else chat_level(parsed)
+                if level is not None:
+                    named.add(level[1])
+            named -= _own(target.chat)
+            if len(named) < DIRECTORY_MIN_CHATS:
+                continue
+            research_db.mark_directory(rdb, session.id, key, depth=target.depth, now=stamp)
+            log.info("research session %d: chat %s is a directory", session.id, chat_id)
+        found.append(chat_id)
+        for evidence in research_db.evidence_from(rdb, session.id, key):
+            if evidence.via != "directory":
+                research_db.add_evidence(
+                    rdb,
+                    evidence.candidate_id,
+                    "directory",
+                    evidence.origin_key,
+                    chat=key,
+                    msg_id=evidence.msg_id,
+                    snippet=evidence.snippet,
+                    now=stamp,
+                )
+    return found
 
 
 def discover_offline(
@@ -591,96 +853,49 @@ def discover_offline(
     """Read the session's chats from where it last stopped and record what they lead to.
 
     Offline: nothing here talks to Telegram. New identities become ``proposed`` candidates one
-    hop deeper than the chat they were found in — never beyond ``max_depth``, never an excluded
-    one, at most ``max_candidates`` per call, best corroborated first — and every lead is kept as
-    evidence, on an existing candidate as on a new one. The candidates, their evidence and the
-    moved scan cursors are written in one transaction. See the module docstring for what counts
-    as a lead and as corroboration.
+    hop deeper than the chat they were found in (:func:`_propose`), a chat whose messages name
+    many others is marked a directory (:func:`_directories`), and the candidates, their evidence
+    and the moved scan cursors are written in one transaction. See the module docstring for
+    what counts as a lead and as corroboration.
     """
     require_enabled(cfg)
     session = active_session(rdb, session_id)
-    limits = session.limits
     stamp = int(time.time()) if now is None else now
-    targets = scan_targets(rdb, session)
-    scan = collect_leads(conn, targets, {chat: cursor for chat, (_, cursor) in targets.items()})
-
-    found: dict[str, _Found] = {}
-    in_session = 0
-    for lead in scan.leads:
-        if _cached_ids(conn, lead.chat) & targets.keys():
-            in_session += 1
-            continue
-        depth = targets[lead.chat_id][0] + 1
-        entry = found.setdefault(lead.identity, _Found(first=lead, depth=depth))
-        entry.depth = min(entry.depth, depth)
-        entry.leads.append(lead)
-
-    terms = question_terms(session.question)
-    fresh: list[_Found] = []
-    new: list[int] = []
-    updated: list[int] = []
-    beyond_depth = excluded = 0
+    index = db.index_id(conn)
+    targets = scan_targets(rdb, conn, session)
+    scan = collect_leads(conn, {chat_id: target.after for chat_id, target in targets.items()})
     with db.transaction(rdb):
-        for identity, entry in found.items():
-            chat = entry.first.chat
-            existing = research_db.candidate_for(
-                rdb,
-                session.id,
-                identity,
-                peer_id=chat.peer_id,
-                username=chat.username,
-                invite_hash=chat.invite_hash,
-            )
-            if existing is not None:
-                if _record(rdb, existing, entry, stamp) and existing.id not in updated:
-                    updated.append(existing.id)
-            elif entry.depth > limits.max_depth:
-                beyond_depth += 1
-            elif research_db.excluded_by(
-                rdb, identity, peer_id=chat.peer_id, username=chat.username
-            ):
-                excluded += 1
-            else:
-                fresh.append(entry)
-        fresh.sort(key=lambda entry: entry.rank(terms))
-        kept, over = fresh[: limits.max_candidates], fresh[limits.max_candidates :]
-        for entry in kept:
-            chat = entry.first.chat
-            candidate = research_db.add_candidate(
-                rdb,
-                session.id,
-                entry.first.identity,
-                entry.first.kind,
-                entry.depth,
-                peer_id=chat.peer_id,
-                username=chat.username,
-                invite_hash=chat.invite_hash,
-                addlist_slug=chat.slug,
-                now=stamp,
-            )
-            if candidate is not None:  # None only for an excluded identity, asked above
-                _record(rdb, candidate, entry, stamp)
-                new.append(candidate.id)
-        held_back = {lead.chat_id for entry in over for lead in entry.leads}
+        proposal = _propose(rdb, conn, session, targets, scan.leads, stamp)
+        read = {lead.row_id for lead in scan.leads}
+        directories = _directories(rdb, conn, session, targets, read, {}, stamp)
         for chat_id, newest in scan.newest.items():
-            if chat_id not in held_back:
+            if chat_id not in proposal.held_back:
+                target = targets[chat_id]
                 research_db.set_scan_cursor(
-                    rdb, session.id, chat_id, depth=targets[chat_id][0], msg_id=newest, now=stamp
+                    rdb,
+                    session.id,
+                    chat_key(target.chat),
+                    depth=target.depth,
+                    index_id=index,
+                    lead_seq=newest,
+                    now=stamp,
                 )
     report = DiscoverReport(
         session_id=session.id,
         chats_scanned=len(scan.newest),
         messages_scanned=scan.messages,
         text_fallback=scan.text_fallback,
-        leads=len(scan.leads) - in_session,
-        in_session=in_session,
+        leads=len(scan.leads) - proposal.in_session,
+        in_session=proposal.in_session,
         people=scan.people,
-        new_candidates=new,
-        updated_candidates=updated,
-        beyond_depth=beyond_depth,
-        excluded=excluded,
-        over_cap=len(over),
-        truncated=bool(over),
+        new_candidates=proposal.new,
+        updated_candidates=proposal.updated,
+        beyond_depth=proposal.beyond_depth,
+        excluded=proposal.excluded,
+        over_cap=proposal.over_cap,
+        truncated=bool(proposal.held_back),
+        session_full=proposal.full,
+        directories=directories,
     )
     log.info(
         "research session %d: %d chat(s) read, %d lead(s), %d new candidate(s), "
@@ -688,29 +903,143 @@ def discover_offline(
         session.id,
         report.chats_scanned,
         report.leads,
-        len(new),
-        beyond_depth,
-        excluded,
-        len(over),
+        len(proposal.new),
+        proposal.beyond_depth,
+        proposal.excluded,
+        proposal.over_cap,
     )
     return report
 
 
-def _record(rdb: sqlite3.Connection, candidate: Candidate, entry: _Found, now: int) -> bool:
-    """Add every lead of ``entry`` as evidence of ``candidate``; whether any path was new."""
-    added = False
-    for lead in entry.leads:
-        added |= research_db.add_evidence(
-            rdb,
-            candidate.id,
-            lead.via,
-            lead.origin_key,
-            chat_id=lead.chat_id,
-            msg_id=lead.msg_id,
-            snippet=lead.snippet,
-            now=now,
+# --- pinned posts ----------------------------------------------------------------------------
+
+PIN_CHATS_PER_CALL = 20
+"""Chats whose pinned posts one discover call or run reads — one request each."""
+PINNED_PER_CHAT = 50
+"""The most pinned posts read of one chat."""
+
+
+def _pin_reader(chat: ChatRow, session: ResearchSession) -> bool:
+    """Whether the session's account may ask about ``chat``'s pinned posts: a shared chat it
+    reaches or may try, or a private chat of its own — never another account's private chat."""
+    return chat.is_shared or chat.scope == session.account
+
+
+async def read_pins(
+    client: Any,
+    rdb: sqlite3.Connection,
+    conn: sqlite3.Connection,
+    cfg: Config,
+    session_id: int,
+    *,
+    only: Collection[ChatKey] | None = None,
+    limit: int = PIN_CHATS_PER_CALL,
+    now: int | None = None,
+) -> PinReport:
+    """Read the pinned posts of the chats the session reads whose pins it has not read yet, and
+    propose what they lead to (``via = pinned``); ``only`` narrows it to those chats.
+
+    A chat the session reads is a seed — an indexed source of the user's own — or a chat a run
+    fetched under a human's grant, so reading its pinned posts needs no approval of its own, and
+    nothing else is ever asked about. A pin is read whatever its age: a directory often keeps its
+    index in a post pinned years before any ``since``. The posts are read
+    (``messages.search`` with ``inputMessagesFilterPinned``, through ``iter_messages``) and
+    their leads kept as evidence in ``research.db`` only: **they are not stored as messages** and
+    no sync cursor moves — a sparse read must never pass for the history before it. At most
+    ``limit`` chats per call, :data:`PINNED_PER_CHAT` posts each; a flood wait stops the pass
+    with a warning and the rest wait for the next call. A chat that refuses the account (or that
+    it cannot address) is marked read with a warning, and so is another account's private chat,
+    which the session's account is never asked about.
+    """
+    require_enabled(cfg)
+    session = active_session(rdb, session_id)
+    stamp = _stamp(now)
+    report = PinReport(session_id=session.id)
+    targets = scan_targets(rdb, conn, session)
+    pending = [
+        target
+        for target in targets.values()
+        if (target.cursor is None or target.cursor.pins_read_at is None)
+        and (only is None or chat_key(target.chat) in only)
+    ]
+    pending.sort(key=lambda target: (target.depth, target.chat.id))
+    foreign = [target for target in pending if not _pin_reader(target.chat, session)]
+    asked = [target for target in pending if _pin_reader(target.chat, session)][: max(limit, 0)]
+    if asked:
+        await sync.warm_peer_cache(client, [target.chat for target in asked], conn, session.account)
+    scan = LeadScan()
+    done: list[ScanTarget] = list(foreign)
+    extra: dict[int, set[str]] = {}
+    for target in asked:
+        chat = target.chat
+        try:
+            posts = [
+                message
+                async for message in client.iter_messages(
+                    chat.peer_id, limit=PINNED_PER_CHAT, filter=types.InputMessagesFilterPinned
+                )
+            ]
+        except errors.FloodError as exc:
+            report.flood_wait_s = _flood_seconds(exc)
+            wait = f"{report.flood_wait_s}s" if report.flood_wait_s is not None else "a while"
+            report.warnings.append(
+                f"Telegram asks to wait {wait} before reading more pinned posts; stopped"
+            )
+            break
+        except errors.UnauthorizedError as exc:
+            _raise_auth(exc, session.account)
+        except (errors.RPCError, ValueError) as exc:
+            report.warnings.append(f"the pinned posts of chat {chat.id} could not be read: {exc}")
+            done.append(target)
+            continue
+        sync.remember_forward_peers(conn, session.account, posts, stamp)
+        own = _own(chat)
+        found: list[Lead] = []
+        for post in posts:
+            row = sync.map_message(post, chat, {})
+            if row is None:
+                continue
+            report.messages += 1
+            found += [
+                lead
+                for lead in message_leads(row, chat, row.links, scan, via="pinned")
+                if lead.identity not in own
+            ]
+        scan.leads += found
+        extra[chat.id] = {lead.identity for lead in found}
+        report.chats.append(chat.id)
+        done.append(target)
+    for target in foreign:
+        report.warnings.append(
+            f"chat {target.chat.id} is account {target.chat.scope}'s own; its pinned posts are "
+            f"not read as {session.account}"
         )
-    return added
+    with db.transaction(rdb):
+        proposal = _propose(rdb, conn, session, targets, scan.leads, stamp)
+        _directories(rdb, conn, session, targets, extra, extra, stamp)
+        for target in done:
+            if target.chat.id not in proposal.held_back:
+                research_db.mark_pins_read(
+                    rdb, session.id, chat_key(target.chat), depth=target.depth, now=stamp
+                )
+    report.leads = len(scan.leads) - proposal.in_session
+    report.new_candidates = proposal.new
+    report.updated_candidates = proposal.updated
+    report.over_cap = proposal.over_cap
+    report.remaining = sum(
+        1
+        for target in scan_targets(rdb, conn, session).values()
+        if (target.cursor is None or target.cursor.pins_read_at is None)
+        and (only is None or chat_key(target.chat) in only)
+    )
+    log.info(
+        "research session %d: pinned posts of %d chat(s) read, %d new candidate(s), %d left",
+        session.id,
+        len(report.chats),
+        len(proposal.new),
+        report.remaining,
+    )
+    return report
 
 
 # --- probing ---------------------------------------------------------------------------------
@@ -720,9 +1049,9 @@ _PROBED: tuple[CandidateStatus, ...] = ("proposed", "approved")
 SEARCH_LIMIT = 100
 """The most results one global search asks for; ``max_candidates`` may lower it."""
 UNRESOLVABLE_NOTE = (
-    "unresolvable: this account holds no access hash for it — a private chat known only by its "
-    "id (a forward origin, a t.me/c link); only a link that names it (an invite, a username) "
-    "can open it"
+    "unresolvable: this account holds no access hash for it and knows no username it goes by — "
+    "a private chat known only by its id (a forward origin, a t.me/c link); only a link that "
+    "names it (an invite, a username) can open it"
 )
 
 
@@ -876,8 +1205,10 @@ async def probe(
     """Ask Telegram what ``candidate`` is, as its session's account, and store the answer.
 
     Read-only metadata: a username is resolved, an invite checked, a shared folder listed, a
-    bare peer id looked up with the access hash the index stored for this account — and with
-    none, nothing is sent and the candidate is ``unresolvable``. No history is read. A refusal
+    bare peer id looked up with the access hash the index stored for this account — for a chat
+    it holds, or for a peer a sync was handed alongside a forward (``peer_cache``) — or else by
+    the username such a peer was seen under; with neither, nothing is sent and the candidate is
+    ``unresolvable``. No history is read. A refusal
     (an expired invite, a banned account, a username nobody holds) is ``unavailable`` with
     Telegram's reason in the note. A flood wait propagates to the caller; a dead session
     becomes :class:`~grepogram.tg.AuthRequired`.
@@ -960,11 +1291,14 @@ async def _probe_peer(
     if kind is types.PeerChat:
         answer = await client(functions.messages.GetChatsRequest(id=[bare]))
     else:
-        access_hash = (
-            _stored_hash(conn, marked, session.account)
-            if candidate.access_hash is None
-            else candidate.access_hash
-        )
+        access_hash = candidate.access_hash
+        if access_hash is None:
+            access_hash = _stored_hash(conn, marked, session.account)
+        if access_hash is None:
+            access_hash = db.cached_peer_hash(conn, marked, session.account)
+        username = candidate.username or db.cached_peer_username(conn, marked)
+        if kind is types.PeerChannel and access_hash is None and username:
+            return await _probe_named_peer(client, rdb, candidate, username, stamp)
         if kind is not types.PeerChannel or access_hash is None:
             stored = _settle(rdb, candidate, "unresolvable", stamp, note=UNRESOLVABLE_NOTE)
             return ProbeOutcome(candidate=stored, result="unresolvable")
@@ -973,6 +1307,24 @@ async def _probe_peer(
     entity = next((e for e in answer.chats if dialogs.peer_id(e) == marked), None)
     if entity is None:
         stored = _settle(rdb, candidate, "unresolvable", stamp, note=UNRESOLVABLE_NOTE)
+        return ProbeOutcome(candidate=stored, result="unresolvable")
+    return _entity_outcome(rdb, candidate, entity, stamp)
+
+
+async def _probe_named_peer(
+    client: Any, rdb: sqlite3.Connection, candidate: Candidate, username: str, stamp: int
+) -> ProbeOutcome:
+    """Probe a peer known by id through the username the index saw it under — a forward's
+    origin channel, whose username a sync recorded (:func:`grepogram.db.cached_peer_username`).
+    The answer counts only when it is that very peer: a username that moved to another chat
+    since leaves the candidate unresolvable."""
+    try:
+        entity = await client.get_entity(f"@{username}")
+    except (ValueError, errors.UsernameNotOccupiedError, errors.UsernameInvalidError):
+        entity = None
+    if entity is None or dialogs.peer_id(entity) != candidate.peer_id:
+        note = f"{UNRESOLVABLE_NOTE}; @{username}, the name it was seen under, no longer names it"
+        stored = _settle(rdb, candidate, "unresolvable", stamp, note=note)
         return ProbeOutcome(candidate=stored, result="unresolvable")
     return _entity_outcome(rdb, candidate, entity, stamp)
 
@@ -1029,7 +1381,8 @@ async def _probe_addlist(
         title = answer.title.text
         peers = list(answer.peers)
         member = False
-    targets = scan_targets(rdb, session)
+    targets = scan_targets(rdb, conn, session)
+    allowance = room(rdb, session)
     children: list[int] = []
     people = excluded = in_session = over_cap = 0
     with db.transaction(rdb):
@@ -1053,7 +1406,7 @@ async def _probe_addlist(
             existing = research_db.candidate_for(
                 rdb, session.id, target.target, peer_id=marked, username=facts.get("username")
             )
-            if existing is None and len(children) >= session.limits.max_candidates:
+            if existing is None and len(children) >= allowance:
                 over_cap += 1
                 continue
             child = research_db.add_candidate(
@@ -1077,7 +1430,7 @@ async def _probe_addlist(
                 child.id,
                 "shared_folder",
                 f"addlist:{slug}",
-                chat_id=None,
+                chat=None,
                 msg_id=None,
                 snippet=title,
                 now=stamp,
@@ -1296,7 +1649,7 @@ def _found_chat(
     existing = research_db.candidate_for(
         rdb, session.id, target.target, peer_id=marked, username=facts.get("username")
     )
-    if existing is None and len(report.new_candidates) >= session.limits.max_candidates:
+    if existing is None and room(rdb, session) <= 0:
         report.over_cap += 1
         return
     candidate = research_db.add_candidate(
@@ -1320,7 +1673,7 @@ def _found_chat(
         candidate.id,
         report.kind,
         origin_key,
-        chat_id=marked,
+        chat=ChatKey(chat_scope(facts["type"], session.account), marked),
         msg_id=msg_id,
         snippet=snippet_text,
         now=stamp,
@@ -1346,7 +1699,7 @@ async def _chat_search(
     entities = {dialogs.peer_id(e): e for e in (*found.chats, *found.users)}
     peers = [int(utils.get_peer_id(p)) for p in (*found.my_results, *found.results)]
     report.results = len(peers)
-    reads = scan_targets(rdb, session)
+    reads = scan_targets(rdb, conn, session)
     with db.transaction(rdb):
         for marked in dict.fromkeys(peers):
             entity = entities.get(marked)
@@ -1416,7 +1769,7 @@ async def _post_search(
     entities = {dialogs.peer_id(e): e for e in (*answer.chats, *answer.users)}
     posts = [m for m in answer.messages if isinstance(m, types.Message)]
     report.results = len(posts)
-    reads = scan_targets(rdb, session)
+    reads = scan_targets(rdb, conn, session)
     with db.transaction(rdb):
         for post in posts:
             marked = int(utils.get_peer_id(post.peer_id))
@@ -1477,17 +1830,22 @@ async def discover(
     *,
     now: int | None = None,
 ) -> DiscoverReport:
-    """One discover call: offline discovery, then — with a client — the global searches the
-    session may run and has not run for its question yet, then a bounded probing pass.
+    """One discover call: offline discovery, then — with a client — the pinned posts of the
+    session's chats not read yet (:func:`read_pins`), the global searches the session may run and
+    has not run for its question yet, then a bounded probing pass.
 
-    Global search runs only while ``[research]`` switches it on and a ``global_search`` grant is
-    live; without them this call simply does not search. A flood wait during the search skips
-    probing for this call.
+    The offline half reads the whole index and runs on a worker thread, so a server's event loop
+    stays free meanwhile. Global search runs only while ``[research]`` switches it on and a
+    ``global_search`` grant is live; without them this call simply does not search. A flood wait
+    while reading pins or searching skips what follows for this call.
     """
-    report = discover_offline(rdb, conn, cfg, session_id, now=now)
+    report = await asyncio.to_thread(discover_offline, rdb, conn, cfg, session_id, now=now)
     if client is None:
         return report
     session = active_session(rdb, session_id)
+    pins = await read_pins(client, rdb, conn, cfg, session.id, now=now)
+    if pins.flood_wait_s is not None:
+        return dataclasses.replace(report, pins=pins)
     searches: list[GlobalSearchReport] = []
     if search_kinds(cfg) and search_granted(rdb, session.id, "global_search"):
         done = {
@@ -1505,7 +1863,7 @@ async def discover(
     probed = (
         None if flooded else await probe_candidates(client, rdb, conn, cfg, session.id, now=now)
     )
-    return dataclasses.replace(report, probe=probed, searches=tuple(searches))
+    return dataclasses.replace(report, pins=pins, probe=probed, searches=tuple(searches))
 
 
 # --- approval --------------------------------------------------------------------------------
@@ -2239,8 +2597,22 @@ async def _recheck_admissions(
 ) -> bool:
     """Ask again about every candidate waiting for an admission; ``True`` when a flood wait
     stopped the run. A probe reads metadata only — whether the account is in now — so it needs
-    no grant; an admitted candidate is ``joined`` and the rest of its grant runs on."""
+    no grant; an admitted candidate is ``joined`` and the rest of its grant runs on.
+
+    A request no admin answered within the session's ``admission_timeout_days`` is given up:
+    the candidate is ``failed`` with a note and its grants are voided, so it is not asked about
+    forever, and a new approval may send the request again."""
+    timeout = session.limits.admission_timeout_days * 86400
     for candidate in research_db.list_candidates(rdb, session.id, ["pending_admission"]):
+        if candidate.requested_at is None:
+            research_db.update_candidate(rdb, candidate.id, requested_at=stamp)
+        elif stamp - candidate.requested_at >= timeout:
+            note = (
+                f"the admission request got no answer in {session.limits.admission_timeout_days} "
+                "days and was given up; approve `request` again to send another"
+            )
+            _refuse_candidate(rdb, session, candidate, "failed", note, report)
+            continue
         try:
             outcome = await probe(client, rdb, conn, candidate, now=stamp)
         except errors.FloodError as exc:
@@ -2388,7 +2760,12 @@ async def _join_one(
         if route == "join":
             note += "; Telegram turned the approved join into an admission request"
         research_db.update_candidate(
-            rdb, candidate.id, status="pending_admission", member=False, note=note
+            rdb,
+            candidate.id,
+            status="pending_admission",
+            member=False,
+            note=note,
+            requested_at=stamp,
         )
         report.pending_admission.append(candidate.id)
         return
@@ -2715,11 +3092,13 @@ def _settle_fetches(
     synced: SyncReport,
     report: RunReport,
     stamp: int,
-) -> int:
+) -> list[ChatKey]:
     """Record what the sync did for each fetched candidate and register every chat it stored
     into for discovery one hop deeper — the chat and a channel's discussion group, at the
-    candidate's depth (:func:`scan_targets`). Returns how many chats were registered."""
-    registered = 0
+    candidate's depth (:func:`scan_targets`), named by ``(scope, peer_id)``. Returns the chats
+    registered."""
+    index = db.index_id(conn)
+    registered: list[ChatKey] = []
     for candidate in fetching:
         chat = _fetched_chat(conn, candidate)
         if chat is None:
@@ -2739,9 +3118,9 @@ def _settle_fetches(
                 chats.append(discussion)
             for row in chats:
                 research_db.set_scan_cursor(
-                    rdb, session.id, row.id, depth=candidate.depth, msg_id=0, now=stamp
+                    rdb, session.id, chat_key(row), depth=candidate.depth, index_id=index, now=stamp
                 )
-                registered += 1
+                registered.append(chat_key(row))
         if chat.id in synced.chats_done:
             research_db.update_candidate(rdb, candidate.id, status="fetched", note=None)
             report.fetched.append(candidate.id)
@@ -2822,15 +3201,17 @@ async def run(
     further from what it fetched.
 
     In order: the admission requests still waiting are asked about again (an admitted chat is
-    ``joined``); every candidate with a live grant is joined or asked to join exactly as
+    ``joined``, one no admin answered within ``admission_timeout_days`` is ``failed``); every
+    candidate with a live grant is joined or asked to join exactly as
     approved — the chats of one shared folder in one request naming only them — each outward
     step behind :func:`authorized` for that very candidate and action; the approved sources are
     added to the config (account, ``since`` = :func:`horizon`, comments for a channel) in one
     locked write; those chats — and nothing else — are synced through
     :func:`grepogram.sync.sync_all` with ``only``, under ``budget`` (the session's
     ``run_budget_s`` and ``max_messages_per_run`` by default); and every chat the sync stored
-    into is registered for discovery, which runs over it at depth + 1 and only ever *proposes*
-    what it finds. Nothing discovered inside an approved chat is acted on.
+    into is registered for discovery — its pinned posts read (:func:`read_pins`), its messages
+    read on a worker thread — which runs over it at depth + 1 and only ever *proposes* what it
+    finds. Nothing discovered inside an approved chat is acted on.
 
     Telegram's answers are recorded as they are: already a member is ``joined``, an admission
     request is ``pending_admission`` (asked about again next run), a chat that refuses the
@@ -2865,7 +3246,7 @@ async def run(
         flooded = await _join_all(client, rdb, conn, session, work, report, budget, stamp)
     if not flooded and not budget.expired:
         flooded = await _confirm_public(client, rdb, session, work, report)
-    registered = 0
+    registered: list[ChatKey] = []
     if not flooded and not budget.expired:
         try:
             _add_sources(rdb, conn, paths, session, work, report)
@@ -2891,8 +3272,14 @@ async def run(
     waiting = _consume_done(rdb, session, work, stamp)
     if report.stopped_by is None and waiting and budget.halted:
         report.stopped_by = "messages" if budget.exhausted else "time"
+    if registered and not flooded and report.stopped_by != "flood":
+        report.pins = await read_pins(
+            client, rdb, conn, cfg, session.id, only=registered, now=stamp
+        )
     if registered:
-        report.discovery = discover_offline(rdb, conn, cfg, session.id, now=stamp)
+        report.discovery = await asyncio.to_thread(
+            discover_offline, rdb, conn, cfg, session.id, now=stamp
+        )
     _record_progress(rdb, session, report, stamp)
     log.info(
         "research session %d run: %d joined, %d waiting for admission, %d source(s) added, "
@@ -3007,14 +3394,40 @@ def authorized_actions(rdb: sqlite3.Connection, candidate: Candidate) -> list[Ca
 
 def session_document(session: ResearchSession) -> dict[str, Any]:
     """A session as the CLI's ``--json`` and the MCP tools show it, with its history
-    :func:`horizon`."""
-    return {**dataclasses.asdict(session), "horizon": horizon(session)}
+    :func:`horizon`; each seed is the chat as Telegram names it, ``{scope, peer_id}``."""
+    document = dataclasses.asdict(session)
+    document["seeds"] = [{"scope": key.scope, "peer_id": key.peer_id} for key in session.seeds]
+    return {**document, "horizon": horizon(session)}
 
 
-def candidate_document(rdb: sqlite3.Connection, view: CandidateView) -> dict[str, Any]:
+def evidence_document(conn: sqlite3.Connection, evidence: Evidence) -> dict[str, Any]:
+    """One piece of evidence as the documents show it. The chat it was found in is ``scope`` and
+    ``peer_id`` — Telegram's id, whether the index holds the chat or not — and ``chat_id`` is
+    that chat's index row *now*, the id ``thread`` and ``context`` take, or ``None`` when the
+    index does not hold it (a global search's result)."""
+    key = evidence.chat
+    row = None if key is None else chat_of(conn, key)
+    return {
+        "id": evidence.id,
+        "candidate_id": evidence.candidate_id,
+        "via": evidence.via,
+        "origin_key": evidence.origin_key,
+        "scope": None if key is None else key.scope,
+        "peer_id": None if key is None else key.peer_id,
+        "chat_id": None if row is None else row.id,
+        "msg_id": evidence.msg_id,
+        "snippet": evidence.snippet,
+        "found_at": evidence.found_at,
+    }
+
+
+def candidate_document(
+    rdb: sqlite3.Connection, conn: sqlite3.Connection, view: CandidateView
+) -> dict[str, Any]:
     """One candidate with the three facts kept apart — ``member`` (a probe's answer), ``cached``
     (the index holds it, through ``cached_accounts``) and ``authorized`` (the actions a live
-    grant allows) — and every piece of evidence. The acting account's access hash stays out."""
+    grant allows) — and every piece of evidence (:func:`evidence_document`). The acting
+    account's access hash stays out."""
     document = dataclasses.asdict(view.candidate)
     del document["access_hash"]
     document.update(
@@ -3024,7 +3437,7 @@ def candidate_document(rdb: sqlite3.Connection, view: CandidateView) -> dict[str
         cached_chats=list(view.cached_chats),
         cached_accounts=list(view.cached_accounts),
         authorized=authorized_actions(rdb, view.candidate),
-        evidence=[dataclasses.asdict(evidence) for evidence in view.evidence],
+        evidence=[evidence_document(conn, evidence) for evidence in view.evidence],
     )
     return document
 
@@ -3055,7 +3468,7 @@ def candidates_document(
         "question": session.question,
         "account": session.account,
         "state": session.state,
-        "candidates": [candidate_document(rdb, view) for view in views],
+        "candidates": [candidate_document(rdb, conn, view) for view in views],
     }
 
 
