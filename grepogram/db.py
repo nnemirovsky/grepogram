@@ -1,9 +1,12 @@
 """SQLite storage: connection setup, versioned schema migrations and typed row accessors.
 
-One file holds everything: ``chats``, ``users``, ``messages``, ``units``, the FTS5 tables and the
-sqlite-vec table. FTS and vec rows are keyed by the parent rowid (``messages.id`` / ``units.id``)
-so deletes are direct lookups; virtual tables cannot carry foreign keys, so :func:`delete_chat`
-removes their rows before the ``chats`` row cascades to ``messages`` and ``units``.
+``index.db`` holds everything derived from Telegram: ``chats``, ``users``, ``messages``,
+``units``, the FTS5 tables and the sqlite-vec table, and since the accounts steps ``accounts``,
+``chat_access``, ``chat_sources``, ``message_links`` and ``peer_cache``. Research decisions are
+not derived and live in ``research.db`` (:mod:`grepogram.research_db`), never here. FTS and
+vec rows are keyed by the parent rowid (``messages.id`` / ``units.id``) so deletes are direct
+lookups; virtual tables cannot carry foreign keys, so :func:`delete_chat` removes their rows
+before the ``chats`` row cascades to ``messages`` and ``units``.
 
 Every writing function is atomic on its own and commits when it finishes, unless a transaction is
 already open — wrap several calls in ``with transaction(conn):`` to commit them together.
