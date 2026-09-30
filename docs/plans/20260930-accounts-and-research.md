@@ -915,11 +915,38 @@ voided_at)`, `exclusions(identity PRIMARY KEY, reason, created_at)`,
 
 ### Task 19: Verify acceptance criteria
 
-- [ ] every Overview requirement (both features, every permission requirement in the handoff)
+**Files:**
+- Create: `tests/test_upgrade.py`
+- Modify: `tests/test_mcp.py`, `tests/test_research.py`
+
+- [x] every Overview requirement (both features, every permission requirement in the handoff)
   traced to code and a test
-- [ ] upgrade path: a v0.2.0 home (schema 6, single session, imports) works unchanged
-- [ ] run `uv run pytest`, `uv run ruff check .`, `uv run ruff format --check .`, `uv run mypy`
-- [ ] `HF_HUB_OFFLINE=1 uv run pytest -m slow` if the models are cached
+  ➕ traced: explicit enable (`research.require_enabled`; config default, library / CLI / MCP
+  refusals), ask before fetching or searching (`authorized()` before every outward step, probes
+  read metadata only, a run with nothing granted touches nothing), join / admission approval
+  (grant validation, pending admission), descendants (directory and shared-folder tests), grant
+  reuse, member / cached / authorized kept apart (candidate document), skip and global
+  persistent exclusions, ongoing-source and global-search disclosure (exact summary texts), paid
+  search off by default, stop keeps sources; accounts: separate sessions (`tg`), per-account
+  sources (`config`, `sources`), concurrent sync and per-account flood handling (`sync`),
+  account scopes and provenance (`filters`, `search`, CLI, MCP), a shared chat fetched once,
+  removal keeping co-owned chats (`sources`, `accounts rm`), the single-account migration.
+  Gaps closed with new tests (no code was missing): one approval naming several targets grants
+  each its own actions and nothing to an unnamed candidate (`tests/test_research.py`); ordinary
+  `search` neither fetches nor asks Telegram about an approved, not yet run candidate, nor
+  spends its grant; removing a source a research run added (after stop) sends no leave request
+  and keeps the membership (`tests/test_mcp.py`)
+- [x] upgrade path: a v0.2.0 home (schema 6, single session, imports) works unchanged
+  ➕ `tests/test_upgrade.py`: rows written by the CLI (`sync` of a channel, `import` of the
+  Telegram Desktop export) are rebuilt into a schema-6 `index.db` from the released steps with
+  only the v0.2.0 columns, tables and meta; beside it one `session.session` and a config with no
+  `[[accounts]]`. The first `search` migrates in place and answers (no "via" in text output),
+  `sources ls` lists the channel and the imports, `sync` fetches the new post as `default` with
+  no account wording, the imports' rows, units, FTS and vectors are unchanged and reached by no
+  account, the config file is byte-identical and `accounts ls` shows `default` alone
+- [x] run `uv run pytest`, `uv run ruff check .`, `uv run ruff format --check .`, `uv run mypy`
+  (2193 passed)
+- [x] `HF_HUB_OFFLINE=1 uv run pytest -m slow` if the models are cached (both cached; 11 passed)
 
 ### Task 20: [Final] Update documentation
 
