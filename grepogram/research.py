@@ -951,6 +951,18 @@ def _pin_reader(chat: ChatRow, session: ResearchSession) -> bool:
     return chat.is_shared or chat.scope == session.account
 
 
+def _pins_unread(
+    targets: Mapping[int, ScanTarget], only: Collection[ChatKey] | None
+) -> list[ScanTarget]:
+    """The targets whose pinned posts the session has not read yet, narrowed to ``only``."""
+    return [
+        target
+        for target in targets.values()
+        if (target.cursor is None or target.cursor.pins_read_at is None)
+        and (only is None or chat_key(target.chat) in only)
+    ]
+
+
 async def read_pins(
     client: Any,
     rdb: sqlite3.Connection,
@@ -982,15 +994,12 @@ async def read_pins(
     stamp = research_db.clock(now)
     report = PinReport(session_id=session.id)
     targets = scan_targets(rdb, conn, session)
-    pending = [
-        target
-        for target in targets.values()
-        if (target.cursor is None or target.cursor.pins_read_at is None)
-        and (only is None or chat_key(target.chat) in only)
-    ]
-    pending.sort(key=lambda target: (target.depth, target.chat.id))
-    foreign = [target for target in pending if not _pin_reader(target.chat, session)]
-    asked = [target for target in pending if _pin_reader(target.chat, session)][: max(limit, 0)]
+    pending = sorted(_pins_unread(targets, only), key=lambda target: (target.depth, target.chat.id))
+    foreign: list[ScanTarget] = []
+    asked: list[ScanTarget] = []
+    for target in pending:
+        (asked if _pin_reader(target.chat, session) else foreign).append(target)
+    del asked[max(limit, 0) :]
     if asked:
         await sync.warm_peer_cache(client, [target.chat for target in asked], conn, session.account)
     scan = LeadScan()
@@ -1051,12 +1060,7 @@ async def read_pins(
     report.new_candidates = proposal.new
     report.updated_candidates = proposal.updated
     report.over_cap = proposal.over_cap
-    report.remaining = sum(
-        1
-        for target in scan_targets(rdb, conn, session).values()
-        if (target.cursor is None or target.cursor.pins_read_at is None)
-        and (only is None or chat_key(target.chat) in only)
-    )
+    report.remaining = len(_pins_unread(scan_targets(rdb, conn, session), only))
     log.info(
         "research session %d: pinned posts of %d chat(s) read, %d new candidate(s), %d left",
         session.id,
