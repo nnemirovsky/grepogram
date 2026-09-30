@@ -106,14 +106,14 @@ never change the git identity.
   auth failure names whose session died (`tg.auth_hint(account)`). Only `grepogram auth` opens a
   session file for writing (`tg.make_login_client`), and it signs in on a 0600 copy
   (`tg.stage_login`) that replaces the account's file (`tg.commit_login`, an `os.replace`) only
-  once `db.other_user` says the index recorded no *other* Telegram user under that name: an
+  once `db.conflicting_account` says the index recorded no *other* Telegram user under that name: an
   account name is one Telegram user, since its scoped private chats, `chat_access` /
   `peer_cache` hashes and research grants are that user's. A name with no user recorded yet (a
   v0.2.0 `default`) takes whoever signs in; an index `auth` cannot read refuses the sign-in too
   (fail closed); a refused sign-in leaves the old session, logs the staged one out on Telegram's
   side (`tg.log_out`, only when this sign-in made the authorization: `SignedIn.fresh`) and
   deletes the copy. **Every Telegram-facing pass holds the same line through one check**,
-  `sync.check_account` (`get_me` against `db.other_user`, raising `tg.OtherUser`, an
+  `sync.check_account` (`get_me` against `db.conflicting_account`, raising `tg.OtherUser`, an
   `AuthRequired` whose hint is `accounts rm`): `sync._record_account` in a sync,
   `StoredPass.start` (`prune-deleted`, `extract`, `recapture-links` — through
   `sync.checked_accounts`, which leaves the account out with a warning), the folder read of

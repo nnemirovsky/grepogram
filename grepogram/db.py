@@ -1197,7 +1197,7 @@ def get_account(conn: sqlite3.Connection, name: str) -> AccountRow | None:
     return None if row is None else _account_row(row)
 
 
-def other_user(conn: sqlite3.Connection, name: str, user_id: int) -> AccountRow | None:
+def conflicting_account(conn: sqlite3.Connection, name: str, user_id: int) -> AccountRow | None:
     """The row recording ``name`` as a Telegram user other than ``user_id``, or ``None`` — none
     recorded, or one with no user yet (a ``default`` account from before accounts existed)."""
     found = get_account(conn, name)

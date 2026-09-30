@@ -1048,11 +1048,13 @@ def test_accounts_are_recorded_once_and_listed_default_first(conn: sqlite3.Conne
     assert again == AccountRow(name="work", user_id=8, display_name="Work")
     assert [row.name for row in db.list_accounts(conn)] == ["default", "work"]
     assert db.get_account(conn, "work") == again and db.get_account(conn, "nobody") is None
-    assert db.other_user(conn, "work", 8) is None
-    assert db.other_user(conn, "work", 9) == again
+    assert db.conflicting_account(conn, "work", 8) is None
+    assert db.conflicting_account(conn, "work", 9) == again
     db.upsert_account(conn, AccountRow(name="old", user_id=None))
-    assert db.other_user(conn, "old", 9) is None, "a name with no user recorded takes anyone"
-    assert db.other_user(conn, "nobody", 9) is None
+    assert db.conflicting_account(conn, "old", 9) is None, (
+        "a name with no user recorded takes anyone"
+    )
+    assert db.conflicting_account(conn, "nobody", 9) is None
 
 
 def test_forget_account_drops_its_access_and_its_row_only(conn: sqlite3.Connection) -> None:

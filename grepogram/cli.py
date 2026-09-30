@@ -274,7 +274,7 @@ def _another_user(paths: Paths, account: str, who: tg.SignedIn) -> tuple[str, st
     try:
         conn = _open_db(paths)
         try:
-            recorded = db.other_user(conn, account, who.user_id)
+            recorded = db.conflicting_account(conn, account, who.user_id)
         finally:
             conn.close()
     except (db.SchemaError, db.ExtensionsUnsupported, sqlite3.Error) as exc:

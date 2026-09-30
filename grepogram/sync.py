@@ -2168,9 +2168,10 @@ def other_user(conn: sqlite3.Connection, account: str, user_id: int) -> tg.Other
     recorded under ``account``; ``None`` when it is, or when no user is recorded yet (a
     ``default`` from before accounts existed, a name never synced), which takes whoever signs
     in."""
-    recorded = db.other_user(conn, account, user_id)
-    if recorded is None or recorded.user_id is None:
+    recorded = db.conflicting_account(conn, account, user_id)
+    if recorded is None:
         return None
+    assert recorded.user_id is not None  # a row with no user recorded takes anyone
     return tg.OtherUser(account, user_id, recorded.user_id)
 
 
