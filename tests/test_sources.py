@@ -1984,7 +1984,8 @@ async def test_resolve_sources_replaces_what_a_source_covers(conn: sqlite3.Conne
     await sources.resolve_sources(cfg, {"default": _client()}, conn)
     assert db.chat_source_ids(conn, NEWS_ID) == ["chat:@news", "folder:Argentina"]
     assert db.chat_source_ids(conn, OUTSIDE_ID) == ["folder:Argentina"]
-    assert db.access_hash(conn, OUTSIDE_ID, "default") == 300  # resolved outside the dialogs
+    # resolved outside the dialogs, by the access hash the folder's InputPeerChannel carries
+    assert db.access_hash(conn, OUTSIDE_ID, "default") == 300
     unpinned = FakeClient(
         dialogs=_client().dialogs,
         folders=[make_folder(3, "Argentina", include=[ARG, OUTSIDE, GHOST_ID])],

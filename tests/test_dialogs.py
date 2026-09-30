@@ -415,6 +415,18 @@ async def test_catalog_entity_lookup_falls_back_to_get_entity() -> None:
         await catalog.entity(-1000000000998)
 
 
+async def test_fetch_folders_teaches_the_session_the_peers_a_folder_names() -> None:
+    """An explicit folder peer need not be a dialog; the filter carries its access hash, and
+    that is what makes it addressable by id afterwards."""
+    outside = make_channel(999, "Elsewhere")
+    client = FakeClient(
+        entities=[outside], folders=[make_folder(3, "Far", include=[outside, ALICE])]
+    )
+    await dialogs.fetch_folders(client)
+    assert client.seeded == {-1000000000999: 999, ALICE.id: ALICE.id}
+    assert (await client.get_entity(-1000000000999)) is outside
+
+
 # --- matching --------------------------------------------------------------------------------
 
 

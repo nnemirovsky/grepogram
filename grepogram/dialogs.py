@@ -205,15 +205,37 @@ async def fetch_folders(client: Any) -> list[FolderInfo]:
 
     ``InputPeerSelf`` (Saved Messages in a folder) is resolved through ``get_me()`` only when it
     appears. The client must already be connected and authorized.
+
+    A folder names its explicit peers as ``InputPeer*`` objects, access hash included, and those
+    are handed to the client's session (:func:`_seed_folder_peers`): an explicit peer need not be
+    in the dialog list at all, and Telethon learns nothing from this answer on its own — it has no
+    ``chats`` or ``users`` — so without it a later ``get_entity(<marked id>)`` of such a peer
+    would fail on every client grepogram builds, whose entity cache starts empty.
     """
     result = await client(functions.messages.GetDialogFiltersRequest())
     raw: list[Any] = list(getattr(result, "filters", result))
+    _seed_folder_peers(client, raw)
     self_id: int | None = None
     if any(_mentions_self(entry) for entry in raw):
         me = await client.get_me()
         self_id = int(me.id) if me is not None else None
     folders = [folder_from_filter(entry, self_id=self_id) for entry in raw]
     return [folder for folder in folders if folder is not None]
+
+
+def _seed_folder_peers(client: Any, filters: Iterable[Any]) -> None:
+    """Teach ``client``'s session the explicit peers ``filters`` include or pin, with the access
+    hashes the folder carries for this account (``session.process_entities``, the call Telethon
+    feeds every answer through). A legacy group needs no hash and ``InputPeerSelf`` names no
+    one to learn."""
+    peers = [
+        peer
+        for entry in filters
+        for peer in (*getattr(entry, "include_peers", ()), *getattr(entry, "pinned_peers", ()))
+        if isinstance(peer, types.InputPeerUser | types.InputPeerChannel)
+    ]
+    if peers:
+        client.session.process_entities(peers)
 
 
 def is_muted(dialog: Any, now: dt.datetime | None = None) -> bool:
