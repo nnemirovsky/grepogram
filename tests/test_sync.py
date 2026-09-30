@@ -5082,6 +5082,26 @@ def _cfg_two_accounts() -> Config:
     )
 
 
+async def test_a_sweep_keeps_naming_accounts_once_the_only_other_one_is_left_out(
+    conn: sqlite3.Connection, paths: Paths
+) -> None:
+    """Whether a warning names its account is decided over every client the pass was handed:
+    with the work account left out as another Telegram user, the default account's own flood
+    wait still says whose it is, or the report would read as if it came from the work one."""
+    world = _world()
+    home, work = _home(world), _work(world)
+    cfg = _cfg_two_accounts()
+    await _run_accounts({DEFAULT_ACCOUNT: home, WORK: work}, conn, paths, cfg)
+    db.upsert_account(conn, AccountRow(name=WORK, user_id=99, display_name="Earlier"))
+    home.failures[ALICE_ID] = errors.FloodWaitError(request=None, capture=30)
+
+    report = await _prune_accounts({DEFAULT_ACCOUNT: home, WORK: work}, conn, paths, cfg)
+
+    assert len(report.warnings) == 2, report.warnings
+    assert report.warnings[0].startswith(f"account {WORK}: ")
+    assert report.warnings[1].startswith(f"account {DEFAULT_ACCOUNT}: flood wait"), report.warnings
+
+
 async def test_the_sweep_asks_each_account_about_its_own_chats_by_stored_hashes(
     conn: sqlite3.Connection, paths: Paths
 ) -> None:

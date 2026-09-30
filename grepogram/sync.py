@@ -2684,7 +2684,9 @@ class StoredPass:
     reaches them, or wait for the next run), a shared chat its account is refused — or cannot
     address at all — is tried through the next one, warmed for that chat first, and any other
     error costs the chat its turn with a warning. Warnings name their account whenever the pass
-    holds one but the default.
+    was *started* with one but the default (``labelled``, decided over every client
+    :meth:`start` was handed, before :func:`checked_accounts` left any out — so leaving out the
+    only other account does not strip the prefix from the warnings that follow).
     """
 
     conn: sqlite3.Connection
@@ -2692,6 +2694,7 @@ class StoredPass:
     sync_cfg: SyncCfg
     budget: SyncBudget
     flood_warning: Callable[[int], str]
+    labelled: bool = False
     routes: dict[int, list[str]] = field(default_factory=dict)
     unreachable: list[ChatRow] = field(default_factory=list)
     stopped: set[str] = field(default_factory=set)
@@ -2721,11 +2724,9 @@ class StoredPass:
         for client in clients.values():
             _cap_flood_sleep(client, sync_cfg, budget)
         checked, left_out = await checked_accounts(conn, clients)
-        state = cls(conn, checked, sync_cfg, budget, flood_warning)
-        labelled = labels_accounts(clients)
-        state.warnings.extend(
-            account_warning(labelled, account, reason) for account, reason in left_out.items()
-        )
+        state = cls(conn, checked, sync_cfg, budget, flood_warning, labels_accounts(clients))
+        for account, reason in left_out.items():
+            state.warn(account, reason)
         clients = checked
         asked: dict[str, list[ChatRow]] = {}
         for chat in chats:
@@ -2753,7 +2754,7 @@ class StoredPass:
         return state
 
     def warn(self, account: str, warning: str) -> None:
-        self.warnings.append(account_warning(labels_accounts(self.clients), account, warning))
+        self.warnings.append(account_warning(self.labelled, account, warning))
 
     def stop(self, account: str, seconds: int) -> None:
         """A flood wait of ``seconds`` on ``account``: no more requests through it this pass."""
