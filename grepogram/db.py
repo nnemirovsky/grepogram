@@ -1051,6 +1051,26 @@ def list_accounts(conn: sqlite3.Connection) -> list[AccountRow]:
     return [_account_row(row) for row in rows]
 
 
+def account_chat_counts(conn: sqlite3.Connection) -> dict[str, int]:
+    """Account name → how many stored chats ``chat_access`` records it as reaching."""
+    rows = conn.execute("SELECT account, COUNT(*) AS n FROM chat_access GROUP BY account")
+    return {str(row["account"]): int(row["n"]) for row in rows}
+
+
+def forget_account(conn: sqlite3.Connection, account: str) -> int:
+    """Drop every ``chat_access`` row of ``account`` and its ``accounts`` row; returns how many
+    chats it was recorded as reaching.
+
+    Nothing else goes: which chats stay indexed is decided by the sources that cover them
+    (:func:`grepogram.sources.remove_source`), and a chat another account reaches keeps that
+    account's access.
+    """
+    with transaction(conn):
+        dropped = conn.execute("DELETE FROM chat_access WHERE account = ?", (account,)).rowcount
+        conn.execute("DELETE FROM accounts WHERE name = ?", (account,))
+    return int(dropped)
+
+
 def get_discussion_chat(conn: sqlite3.Connection, channel_id: int) -> ChatRow | None:
     """The discussion group linked to a channel (``discussion_of = channel_id``), if stored.
 

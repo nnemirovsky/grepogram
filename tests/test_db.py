@@ -949,6 +949,21 @@ def test_accounts_are_recorded_once_and_listed_default_first(conn: sqlite3.Conne
     assert [row.name for row in db.list_accounts(conn)] == ["default", "work"]
 
 
+def test_forget_account_drops_its_access_and_its_row_only(conn: sqlite3.Connection) -> None:
+    for chat_id in (-1001, -1002):
+        db.upsert_chat(conn, _chat(chat_id))
+        db.set_chat_access(conn, chat_id, "work", access_hash=2)
+    db.set_chat_access(conn, -1001, "default", access_hash=1)
+    db.upsert_account(conn, AccountRow(name="work", user_id=7))
+    db.upsert_account(conn, AccountRow(name="default", user_id=5))
+    assert db.account_chat_counts(conn) == {"default": 1, "work": 2}
+    assert db.forget_account(conn, "work") == 2
+    assert db.account_chat_counts(conn) == {"default": 1}
+    assert [row.name for row in db.list_accounts(conn)] == ["default"]
+    assert [chat.id for chat in db.list_chats(conn)] == [-1002, -1001]
+    assert db.forget_account(conn, "work") == 0
+
+
 def test_delete_chat_cascades_access_and_coverage(conn: sqlite3.Connection) -> None:
     for chat_id in (-1001, -1002):
         db.upsert_chat(conn, _chat(chat_id))
