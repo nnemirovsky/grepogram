@@ -583,7 +583,8 @@ def test_research_bounds_reject_a_value_outside_one_to_the_ceiling(key: str) -> 
     high = RESEARCH_LIMIT_MAX[key]
     for value in (0, -1, high + 1, 10**30):
         with pytest.raises(
-            ConfigError, match=rf"invalid value for research\.{key}: expected an int from 1 to"
+            ConfigError,
+            match=rf"invalid value for research\.{key}: must be a whole number from 1 to",
         ):
             config.loads(f"[research]\n{key} = {value}\n")
     assert getattr(config.loads(f"[research]\n{key} = {high}\n").research, key) == high

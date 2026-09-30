@@ -157,6 +157,7 @@ from grepogram.models import (
     Grant,
     GrantAction,
     GrantChannel,
+    LimitOverrides,
     LinkKind,
     MessageRow,
     PinReport,
@@ -172,6 +173,7 @@ from grepogram.models import (
     Source,
     SyncReport,
     chat_scope,
+    check_research_limit,
 )
 from grepogram.paths import Paths
 
@@ -236,7 +238,7 @@ def start_session(
     question: str,
     seeds: Sequence[str],
     account: str,
-    overrides: Mapping[str, int | None] | None = None,
+    overrides: LimitOverrides | None = None,
     *,
     now: int | None = None,
 ) -> ResearchSession:
@@ -247,7 +249,7 @@ def start_session(
     selects nothing raises :class:`~grepogram.filters.UnknownChat`. ``account`` is the account a
     later run joins and fetches as, and must be one the config knows
     (:class:`~grepogram.config.UnknownAccount` otherwise). The limits are the
-    ``[research]`` section's with ``overrides`` (:class:`ResearchLimits` field → value, ``None``
+    ``[research]`` section's with ``overrides`` (:class:`~grepogram.models.LimitOverrides`, ``None``
     for "keep the config's") applied — the one place a front end's limits are checked
     (:func:`session_limits`). The question is shown in every approval summary, so it is one
     line of plain text of at most :data:`QUESTION_MAX_CHARS` characters. Nothing touches
@@ -290,21 +292,22 @@ def start_session(
     return session
 
 
-def session_limits(
-    cfg: Config, overrides: Mapping[str, int | None] | None = None
-) -> ResearchLimits:
+def session_limits(cfg: Config, overrides: LimitOverrides | None = None) -> ResearchLimits:
     """The ``[research]`` limits with ``overrides`` applied; each given value must be a whole
-    number from 1 to its :data:`~grepogram.models.RESEARCH_LIMIT_MAX`, or
+    number from 1 to its ceiling (:func:`~grepogram.models.check_research_limit`), or
     :class:`ResearchError` says which one is not."""
-    given = {name: value for name, value in (overrides or {}).items() if value is not None}
-    for name, value in given.items():
-        high = RESEARCH_LIMIT_MAX.get(name)
-        if high is None:
+    given: dict[str, int] = {}
+    for name, value in (overrides or {}).items():
+        if value is None:
+            continue
+        if name not in RESEARCH_LIMIT_MAX:
             raise ResearchError(
                 f"unknown research limit {name!r}", f"limits: {', '.join(RESEARCH_LIMIT_MAX)}"
             )
-        if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= high:
-            raise ResearchError(f"{name} must be a whole number from 1 to {high}, not {value!r}")
+        try:
+            given[name] = check_research_limit(name, value)
+        except ValueError as exc:
+            raise ResearchError(f"{name} {exc}") from None
     return dataclasses.replace(cfg.research.limits(), **given)
 
 

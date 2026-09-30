@@ -6,8 +6,10 @@ tools. Everything is an immutable, slotted dataclass so it serialises with ``dat
 """
 
 import re
-from dataclasses import dataclass, field
-from typing import Literal, NamedTuple
+from collections.abc import Mapping
+from dataclasses import dataclass, field, fields
+from types import MappingProxyType
+from typing import Any, Literal, NamedTuple, TypedDict
 
 ChatType = Literal["user", "bot", "group", "supergroup", "channel"]
 UnitKind = Literal["window", "thread", "post"]
@@ -157,6 +159,12 @@ class MediaCfg:
     max_download_mb: int = 20
 
 
+def _limit(default: int, ceiling: int) -> Any:
+    """A :class:`ResearchLimits` field: its ``default``, with ``ceiling`` — the most it may be —
+    in its metadata."""
+    return field(default=default, metadata={"max": ceiling})
+
+
 @dataclass(frozen=True, slots=True)
 class ResearchLimits:
     """The bounds a research session works within, fixed when it starts (``sessions.limits``).
@@ -166,29 +174,49 @@ class ResearchLimits:
     ``since_days`` is the history horizon a source added by a run gets;
     ``max_messages_per_run`` and ``run_budget_s`` bound one run; an admission request no admin
     answered within ``admission_timeout_days`` is given up (``failed``). Each is a whole number
-    from 1 to its :data:`RESEARCH_LIMIT_MAX`.
+    from 1 to its ceiling, which the field carries (:func:`_limit`, read back through
+    :data:`RESEARCH_LIMIT_MAX` and checked by :func:`check_research_limit`).
     """
 
-    max_depth: int = 2
-    max_candidates: int = 50
-    probe_limit: int = 20
-    since_days: int = 365
-    max_messages_per_run: int = 5000
-    run_budget_s: int = 300
-    max_session_candidates: int = 500
-    admission_timeout_days: int = 30
+    max_depth: int = _limit(2, 10)
+    max_candidates: int = _limit(50, 1000)
+    probe_limit: int = _limit(20, 1000)
+    since_days: int = _limit(365, 36_500)
+    max_messages_per_run: int = _limit(5000, 1_000_000)
+    run_budget_s: int = _limit(300, 86_400)
+    max_session_candidates: int = _limit(500, 100_000)
+    admission_timeout_days: int = _limit(30, 3650)
 
 
-RESEARCH_LIMIT_MAX: dict[str, int] = {
-    "max_depth": 10,
-    "max_candidates": 1000,
-    "probe_limit": 1000,
-    "since_days": 36_500,
-    "max_messages_per_run": 1_000_000,
-    "run_budget_s": 86_400,
-    "max_session_candidates": 100_000,
-    "admission_timeout_days": 3650,
-}
+RESEARCH_LIMIT_MAX: Mapping[str, int] = MappingProxyType(
+    {limit.name: int(limit.metadata["max"]) for limit in fields(ResearchLimits)}
+)
+
+
+class LimitOverrides(TypedDict, total=False):
+    """The :class:`ResearchLimits` a session is started with instead of the config's, by field;
+    ``None`` keeps the config's (:func:`grepogram.research.session_limits`)."""
+
+    max_depth: int | None
+    max_candidates: int | None
+    probe_limit: int | None
+    since_days: int | None
+    max_messages_per_run: int | None
+    run_budget_s: int | None
+    max_session_candidates: int | None
+    admission_timeout_days: int | None
+
+
+def check_research_limit(name: str, value: object) -> int:
+    """``value`` when it is a whole number from 1 to the ceiling of research limit ``name`` —
+    the one check both a ``[research]`` key and a session's override go through; ``ValueError``
+    (``must be a whole number from 1 to …, not …``) otherwise."""
+    high = RESEARCH_LIMIT_MAX[name]
+    if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= high:
+        raise ValueError(f"must be a whole number from 1 to {high}, not {value!r}")
+    return value
+
+
 """The largest value each :class:`ResearchLimits` field takes — far above any sensible
 session, and low enough that no date, clock or SQL arithmetic on it can overflow (a
 ``since_days`` of a million would not fit a date). ``[research]``, ``research start`` and the

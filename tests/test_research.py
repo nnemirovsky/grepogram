@@ -9,7 +9,7 @@ import sqlite3
 import threading
 import time
 from collections.abc import Callable, Iterator
-from typing import Any
+from typing import Any, Unpack
 
 import pytest
 from telethon import errors, utils
@@ -28,6 +28,7 @@ from grepogram.models import (
     Config,
     DiscoverReport,
     Grant,
+    LimitOverrides,
     LinkKind,
     MessageRow,
     ResearchCfg,
@@ -99,7 +100,7 @@ def _start(
     rdb: sqlite3.Connection,
     conn: sqlite3.Connection,
     seeds: tuple[str, ...] = (str(SEED),),
-    **limits: int,
+    **limits: Unpack[LimitOverrides],
 ) -> ResearchSession:
     return research.start_session(rdb, conn, CFG, QUESTION, list(seeds), "default", limits, now=1)
 

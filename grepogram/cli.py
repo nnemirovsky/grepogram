@@ -84,6 +84,7 @@ from grepogram.models import (
     ChatRow,
     Config,
     DiscoverReport,
+    LimitOverrides,
     MediaReport,
     MessageView,
     PruneReport,
@@ -1633,14 +1634,14 @@ def research_start(
 ) -> None:
     """Start a research session: a question, the indexed chats to start from and the account
     that later joins and fetches (offline). Limits default to the \\[research] section."""
-    overrides = {
-        "max_depth": max_depth,
-        "max_candidates": max_candidates,
-        "probe_limit": probe_limit,
-        "since_days": since_days,
-        "max_messages_per_run": max_messages,
-        "run_budget_s": budget,
-    }
+    overrides = LimitOverrides(
+        max_depth=max_depth,
+        max_candidates=max_candidates,
+        probe_limit=probe_limit,
+        since_days=since_days,
+        max_messages_per_run=max_messages,
+        run_budget_s=budget,
+    )
     with _research_store() as (_, cfg, conn, rdb):
         try:
             name = account or DEFAULT_ACCOUNT

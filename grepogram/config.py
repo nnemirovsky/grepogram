@@ -36,6 +36,7 @@ from grepogram.models import (
     SyncCfg,
     TelegramCfg,
     UnitsCfg,
+    check_research_limit,
     is_account_name,
 )
 from grepogram.paths import PRIVATE_FILE_MODE, FileLock, Paths
@@ -116,8 +117,6 @@ _SOURCE_KEYS = ("folder", "chat", "account", "since", "comments")
 _ACCOUNT_KEYS = ("name", "label")
 _POSITIVE_KEYS = frozenset({"models.max_seq_length", "media.max_download_mb"})
 """Integer settings a zero or a negative value is meaningless for, checked after the type."""
-_BOUNDED_KEYS = {f"research.{name}": high for name, high in RESEARCH_LIMIT_MAX.items()}
-"""The research limits, whole numbers from 1 to :data:`~grepogram.models.RESEARCH_LIMIT_MAX`."""
 _NON_NEGATIVE_KEYS = frozenset({"research.paid_stars_max"})
 """Integer settings where zero means "never" and only a negative value is meaningless."""
 
@@ -320,11 +319,11 @@ def _section[
         checked = _checked(value, hints[key], where)
         if where in _POSITIVE_KEYS and isinstance(checked, int) and checked < 1:
             raise ConfigError(f"invalid value for {where}: expected a positive int, got {checked}")
-        high = _BOUNDED_KEYS.get(where)
-        if high is not None and isinstance(checked, int) and not 1 <= checked <= high:
-            raise ConfigError(
-                f"invalid value for {where}: expected an int from 1 to {high}, got {checked}"
-            )
+        if cls is ResearchCfg and key in RESEARCH_LIMIT_MAX:
+            try:
+                check_research_limit(key, checked)
+            except ValueError as exc:
+                raise ConfigError(f"invalid value for {where}: {exc}") from None
         if where in _NON_NEGATIVE_KEYS and isinstance(checked, int) and checked < 0:
             raise ConfigError(
                 f"invalid value for {where}: expected a non-negative int, got {checked}"

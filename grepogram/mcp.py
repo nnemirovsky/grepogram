@@ -76,7 +76,15 @@ from grepogram.dialogs import match as match_dialogs
 from grepogram.embed import Embedder, ModelUnavailable
 from grepogram.filters import FilterError, UnknownChat
 from grepogram.log import setup_logging
-from grepogram.models import DEFAULT_ACCOUNT, Config, Filters, MessageView, SearchMode, SearchResult
+from grepogram.models import (
+    DEFAULT_ACCOUNT,
+    Config,
+    Filters,
+    LimitOverrides,
+    MessageView,
+    SearchMode,
+    SearchResult,
+)
 from grepogram.paths import Paths
 from grepogram.rerank import Reranker
 from grepogram.search import UnknownMessage
@@ -1087,14 +1095,14 @@ def research_start(
     cfg = state.config()
     rdb = state.research_store(cfg)
     name = account or DEFAULT_ACCOUNT
-    overrides = {
-        "max_depth": max_depth,
-        "max_candidates": max_candidates,
-        "probe_limit": probe_limit,
-        "since_days": since_days,
-        "max_messages_per_run": max_messages_per_run,
-        "run_budget_s": run_budget_s,
-    }
+    overrides = LimitOverrides(
+        max_depth=max_depth,
+        max_candidates=max_candidates,
+        probe_limit=probe_limit,
+        since_days=since_days,
+        max_messages_per_run=max_messages_per_run,
+        run_budget_s=run_budget_s,
+    )
     session = research.start_session(rdb, state.conn, cfg, question, seeds, name, overrides)
     return research.session_document(session)
 
