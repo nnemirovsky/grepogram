@@ -1247,6 +1247,13 @@ def sources_rm(
         f", {len(removed.kept_chat_ids)} kept under another source" if removed.kept_chat_ids else ""
     )
     typer.echo(f"removed {removed.source_id} ({len(removed.chat_ids)} chats deleted{kept})")
+    if removed.undecided_chat_ids:
+        typer.echo(
+            f"note: {len(removed.undecided_chat_ids)} of them kept because a source not synced "
+            "yet may cover them; after its next sync, `grepogram sources prune` removes what it "
+            "does not",
+            err=True,
+        )
 
 
 @sources_app.command("prune")

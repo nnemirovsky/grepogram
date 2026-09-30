@@ -996,8 +996,10 @@ def sources_remove(target: str) -> ToolResult:
     out of the folder in Telegram), nor can a channel's discussion group indexed through the
     channel's source. A chat another source
     still covers (a channel a second account also configured) is kept and listed in
-    `kept_chat_ids`; `removed_chat_ids` are the chats deleted. Refused with `error` while a
-    sync is running.
+    `kept_chat_ids`; `removed_chat_ids` are the chats deleted. `undecided_chat_ids` are the
+    kept ones only a source not synced yet (a folder, a fuzzy title) might cover: they wait
+    under it, and `grepogram sources prune` after its sync removes what it does not list.
+    Refused with `error` while a sync is running.
     """
     state = _app()
     parsed = sourcing.parse_target(target)
@@ -1010,6 +1012,7 @@ def sources_remove(target: str) -> ToolResult:
         "source_id": removed.source_id,
         "removed_chat_ids": removed.chat_ids,
         "kept_chat_ids": removed.kept_chat_ids,
+        "undecided_chat_ids": removed.undecided_chat_ids,
         "config_updated": removed.source is not None,
     }
 

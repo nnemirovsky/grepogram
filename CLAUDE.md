@@ -181,7 +181,11 @@ never change the git identity.
   lists the group keeps the supergroup covered (`sources._with_migrations`); a `migrated_to`
   naming a row deleted since makes the next sync check the migration again rather than follow
   a dangling id. `sources.remove_source` deletes a chat only when no
-  source left in the config covers it; otherwise the primary moves to the first remaining
+  source left in the config covers it — recorded in `chat_sources`, or named outright by a
+  `chat:` entry through its id or stored username (`sources._configured_for`), which covers it
+  before its first sync; a folder or fuzzy entry that has recorded nothing yet keeps the chat
+  undecided under it (`sources._undecided_cover`, `Removed.undecided_chat_ids`) instead of
+  deleting on a guess; otherwise the primary moves to the first remaining
   covering source in config order — for a link-only discussion group to its channel's
   (`discussion_source_id`), which is why channels are decided before groups — and never onto an
   `import:` tag, and `Removed.kept_chat_ids` names what stayed. `accounts rm` removes an

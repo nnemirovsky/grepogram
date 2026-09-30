@@ -2128,6 +2128,54 @@ async def test_removing_one_accounts_source_keeps_a_chat_the_other_still_covers(
     assert db.get_messages(conn, NEWS_ID) == []
 
 
+@pytest.mark.parametrize("chat", ["@NEWS", "https://t.me/news", NEWS_ID])
+async def test_a_source_added_for_another_account_covers_the_chat_before_its_first_sync(
+    conn: sqlite3.Connection, chat: str | int
+) -> None:
+    """The work account's entry names the channel by any spelling but has never synced, so
+    nothing recorded its coverage: the config still says it covers the chat, which keeps it."""
+    await _resolve(_cfg(Source(chat="@news")), _clients(), conn)
+    db.upsert_messages(conn, [MessageRow(chat_id=NEWS_ID, msg_id=1, date=1, text="post")])
+    cfg = _cfg(Source(chat="@news"), Source(chat=chat, account=WORK))
+
+    removed = sources.remove_source(cfg, conn, sources.parse_target("chat:@news"))
+
+    assert (removed.chat_ids, removed.kept_chat_ids, removed.undecided_chat_ids) == (
+        [],
+        [NEWS_ID],
+        [],
+    )
+    news = db.get_chat(conn, NEWS_ID)
+    assert news is not None and news.source_id == Source(chat=chat, account=WORK).id
+    assert len(db.get_messages(conn, NEWS_ID)) == 1
+
+
+async def test_a_folder_not_synced_yet_keeps_a_chat_it_might_cover_undecided(
+    conn: sqlite3.Connection, caplog: pytest.LogCaptureFixture
+) -> None:
+    """What a folder lists is unknown until it resolves: the shared channel stays under it and
+    the removal says why, while a private chat of the other account — which that folder could
+    never mean — goes."""
+    await _resolve(_cfg(Source(chat="@news"), Source(chat="@alice")), _clients(), conn)
+    db.upsert_messages(conn, [MessageRow(chat_id=NEWS_ID, msg_id=1, date=1, text="post")])
+    folder = Source(folder="Argentina", account=WORK)
+    cfg = _cfg(Source(chat="@news"), Source(chat="@alice"), folder)
+
+    with caplog.at_level("WARNING", logger="grepogram.sources"):
+        news = sources.remove_source(cfg, conn, sources.parse_target("chat:@news"))
+        alice = sources.remove_source(news.config, conn, sources.parse_target("chat:@alice"))
+
+    assert (news.chat_ids, news.kept_chat_ids, news.undecided_chat_ids) == (
+        [],
+        [NEWS_ID],
+        [NEWS_ID],
+    )
+    kept = db.get_chat(conn, NEWS_ID)
+    assert kept is not None and kept.source_id == folder.id
+    assert "a source not synced yet may cover them" in caplog.text
+    assert alice.chat_ids == [1] and alice.undecided_chat_ids == [], "a user is private"
+
+
 async def test_a_linked_discussion_group_follows_its_channel_to_the_remaining_source(
     conn: sqlite3.Connection,
 ) -> None:

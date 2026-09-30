@@ -918,6 +918,7 @@ async def test_sources_remove_deletes_data_and_saves_the_config(
         "source_id": "folder:Argentina",
         "removed_chat_ids": [ARG],
         "kept_chat_ids": [],
+        "undecided_chat_ids": [],
         "config_updated": True,
     }
     assert db.get_chat(conn, ARG) is None and db.get_chat(conn, GEO) is not None

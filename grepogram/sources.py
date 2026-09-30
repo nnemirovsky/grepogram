@@ -171,6 +171,11 @@ class Removed:
     kept_chat_ids: list[int] = dataclasses.field(default_factory=list)
     """The chats it covered that another configured source still covers; they stay, with the
     first of those as their new primary source (:func:`remove_source`)."""
+    undecided_chat_ids: list[int] = dataclasses.field(default_factory=list)
+    """Those of :attr:`kept_chat_ids` kept only because a source left in the config has never
+    recorded what it covers — a folder or a fuzzy ``chat =`` entry not synced yet — and might
+    cover them: nothing offline can tell, so they wait under that source for its first sync
+    (:func:`_undecided_cover`)."""
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -604,7 +609,11 @@ def remove_source(cfg: Config, conn: sqlite3.Connection, target: Target) -> Remo
 
     **A chat is deleted only when no source left in the config covers it.** Several can — a
     channel two accounts each configured, a chat both a folder and a ``chat:`` entry list —
-    and ``chat_sources`` records which (:func:`resolve_sources`). A chat another configured
+    and ``chat_sources`` records which (:func:`resolve_sources`); a ``chat:`` entry naming the
+    chat by its id, ``@username`` or link covers it too before its first sync has recorded
+    anything (:func:`_configured_for`), and a folder or fuzzy entry that has recorded nothing
+    yet keeps it undecided rather than let it go (:func:`_undecided_cover`,
+    :attr:`Removed.undecided_chat_ids`). A chat another configured
     source still covers keeps everything indexed from it and only changes its primary owner
     (``chats.source_id``): to the first remaining covering source in config order, or — for a
     channel's discussion group known only through the link — to its channel's source
@@ -628,10 +637,15 @@ def remove_source_id(cfg: Config, conn: sqlite3.Connection, source_id: str) -> R
     rank = {s.id: position for position, s in enumerate(remaining)}
     deleted: list[int] = []
     kept: list[int] = []
+    undecided: list[int] = []
     with db.transaction(conn):
         owned = db.list_chats(conn, source_id=source_id)
         for chat in sorted(owned, key=lambda c: (c.discussion_of is not None, c.id)):
-            successor = _successor(conn, chat, source_id, rank)
+            successor = _successor(conn, chat, source_id, remaining, rank)
+            if successor is None:
+                successor = _undecided_cover(conn, chat, remaining)
+                if successor is not None:
+                    undecided.append(chat.id)
             if successor is None:
                 db.delete_chat(conn, chat.id)
                 deleted.append(chat.id)
@@ -639,6 +653,13 @@ def remove_source_id(cfg: Config, conn: sqlite3.Connection, source_id: str) -> R
                 db.set_primary_source(conn, chat.id, successor)
                 kept.append(chat.id)
         db.set_source_chats(conn, source_id, [])
+    if undecided:
+        log.warning(
+            "removing source %s: %d chat(s) kept because a source not synced yet may cover "
+            "them; `grepogram sources prune` after its sync removes what it does not",
+            source_id,
+            len(undecided),
+        )
     log.info(
         "removed source %s with %d chats; %d stay under another source",
         source_id,
@@ -651,14 +672,24 @@ def remove_source_id(cfg: Config, conn: sqlite3.Connection, source_id: str) -> R
         source=source,
         chat_ids=sorted(deleted),
         kept_chat_ids=sorted(kept),
+        undecided_chat_ids=sorted(undecided),
     )
 
 
 def _successor(
-    conn: sqlite3.Connection, chat: ChatRow, removed: str, rank: Mapping[str, int]
+    conn: sqlite3.Connection,
+    chat: ChatRow,
+    removed: str,
+    remaining: Sequence[Source],
+    rank: Mapping[str, int],
 ) -> str | None:
     """The configured source that owns ``chat`` once ``removed`` is gone, ``None`` when none
-    covers it and it goes too. ``rank`` orders the sources left in the config."""
+    covers it. ``remaining`` are the sources left in the config and ``rank`` their order.
+
+    Coverage is what ``chat_sources`` recorded *and* what the config says outright: a ``chat:``
+    entry naming this very chat (:func:`_configured_for`) covers it before its first sync has
+    recorded anything, so adding a chat under another account and removing the original source
+    before that sync keeps its history."""
     if (chat.source_id or "").startswith(IMPORT_PREFIX):
         return None
     if chat.discussion_of is not None:
@@ -666,8 +697,47 @@ def _successor(
         linked = None if channel is None else discussion_source_id(chat, channel)
         if linked is not None and linked != removed and linked in rank:
             return linked
-    covering = [s for s in db.chat_source_ids(conn, chat.id) if s in rank]
+    covering = {s for s in db.chat_source_ids(conn, chat.id) if s in rank}
+    covering |= {s.id for s in remaining if _configured_for(s, chat)}
     return min(covering, key=rank.__getitem__) if covering else None
+
+
+def _configured_for(source: Source, chat: ChatRow) -> bool:
+    """Whether ``source`` is a ``chat:`` entry naming ``chat`` by identity — its marked id, or its
+    ``@username`` / link through the username the row stores (:func:`_names_chat`) — and of an
+    account that may mean this row (:func:`_reaches`)."""
+    if source.chat is None or not _reaches(chat, source.account):
+        return False
+    target = _target_of(str(source.chat))
+    return target is not None and _names_chat(target, chat.peer_id, chat.username)
+
+
+def _recorded(conn: sqlite3.Connection, source_id: str) -> bool:
+    """Whether the index records anything ``source_id`` covers: a ``chat_sources`` row, or a
+    chat it is the primary owner of."""
+    return bool(db.source_chat_ids(conn, source_id) or db.list_chats(conn, source_id=source_id))
+
+
+def _undecided_cover(
+    conn: sqlite3.Connection, chat: ChatRow, remaining: Sequence[Source]
+) -> str | None:
+    """The first source of ``remaining`` that might cover ``chat`` although nothing offline can
+    say so, or ``None``: a folder, or a ``chat =`` value naming no identity (a fuzzy title),
+    of an account that may mean this row, that has **recorded no coverage at all** — it has not
+    resolved since it was added, so what it lists is unknown. Such a chat is kept under it,
+    never deleted on a guess; ``sources prune`` offers it once that folder's sync shows it does
+    not list the chat. An imported chat is never kept this way (:func:`_successor`)."""
+    if (chat.source_id or "").startswith(IMPORT_PREFIX):
+        return None
+    for source in remaining:
+        if not _reaches(chat, source.account) or _recorded(conn, source.id):
+            continue
+        if source.folder is not None:
+            return source.id
+        target = _target_of(str(source.chat))
+        if target is None or target.kind == "fuzzy":
+            return source.id
+    return None
 
 
 def find_source(cfg: Config, conn: sqlite3.Connection, target: Target) -> str:
