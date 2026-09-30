@@ -45,6 +45,15 @@ _TOKEN = re.compile(r"[A-Za-z0-9_-]+")
 """An invite hash or a folder slug: base64url."""
 _DIGITS = re.compile(r"[0-9]+")
 
+INT64_MAX = 2**63 - 1
+"""The largest id Telegram's ``long`` — and an SQLite ``INTEGER`` — holds: a peer id, marked or
+bare, is one of them."""
+MSG_ID_MAX = 2**31 - 1
+"""The largest message id: Telegram's ``int``."""
+_ID_DIGITS = 19
+"""The most digits a number read out of a link may have; anything longer names no Telegram id
+(and past about 4300 digits ``int`` itself refuses to read it)."""
+
 _RESERVED = frozenset(
     {
         "addemoji",
@@ -98,19 +107,49 @@ def username(name: str) -> LeadTarget | None:
     return LeadTarget(kind="username", target=f"@{name}", username=name)
 
 
+def number(text: str) -> int | None:
+    """``text`` as a non-negative number when it is ASCII digits of an id's length, else
+    ``None`` — the one reader of an id a link spells."""
+    if len(text) > _ID_DIGITS or not _DIGITS.fullmatch(text):
+        return None
+    return int(text)
+
+
+def valid_peer(marked_id: int) -> bool:
+    """Whether ``marked_id`` can be a Telegram peer: not zero, a signed 64-bit value, and for a
+    group or channel a mark (:func:`telethon.utils.resolve_id`) over a positive bare id."""
+    if marked_id == 0 or not -INT64_MAX - 1 <= marked_id <= INT64_MAX:
+        return False
+    return int(utils.resolve_id(marked_id)[0]) > 0
+
+
+def _msg_id(msg_id: int) -> bool:
+    return 0 < msg_id <= MSG_ID_MAX
+
+
+def _channel_mark(channel_id: int) -> int | None:
+    """The marked id of the channel ``t.me/c/<channel_id>`` names, or ``None`` when no channel
+    has that bare id; the mark is arithmetic (:func:`telethon.utils.get_peer_id`), never a
+    prefix glued onto the digits."""
+    if not 0 < channel_id <= INT64_MAX:
+        return None
+    marked = int(utils.get_peer_id(types.PeerChannel(channel_id)))
+    return marked if valid_peer(marked) else None
+
+
 def post(name: str, msg_id: int) -> LeadTarget | None:
-    if not _is_username(name) or msg_id <= 0:
+    if not _is_username(name) or not _msg_id(msg_id):
         return None
     name = name.lower()
     return LeadTarget(kind="post", target=f"@{name}/{msg_id}", username=name, msg_id=msg_id)
 
 
 def private_post(channel_id: int, msg_id: int) -> LeadTarget | None:
-    """A post of the channel whose bare id ``t.me/c/<id>`` names; the mark is arithmetic
-    (:func:`telethon.utils.get_peer_id`), never a prefix glued onto the digits."""
-    if channel_id <= 0 or msg_id <= 0:
+    """A post of the channel whose bare id ``t.me/c/<id>`` names (:func:`_channel_mark`); an id
+    out of Telegram's range names nothing."""
+    marked = _channel_mark(channel_id)
+    if marked is None or not _msg_id(msg_id):
         return None
-    marked = int(utils.get_peer_id(types.PeerChannel(channel_id)))
     return LeadTarget(
         kind="private_post", target=f"c/{channel_id}/{msg_id}", peer_id=marked, msg_id=msg_id
     )
@@ -130,7 +169,7 @@ def addlist(slug: str) -> LeadTarget | None:
 
 
 def peer(marked_id: int) -> LeadTarget | None:
-    if marked_id == 0:
+    if not valid_peer(marked_id):
         return None
     return LeadTarget(kind="peer", target=f"peer:{marked_id}", peer_id=marked_id)
 
@@ -145,18 +184,23 @@ def normalize(value: str) -> LeadTarget | None:
         return None
     if text.startswith("@"):
         name, _, rest = text[1:].partition("/")
-        return (
-            post(name, int(rest)) if _DIGITS.fullmatch(rest) else (None if rest else username(name))
-        )
+        if not rest:
+            return username(name)
+        msg_id = number(rest)
+        return None if msg_id is None else post(name, msg_id)
     if text.startswith("peer:"):
-        number = text.removeprefix("peer:")
-        return peer(int(number)) if re.fullmatch(r"-?[0-9]+", number) else None
+        spelled = text.removeprefix("peer:")
+        bare = number(spelled.removeprefix("-"))
+        if bare is None:
+            return None
+        return peer(-bare if spelled.startswith("-") else bare)
     if text.startswith("+"):
         return invite(text[1:])
     if text.startswith("c/"):
         parts = text.split("/")
-        if len(parts) == 3 and all(_DIGITS.fullmatch(part) for part in parts[1:]):
-            return private_post(int(parts[1]), int(parts[2]))
+        numbers = [number(part) for part in parts[1:]]
+        if len(parts) == 3 and numbers[0] is not None and numbers[1] is not None:
+            return private_post(numbers[0], numbers[1])
         return None
     if text.startswith("addlist/"):
         return addlist(text.removeprefix("addlist/"))
@@ -190,20 +234,23 @@ def _tg_url(text: str) -> LeadTarget | None:
     query = {key: values[0] for key, values in parse_qs(parts.query).items() if values}
     if action == "resolve":
         domain = query.get("domain", "")
-        number = query.get("post", "")
-        return post(domain, int(number)) if _DIGITS.fullmatch(number) else username(domain)
+        spelled = query.get("post", "")
+        if not _DIGITS.fullmatch(spelled):
+            return username(domain)
+        msg_id = number(spelled)
+        return None if msg_id is None else post(domain, msg_id)
     if action == "join":
         return invite(query.get("invite", ""))
     if action == "addlist":
         return addlist(query.get("slug", ""))
     if action == "privatepost":
-        channel, number = query.get("channel", ""), query.get("post", "")
-        if _DIGITS.fullmatch(channel) and _DIGITS.fullmatch(number):
-            return private_post(int(channel), int(number))
+        channel, msg_id = number(query.get("channel", "")), number(query.get("post", ""))
+        if channel is not None and msg_id is not None:
+            return private_post(channel, msg_id)
         return None
     if action == "user":
-        user_id = query.get("id", "")
-        return peer(int(user_id)) if _DIGITS.fullmatch(user_id) else None
+        user_id = number(query.get("id", ""))
+        return None if user_id is None else peer(user_id)
     return None
 
 
@@ -241,17 +288,23 @@ def _web_url(text: str) -> LeadTarget | None:
 
 def _private_path(rest: list[str]) -> LeadTarget | None:
     """``t.me/c/<id>`` names the chat; ``/<post>`` or ``/<topic>/<post>`` a post of it."""
-    if not rest or not all(_DIGITS.fullmatch(segment) for segment in rest[:3]):
+    numbers = [number(segment) for segment in rest[:3]]
+    if not rest or any(found is None for found in numbers):
         return None
-    channel_id = int(rest[0])
+    channel_id = numbers[0]
+    assert channel_id is not None
     if len(rest) == 1:
-        return peer(int(utils.get_peer_id(types.PeerChannel(channel_id)))) if channel_id else None
-    return private_post(channel_id, int(rest[min(len(rest), 3) - 1]))
+        marked = _channel_mark(channel_id)
+        return None if marked is None else peer(marked)
+    msg_id = numbers[min(len(rest), 3) - 1]
+    assert msg_id is not None
+    return private_post(channel_id, msg_id)
 
 
 def _public_path(name: str, rest: list[str]) -> LeadTarget | None:
     """``t.me/<name>`` names the chat; ``/<post>`` or ``/<topic>/<post>`` a post of it."""
-    numbers = [int(segment) for segment in rest[:2] if _DIGITS.fullmatch(segment)]
-    if rest and numbers and len(numbers) == min(len(rest), 2):
-        return post(name, numbers[-1])
+    digits = [segment for segment in rest[:2] if _DIGITS.fullmatch(segment)]
+    if rest and digits and len(digits) == min(len(rest), 2):
+        msg_id = number(digits[-1])
+        return None if msg_id is None else post(name, msg_id)
     return username(name)

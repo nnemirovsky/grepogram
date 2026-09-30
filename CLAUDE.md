@@ -86,7 +86,14 @@ never change the git identity.
   `sync.forward_origin` (channel post first, then the saved-from pair, else the author alone,
   nothing for a hidden account); the Telegram destinations a message names are `sync.links_of`
   (entity offsets are UTF-16 code units) normalized through `leads.normalize`, which drops every
-  non-Telegram URL. `MessageRow.links` is `None` for a row nobody read links for — one read back
+  non-Telegram URL. **Every id a link, a message or a user spells is range-checked before it can
+  be bound**: `leads.number` reads at most 19 ASCII digits, `leads.valid_peer` takes a signed
+  64-bit marked id over a positive bare one, message ids stop at Telegram's `int` — so
+  `t.me/c/99999999999999999999/5` names nothing instead of raising `OverflowError` at the first
+  SQL bind and halting discovery for every session reading that chat. `sources.parse_target`,
+  `research.target_identities` / `parse_approval` and `research_db._spelled` read ids through the
+  same helpers, `research_db.get_candidate` / `get_session` answer `None` for an id past 64 bits,
+  and `research.message_leads` skips one link that still fails to read. `MessageRow.links` is `None` for a row nobody read links for — one read back
   from the index, an import — and `upsert_messages` then leaves the stored `message_links` alone;
   a tuple, even an empty one, replaces them. `sync._differs` compares the links and the `fwd_*`
   columns in full (`sync._with_links` gives a stored row its links), so changed links alone

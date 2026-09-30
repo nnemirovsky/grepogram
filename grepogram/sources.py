@@ -246,7 +246,11 @@ def parse_target(raw: str) -> Target:
             raise InvalidTarget(f"folder name missing in {raw!r}")
         return Target(kind="folder", value=name)
     if _INT_RE.match(text):
-        return Target(kind="id", value=int(text))
+        bare = leads.number(text.removeprefix("-"))
+        marked = None if bare is None else (-bare if text.startswith("-") else bare)
+        if marked is None or not leads.valid_peer(marked):
+            raise InvalidTarget(f"{raw!r} is not a Telegram chat id")
+        return Target(kind="id", value=marked)
     if text.startswith("@"):
         return Target(kind="username", value=_username(text[1:], raw))
     if _LINK_RE.match(text) is not None:

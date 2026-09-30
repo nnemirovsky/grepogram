@@ -507,7 +507,12 @@ def message_leads(
     key = origin_key(message, chat)
     named: list[tuple[EvidenceVia, LeadTarget]] = []
     for link_kind, value in links or ():
-        target = leads.normalize(value)
+        try:
+            target = leads.normalize(value)
+        except (ValueError, OverflowError):
+            # one link nothing reads must not keep every other lead of the chat from being read
+            log.debug("research: a stored link of chat %d could not be read: %r", chat.id, value)
+            continue
         if target is not None:
             named.append((via or link_kind, target))
     if message.fwd_peer_id is not None:
@@ -2543,18 +2548,25 @@ def target_identities(
         if _is_number(text):
             if session_id is None:
                 raise ResearchError(
-                    f"{text} is a candidate id and needs a session", "name the session too"
+                    f"{shown(text)} is a candidate id and needs a session", "name the session too"
                 )
             if research_db.get_session(rdb, session_id) is None:
                 raise UnknownSession(session_id)
-            candidate = research_db.get_candidate(rdb, int(text))
+            number = leads.number(text)
+            if number is None:  # longer than any id: no row holds it
+                raise ResearchError(
+                    f"no candidate {shown(text)} in research session {session_id}",
+                    f"list them with `grepogram research candidates {session_id}`",
+                )
+            candidate = research_db.get_candidate(rdb, number)
             if candidate is None or candidate.session_id != session_id:
-                raise UnknownCandidate(session_id, int(text))
+                raise UnknownCandidate(session_id, number)
             identities.append(candidate.identity)
             continue
         target = leads.normalize(text)
-        if target is None and _is_number(text.removeprefix("-")):
-            target = leads.peer(int(text))
+        bare = leads.number(text.removeprefix("-")) if _is_number(text.removeprefix("-")) else None
+        if target is None and bare is not None:
+            target = leads.peer(-bare if text.startswith("-") else bare)
         chat = None if target is None else chat_level(target)
         if chat is None:
             raise ResearchError(
@@ -3444,9 +3456,10 @@ def parse_approval(tokens: Sequence[str]) -> list[ApprovalItem]:
             items.append(ApprovalItem(candidate_id=None, actions=(head,)))
             continue
         actions = tuple(action.strip() for action in tail.split(",") if action.strip())
-        if not _is_number(head) or (sep and not actions):
+        candidate_id = leads.number(head) if _is_number(head) else None
+        if candidate_id is None or (sep and not actions):
             raise ResearchError(f"{token!r} is not an approval item", APPROVAL_GRAMMAR)
-        items.append(ApprovalItem(candidate_id=int(head), actions=actions))
+        items.append(ApprovalItem(candidate_id=candidate_id, actions=actions))
     if not items:
         raise ResearchError("nothing to approve", APPROVAL_GRAMMAR)
     return items

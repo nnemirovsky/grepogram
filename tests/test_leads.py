@@ -84,6 +84,22 @@ def test_normalize(value: str, target: str) -> None:
         "c/42",
         "peer:x",
         "peer:0",
+        # ids past Telegram's 64-bit range name nothing, whatever form spells them
+        "https://t.me/c/99999999999999999999/5",
+        "https://t.me/c/99999999999999999999",
+        "https://t.me/c/9223372036854775807/5",
+        "https://t.me/c/5/9999999999",
+        "https://t.me/news_chat/99999999999999999999",
+        "tg://privatepost?channel=99999999999999999999&post=5",
+        "tg://privatepost?channel=5&post=99999999999999999999",
+        "tg://user?id=99999999999999999999",
+        "tg://resolve?domain=news_chat&post=99999999999999999999",
+        "c/99999999999999999999/5",
+        "peer:99999999999999999999",
+        "peer:-99999999999999999999",
+        "@news_chat/99999999999999999999",
+        pytest.param("https://t.me/c/" + "9" * 5000 + "/5", id="private-5000-digits"),
+        pytest.param("https://t.me/news_chat/" + "9" * 5000, id="post-5000-digits"),
         "mailto:someone@t.me",
         "https://someone@t.me/news_chat",
     ],
@@ -164,3 +180,11 @@ def test_text_leads_deduplicates_and_is_empty_without_leads() -> None:
     )
     assert leads.text_leads("nothing to see at https://example.com") == ()
     assert leads.text_leads("") == ()
+
+
+def test_ids_at_the_edge_of_telegram_s_range_still_read() -> None:
+    top = leads.normalize(f"https://t.me/c/{2**63 - 1 - 10**12}/{2**31 - 1}")
+    assert top is not None and top.peer_id == -(2**63 - 1) and top.msg_id == 2**31 - 1
+    assert leads.normalize(f"tg://user?id={2**63 - 1}") == leads.peer(2**63 - 1)
+    assert not leads.valid_peer(-(2**63) - 1) and not leads.valid_peer(2**63)
+    assert leads.normalize("https://t.me/c/1") == leads.peer(-1000000000001)

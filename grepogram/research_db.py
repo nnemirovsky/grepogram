@@ -57,7 +57,7 @@ import time
 from collections.abc import Collection, Iterable, Mapping, Sequence
 from typing import Any, get_args
 
-from grepogram import db
+from grepogram import db, leads
 from grepogram.models import (
     Candidate,
     CandidateAction,
@@ -451,7 +451,15 @@ def create_session(
         return _session(conn, row)
 
 
+def _row_id(value: int) -> bool:
+    """Whether ``value`` can be a row id at all: a number typed on a command line or sent to a
+    tool is unbounded, and SQLite refuses to bind one past 64 bits rather than find nothing."""
+    return 0 < value <= leads.INT64_MAX
+
+
 def get_session(conn: sqlite3.Connection, session_id: int) -> ResearchSession | None:
+    if not _row_id(session_id):
+        return None
     row = conn.execute("SELECT * FROM sessions WHERE id = ?", (session_id,)).fetchone()
     return None if row is None else _session(conn, row)
 
@@ -627,6 +635,8 @@ def count_candidates(conn: sqlite3.Connection, session_id: int) -> int:
 
 
 def get_candidate(conn: sqlite3.Connection, candidate_id: int) -> Candidate | None:
+    if not _row_id(candidate_id):
+        return None
     row = conn.execute("SELECT * FROM candidates WHERE id = ?", (candidate_id,)).fetchone()
     return None if row is None else _candidate(row)
 
@@ -1092,10 +1102,8 @@ def _spelled(identity: str) -> tuple[int | None, str | None, str | None]:
     if identity.startswith("+"):
         return None, None, identity[1:] or None
     if identity.startswith("peer:"):
-        try:
-            return int(identity.removeprefix("peer:")), None, None
-        except ValueError:
-            return None, None, None
+        target = leads.normalize(identity)
+        return (None if target is None else target.peer_id), None, None
     return None, None, None
 
 

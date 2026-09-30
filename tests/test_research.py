@@ -506,6 +506,37 @@ def test_snippet_centres_on_the_target_in_a_long_text() -> None:
     assert research.snippet("   ") is None
 
 
+def test_a_link_with_an_id_past_telegram_s_range_is_skipped_not_fatal(
+    rdb: sqlite3.Connection, conn: sqlite3.Connection
+) -> None:
+    """A crafted link anyone can post — in the stored links or only in the text — never stops
+    discovery: it names nothing, the other leads are read and the cursor moves past it."""
+    _store(
+        conn,
+        SEED,
+        1,
+        "see https://t.me/c/99999999999999999999/5",
+        links=(("link", "c/99999999999999999999/5"), ("link", "@alpha_rent")),
+    )
+    _store(
+        conn,
+        SEED,
+        2,
+        "tg://privatepost?channel=99999999999999999999&post=5 and t.me/c/99999999999999999999",
+        links=None,
+    )
+    _store(conn, SEED, 3, "t.me/c/" + "9" * 5000 + "/1 or @beta_rent", links=None)
+    session = _start(rdb, conn)
+
+    report = research.discover_offline(rdb, conn, CFG, session.id)
+
+    found = {c.identity for c in research_db.list_candidates(rdb, session.id)}
+    assert found == {"@alpha_rent", "@beta_rent"}
+    assert report.leads == 2
+    again = research.discover_offline(rdb, conn, CFG, session.id)
+    assert (again.messages_scanned, again.leads) == (0, 0), "the cursor moved past them"
+
+
 def test_message_text_never_reaches_the_log_above_debug(
     rdb: sqlite3.Connection, conn: sqlite3.Connection, caplog: pytest.LogCaptureFixture
 ) -> None:
@@ -1622,6 +1653,22 @@ def test_targets_are_named_by_candidate_id_link_or_peer(rdb: sqlite3.Connection)
         research.target_identities(rdb, ["https://example.com"])
     with pytest.raises(research.UnknownCandidate):
         research.target_identities(rdb, ["999"], session.id)
+    # ids past 64 bits name nothing — refused, never bound into a query that overflows
+    with pytest.raises(research.UnknownCandidate):
+        research.target_identities(rdb, [str(2**63)], session.id)
+    with pytest.raises(research.ResearchError, match="no candidate"):
+        research.target_identities(rdb, ["9" * 5000], session.id)
+    for huge in (
+        "https://t.me/c/99999999999999999999/5",
+        "tg://privatepost?channel=99999999999999999999&post=5",
+        "-99999999999999999999",
+        "peer:-99999999999999999999",
+    ):
+        with pytest.raises(research.ResearchError, match="names no chat"):
+            research.target_identities(rdb, [huge])
+    assert research_db.get_candidate(rdb, 2**64) is None
+    assert research_db.get_session(rdb, 2**64) is None
+    assert research_db.excluded_by(rdb, "peer:99999999999999999999") is None
 
 
 def test_approval_refuses_while_research_is_disabled(
@@ -2073,7 +2120,18 @@ def test_approval_items_read_back_what_they_print() -> None:
 @pytest.mark.parametrize(
     "tokens",
     # "²" and "٣" pass str.isdigit and make int() raise: a digit is an ASCII one
-    [[], ["abc"], ["12:"], ["-3:fetch"], ["global_search:x"], ["²"], ["٣:fetch"], ["1²:join"]],
+    [
+        [],
+        ["abc"],
+        ["12:"],
+        ["-3:fetch"],
+        ["global_search:x"],
+        ["²"],
+        ["٣:fetch"],
+        ["1²:join"],
+        ["99999999999999999999:fetch"],
+        pytest.param(["9" * 5000], id="5000-digits"),
+    ],
 )
 def test_a_malformed_approval_item_is_refused(tokens: list[str]) -> None:
     with pytest.raises(research.ResearchError) as caught:
