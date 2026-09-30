@@ -31,6 +31,47 @@ LinkKind = Literal["link", "text_url", "mention", "button", "webpage"]
 """How a message names a Telegram destination (``message_links.kind``): a visible URL, a hidden
 ``text_url`` hyperlink, an ``@mention`` (or a mention by id), a URL button, a link preview."""
 
+ResearchState = Literal["active", "stopped"]
+"""A research session explores while ``active``; ``stopped`` is final and voids its grants."""
+CandidateKind = Literal["username", "peer", "invite", "addlist"]
+"""What a candidate's identity names: a public chat by ``@name``, a chat by its marked id, an
+invite link's hash, a shared folder's slug — the chat-level forms of :mod:`grepogram.leads`."""
+CandidateStatus = Literal[
+    "proposed",
+    "approved",
+    "skipped",
+    "excluded",
+    "joined",
+    "pending_admission",
+    "fetched",
+    "unavailable",
+    "failed",
+]
+EvidenceVia = Literal[
+    "link",
+    "mention",
+    "text_url",
+    "button",
+    "webpage",
+    "pinned",
+    "forward",
+    "directory",
+    "shared_folder",
+    "chat_search",
+    "post_search",
+]
+"""The path that led research to a candidate (``evidence.via``)."""
+CandidateAction = Literal["fetch", "join", "request", "add_source"]
+"""What a grant may allow for one candidate."""
+SessionAction = Literal["global_search", "paid_search"]
+"""What a grant may allow for a whole session rather than one candidate."""
+GrantAction = CandidateAction | SessionAction
+GrantChannel = Literal["elicitation", "cli"]
+"""Where a human approved a grant: an MCP elicitation answered in the host, or the CLI reading
+the controlling terminal. Nothing else can produce one — there is no third channel."""
+SearchKind = Literal["chat_search", "post_search"]
+"""A Telegram-side search research ran (``searches.kind``)."""
+
 
 DEFAULT_ACCOUNT = "default"
 """The implicit account: always present, signed in by ``grepogram auth``, session in
@@ -112,6 +153,57 @@ class MediaCfg:
     max_download_mb: int = 20
 
 
+@dataclass(frozen=True, slots=True)
+class ResearchLimits:
+    """The bounds a research session works within, fixed when it starts (``sessions.limits``).
+
+    ``max_depth`` is how many hops from a seed a candidate may be; ``max_candidates`` and
+    ``probe_limit`` cap one discover call; ``since_days`` is the history horizon a source added
+    by a run gets; ``max_messages_per_run`` and ``run_budget_s`` bound one run.
+    """
+
+    max_depth: int = 2
+    max_candidates: int = 50
+    probe_limit: int = 20
+    since_days: int = 365
+    max_messages_per_run: int = 5000
+    run_budget_s: int = 300
+
+
+@dataclass(frozen=True, slots=True)
+class ResearchCfg:
+    """``[research]``: whether research runs at all, what it may ask Telegram, and its limits.
+
+    ``enabled`` is off by default and every research entry point refuses while it is. The two
+    search switches let discovery reach Telegram's own chat search (``contacts.search``) and
+    public-post search (``channels.searchPosts``), each still behind a grant; ``paid_stars_max``
+    at 0 means post search never pays. The remaining keys are the defaults of
+    :class:`ResearchLimits` a new session copies.
+    """
+
+    enabled: bool = False
+    chat_search: bool = False
+    post_search: bool = False
+    paid_stars_max: int = 0
+    max_depth: int = 2
+    max_candidates: int = 50
+    probe_limit: int = 20
+    since_days: int = 365
+    max_messages_per_run: int = 5000
+    run_budget_s: int = 300
+
+    def limits(self) -> ResearchLimits:
+        """The limits a session started under this config gets unless it overrides them."""
+        return ResearchLimits(
+            max_depth=self.max_depth,
+            max_candidates=self.max_candidates,
+            probe_limit=self.probe_limit,
+            since_days=self.since_days,
+            max_messages_per_run=self.max_messages_per_run,
+            run_budget_s=self.run_budget_s,
+        )
+
+
 @dataclass(frozen=True, slots=True, kw_only=True)
 class AccountCfg:
     """One ``[[accounts]]`` entry: a Telegram account signed in besides :data:`DEFAULT_ACCOUNT`.
@@ -163,6 +255,7 @@ class Config:
     units: UnitsCfg = field(default_factory=UnitsCfg)
     sync: SyncCfg = field(default_factory=SyncCfg)
     media: MediaCfg = field(default_factory=MediaCfg)
+    research: ResearchCfg = field(default_factory=ResearchCfg)
     accounts: list[AccountCfg] = field(default_factory=list)
     sources: list[Source] = field(default_factory=list)
 
@@ -478,3 +571,129 @@ class SourceStatus:
     source_id: str
     account: str | None = DEFAULT_ACCOUNT
     chats: list[ChatStatus]
+
+
+# --- research.db rows ------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class ResearchSession:
+    """One ``sessions`` row of ``research.db``: a question explored from seed chats by one
+    account. ``seeds`` are ``chats.id`` values of the index; ``progress`` is what the research
+    loop records about its runs."""
+
+    id: int
+    question: str
+    account: str
+    seeds: tuple[int, ...]
+    limits: ResearchLimits
+    state: ResearchState
+    created_at: int
+    stopped_at: int | None = None
+    progress: dict[str, object] = field(default_factory=dict)
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class Candidate:
+    """One ``candidates`` row: a chat research found and has not indexed, unique per session by
+    ``identity`` (a :mod:`grepogram.leads` target string).
+
+    Three facts stay apart: ``member`` is whether the acting account is in the chat (``None``
+    until a probe says), whether the index already holds it is asked of ``index.db`` when needed
+    and never stored, and whether a human authorised anything is a live row of ``grants``.
+    ``access_hash`` is the acting account's. ``parent_id`` names the candidate it was found
+    inside (a shared folder's peers), which grants nothing for it.
+    """
+
+    id: int
+    session_id: int
+    identity: str
+    kind: CandidateKind
+    depth: int
+    status: CandidateStatus = "proposed"
+    peer_id: int | None = None
+    username: str | None = None
+    invite_hash: str | None = None
+    addlist_slug: str | None = None
+    title: str | None = None
+    type: ChatType | None = None
+    participants: int | None = None
+    member: bool | None = None
+    access_hash: int | None = None
+    request_needed: bool | None = None
+    parent_id: int | None = None
+    source_id: str | None = None
+    probed_at: int | None = None
+    created_at: int = 0
+    note: str | None = None
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class Evidence:
+    """One path that led to a candidate. ``chat_id`` / ``msg_id`` name the message it was found
+    in (index ids for an indexed chat, the peer and post for a search result); ``origin_key``
+    is what corroboration counts — every forward of one post shares it."""
+
+    id: int
+    candidate_id: int
+    via: EvidenceVia
+    origin_key: str
+    chat_id: int | None = None
+    msg_id: int | None = None
+    snippet: str | None = None
+    found_at: int = 0
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class Grant:
+    """One human approval: ``actions`` on one candidate (or the session, when ``candidate_id``
+    is ``None``) by ``account``, given through ``via``. Live while neither consumed nor voided."""
+
+    id: int
+    session_id: int
+    candidate_id: int | None
+    account: str
+    actions: tuple[GrantAction, ...]
+    via: GrantChannel
+    summary: str
+    granted_at: int
+    consumed_at: int | None = None
+    voided_at: int | None = None
+
+    @property
+    def live(self) -> bool:
+        return self.consumed_at is None and self.voided_at is None
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class Exclusion:
+    """A target research never proposes again, in any session."""
+
+    identity: str
+    reason: str | None = None
+    created_at: int = 0
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class SearchRecord:
+    """One Telegram-side search a session ran; its results are evidence, never messages."""
+
+    id: int
+    session_id: int
+    kind: SearchKind
+    query: str
+    ran_at: int
+    results: int = 0
+    note: str | None = None
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class ScanCursor:
+    """How far a session's discovery has read one indexed chat: the Telegram ``msg_id`` of the
+    newest message scanned and the depth the chat's leads are found at."""
+
+    session_id: int
+    chat_id: int
+    depth: int
+    msg_id: int
+    scanned_at: int

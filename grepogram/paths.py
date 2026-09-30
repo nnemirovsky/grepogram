@@ -1,9 +1,9 @@
 """Filesystem locations used by grepogram, the flags that steer them and the lock over a file.
 
 ``GREPOGRAM_HOME=<dir>`` redirects everything under one directory (``config.toml``,
-``config.lock``, ``session.session``, ``sessions/``, ``index.db``, ``sync.lock``, ``logs/``);
-tests rely on this. Without it the macOS conventions apply: config, its lock and the sessions
-under ``~/.config/grepogram``, index and sync lock under
+``config.lock``, ``session.session``, ``sessions/``, ``index.db``, ``research.db``, ``sync.lock``,
+``logs/``); tests rely on this. Without it the macOS conventions apply: config, its lock and the
+sessions under ``~/.config/grepogram``, index, research store and sync lock under
 ``~/Library/Application Support/grepogram``, logs under ``~/Library/Logs/grepogram``. The
 default account's session is ``session.session``; every other account's is
 ``sessions/<name>.session`` next to the config (:meth:`Paths.session_file_for`).
@@ -28,6 +28,7 @@ ENV_HOME = "GREPOGRAM_HOME"
 SESSION_SUFFIX = ".session"
 SESSIONS_DIR_NAME = "sessions"
 CONFIG_LOCK_NAME = "config.lock"
+RESEARCH_DB_NAME = "research.db"
 LOG_FILE_NAME = "grepogram.log"
 DIR_MODE = 0o700
 PRIVATE_FILE_MODE = 0o600
@@ -64,6 +65,15 @@ class Paths:
     def config_lock_file(self) -> Path:
         """The flock taken around every read-modify-write of ``config_file``, next to it."""
         return self.config_file.with_name(CONFIG_LOCK_NAME)
+
+    @property
+    def research_db_file(self) -> Path:
+        """The research store (:mod:`grepogram.research_db`), next to ``db_file``.
+
+        A file of its own because the index is derived and may be deleted and rebuilt, while
+        what research records — approvals, exclusions, session history — is the user's decisions.
+        """
+        return self.db_file.with_name(RESEARCH_DB_NAME)
 
     @property
     def sessions_dir(self) -> Path:

@@ -20,6 +20,8 @@ from grepogram.models import (
     Config,
     MediaCfg,
     ModelsCfg,
+    ResearchCfg,
+    ResearchLimits,
     SearchCfg,
     Source,
     TelegramCfg,
@@ -41,6 +43,7 @@ def test_paths_follow_grepogram_home(tmp_home: Path, paths: Paths) -> None:
     assert paths.session_file == tmp_home / "session.session"
     assert paths.sessions_dir == tmp_home / "sessions"
     assert paths.db_file == tmp_home / "index.db"
+    assert paths.research_db_file == tmp_home / "research.db"
     assert paths.lock_file == tmp_home / "sync.lock"
     assert paths.config_lock_file == tmp_home / "config.lock"
     assert paths.log_dir == tmp_home / "logs"
@@ -62,6 +65,7 @@ def test_paths_macos_defaults_without_override(monkeypatch: pytest.MonkeyPatch) 
     assert paths.sessions_dir == home / ".config" / "grepogram" / "sessions"
     assert paths.db_file == home / "Library" / "Application Support" / "grepogram" / "index.db"
     assert paths.lock_file == home / "Library" / "Application Support" / "grepogram" / "sync.lock"
+    assert paths.research_db_file == paths.db_file.with_name("research.db")
     assert paths.config_lock_file == home / ".config" / "grepogram" / "config.lock"
     assert paths.log_dir == home / "Library" / "Logs" / "grepogram"
     assert Paths.from_env({"GREPOGRAM_HOME": "  "}) == paths
@@ -504,6 +508,99 @@ def test_media_is_a_known_section_with_its_own_unknown_key_hint() -> None:
     with pytest.raises(ConfigError, match=r"unknown key: media\.nope") as caught:
         config.loads("[media]\nnope = 1\n")
     assert caught.value.hint is not None and "[media]" in caught.value.hint
+
+
+# --- [research] ------------------------------------------------------------------------------
+
+
+def test_research_defaults_keep_research_off() -> None:
+    assert ResearchCfg() == ResearchCfg(
+        enabled=False,
+        chat_search=False,
+        post_search=False,
+        paid_stars_max=0,
+        max_depth=2,
+        max_candidates=50,
+        probe_limit=20,
+        since_days=365,
+        max_messages_per_run=5000,
+        run_budget_s=300,
+    )
+    assert config.loads("").research == ResearchCfg()
+    assert config.loads(TEMPLATE).research == ResearchCfg()
+    assert Config().research == ResearchCfg()
+
+
+def test_research_round_trips_through_save_and_load(paths: Paths) -> None:
+    cfg = Config(research=ResearchCfg(enabled=True, post_search=True, paid_stars_max=10))
+    config.save(cfg, paths)
+    text = paths.config_file.read_text()
+    assert "[research]" in text and "paid_stars_max = 10" in text
+    assert config.load(paths) == cfg
+
+
+def test_research_limits_copy_the_configured_bounds() -> None:
+    cfg = ResearchCfg(
+        max_depth=3,
+        max_candidates=7,
+        probe_limit=4,
+        since_days=30,
+        max_messages_per_run=100,
+        run_budget_s=60,
+    )
+    assert cfg.limits() == ResearchLimits(
+        max_depth=3,
+        max_candidates=7,
+        probe_limit=4,
+        since_days=30,
+        max_messages_per_run=100,
+        run_budget_s=60,
+    )
+    assert ResearchCfg().limits() == ResearchLimits()
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        "max_depth",
+        "max_candidates",
+        "probe_limit",
+        "since_days",
+        "max_messages_per_run",
+        "run_budget_s",
+    ],
+)
+@pytest.mark.parametrize("value", [0, -1])
+def test_research_bounds_reject_non_positive(key: str, value: int) -> None:
+    with pytest.raises(ConfigError, match=rf"invalid value for research\.{key}: .*positive"):
+        config.loads(f"[research]\n{key} = {value}\n")
+
+
+def test_paid_stars_max_takes_zero_and_refuses_a_negative() -> None:
+    assert config.loads("[research]\npaid_stars_max = 0\n").research.paid_stars_max == 0
+    with pytest.raises(ConfigError, match=r"research\.paid_stars_max: expected a non-negative"):
+        config.loads("[research]\npaid_stars_max = -5\n")
+
+
+@pytest.mark.parametrize(
+    ("text", "key", "expected"),
+    [
+        ("[research]\nenabled = 1\n", "research.enabled", "bool"),
+        ("[research]\npost_search = 'no'\n", "research.post_search", "bool"),
+        ("[research]\nmax_depth = 2.0\n", "research.max_depth", "int"),
+    ],
+)
+def test_research_rejects_wrong_types(text: str, key: str, expected: str) -> None:
+    with pytest.raises(
+        ConfigError, match=rf"invalid value for {re.escape(key)}: expected {expected}"
+    ):
+        config.loads(text)
+
+
+def test_research_is_a_known_section() -> None:
+    assert "[research]" in config.UNKNOWN_SECTION_HINT
+    with pytest.raises(ConfigError, match=r"unknown key: research\.nope"):
+        config.loads("[research]\nnope = 1\n")
 
 
 # --- README ----------------------------------------------------------------------------------

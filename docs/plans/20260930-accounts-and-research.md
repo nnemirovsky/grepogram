@@ -644,16 +644,32 @@ voided_at)`, `exclusions(identity PRIMARY KEY, reason, created_at)`,
 
 **Files:**
 - Create: `grepogram/research_db.py`, `tests/test_research_db.py`
-- Modify: `grepogram/models.py`, `grepogram/config.py`, `grepogram/paths.py`, `tests/test_config.py`
+- Modify: `grepogram/models.py`, `grepogram/config.py`, `grepogram/paths.py`, `tests/test_config.py`, `README.md`
 
-- [ ] `ResearchCfg` with the defaults in Technical Details; `[research]` section and `TEMPLATE`
-- [ ] `paths.research_db_file` next to `index.db`
-- [ ] `research_db`: connect (0600), own versioned schema, `SchemaError` on an unknown version,
+- [x] `ResearchCfg` with the defaults in Technical Details; `[research]` section and `TEMPLATE`
+  ➕ `ResearchLimits` (the per-session bounds, `ResearchCfg.limits()`); `paid_stars_max` may be 0
+  (`_NON_NEGATIVE_KEYS`), every other bound must be positive; README's config block and key table
+  follow the template (the README tests demand it)
+- [x] `paths.research_db_file` next to `index.db`
+- [x] `research_db`: connect (0600), own versioned schema, `SchemaError` on an unknown version,
   accessors for sessions, candidates, evidence, grants, exclusions, searches; every writer in a
   transaction
-- [ ] tests: create/reopen, mode, CRUD, candidate identity uniqueness per session, exclusions
+  ➕ `research_db.SchemaError` subclasses `db.SchemaError` (existing handlers catch it) and never
+  advises deleting the file; the row types (`ResearchSession`, `Candidate`, `Evidence`, `Grant`,
+  `Exclusion`, `SearchRecord`, `ScanCursor`) and the research `Literal`s live in `models.py`.
+  Beyond the Technical Details: `sessions.progress` (JSON), `candidates.participants`,
+  `parent_id` (the shared folder a peer came from) and `source_id` (the source a run added),
+  `grants.summary` (the approval text the human saw, `CHECK <> ''`), `grants.via` under
+  `CHECK (via IN ('elicitation', 'cli'))`, `searches.note`, and a `scans(session_id, chat_id,
+  depth, msg_id)` table — per-chat discovery cursors in Telegram `msg_id`s so a run resumes from
+  `research.db` alone and survives an index rebuild. `cached` is not stored (asked of `index.db`).
+  `add_grant` is the only grant writer and takes `via` keyword-only with no default;
+  `add_candidate` answers `None` for an excluded identity; `add_exclusion` moves unacted
+  candidates of every session to `excluded` and voids their live grants; `stop_session` voids
+  unconsumed grants in the same transaction
+- [x] tests: create/reopen, mode, CRUD, candidate identity uniqueness per session, exclusions
   global
-- [ ] run checks — must pass before task 13
+- [x] run checks — must pass before task 13
 
 ### Task 13: Offline discovery
 

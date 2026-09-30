@@ -448,6 +448,18 @@ ocr = true                             # photos through macOS Vision (the `media
 documents = true                       # pdf and docx
 max_download_mb = 20                   # anything larger is skipped, never downloaded
 
+[research]
+enabled = false                        # research tools refuse until this is true
+chat_search = false                    # contacts.search for public chats by name
+post_search = false                    # channels.searchPosts (public posts)
+paid_stars_max = 0                     # 0 = never pay for post search
+max_depth = 2                          # hops from a seed chat a candidate may be
+max_candidates = 50                    # per discover call
+probe_limit = 20                       # username / invite / addlist probes per discover call
+since_days = 365                       # horizon given to sources a research run adds
+max_messages_per_run = 5000
+run_budget_s = 300
+
 # The account `grepogram auth` signs in is "default" and needs no entry. Every other account
 # signed in at the same time is listed here; all of them share the [telegram] app:
 #
@@ -491,6 +503,15 @@ max_download_mb = 20                   # anything larger is skipped, never downl
 | `media.ocr` | read text off photos with macOS Vision; needs the `media` extra and a Mac, and is simply unavailable elsewhere |
 | `media.documents` | read text out of PDF and DOCX attachments; needs the `media` extra |
 | `media.max_download_mb` | a file Telegram reports as larger than this is skipped without being downloaded |
+| `research.enabled` | research (discovering chats you do not index yet, from a question and seed chats) is off until this is `true`; every research command and tool refuses while it is off, and ordinary search never widens what it reads |
+| `research.chat_search` | let discovery ask Telegram's own chat search (`contacts.search`) for public chats by name; still needs a `global_search` approval in the session, whose text says the query leaves this machine |
+| `research.post_search` | the same for Telegram's public-post search (`channels.searchPosts`), which has a small free daily quota |
+| `research.paid_stars_max` | the most Telegram Stars one post search may spend once the free quota is gone; `0` never pays, and paying needs its own `paid_search` approval |
+| `research.max_depth` | how many hops from a seed chat a candidate may be: leads in the seeds are depth 1, leads in a chat fetched from a depth-1 candidate depth 2 |
+| `research.max_candidates` | the most candidates one discover call proposes |
+| `research.probe_limit` | how many usernames, invite links and shared-folder links one discover call looks up on Telegram (metadata only, no history) |
+| `research.since_days` | how far back a source added by a research run fetches history |
+| `research.max_messages_per_run`, `research.run_budget_s` | the message and time budget of one research run; a run stopped by either resumes next time |
 | `accounts[].name` | an account signed in besides the implicit `default` one: 1 to 32 of `a-z`, `0-9`, `_` and `-`, unique, and never `default`; its session lives in `sessions/<name>.session` next to the config, while `default` keeps `session.session` |
 | `accounts[].label` | optional free text describing the account, for your own reference |
 | `sources[].folder` | a Telegram folder by name; its membership (included and pinned chats minus excluded ones, plus category flags) is re-resolved on every sync |
@@ -500,7 +521,7 @@ max_download_mb = 20                   # anything larger is skipped, never downl
 | `sources[].comments` | channels only: index the comment threads of the linked discussion group as well; on a folder source it applies to every channel in the folder. The comments are stored under the group, each naming the channel and the post it hangs under; a source that lists the group itself (the folder holding both, or a `chat` entry) indexes its whole history on top, and the two share one set of rows |
 
 `GREPOGRAM_HOME=<dir>` puts every file (`config.toml`, `config.lock`, `session.session`,
-`sessions/`, `index.db`, `sync.lock`, `logs/`) under one directory; the tests use it. `GREPOGRAM_FAKE_MODELS=1`
+`sessions/`, `index.db`, `research.db`, `sync.lock`, `logs/`) under one directory; the tests use it. `GREPOGRAM_FAKE_MODELS=1`
 swaps both models for deterministic fakes (tests and CI only).
 
 ## How Search Works
@@ -697,6 +718,7 @@ a session created with `grepogram auth` while the server runs is picked up by it
 | `~/.config/grepogram/config.toml` | settings, API keys, sources | 0600 |
 | `~/.config/grepogram/session.session` | Telethon session with the account's auth key | 0600 |
 | `~/Library/Application Support/grepogram/index.db` | messages, units, FTS and vector tables (WAL) | — |
+| `~/Library/Application Support/grepogram/research.db` | research sessions, candidates, evidence, approvals and exclusions — your decisions, kept apart from the rebuildable index | 0600 |
 | `~/.config/grepogram/config.lock` | cross-process lock around every edit of `config.toml` | 0600 |
 | `~/Library/Application Support/grepogram/sync.lock` | cross-process sync lock | 0600 |
 | `~/Library/Logs/grepogram/grepogram.log` | log, rotated at 5 MB, three old files kept | — |

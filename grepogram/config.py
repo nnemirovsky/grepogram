@@ -29,6 +29,7 @@ from grepogram.models import (
     Config,
     MediaCfg,
     ModelsCfg,
+    ResearchCfg,
     SearchCfg,
     Source,
     SyncCfg,
@@ -75,6 +76,18 @@ ocr = true                             # photos through macOS Vision (the `media
 documents = true                       # pdf and docx
 max_download_mb = 20                   # anything larger is skipped, never downloaded
 
+[research]
+enabled = false                        # research tools refuse until this is true
+chat_search = false                    # contacts.search for public chats by name
+post_search = false                    # channels.searchPosts (public posts)
+paid_stars_max = 0                     # 0 = never pay for post search
+max_depth = 2                          # hops from a seed chat a candidate may be
+max_candidates = 50                    # per discover call
+probe_limit = 20                       # username / invite / addlist probes per discover call
+since_days = 365                       # horizon given to sources a research run adds
+max_messages_per_run = 5000
+run_budget_s = 300
+
 # The account `grepogram auth` signs in is "default" and needs no entry. Every other account
 # signed in at the same time is listed here; all of them share the [telegram] app:
 #
@@ -94,11 +107,24 @@ max_download_mb = 20                   # anything larger is skipped, never downl
 # comments = false                     # channels only: also index linked discussion threads
 """
 
-_SECTIONS = ("telegram", "models", "search", "units", "sync", "media")
+_SECTIONS = ("telegram", "models", "search", "units", "sync", "media", "research")
 _SOURCE_KEYS = ("folder", "chat", "account", "since", "comments")
 _ACCOUNT_KEYS = ("name", "label")
-_POSITIVE_KEYS = frozenset({"models.max_seq_length", "media.max_download_mb"})
+_POSITIVE_KEYS = frozenset(
+    {
+        "models.max_seq_length",
+        "media.max_download_mb",
+        "research.max_depth",
+        "research.max_candidates",
+        "research.probe_limit",
+        "research.since_days",
+        "research.max_messages_per_run",
+        "research.run_budget_s",
+    }
+)
 """Integer settings a zero or a negative value is meaningless for, checked after the type."""
+_NON_NEGATIVE_KEYS = frozenset({"research.paid_stars_max"})
+"""Integer settings where zero means "never" and only a negative value is meaningless."""
 
 
 UNKNOWN_SECTION_HINT = (
@@ -164,6 +190,7 @@ def from_dict(raw: dict[str, Any]) -> Config:
         units=_section(UnitsCfg, raw, "units"),
         sync=_section(SyncCfg, raw, "sync"),
         media=_section(MediaCfg, raw, "media"),
+        research=_section(ResearchCfg, raw, "research"),
         accounts=accounts,
         sources=_sources(raw.get("sources", []), known),
     )
@@ -250,9 +277,9 @@ def write_private(path: Path, text: str) -> None:
     os.replace(tmp, path)
 
 
-def _section[SectionT: (TelegramCfg, ModelsCfg, SearchCfg, UnitsCfg, SyncCfg, MediaCfg)](
-    cls: type[SectionT], raw: dict[str, Any], name: str
-) -> SectionT:
+def _section[
+    SectionT: (TelegramCfg, ModelsCfg, SearchCfg, UnitsCfg, SyncCfg, MediaCfg, ResearchCfg)
+](cls: type[SectionT], raw: dict[str, Any], name: str) -> SectionT:
     data = raw.get(name, {})
     if not isinstance(data, dict):
         raise ConfigError(f"invalid value for {name}: expected a table")
@@ -265,6 +292,10 @@ def _section[SectionT: (TelegramCfg, ModelsCfg, SearchCfg, UnitsCfg, SyncCfg, Me
         checked = _checked(value, hints[key], where)
         if where in _POSITIVE_KEYS and isinstance(checked, int) and checked < 1:
             raise ConfigError(f"invalid value for {where}: expected a positive int, got {checked}")
+        if where in _NON_NEGATIVE_KEYS and isinstance(checked, int) and checked < 0:
+            raise ConfigError(
+                f"invalid value for {where}: expected a non-negative int, got {checked}"
+            )
         kwargs[key] = checked
     return cls(**kwargs)
 
