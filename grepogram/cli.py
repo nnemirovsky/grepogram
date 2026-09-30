@@ -163,7 +163,7 @@ def auth(
             "--account",
             "-a",
             help="Sign in this account: a new name (lowercase letters, digits, '_' or '-') is "
-            "added to [[accounts]] once the sign-in succeeds.",
+            "added to \\[\\[accounts]] once the sign-in succeeds.",
         ),
     ] = DEFAULT_ACCOUNT,
     label: Annotated[
@@ -1459,7 +1459,7 @@ def research_start(
     as_json: JsonOption = False,
 ) -> None:
     """Start a research session: a question, the indexed chats to start from and the account
-    that later joins and fetches (offline). Limits default to the [research] section."""
+    that later joins and fetches (offline). Limits default to the \\[research] section."""
     overrides = {
         "max_depth": max_depth,
         "max_candidates": max_candidates,
