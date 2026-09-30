@@ -435,7 +435,7 @@ def export_links(message: Mapping[str, Any]) -> tuple[tuple[LinkKind, str], ...]
             value: Any = run.get("href")
         elif run.get("type") == "mention_name":
             user = run.get("user_id")
-            value = f"peer:{int(user)}" if _is_int(user) else None
+            value = leads.peer_identity(int(user)) if _is_int(user) else None
         else:
             value = run.get("text")
         if isinstance(value, str) and (lead := leads.normalize(value)) is not None:

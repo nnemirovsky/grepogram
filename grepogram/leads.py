@@ -100,11 +100,27 @@ class LeadTarget:
     slug: str | None = None
 
 
+def username_identity(name: str) -> str:
+    """How an identity spells the chat ``@name`` names: lowercased, as Telegram matches it. The
+    one spelling of it — :func:`username` and every reader of a stored name build it here."""
+    return f"@{name.lower()}"
+
+
+def peer_identity(marked_id: int) -> str:
+    """How an identity spells a peer named by its marked id alone (:func:`peer`)."""
+    return f"peer:{marked_id}"
+
+
+def invite_identity(invite_hash: str) -> str:
+    """How an identity spells an invite link by its hash (:func:`invite`)."""
+    return f"+{invite_hash}"
+
+
 def username(name: str) -> LeadTarget | None:
     if not _is_username(name):
         return None
     name = name.lower()
-    return LeadTarget(kind="username", target=f"@{name}", username=name)
+    return LeadTarget(kind="username", target=username_identity(name), username=name)
 
 
 def number(text: str) -> int | None:
@@ -159,7 +175,7 @@ def invite(invite_hash: str) -> LeadTarget | None:
     # an all-digit `t.me/+…` is a phone number link, not an invite
     if not _TOKEN.fullmatch(invite_hash) or _DIGITS.fullmatch(invite_hash):
         return None
-    return LeadTarget(kind="invite", target=f"+{invite_hash}", invite_hash=invite_hash)
+    return LeadTarget(kind="invite", target=invite_identity(invite_hash), invite_hash=invite_hash)
 
 
 def addlist(slug: str) -> LeadTarget | None:
@@ -171,7 +187,7 @@ def addlist(slug: str) -> LeadTarget | None:
 def peer(marked_id: int) -> LeadTarget | None:
     if not valid_peer(marked_id):
         return None
-    return LeadTarget(kind="peer", target=f"peer:{marked_id}", peer_id=marked_id)
+    return LeadTarget(kind="peer", target=peer_identity(marked_id), peer_id=marked_id)
 
 
 def normalize(value: str) -> LeadTarget | None:

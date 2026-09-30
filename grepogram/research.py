@@ -430,12 +430,29 @@ def origin_key(message: MessageRow, chat: ChatRow) -> str:
     row it was read from.
     """
     if message.fwd_peer_id is not None and message.fwd_msg_id is not None:
-        return f"post:{message.fwd_peer_id}/{message.fwd_msg_id}"
+        return post_key(message.fwd_peer_id, message.fwd_msg_id)
     if message.fwd_peer_id is not None:
         return f"fwd:{message.fwd_peer_id}@{message.fwd_date or 0}"
     if chat.is_shared:
-        return f"post:{chat.peer_id}/{message.msg_id}"
+        return post_key(chat.peer_id, message.msg_id)
     return f"msg:{chat.scope}:{chat.peer_id}/{message.msg_id}"
+
+
+def post_key(peer_id: int, msg_id: int) -> str:
+    """The origin key of post ``msg_id`` of the channel or supergroup ``peer_id``: the same for
+    a forward of it, for the post where it is itself indexed (:func:`origin_key`) and for a
+    global post search's result — which is what lets them corroborate each other."""
+    return f"post:{peer_id}/{msg_id}"
+
+
+def folder_key(slug: str) -> str:
+    """The origin key of what a shared folder (``addlist/<slug>``) listed."""
+    return f"addlist:{slug}"
+
+
+def chat_search_key(peer_id: int) -> str:
+    """The origin key of a chat Telegram's own chat search answered with."""
+    return f"chat_search:{peer_id}"
 
 
 def snippet(text: str, needle: str | None = None) -> str | None:
@@ -458,7 +475,8 @@ def _needle(target: LeadTarget) -> str | None:
 
 def _own(chat: ChatRow) -> set[str]:
     """The identities that name ``chat`` itself: a lead to the chat it was found in is none."""
-    return {f"peer:{chat.peer_id}", *([f"@{chat.username.lower()}"] if chat.username else [])}
+    own = {leads.peer_identity(chat.peer_id)}
+    return own | ({leads.username_identity(chat.username)} if chat.username else set())
 
 
 def collect_leads(conn: sqlite3.Connection, after: Mapping[int, int]) -> LeadScan:
@@ -1217,14 +1235,20 @@ async def probe(
     if session is None:
         raise UnknownSession(candidate.session_id)
     stamp = research_db.clock(now)
+    if candidate.kind == "peer":
+        handle = None
+    elif (handle := _handle(candidate)) is None:
+        note = f"{candidate.identity!r} names no {candidate.kind} to ask Telegram about"
+        stored = _settle(rdb, candidate, "unavailable", stamp, note=note)
+        return ProbeOutcome(candidate=stored, result="unavailable")
     try:
-        if candidate.kind == "username":
-            return await _probe_username(client, rdb, candidate, stamp)
-        if candidate.kind == "peer":
+        if handle is None:  # a peer: asked about by its id and a stored access hash
             return await _probe_peer(client, rdb, conn, session, candidate, stamp)
+        if candidate.kind == "username":
+            return await _probe_username(client, rdb, candidate, handle, stamp)
         if candidate.kind == "invite":
-            return await _probe_invite(client, rdb, candidate, stamp)
-        return await _probe_addlist(client, rdb, conn, session, candidate, stamp)
+            return await _probe_invite(client, rdb, candidate, handle, stamp)
+        return await _probe_addlist(client, rdb, conn, session, candidate, handle, stamp)
     except errors.FloodError:
         raise
     except errors.UnauthorizedError as exc:
@@ -1232,6 +1256,20 @@ async def probe(
     except errors.RPCError as exc:
         refused = _settle(rdb, candidate, "unavailable", stamp, note=f"Telegram refused: {exc}")
         return ProbeOutcome(candidate=refused, result="unavailable")
+
+
+def _handle(candidate: Candidate) -> str | None:
+    """What a probe asks Telegram about ``candidate`` by: the username, invite hash or folder
+    slug its row holds, else the one its identity spells — read back through
+    :func:`grepogram.leads.normalize`, which every identity research stores comes from."""
+    spelled = leads.normalize(candidate.identity)
+    if candidate.kind == "username":
+        return candidate.username or (None if spelled is None else spelled.username)
+    if candidate.kind == "invite":
+        return candidate.invite_hash or (None if spelled is None else spelled.invite_hash)
+    if candidate.kind == "addlist":
+        return candidate.addlist_slug or (None if spelled is None else spelled.slug)
+    return None
 
 
 _NAME_MOVED_TO: dict[CandidateStatus, CandidateStatus] = {
@@ -1303,9 +1341,8 @@ def _entity_outcome(
 
 
 async def _probe_username(
-    client: Any, rdb: sqlite3.Connection, candidate: Candidate, stamp: int
+    client: Any, rdb: sqlite3.Connection, candidate: Candidate, name: str, stamp: int
 ) -> ProbeOutcome:
-    name = candidate.username or candidate.identity.lstrip("@")
     try:
         entity = await client.get_entity(f"@{name}")
     except (ValueError, errors.UsernameNotOccupiedError, errors.UsernameInvalidError):
@@ -1378,9 +1415,8 @@ def _invite_type(invite: types.ChatInvite) -> str:
 
 
 async def _probe_invite(
-    client: Any, rdb: sqlite3.Connection, candidate: Candidate, stamp: int
+    client: Any, rdb: sqlite3.Connection, candidate: Candidate, invite_hash: str, stamp: int
 ) -> ProbeOutcome:
-    invite_hash = candidate.invite_hash or candidate.identity.lstrip("+")
     answer = await client(functions.messages.CheckChatInviteRequest(hash=invite_hash))
     if isinstance(answer, types.ChatInviteAlready):
         return _entity_outcome(rdb, candidate, answer.chat, stamp, member=True)
@@ -1406,9 +1442,9 @@ async def _probe_addlist(
     conn: sqlite3.Connection,
     session: ResearchSession,
     candidate: Candidate,
+    slug: str,
     stamp: int,
 ) -> ProbeOutcome:
-    slug = candidate.addlist_slug or candidate.identity.removeprefix("addlist/")
     answer = await client(functions.chatlists.CheckChatlistInviteRequest(slug=slug))
     entities = {dialogs.peer_id(e): e for e in (*answer.chats, *answer.users)}
     joined: dict[int, bool] = {}
@@ -1428,7 +1464,7 @@ async def _probe_addlist(
     children: list[int] = []
     left_out: Counter[EntityOutcome] = Counter()
     found = _AnsweredEvidence(
-        "shared_folder", f"addlist:{slug}", in_itself=False, msg_id=None, snippet=title
+        "shared_folder", folder_key(slug), in_itself=False, msg_id=None, snippet=title
     )
     with db.transaction(rdb):
         for peer in peers:
@@ -1833,7 +1869,7 @@ async def _chat_search(
                 reads.keys(),
                 report,
                 entity,
-                origin_key=f"chat_search:{marked}",
+                origin_key=chat_search_key(marked),
                 msg_id=None,
                 snippet_text=utils.get_display_name(entity) or None,
                 stamp=stamp,
@@ -1904,7 +1940,7 @@ async def _post_search(
                 reads.keys(),
                 report,
                 entity,
-                origin_key=f"post:{marked}/{post.id}",
+                origin_key=post_key(marked, post.id),
                 msg_id=post.id,
                 snippet_text=snippet(post.message or "", report.query),
                 stamp=stamp,

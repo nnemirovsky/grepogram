@@ -862,6 +862,27 @@ async def test_a_chat_the_account_was_banned_from_is_unavailable(
     assert request.id[0].access_hash == 77, "the hash this account stored, nothing else"
 
 
+async def test_a_probe_asks_by_what_the_identity_spells_and_never_by_a_guess(
+    rdb: sqlite3.Connection, conn: sqlite3.Connection
+) -> None:
+    """A row that knows no handle is asked about by the one its identity spells, read back
+    through ``leads.normalize``; an identity that spells none is not sent to Telegram at all."""
+    session = _start(rdb, conn)
+    named = research_db.add_candidate(rdb, session.id, "@tb_flats", "username", 1)
+    garbled = research_db.add_candidate(rdb, session.id, "+", "invite", 1)
+    assert named is not None and named.username is None and garbled is not None
+    client = _world().client("default")
+
+    asked = await research.probe(client, rdb, conn, named)
+    refused = await research.probe(client, rdb, conn, garbled)
+
+    assert asked.result == "probed" and asked.candidate.username == "tb_flats"
+    assert refused.result == "unavailable" and "names no invite" in (refused.candidate.note or "")
+    assert not any(
+        isinstance(r, functions.messages.CheckChatInviteRequest) for r in client.requests
+    )
+
+
 async def test_a_legacy_group_peer_is_probed_only_by_a_member(
     rdb: sqlite3.Connection, conn: sqlite3.Connection
 ) -> None:

@@ -599,7 +599,7 @@ def add_candidate(
             # the spelling already names another chat (a username that moved): this one is
             # recorded under its marked id, never folded into the row a human may have decided on
             assert peer_id is not None
-            identity, kind = f"peer:{peer_id}", "peer"
+            identity, kind = leads.peer_identity(peer_id), "peer"
         if excluded_by(conn, identity, peer_id=peer_id, username=username) is not None:
             return None
         known = candidate_for(
@@ -762,7 +762,7 @@ def renamed_away(
     """The candidates of the session that a probe tied to a peer other than ``peer_id`` but that
     go by the name Telegram now gives ``peer_id``'s chat — ``identity`` or ``@username``: the
     name moved away from the chat they were probed as."""
-    names = [identity, *([f"@{username.lower()}"] if username else [])]
+    names = [identity, *([leads.username_identity(username)] if username else [])]
     rows = conn.execute(
         "SELECT * FROM candidates WHERE session_id = ? AND peer_id IS NOT NULL AND peer_id <> ? "
         f"AND (identity IN ({_placeholders(len(names))}) OR username = ?) ORDER BY id",
@@ -1170,15 +1170,17 @@ def void_grants(
 
 
 def _spelled(identity: str) -> tuple[int | None, str | None, str | None]:
-    """The peer id, username or invite hash an identity names outright: ``peer:<id>``,
-    ``@name``, ``+hash``."""
-    if identity.startswith("@"):
-        return None, identity[1:].lower() or None, None
-    if identity.startswith("+"):
-        return None, None, identity[1:] or None
-    if identity.startswith("peer:"):
-        target = leads.normalize(identity)
-        return (None if target is None else target.peer_id), None, None
+    """The peer id, username or invite hash an identity names outright — ``peer:<id>``,
+    ``@name``, ``+hash`` — as :func:`grepogram.leads.normalize` reads it back."""
+    target = leads.normalize(identity)
+    if target is None:
+        return None, None, None
+    if target.kind == "username":
+        return None, target.username, None
+    if target.kind == "invite":
+        return None, None, target.invite_hash
+    if target.kind == "peer":
+        return target.peer_id, None, None
     return None, None, None
 
 
@@ -1215,9 +1217,9 @@ def excluded_by(
             peers.add(row["peer_id"])
             usernames.add(row["username"])
             invites.add(row["invite_hash"])
-    names.update(f"@{name}" for name in usernames if name)
-    names.update(f"peer:{peer}" for peer in peers if peer is not None)
-    names.update(f"+{invite}" for invite in invites if invite)
+    names.update(leads.username_identity(name) for name in usernames if name)
+    names.update(leads.peer_identity(peer) for peer in peers if peer is not None)
+    names.update(leads.invite_identity(invite) for invite in invites if invite)
     wanted = sorted(names)
     row = conn.execute(
         f"SELECT identity FROM exclusions WHERE identity IN ({_placeholders(len(wanted))}) "

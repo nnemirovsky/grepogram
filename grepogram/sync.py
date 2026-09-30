@@ -403,7 +403,7 @@ def links_of(msg: Any) -> tuple[tuple[LinkKind, str], ...]:
         elif isinstance(entity, types.MessageEntityMention):
             add("mention", span)
         elif isinstance(entity, types.MessageEntityMentionName):
-            add("mention", f"peer:{int(entity.user_id)}")
+            add("mention", leads.peer_identity(int(entity.user_id)))
     markup = msg.reply_markup
     if isinstance(markup, types.ReplyInlineMarkup):
         for row in markup.rows:
