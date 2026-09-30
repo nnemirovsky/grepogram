@@ -193,7 +193,10 @@ never change the git identity.
   report's warnings read `account <name>: …` only when an account other than `default` is in
   the run, so a single-account report is what it always was. `SyncBudget(seconds, messages=…)`
   carries a research run's message allowance: the fetch loops check `halted` (clock or cap),
-  while `expired` stays the clock alone so the cap never cuts indexing or embedding. The CLI's
+  while `expired` stays the clock alone so the cap never cuts indexing or embedding. Every
+  batch of new rows — comments included — is stored through `_Run.store_new`, which
+  `SyncBudget.hold`s its share of the allowance first, so concurrent queues cannot each store a
+  batch past the cap; a comment thread stops at the cap and its post is fetched again with it. The CLI's
   multi-account commands and `AppState.telegrams()` leave out an account with no session (warned
   about only when it owns a source) or one Telegram signed out, and fail only when no account is
   left; the MCP `sync` reports the skipped ones in `accounts_skipped`.

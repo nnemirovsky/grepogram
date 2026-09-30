@@ -462,6 +462,7 @@ class SyncBudget:
         self.seconds = seconds
         self.messages = messages
         self.spent = 0
+        self.held = 0
         self._clock = clock
         self.deadline: float | None = None if seconds is None else clock() + seconds
         self._cancelled = False
@@ -470,17 +471,41 @@ class SyncBudget:
         """Count ``count`` newly stored messages against the allowance."""
         self.spent += max(0, count)
 
+    def hold(self, wanted: int) -> int:
+        """Set aside up to ``wanted`` messages of the allowance for a batch about to be stored,
+        and return how many were set aside — ``wanted`` itself without an allowance.
+
+        Several accounts' queues fetch at once against the one budget, and each gathers a batch
+        before storing it: without this, two queues reading the same :attr:`messages_left` would
+        each store up to that many and overshoot the cap by a batch per queue. What a queue
+        holds is out of every other queue's :attr:`messages_left` until :meth:`release` — so it
+        stores no more rows than it holds (every stored row costs at most one message), spends
+        what was actually new, and then releases the hold.
+        """
+        if self.messages is None:
+            return wanted
+        granted = max(0, min(wanted, self.messages - self.spent - self.held))
+        self.held += granted
+        return granted
+
+    def release(self, held: int) -> None:
+        """Give back a :meth:`hold` once its batch is stored (and spent)."""
+        if self.messages is not None:
+            self.held -= held
+
     @property
     def messages_left(self) -> int | None:
-        """Messages the allowance still admits, ``None`` without one, never negative."""
+        """Messages the allowance still admits, ``None`` without one, never negative — what any
+        queue holds for a batch it is storing (:meth:`hold`) already taken off."""
         if self.messages is None:
             return None
-        return max(0, self.messages - self.spent)
+        return max(0, self.messages - self.spent - self.held)
 
     @property
     def exhausted(self) -> bool:
-        """Whether the message allowance is used up; never, without one."""
-        return self.messages is not None and self.spent >= self.messages
+        """Whether the message allowance is used up (or held by a batch being stored); never,
+        without one."""
+        return self.messages is not None and self.messages_left == 0
 
     @property
     def halted(self) -> bool:
@@ -683,6 +708,16 @@ class _Run:
         self.inserted[chat_id] = self.inserted.get(chat_id, 0) + fresh
         self.budget.spend(fresh)
         return ids
+
+    async def store_new(self, rows: list[MessageRow]) -> tuple[list[int], int]:
+        """:meth:`store` as many of ``rows`` as the message allowance has room for, in order;
+        returns their row ids and how many of ``rows`` were stored. Fewer than all of them means
+        the allowance ran out: the caller stops fetching and the rest comes next run."""
+        held = self.budget.hold(len(rows))
+        try:
+            return await self.store(rows[:held]), held
+        finally:
+            self.budget.release(held)
 
     def _write(self, chat_id: int, rows: list[MessageRow], stale: Sequence[int]) -> list[int]:
         """The upsert and, for the rows whose extraction it just dropped, the re-cut."""
@@ -904,7 +939,7 @@ async def _fetch_new(run: _Run) -> _Fetched:
             continue
         progress = await _store_batch(run, batch, progress, seen_up_to)
         batch = []
-        if run.budget.halted:
+        if run.budget.halted or progress < seen_up_to:
             complete = False
             break
     if complete and (batch or seen_up_to > progress):
@@ -940,7 +975,12 @@ async def _store_batch(run: _Run, batch: list[MessageRow], progress: int, seen_u
     channel Telegram is already rate-limiting.
     """
     chat = run.chat
-    _track(run.changes, await run.store(batch))
+    ids, kept = await run.store_new(batch)
+    _track(run.changes, ids)
+    if kept < len(batch):
+        # the message allowance ran out inside the batch: what was stored is the progress
+        batch = batch[:kept]
+        seen_up_to = batch[-1].msg_id if batch else progress
     if run.discussion is None:
         run.replies.clear()
         db.set_chat_progress(run.conn, chat.id, seen_up_to, chat.last_sync_at)
@@ -960,6 +1000,8 @@ async def _store_batch(run: _Run, batch: list[MessageRow], progress: int, seen_u
                 break
             if run.replies.pop(row.msg_id, 0) > stored.get(row.msg_id, 0):
                 _track(run.comment_ids, await _fetch_comments(run, row.msg_id))
+                if run.budget.exhausted:
+                    break  # the cap cut its thread short: the post comes again with it next run
             progress = row.msg_id
         else:
             progress = seen_up_to
@@ -984,13 +1026,19 @@ async def _fetch_comments(run: _Run, post_id: int) -> list[int]:
     wait partway through a long one, a cancellation — keeps the prefix it fetched instead of
     dropping everything on the floor and starting from the same place on every later run. The
     next run re-reads the thread from the top (an upsert, so nothing is stored twice) until as
-    many comments are stored as Telegram reports replies.
+    many comments are stored as Telegram reports replies. Comments are new messages like any
+    other: the read stops once the message allowance is :attr:`~SyncBudget.exhausted`, and every
+    batch is stored within it (:meth:`_Run.store_new`), so a research run's cap holds for a
+    channel's threads as it does for its posts. The clock does not cut a thread: it is checked
+    between posts (:func:`_store_batch`).
     """
     assert run.discussion is not None
     rows: list[MessageRow] = []
     stored: list[int] = []
     try:
         async for msg in run.client.iter_messages(run.chat.peer_id, reply_to=post_id):
+            if run.budget.exhausted:
+                break
             row = run.map(msg, run.discussion)
             if row is not None:
                 rows.append(
@@ -998,15 +1046,18 @@ async def _fetch_comments(run: _Run, post_id: int) -> list[int]:
                         row, comment_of_chat_id=run.chat.id, comment_of_msg_id=post_id
                     )
                 )
-            if len(rows) >= BATCH_SIZE:
-                stored += await run.store(rows)
-                rows = []
+            if len(rows) >= _batch_size(run.budget):
+                ids, kept = await run.store_new(rows)
+                stored += ids
+                rows = rows[kept:]
+                if rows:
+                    break
     except errors.MsgIdInvalidError:
         log.debug("post %s in channel %s has no comment thread", post_id, run.chat.id)
     except UNAVAILABLE_ERRORS as exc:
         run.drop_comments(exc)
     finally:
-        stored += await run.store(rows)
+        stored += (await run.store_new(rows))[0]
     return stored
 
 
@@ -1198,7 +1249,7 @@ async def _refresh_comments(
     touched: list[int] = []
     reread: list[int] = []
     for post_id in grown:
-        if run.budget.expired or run.discussion is None:
+        if run.budget.halted or run.discussion is None:
             break
         ids = await _fetch_comments(run, post_id)
         _track(run.comment_ids, ids)

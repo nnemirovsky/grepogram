@@ -4074,6 +4074,50 @@ async def test_two_accounts_failing_at_once_are_both_named(
     assert any("grepogram auth --account work" in note for note in raised.value.__notes__)
 
 
+async def test_a_message_allowance_holds_across_concurrent_accounts(
+    conn: sqlite3.Connection, paths: Paths, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Both queues gather a batch at once against one allowance; the first to store it holds
+    the allowance and the other stores nothing — never a batch per account past the cap."""
+    world = _world()
+    world.messages[NEWS_ID] = [tl.channel_post(NEWS_ID, i, f"news {i}") for i in range(1, 11)]
+    world.messages[PRIV_ID] = [tl.message(PRIV_ID, i, f"club {i}", sender=1) for i in range(1, 11)]
+    home, work = _home(world), _work(world)
+    started = {DEFAULT_ACCOUNT: asyncio.Event(), WORK: asyncio.Event()}
+    _meet(monkeypatch, home, started[DEFAULT_ACCOUNT], started[WORK])
+    _meet(monkeypatch, work, started[WORK], started[DEFAULT_ACCOUNT])
+    _slow(monkeypatch, home)
+    _slow(monkeypatch, work)
+    cfg = _cfg(Source(chat="@news"), Source(chat=PRIV_ID, account=WORK))
+    budget = SyncBudget(messages=6)
+
+    async with contextlib.AsyncExitStack() as stack:
+        for account, client in {DEFAULT_ACCOUNT: home, WORK: work}.items():
+            await stack.enter_async_context(tg.connected(client, account))
+        report = await sync.sync_all({DEFAULT_ACCOUNT: home, WORK: work}, conn, cfg, paths, budget)
+
+    assert budget.spent == 6 and report.new == 6
+    assert sum(db.message_counts(conn).values()) == 6
+    assert sorted(report.chats_remaining) == sorted([NEWS_ID, PRIV_ID])
+
+
+async def test_the_message_allowance_counts_comments_too(conn: sqlite3.Connection) -> None:
+    """A channel's comment threads are new messages like its posts: the cap stops the fetch
+    before the threads, and the posts come again with them next run."""
+    client = _news_client()
+    news = db.upsert_chat(conn, ChatRow(id=NEWS_ID, type="channel", source_id=NEWS_SOURCE.id))
+    budget = SyncBudget(messages=2)
+
+    synced = await sync.sync_chat(client, conn, news, NEWS_SOURCE, budget)
+
+    discussion_new = 0 if synced.discussion is None else synced.discussion.new
+    assert budget.spent == 2 and synced.new + discussion_new == 2
+    assert not synced.complete
+    resumed = await sync.sync_chat(client, conn, synced.chat, NEWS_SOURCE, SyncBudget())
+    assert resumed.complete
+    assert {m.msg_id for m in db.get_messages(conn, DISC_ID)} == {1, 2, 9}
+
+
 # --- the sweep through several accounts ------------------------------------------------------
 
 
