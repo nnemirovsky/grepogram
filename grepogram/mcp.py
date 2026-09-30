@@ -97,7 +97,9 @@ filters or chats.
 - Several Telegram accounts may be signed in: `accounts` lists them. `dialogs` and `sources_add` \
 act as one account (`account`, the default one when omitted), and a match's `target` already \
 names it; `sync` fetches through every signed-in account and names any account it had to skip, \
-with the command that signs it in.
+with the command that signs it in. One search spans every account; each hit's `accounts` says \
+which ones reach its chat, and `search(accounts=[...])` or a `chats` entry `account:<name>` \
+narrows it to what an account reaches — a scope, not isolation.
 - A result with `error` explains what went wrong and `hint` what to do next; `warnings` are \
 advisory and the hits alongside them are valid.
 """
@@ -592,14 +594,19 @@ async def search(
     mode: SearchMode = "hybrid",
     rerank: bool = True,
     full: bool = False,
+    accounts: list[str] | None = None,
 ) -> ToolResult:
     """Search the indexed Telegram chats; returns ranked hits with deep links.
 
     Hits are conversation units — time windows, reply threads, channel posts — with `chat`,
-    `kind`, `date_start`/`date_end` (unix seconds, UTC), `anchor_msg_id` (the message the link
-    opens), `url`, `snippet` and `msg_ids`; `full=true` adds the whole unit `text`. `chats`
-    restricts the search: each entry is a chat id, `@username`, t.me link, `folder:<name>`,
-    `import:<slug>` (a source id `sources` reports) or a chat / folder title (fuzzy). `since` /
+    `peer_id` (the chat's Telegram id), `accounts` (the signed-in accounts that reach the chat;
+    empty for an import), `kind`, `date_start`/`date_end` (unix seconds, UTC), `anchor_msg_id`
+    (the message the link opens), `url`, `snippet` and `msg_ids`; `full=true` adds the whole
+    unit `text`. `chats` restricts the search: each entry is a chat id, `@username`, t.me link,
+    `folder:<name>`, `import:<slug>` (a source id `sources` reports), `account:<name>` (every
+    chat that account reaches), `<account>/<id>` (that account's private chat with a person) or
+    a chat / folder title (fuzzy). `accounts` narrows the search to the chats those accounts
+    reach — a scope, not isolation: a channel two accounts reach is in both scopes. `since` /
     `until` take an ISO date (2025-06-01), month (2025-06), datetime (2025-06-01T14:30) or an
     age such as 7d, 3w, 6m, 1y; `until` is inclusive. `mode`: `hybrid` fuses stemmed BM25 with
     dense embeddings (default), `lexical` is BM25 only (exact tokens, names, numbers), `dense`
@@ -617,7 +624,9 @@ async def search(
     if _stale(state, cfg):
         synced, warnings = await _auto_sync(state, cfg)
     selected = filters.resolve_filters(state.conn, cfg, chats, since, until)
-    result = await asyncio.to_thread(_retrieve, state, cfg, query, selected, k, mode, rerank, full)
+    result = await asyncio.to_thread(
+        _retrieve, state, cfg, query, selected, k, mode, rerank, full, accounts
+    )
     result = dataclasses.replace(result, warnings=[*warnings, *result.warnings], synced=synced)
     return asdict(result)
 
@@ -706,6 +715,7 @@ def _retrieve(
     mode: SearchMode,
     rerank: bool,
     full: bool,
+    accounts: Sequence[str] | None = None,
 ) -> SearchResult:
     """The search proper, on a worker thread, with the state's model loaders.
 
@@ -722,6 +732,7 @@ def _retrieve(
         mode=mode,
         full=full,
         rerank=rerank,
+        accounts=accounts,
         load_embedder=state.load_embedder,
         load_reranker=state.load_reranker,
     )
@@ -732,8 +743,9 @@ def thread(chat_id: int, msg_id: int) -> ToolResult:
     """The whole reply thread a message belongs to, root first, chronological.
 
     For a channel post: the post followed by its comments from the linked discussion chat. Each
-    message has `chat_id`, `msg_id`, `date` (unix seconds, UTC), `from_name`, `text`, `url`,
-    `fallback_url` and `reply_to_msg_id`. A message's own `chat_id` is the one to pass back to
+    message has `chat_id`, `peer_id` (the chat's Telegram id), `msg_id`, `date` (unix seconds,
+    UTC), `from_name`, `text`, `url`, `fallback_url`, `reply_to_msg_id` and `accounts` (the
+    accounts that reach its chat). A message's own `chat_id` is the one to pass back to
     `context` with its `msg_id` — comments carry the discussion group's id, not the channel's,
     and the two number their messages from 1 alike. Read it before concluding from a snippet;
     the arguments come from a hit's `chat.id` and `anchor_msg_id`.

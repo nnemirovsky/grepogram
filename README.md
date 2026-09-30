@@ -225,7 +225,8 @@ argument, put `--` before it: `grepogram sources add --since 2024-01-01 -- -1001
 
 | option | meaning |
 |---|---|
-| `-c`, `--chat <spec>` | restrict to these chats (repeatable): id, `@username`, `t.me` link, `folder:<name>`, `import:<slug>` or a title / folder name (substring, then fuzzy) |
+| `-c`, `--chat <spec>` | restrict to these chats (repeatable): id, `<account>/<id>`, `@username`, `t.me` link, `folder:<name>`, `import:<slug>`, `account:<name>` or a title / folder name (substring, then fuzzy) |
+| `-a`, `--account <name>` | restrict to the chats this account reaches (repeatable) — a scope, not isolation: a channel two accounts reach is in both scopes |
 | `--since <when>`, `--until <when>` | date bounds on the unit's start: an ISO date (`2025-06-01`), month (`2025-06`), datetime (`2025-06-01T14:30`, optional seconds and `Z` / `+03:00`) or an age (`7d`, `3w`, `6m`, `1y`); `--until` is inclusive; naive input is UTC |
 | `--mode hybrid\|lexical\|dense` | `hybrid` (default) fuses BM25 and embeddings, `lexical` is BM25 over stems only, `dense` is embeddings only; without vectors or a model every mode falls back to lexical with a warning |
 | `-k`, `--limit N` | number of hits (default `[search] k`) |
@@ -233,7 +234,8 @@ argument, put `--` before it: `grepogram sources add --since 2024-01-01 -- -1001
 | `--full` | include each hit's whole unit text |
 | `--json` | print the result document as JSON and nothing else on stdout |
 
-Text output prints one block per hit — rank, score, unit kind, chat, UTC date range, the deep link
+Text output prints one block per hit — rank, score, unit kind, chat, UTC date range (followed by
+`via <accounts>` when an account other than the default one reaches the chat), the deep link
 (and a fallback link for private chats), then the snippet. The `score` ranks the hits of *this*
 answer against each other and means nothing across two searches: it is normalised across the
 candidate set before the reaction bonus goes on (see [How Search Works](#how-search-works)).
@@ -366,7 +368,7 @@ advisory; the data next to them is valid.
 
 | tool | arguments | returns |
 |---|---|---|
-| `search` | `query`, `chats: list[str] \| null`, `since`, `until`, `k=10`, `mode="hybrid"`, `rerank=true`, `full=false` | `{hits, warnings, index_age_min, synced}`; each hit has `score` (a within-result-set number — it orders this answer and compares across nothing else), `chat` (id, type, title, username, …), `kind` (`window` / `thread` / `post`), `date_start`, `date_end` (unix seconds, UTC), `anchor_msg_id`, `url`, `fallback_url`, `snippet`, `msg_ids`, `text` (with `full`) |
+| `search` | `query`, `chats: list[str] \| null`, `since`, `until`, `k=10`, `mode="hybrid"`, `rerank=true`, `full=false`, `accounts: list[str] \| null` | `{hits, warnings, index_age_min, synced}`; each hit has `score` (a within-result-set number — it orders this answer and compares across nothing else), `chat` (id, type, title, username, …), `peer_id` (the chat's Telegram id), `accounts` (the accounts that reach the chat, empty for an import), `kind` (`window` / `thread` / `post`), `date_start`, `date_end` (unix seconds, UTC), `anchor_msg_id`, `url`, `fallback_url`, `snippet`, `msg_ids`, `text` (with `full`) |
 | `thread` | `chat_id`, `msg_id` | `{chat_id, msg_id, messages}`: the whole reply thread the message belongs to, root first; for a channel post, the post followed by its comments — those live in the discussion group, so the list spans two chats and each message names its own |
 | `context` | `chat_id`, `msg_id`, `before=15`, `after=15` | `{chat_id, msg_id, messages}`: the surrounding messages in the same chat, bounded to the message's own thread or forum topic where Telegram gave it one |
 | `sync` | `budget_s=45` | the sync report: `new`, `chats_done`, `chats_remaining`, `unavailable`, `warnings`, `accounts_skipped`, `index_age_min`; every signed-in account fetches its sources, and one whose session is missing or signed out is listed in `accounts_skipped` with its `error` and the `hint` that signs it in while the others sync |
@@ -376,10 +378,9 @@ advisory; the data next to them is valid.
 | `sources_remove` | `target` | `{source_id, removed_chat_ids, kept_chat_ids, config_updated}` after deleting the data of the chats no other source covers; `target` is a source id from `sources` (`folder:<name>`, `chat:<value>`, `<account>/chat:<value>`), a folder name, a chat id, `@username` or a fuzzy title; `error` while a sync is running |
 | `accounts` | — | `{accounts, hint}`: every account (offline) with `name`, `label`, `session` (`missing` / `present` / `authorized`), `user_id`, `display_name`, `sources`, `chats` and, for a missing session, the `hint` that signs it in; accounts are signed in and removed from a terminal only |
 
-Messages in `thread` and `context` have `chat_id`, `msg_id`, `date`, `from_name`, `text` (a
-`[photo]`-style placeholder for media without a caption, followed by whatever `grepogram extract`
-read off it), `url`, `fallback_url` and
-`reply_to_msg_id`. A message's `chat_id` is the chat it is really in, which the top-level one
+Messages in `thread` and `context` have `chat_id`, `peer_id`, `msg_id`, `date`, `from_name`,
+`text` (a `[photo]`-style placeholder for media without a caption, followed by whatever
+`grepogram extract` read off it), `url`, `fallback_url`, `reply_to_msg_id` and `accounts`. A message's `chat_id` is the chat it is really in, which the top-level one
 need not be: a channel post's comments come back under the discussion group's id, and comment
 ids collide with the channel's post ids (both number from 1), so pass a message's own `chat_id`
 back to `context` alongside its `msg_id`.
@@ -629,8 +630,12 @@ means CPU with a one-time warning in the log.
 link, `folder:<name>` or `import:<slug>` (through the source that pulled the chats in, matched
 exactly and then fuzzily on the name past the prefix), or free text matched against titles,
 usernames and folder names (substring first, then a `SequenceMatcher` ratio of at least 0.6; all
-hits of the best tier are searched). A spec that matches nothing is an error listing what
-is indexed. Date bounds apply to the unit's start time; `until` covers the whole day or month
+hits of the best tier are searched). `account:<name>` selects every chat that account reaches,
+and an `<account>/` prefix on any other spec keeps it to that account's private chats and the
+shared channels and groups: one person's private chats with two accounts are two chats under one
+Telegram id, so `thread 42 7` asks which one and `thread work/42 7` names it. An account is a
+scope, not isolation — every account is the same local user's, and a channel two accounts reach
+is one chat in both scopes. A spec that matches nothing is an error listing what is indexed. Date bounds apply to the unit's start time; `until` covers the whole day or month
 named; relative ages (`6m`) step the calendar rather than counting 30-day months.
 
 **Snippets and links.** Every hit has an *anchor*, the message its link opens: the matched message

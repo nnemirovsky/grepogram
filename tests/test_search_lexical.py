@@ -11,7 +11,7 @@ from grepogram.paths import Paths
 from grepogram.search import Match
 from grepogram.stem import fts_query, stem_text
 from grepogram.units import render_line
-from tests.fixtures import chat_ru
+from tests.fixtures import chat_ru, two_accounts
 
 ARG = chat_ru.ARG_ID
 GEO = chat_ru.GEO_ID
@@ -494,6 +494,81 @@ def test_best_line_picks_the_line_sharing_the_most_stems_with_the_query() -> Non
     assert search.snippet_lines(lines, 2) == "\n".join([lines[2], lines[0], lines[1]])
 
 
+# --- accounts --------------------------------------------------------------------------------
+
+
+def _search(
+    conn: sqlite3.Connection, chosen: Filters | None = None, accounts: list[str] | None = None
+) -> list[tuple[int, list[str]]]:
+    """``(chat id, accounts)`` of every hit of a lexical ``Brubank`` search, by chat id."""
+    result = search.search(
+        conn, two_accounts.CFG, "Brubank", chosen, mode="lexical", rerank=False, accounts=accounts
+    )
+    return sorted((hit.chat.id, hit.accounts) for hit in result.hits)
+
+
+def test_account_scope_keeps_shared_channels_and_drops_the_other_accounts_dms(
+    conn: sqlite3.Connection,
+) -> None:
+    """Both accounts reach the channel (and, through its link, its discussion group); each has
+    its own private chat with Bob. A scope keeps what that account reaches and nothing else, and
+    every hit names who reaches it either way."""
+    two = two_accounts.load(conn)
+    hall = (two.hall.id, ["default", "work"])
+    hall_chat = (two.hall_chat.id, ["default", "work"])
+    default_bob = (two.default_bob.id, ["default"])
+    work_bob = (two.work_bob.id, ["work"])
+    assert _search(conn) == sorted([hall, hall_chat, default_bob, work_bob])
+    assert _search(conn, accounts=["work"]) == sorted([hall, hall_chat, work_bob])
+    assert _search(conn, accounts=["default"]) == sorted([hall, hall_chat, default_bob])
+    assert _search(conn, accounts=["default", "work"]) == _search(conn)
+    spec = filters.resolve_filters(conn, two_accounts.CFG, ["account:work"], None, None)
+    assert _search(conn, spec) == _search(conn, accounts=["work"])
+
+
+def test_an_account_scope_narrows_a_chat_filter_and_says_when_nothing_is_left(
+    conn: sqlite3.Connection,
+) -> None:
+    two = two_accounts.load(conn)
+    both = Filters(chat_ids={two.hall.id, two.default_bob.id})
+    assert _search(conn, both, accounts=["work"]) == [(two.hall.id, ["default", "work"])]
+    result = search.search(
+        conn,
+        two_accounts.CFG,
+        "Brubank",
+        Filters(chat_ids={two.default_bob.id}),
+        mode="lexical",
+        accounts=["work"],
+    )
+    assert result.hits == []
+    assert result.warnings == ["none of the selected chats is reached by account work"]
+
+
+def test_an_unknown_account_scope_is_refused(conn: sqlite3.Connection) -> None:
+    two_accounts.load(conn)
+    with pytest.raises(filters.UnknownChat) as excinfo:
+        search.search(conn, two_accounts.CFG, "Brubank", accounts=["home"])
+    assert excinfo.value.candidates == ["account:default", "account:work"]
+    assert excinfo.value.hint is not None and "no account is named 'home'" in excinfo.value.hint
+
+
+def test_a_hit_in_a_synthetic_row_carries_its_peer_and_links_by_it(
+    conn: sqlite3.Connection,
+) -> None:
+    two = two_accounts.load(conn)
+    assert two.work_bob.id >= db.SYNTHETIC_BASE
+    (hit,) = search.search(
+        conn, two_accounts.CFG, "payroll", mode="lexical", rerank=False, accounts=["work"]
+    ).hits
+    assert hit.chat.id == two.work_bob.id and hit.peer_id == two_accounts.BOB
+    assert hit.url == f"tg://openmessage?user_id={two_accounts.BOB}&message_id=7"
+    assert hit.accounts == ["work"]
+    (channel_hit,) = search.search(
+        conn, two_accounts.CFG, "downtown", mode="lexical", rerank=False
+    ).hits
+    assert channel_hit.peer_id == two.hall.id == channel_hit.chat.id
+
+
 # --- CLI -------------------------------------------------------------------------------------
 
 
@@ -520,6 +595,7 @@ def test_cli_search_json_prints_the_result_and_nothing_else(seeded_home: Path) -
     assert set(hit) == {
         "score",
         "chat",
+        "peer_id",
         "kind",
         "date_start",
         "date_end",
@@ -529,6 +605,7 @@ def test_cli_search_json_prints_the_result_and_nothing_else(seeded_home: Path) -
         "snippet",
         "msg_ids",
         "text",
+        "accounts",
     }
     assert hit["url"] == f"https://t.me/arg_chat/{hit['anchor_msg_id']}"
     assert hit["chat"]["id"] == ARG and hit["chat"]["title"] == "Argentina chat"
@@ -602,3 +679,57 @@ def test_cli_search_on_a_fresh_home_warns(tmp_home: Path) -> None:
     config.save(CFG, Paths.from_env())
     unsynced = runner.invoke(cli.app, ["search", "DNI"])
     assert unsynced.stdout == "no hits\n" and "nothing is indexed yet" in unsynced.stderr
+
+
+@pytest.fixture
+def two_home(tmp_home: Path) -> two_accounts.TwoAccounts:
+    conn = db.connect(Paths.from_env())
+    db.migrate(conn)
+    loaded = two_accounts.load(conn)
+    conn.close()
+    config.save(two_accounts.CFG, Paths.from_env())
+    return loaded
+
+
+def test_cli_search_scopes_by_account_and_prints_where_hits_came_from(
+    two_home: two_accounts.TwoAccounts,
+) -> None:
+    two = two_home
+    scoped = runner.invoke(
+        cli.app, ["search", "Brubank", "--account", "work", "--mode", "lexical", "--json"]
+    )
+    assert scoped.exit_code == 0, scoped.output
+    hits = json.loads(scoped.stdout)["hits"]
+    assert {h["chat"]["id"] for h in hits} == {two.hall.id, two.hall_chat.id, two.work_bob.id}
+    (bob,) = [h for h in hits if h["chat"]["id"] == two.work_bob.id]
+    assert bob["peer_id"] == two_accounts.BOB and bob["accounts"] == ["work"]
+    text = runner.invoke(cli.app, ["search", "payroll", "-a", "work", "--mode", "lexical"])
+    assert text.exit_code == 0, text.output
+    assert text.stdout.splitlines()[0].endswith("  via work")
+    unknown = runner.invoke(cli.app, ["search", "Brubank", "--account", "home"])
+    assert unknown.exit_code == 1 and unknown.stdout == ""
+    assert "no account is named 'home'" in unknown.stderr
+
+
+def test_cli_readers_take_an_account_prefixed_peer_and_refuse_a_shared_bare_one(
+    two_home: two_accounts.TwoAccounts,
+) -> None:
+    two = two_home
+    bob = two_accounts.BOB
+    ambiguous = runner.invoke(cli.app, ["thread", str(bob), "7"])
+    assert ambiguous.exit_code == 1 and ambiguous.stdout == ""
+    assert f"'Bob' (default/{bob})" in ambiguous.stderr
+    assert f"'Bob' (work/{bob})" in ambiguous.stderr
+    work = runner.invoke(cli.app, ["thread", f"work/{bob}", "7", "--json"])
+    assert work.exit_code == 0, work.output
+    document = json.loads(work.stdout)
+    assert document["chat_id"] == two.work_bob.id
+    (message,) = document["messages"]
+    assert message["peer_id"] == bob and message["accounts"] == ["work"]
+    around = runner.invoke(cli.app, ["context", f"default/{bob}", "7"])
+    assert around.exit_code == 0, around.output
+    assert around.stdout.splitlines()[0].startswith(f"1. {bob}/7 ")
+    assert "via" not in around.stdout
+    shared = runner.invoke(cli.app, ["context", "--", str(two.hall_chat.id), "3"])
+    assert shared.exit_code == 0, shared.output
+    assert shared.stdout.splitlines()[0].endswith("  via default, work")

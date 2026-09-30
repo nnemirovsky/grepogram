@@ -444,6 +444,7 @@ def test_thread_json_prints_the_mcp_document_and_nothing_else(tmp_home: Path) ->
     assert [m["msg_id"] for m in document["messages"]] == [1, 2, 3, 4, 5, 6, 7, 10]
     assert set(document["messages"][0]) == {
         "chat_id",
+        "peer_id",
         "msg_id",
         "date",
         "from_name",
@@ -451,6 +452,7 @@ def test_thread_json_prints_the_mcp_document_and_nothing_else(tmp_home: Path) ->
         "url",
         "fallback_url",
         "reply_to_msg_id",
+        "accounts",
     }
 
 

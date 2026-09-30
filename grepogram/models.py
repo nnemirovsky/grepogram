@@ -330,8 +330,16 @@ class Link:
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class Hit:
+    """One search result: a unit of ``chat`` and the message its link opens.
+
+    ``peer_id`` is the chat's Telegram id (``chat.peer_id``), which differs from ``chat.id`` only
+    for a private chat stored under a synthetic id; ``chat.id`` is what the readers take back.
+    ``accounts`` are the signed-in accounts that reach the chat (:func:`grepogram.db.chat_reach`)
+    — where the hit came from, empty for a Telegram Desktop import."""
+
     score: float
     chat: ChatRow
+    peer_id: int
     kind: UnitKind
     date_start: int
     date_end: int
@@ -341,6 +349,7 @@ class Hit:
     snippet: str
     msg_ids: list[int]
     text: str | None = None
+    accounts: list[str] = field(default_factory=list)
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -348,9 +357,14 @@ class MessageView:
     """One message as a reader sees it. ``chat_id`` is the chat the message is *in*, which is
     not always the chat that was asked about: a channel post's thread carries the comments of
     the linked discussion group, and their ``msg_id`` lives in that group's id space, where post
-    ids and comment ids both number from 1 and collide by construction."""
+    ids and comment ids both number from 1 and collide by construction.
+
+    ``chat_id`` is the stored row's id, the one to pass back to a reader; ``peer_id`` is that
+    chat's Telegram id, and ``accounts`` the accounts that reach it, as on a
+    :class:`Hit`."""
 
     chat_id: int
+    peer_id: int
     msg_id: int
     date: int
     from_name: str | None
@@ -358,6 +372,7 @@ class MessageView:
     url: str
     fallback_url: str | None = None
     reply_to_msg_id: int | None = None
+    accounts: list[str] = field(default_factory=list)
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)

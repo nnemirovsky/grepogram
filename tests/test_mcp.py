@@ -46,7 +46,7 @@ from grepogram.sources import AmbiguousTarget
 from grepogram.sync import SyncInProgress, SyncLock
 from grepogram.tg import AuthRequired, SessionError, SessionMissing
 from tests.fakes import FakeClient, FakeWorld, make_channel, make_dialog, make_folder, make_user
-from tests.fixtures import chat_ru, tl
+from tests.fixtures import chat_ru, tl, two_accounts
 
 ARG = chat_ru.ARG_ID
 GEO = chat_ru.GEO_ID
@@ -928,6 +928,7 @@ def test_thread_and_context_read_messages(state: tools.AppState) -> None:
     assert result["messages"][0]["url"] == "https://t.me/arg_chat/1"
     assert set(result["messages"][0]) == {
         "chat_id",
+        "peer_id",
         "msg_id",
         "date",
         "from_name",
@@ -935,6 +936,7 @@ def test_thread_and_context_read_messages(state: tools.AppState) -> None:
         "url",
         "fallback_url",
         "reply_to_msg_id",
+        "accounts",
     }
     around = tools.context(ARG, 5, before=1, after=1)
     assert [m["msg_id"] for m in around["messages"]] == [4, 5, 6]
@@ -1579,3 +1581,62 @@ def test_server_speaks_json_rpc_over_real_stdio(tmp_home: Path) -> None:
     listed = by_id[2]["result"]["tools"]
     assert sorted(tool["name"] for tool in listed) == sorted(tool.__name__ for tool in tools.TOOLS)
     assert "grepogram-mcp serving" in completed.stderr
+
+
+# --- account scopes and provenance -----------------------------------------------------------
+
+
+@pytest.fixture
+def two(bind: Callable[..., tools.AppState], conn: sqlite3.Connection) -> two_accounts.TwoAccounts:
+    """Two accounts' chats, synced just now (no auto-sync on search)."""
+    loaded = two_accounts.load(conn, synced_at=int(time.time()))
+    bind(two_accounts.CFG)
+    return loaded
+
+
+async def test_search_scopes_by_account_and_names_the_accounts_of_every_hit(
+    two: two_accounts.TwoAccounts, capsys: pytest.CaptureFixture[str]
+) -> None:
+    everything = await tools.search("Brubank", mode="lexical")
+    reach = {h["chat"]["id"]: (h["peer_id"], h["accounts"]) for h in everything["hits"]}
+    assert reach == {
+        two.hall.id: (two.hall.id, ["default", "work"]),
+        two.hall_chat.id: (two.hall_chat.id, ["default", "work"]),
+        two.default_bob.id: (two_accounts.BOB, ["default"]),
+        two.work_bob.id: (two_accounts.BOB, ["work"]),
+    }
+    work = await tools.search("Brubank", mode="lexical", accounts=["work"])
+    assert {h["chat"]["id"] for h in work["hits"]} == {
+        two.hall.id,
+        two.hall_chat.id,
+        two.work_bob.id,
+    }
+    by_spec = await tools.search("Brubank", chats=["account:default"], mode="lexical")
+    assert {h["chat"]["id"] for h in by_spec["hits"]} == {
+        two.hall.id,
+        two.hall_chat.id,
+        two.default_bob.id,
+    }
+    by_peer = await tools.search("Brubank", chats=[f"work/{two_accounts.BOB}"], mode="lexical")
+    assert {h["chat"]["id"] for h in by_peer["hits"]} == {two.work_bob.id}
+    refused = await tools.search("Brubank", accounts=["home"])
+    assert refused["error"].startswith("no indexed chat matches 'account:home'")
+    assert refused["hint"] == "no account is named 'home'; known accounts: default, work"
+    assert refused["candidates"] == ["account:default", "account:work"]
+    assert capsys.readouterr().out == ""
+
+
+def test_readers_follow_a_synthetic_row_and_report_its_peer(
+    two: two_accounts.TwoAccounts, capsys: pytest.CaptureFixture[str]
+) -> None:
+    result = tools.thread(two.work_bob.id, 7)
+    assert result["chat_id"] == two.work_bob.id
+    (message,) = result["messages"]
+    assert message["chat_id"] == two.work_bob.id and message["peer_id"] == two_accounts.BOB
+    assert message["accounts"] == ["work"] and message["text"] == "Brubank payroll moves to Friday"
+    around = tools.context(two_accounts.BOB, 7)
+    assert [(m["chat_id"], m["msg_id"], m["accounts"]) for m in around["messages"]] == [
+        (two_accounts.BOB, 7, ["default"]),
+        (two_accounts.BOB, 8, ["default"]),
+    ]
+    assert capsys.readouterr().out == ""

@@ -959,6 +959,50 @@ def chat_accounts(conn: sqlite3.Connection, chat_id: int) -> list[str]:
     return [str(row["account"]) for row in rows]
 
 
+def chat_reach(conn: sqlite3.Connection, chat_id: int) -> list[str]:
+    """The accounts what is stored of chat ``chat_id`` came through, :data:`DEFAULT_ACCOUNT`
+    first, then by name — the provenance a hit and a message view report.
+
+    Those ``chat_access`` records as reaching the chat and, for a discussion group, those
+    reaching the channel it holds the comments of: a sync reaches such a group through its
+    channel's link rather than a resolve of its own, so it may have no access row at all. Empty
+    for a chat no account reaches — a Telegram Desktop import, whose history came from a file.
+    """
+    rows = conn.execute(
+        "SELECT account FROM chat_access WHERE chat_id = ? "
+        "OR chat_id = (SELECT discussion_of FROM chats WHERE id = ?) "
+        "GROUP BY account ORDER BY account != ?, account",
+        (chat_id, chat_id, DEFAULT_ACCOUNT),
+    )
+    return [str(row["account"]) for row in rows]
+
+
+def chats_reached_by(conn: sqlite3.Connection, accounts: Iterable[str]) -> set[int]:
+    """Ids of the chats any of ``accounts`` reaches, by :func:`chat_reach`'s rule: every chat
+    ``chat_access`` records for one of them and the discussion groups of those chats."""
+    names = sorted(set(accounts))
+    if not names:
+        return set()
+    marks = ", ".join("?" * len(names))
+    rows = conn.execute(
+        f"WITH reached AS (SELECT chat_id FROM chat_access WHERE account IN ({marks})) "
+        "SELECT chat_id AS id FROM reached "
+        "UNION SELECT id FROM chats WHERE discussion_of IN (SELECT chat_id FROM reached)",
+        names,
+    )
+    return {int(row["id"]) for row in rows}
+
+
+def known_accounts(conn: sqlite3.Connection) -> set[str]:
+    """Every account name the index mentions: recorded in ``accounts``, reaching a chat in
+    ``chat_access``, or scoping a private chat's row."""
+    rows = conn.execute(
+        "SELECT name FROM accounts UNION SELECT account FROM chat_access "
+        "UNION SELECT scope FROM chats WHERE scope != ''"
+    )
+    return {str(row[0]) for row in rows}
+
+
 def access_hash(conn: sqlite3.Connection, chat_id: int, account: str) -> int | None:
     """The access hash ``account`` addresses chat ``chat_id`` by, ``None`` when none is stored."""
     row = conn.execute(

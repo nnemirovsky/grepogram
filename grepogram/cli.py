@@ -14,6 +14,8 @@ add`` and ``leave`` take ``--account`` (``default`` when omitted, the account a 
 prune`` use every signed-in account at once. ``accounts rm`` and ``leave`` change things a
 config edit cannot undo, so they ask on the controlling terminal (:func:`_terminal`) and refuse
 without one; no option answers for the human.
+One search spans every account's chats: ``search --account`` scopes it to what an account reaches
+(a scope, not isolation) and every hit and message names the accounts its chat came through.
 
 ``thread`` and ``context`` are the readers a hit leads to, the CLI half of the MCP tools of the
 same names: they take the chat specs ``search -c`` takes (through
@@ -77,8 +79,8 @@ from grepogram.search import UnknownMessage
 
 HELP = "Local hybrid search over opt-in Telegram chats, exposed to Claude Code through MCP."
 _CHAT_HELP = (
-    "The chat the message is in, naming exactly one indexed chat: id, @username, t.me link, "
-    "folder:<name>, import:<slug> or a title (put -- before a negative id)."
+    "The chat the message is in, naming exactly one indexed chat: id, <account>/<id>, "
+    "@username, t.me link, folder:<name>, import:<slug> or a title (put -- before a negative id)."
 )
 
 app = typer.Typer(name="grepogram", help=HELP, no_args_is_help=True, add_completion=False)
@@ -762,8 +764,17 @@ def search_cmd(
         typer.Option(
             "--chat",
             "-c",
-            help="Search only these chats: id, @username, folder:<name>, import:<slug> or a "
-            "title (repeatable).",
+            help="Search only these chats: id, <account>/<id>, @username, folder:<name>, "
+            "import:<slug>, account:<name> or a title (repeatable).",
+        ),
+    ] = None,
+    account: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--account",
+            "-a",
+            help="Search only the chats this account reaches (repeatable); a scope, not "
+            "isolation: a channel two accounts reach is in both.",
         ),
     ] = None,
     since: Annotated[
@@ -802,12 +813,21 @@ def search_cmd(
         bool, typer.Option("--json", help="Print the result as JSON and nothing else.")
     ] = False,
 ) -> None:
-    """Search the indexed chats (offline); every hit carries a link that opens the message."""
+    """Search the indexed chats (offline); every hit carries a link that opens the message and
+    names the accounts that reach its chat."""
     _, cfg, conn = _load()
     try:
         selected = filters.resolve_filters(conn, cfg, chat, since, until)
         result = search.search(
-            conn, cfg, query, selected, k, mode=mode.value, full=full, rerank=rerank
+            conn,
+            cfg,
+            query,
+            selected,
+            k,
+            mode=mode.value,
+            full=full,
+            rerank=rerank,
+            accounts=account,
         )
     except FilterError as exc:
         fail(str(exc))
@@ -834,6 +854,7 @@ def _print_hits(result: SearchResult, cfg: Config) -> None:
         title = hit.chat.title or f"chat {hit.chat.id}"
         typer.echo(
             f"{n}. {hit.score:.4f}  {hit.kind}  {title}  {_span(hit.date_start, hit.date_end)}"
+            f"{_via(hit.accounts)}"
         )
         typer.echo(f"   {hit.url}")
         if hit.fallback_url:
@@ -841,6 +862,14 @@ def _print_hits(result: SearchResult, cfg: Config) -> None:
         body = hit.snippet if hit.text is None else hit.text
         for line in body.splitlines():
             typer.echo(f"   {line}")
+
+
+def _via(accounts: Sequence[str]) -> str:
+    """``  via a, b`` naming the accounts a result came through, when any of them is not the
+    default one; a single-account install prints what it always printed."""
+    if all(account == DEFAULT_ACCOUNT for account in accounts):
+        return ""
+    return f"  via {', '.join(accounts)}"
 
 
 def _span(start: int, end: int) -> str:
@@ -921,7 +950,9 @@ def _print_messages(
         if n > 1:
             typer.echo("")
         who = view.from_name or "-"
-        typer.echo(f"{n}. {view.chat_id}/{view.msg_id}  {_moment(view.date)}  {who}")
+        typer.echo(
+            f"{n}. {view.chat_id}/{view.msg_id}  {_moment(view.date)}  {who}{_via(view.accounts)}"
+        )
         typer.echo(f"   {view.url}")
         if view.fallback_url:
             typer.echo(f"   fallback: {view.fallback_url}")

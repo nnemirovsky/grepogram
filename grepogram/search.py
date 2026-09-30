@@ -44,6 +44,7 @@ chat) and :func:`context` the messages around one in its topic, both as
 :class:`~grepogram.models.MessageView` lists with deep links.
 """
 
+import dataclasses
 import logging
 import math
 import sqlite3
@@ -55,6 +56,7 @@ from typing import get_args
 from grepogram import db, embed, index, links, units
 from grepogram import rerank as reranking
 from grepogram.embed import Embedder, ModelUnavailable
+from grepogram.filters import account_chats
 from grepogram.index import EmbeddingSpaceMismatch
 from grepogram.models import (
     ChatRow,
@@ -395,7 +397,9 @@ def build_hit(
 ) -> Hit:
     """A :class:`~grepogram.models.Hit` for ``unit`` anchored at ``anchor_msg_id`` (the unit's
     first message when ``None`` or not part of it), linked through
-    :func:`grepogram.links.message_url`; ``full`` copies the unit text into ``text``.
+    :func:`grepogram.links.message_url`; ``full`` copies the unit text into ``text``. ``peer_id``
+    and ``accounts`` say which Telegram chat it is and through which accounts it was indexed
+    (:func:`grepogram.db.chat_reach`).
 
     The snippet is built from the unit's stored messages around the anchor, except for a
     channel's post thread, whose comments are not among its messages: there it is cut from the
@@ -417,6 +421,7 @@ def build_hit(
     return Hit(
         score=score,
         chat=chat,
+        peer_id=chat.peer_id,
         kind=unit.kind,
         date_start=unit.date_start,
         date_end=unit.date_end,
@@ -426,6 +431,7 @@ def build_hit(
         snippet=excerpt,
         msg_ids=list(unit.msg_ids),
         text=unit.text if full else None,
+        accounts=db.chat_reach(conn, chat.id),
     )
 
 
@@ -465,6 +471,7 @@ def search(
     now: int | None = None,
     *,
     rerank: bool = True,
+    accounts: Sequence[str] | None = None,
     embedder: Embedder | None = None,
     reranker: Reranker | None = None,
     load_embedder: EmbedderLoader | None = None,
@@ -491,6 +498,14 @@ def search(
     :data:`RerankerLoader`; the package loaders by default) would load. An index with no chats
     yields no hits and a warning — that no source is configured, or that the configured ones are
     not synced yet; ``index_age_min`` is filled in either way.
+
+    ``accounts`` scopes the search to the chats those accounts reach
+    (:func:`grepogram.filters.account_chats`, which raises
+    :class:`~grepogram.filters.UnknownChat` for an account that reaches nothing), narrowing
+    whatever ``filters.chat_ids`` already selects. It is a **scope, not isolation**: a channel
+    two accounts reach is one row and stays in either account's scope, and every account belongs
+    to the same local user — nothing is hidden from anyone. Every hit names the accounts that
+    reach its chat either way (``Hit.accounts``).
     """
     if mode not in MODES:
         raise ValueError(f"unknown search mode {mode!r}; expected one of {', '.join(MODES)}")
@@ -503,6 +518,8 @@ def search(
     if not db.list_chats(conn):
         warnings.append(NOTHING_INDEXED if cfg.sources else NO_SOURCES)
         return SearchResult(hits=[], warnings=warnings, index_age_min=age)
+    if accounts:
+        filters = _in_accounts(conn, cfg, filters, accounts, warnings)
     if db.unit_recipe(conn) != units.RECIPE_VERSION:
         warnings.append(RECUT_PENDING)
     limit = max(k, cfg.search.rerank_top)
@@ -523,6 +540,26 @@ def search(
         len(hits),
     )
     return SearchResult(hits=hits, warnings=warnings, index_age_min=age)
+
+
+def _in_accounts(
+    conn: sqlite3.Connection,
+    cfg: Config,
+    filters: Filters,
+    accounts: Sequence[str],
+    warnings: list[str],
+) -> Filters:
+    """``filters`` narrowed to the chats ``accounts`` reach; a warning when the chats the caller
+    selected and the account scope have nothing in common, which is an empty answer by design
+    rather than a failure to find anything."""
+    reached = account_chats(conn, cfg, accounts)
+    if filters.chat_ids is None:
+        return dataclasses.replace(filters, chat_ids=reached)
+    narrowed = filters.chat_ids & reached
+    if filters.chat_ids and not narrowed:
+        names = ", ".join(dict.fromkeys(a.strip().casefold() for a in accounts))
+        warnings.append(f"none of the selected chats is reached by account {names}")
+    return dataclasses.replace(filters, chat_ids=narrowed)
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -721,10 +758,11 @@ def _reaction_share(reactions: int) -> float:
 # --- readers ---------------------------------------------------------------------------------
 
 
-def message_view(chat: ChatRow, msg: MessageRow) -> MessageView:
+def message_view(chat: ChatRow, msg: MessageRow, accounts: Sequence[str] = ()) -> MessageView:
     """``msg`` as the caller sees it: linked through :func:`grepogram.links.message_url`, with a
     ``[photo]``-style placeholder as ``text`` when it has media and no caption and ``chat.id``
-    as ``chat_id`` — the chat the message is really in, which :func:`thread` mixes.
+    as ``chat_id`` — the chat the message is really in, which :func:`thread` mixes — with its
+    Telegram ``peer_id`` and the ``accounts`` that reach it (:func:`grepogram.db.chat_reach`).
 
     The text is rendered by :func:`grepogram.units.message_body`, the same function that writes
     a unit's line, so what an extractor read off the media is here too. Anything else would hide
@@ -734,6 +772,7 @@ def message_view(chat: ChatRow, msg: MessageRow) -> MessageView:
     link = links.message_url(chat, msg.msg_id, msg.topic_id)
     return MessageView(
         chat_id=chat.id,
+        peer_id=chat.peer_id,
         msg_id=msg.msg_id,
         date=msg.date,
         from_name=msg.from_name,
@@ -741,6 +780,7 @@ def message_view(chat: ChatRow, msg: MessageRow) -> MessageView:
         url=link.url,
         fallback_url=link.fallback_url,
         reply_to_msg_id=msg.reply_to_msg_id,
+        accounts=list(accounts),
     )
 
 
@@ -758,13 +798,17 @@ def thread(conn: sqlite3.Connection, chat_id: int, msg_id: int) -> list[MessageV
     :class:`UnknownMessage` when the message is not indexed.
     """
     chat = _locate(conn, chat_id, msg_id)
-    views = [message_view(chat, msg) for msg in db.get_thread_messages(conn, chat_id, msg_id)]
+    reach = db.chat_reach(conn, chat.id)
+    views = [
+        message_view(chat, msg, reach) for msg in db.get_thread_messages(conn, chat_id, msg_id)
+    ]
     if chat.is_broadcast:
         discussion = db.get_discussion_chat(conn, chat.id)
         if discussion is not None:
             by_post = db.get_comment_messages(conn, discussion.id, chat.id, [msg_id])
             comments = chronological(by_post.get(msg_id, []))
-            views += [message_view(discussion, msg) for msg in comments]
+            group_reach = db.chat_reach(conn, discussion.id)
+            views += [message_view(discussion, msg, group_reach) for msg in comments]
     return views
 
 
@@ -777,7 +821,8 @@ def context(
     negative count."""
     chat = _locate(conn, chat_id, msg_id)
     messages = db.get_context_messages(conn, chat_id, msg_id, before, after)
-    return [message_view(chat, msg) for msg in messages]
+    reach = db.chat_reach(conn, chat.id)
+    return [message_view(chat, msg, reach) for msg in messages]
 
 
 def _locate(conn: sqlite3.Connection, chat_id: int, msg_id: int) -> ChatRow:

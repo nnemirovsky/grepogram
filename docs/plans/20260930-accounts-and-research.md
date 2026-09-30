@@ -590,16 +590,24 @@ voided_at)`, `exclusions(identity PRIMARY KEY, reason, created_at)`,
 
 **Files:**
 - Modify: `grepogram/filters.py`, `grepogram/search.py`, `grepogram/models.py`, `grepogram/mcp.py`, `grepogram/cli.py`
+- Modify: `grepogram/db.py` (`chat_reach`, `chats_reached_by`, `known_accounts`), `README.md`
 - Modify: `tests/test_filters.py`, `tests/test_readers.py`, `tests/test_search_lexical.py`, `tests/test_mcp.py`
+- Modify: `tests/test_cli.py`, `tests/test_search_hybrid.py` (new JSON keys, `Hit.peer_id`)
+- Create: `tests/fixtures/two_accounts.py` (two accounts' chats in one index)
 
-- [ ] chat spec `account:<name>` → chats whose `chat_access` includes it; `search(…, accounts=)`
+- [x] chat spec `account:<name>` → chats whose `chat_access` includes it; `search(…, accounts=)`
   in the library, `--account` in the CLI, `accounts` in the MCP tool
-- [ ] `resolve_chat` accepts `<account>/<peer>` and answers an ambiguous bare peer id with
+  ➕ an account reaches the discussion groups of the chats it reaches too (such a group is
+  reached through its channel's link and may have no access row); an unknown account, or one
+  reaching nothing, is `UnknownChat` with the `account:` specs as candidates
+- [x] `resolve_chat` accepts `<account>/<peer>` and answers an ambiguous bare peer id with
   candidates
-- [ ] `Hit` and `MessageView` gain `peer_id` and `accounts`; JSON outputs carry them
-- [ ] tests: account-scoped search excludes the other account's DMs but keeps shared channels
+  ➕ the `<account>/` prefix works on every spec (not only `chat:` / `folder:`) when it names a
+  known account; ambiguous private chats are labelled `'Title' (<account>/<peer>)`
+- [x] `Hit` and `MessageView` gain `peer_id` and `accounts`; JSON outputs carry them
+- [x] tests: account-scoped search excludes the other account's DMs but keeps shared channels
   both reach; thread/context on a synthetic-id chat; ambiguity error
-- [ ] run checks — must pass before task 11
+- [x] run checks — must pass before task 11
 
 ### Task 11: Schema step 8 and link/forward capture in `map_message`
 
