@@ -2380,10 +2380,16 @@ def _action_line(
             "it is and nothing is added to the config"
         )
     comments = _discussion(c, True)
+    pinned = (
+        ""
+        if c.peer_id is None
+        else f"; the source names the chat by its id {c.peer_id}, so it stays this chat whatever "
+        "its username does later"
+    )
     return (
         f"add it as an ongoing source of account {account} (since {since}"
         f"{', ' + comments if comments else ''}): regular sync and search will include it from "
-        "now on, and stopping this research session does not remove it"
+        f"now on, and stopping this research session does not remove it{pinned}"
     )
 
 
@@ -3143,8 +3149,14 @@ def _planned_source(
     Only with a live ``add_source`` grant, once the account can read the chat — a member, or a
     public chat anyone reads — and never over a chat the index holds as a Telegram Desktop
     import (:func:`grepogram.sources.imported_tag`), whose history a live source would take over.
-    A member's source names the chat by its peer id, so it is the chat that was approved
-    whatever its username does later; comments come along for a channel and nothing else.
+    The source names the chat by its peer id — a member's and a public chat read without
+    joining alike — so it is the chat that was approved on every later sync whatever its
+    username does: a ``chat = "@name"`` source follows the handle, and whoever registers a
+    freed name would be fetched by every ordinary sync after it. A public chat outside the
+    account's dialogs is addressed through the access hash the probe stored
+    (:func:`_address_public` seeds it for this run; the sync stores it in ``chat_access`` for
+    every later one). A candidate no probe tied to a peer id is ``failed``. Comments come along
+    for a channel and nothing else.
     """
     if candidate.source_id is not None or not authorized(rdb, candidate, "add_source"):
         return None
@@ -3152,56 +3164,60 @@ def _planned_source(
         return None
     if not (_is_member(candidate) or candidate.username):
         return None
-    if candidate.peer_id is None and not candidate.username:
-        note = "nothing names the chat well enough to add it as a source"
+    if candidate.peer_id is None:
+        note = (
+            "no probe tied it to a chat id, and a source by its username would follow the name "
+            "to whichever chat holds it later; approve it again once it is probed"
+        )
         _refuse_candidate(rdb, session, candidate, "failed", note, report)
         return None
-    if candidate.peer_id is not None:
-        # an unknown type is looked up in both scopes rather than guessed
-        kinds: tuple[ChatType, ...] = (
-            (candidate.type,) if candidate.type is not None else ("channel", "group")
+    # an unknown type is looked up in both scopes rather than guessed
+    kinds: tuple[ChatType, ...] = (
+        (candidate.type,) if candidate.type is not None else ("channel", "group")
+    )
+    for kind in kinds:
+        held = sources.imported_tag(
+            conn, candidate.peer_id, scope=chat_scope(kind, session.account)
         )
-        for kind in kinds:
-            held = sources.imported_tag(
-                conn, candidate.peer_id, scope=chat_scope(kind, session.account)
+        if held is not None:
+            note = (
+                f"the index holds this chat as {held}, a Telegram Desktop import; a live "
+                f"source would take it over, so none was added — `grepogram sources rm "
+                f"{held}` first"
             )
-            if held is not None:
-                note = (
-                    f"the index holds this chat as {held}, a Telegram Desktop import; a live "
-                    f"source would take it over, so none was added — `grepogram sources rm "
-                    f"{held}` first"
-                )
-                _refuse_candidate(rdb, session, candidate, "failed", note, report)
-                return None
-    # a member reaches the chat through its dialogs, so the source names the very peer that was
-    # probed and approved; a public chat read without joining is named by its username, which
-    # _confirm_public checked still names that peer before this run adds and fetches it
-    pinned = _is_member(candidate) and candidate.peer_id is not None
+            _refuse_candidate(rdb, session, candidate, "failed", note, report)
+            return None
+    # the very peer that was probed and approved, never a handle that may move to another chat
     return Source(
-        chat=candidate.peer_id if pinned or not candidate.username else f"@{candidate.username}",
+        chat=candidate.peer_id,
         since=horizon(session),
         comments=candidate.type == "channel",
         account=session.account,
     )
 
 
-async def _confirm_public(
+async def _address_public(
     client: Any,
     rdb: sqlite3.Connection,
     session: ResearchSession,
     work: Sequence[Candidate],
     report: RunReport,
 ) -> bool:
-    """Check that the username of every public chat this run reads without joining still names
-    the chat that was probed and approved; ``True`` when a flood wait stopped the run.
+    """Make every public chat this run reads without joining addressable by its id; ``True``
+    when a flood wait stopped the run.
 
-    Such a chat's source is its ``@username`` (a member's is its peer id), so a username that
-    moved to another chat since the probe would add and fetch a chat no one approved: that
-    candidate is ``unavailable`` instead, and its grants are voided.
+    Such a chat's source names it by its peer id (:func:`_planned_source`) and the account has
+    no dialog for it, so the sync reaches it only through an access hash its client already
+    holds. The one the probe stored for this account is handed to the client's session
+    (:func:`grepogram.sources.seed_peers`) with no request at all, and the sync then stores it
+    in ``chat_access``, where every later sync seeds it from. Only a candidate probed without
+    one has its username resolved, and that answer counts only while the name still names the
+    probed peer: one that moved since makes the candidate ``unavailable`` and voids its grants
+    — the chat approved is not the one the name leads to now.
     """
     for candidate in work:
         current = _fresh(rdb, candidate)
-        if current.peer_id is None or not current.username or _is_member(current):
+        if current.peer_id is None or _is_member(current):
             continue
         if current.status == "pending_admission" or current.status not in _ACTIONABLE:
             continue
@@ -3209,8 +3225,13 @@ async def _confirm_public(
             continue
         if current.source_id is not None and not authorized(rdb, current, "fetch"):
             continue
+        if current.access_hash is not None:
+            sources.seed_peers(client, [(current.peer_id, current.access_hash)])
+            continue
+        if not current.username:
+            continue
         try:
-            await _resolve_approved(client, current)
+            entity = await _resolve_approved(client, current)
         except errors.FloodError as exc:
             _flood_note(report, exc, "checking the chats to read")
             return True
@@ -3219,9 +3240,14 @@ async def _confirm_public(
         except _OtherChat as exc:
             note = f"{exc}; nothing was added or fetched"
             _refuse_candidate(rdb, session, current, "unavailable", note, report)
+            continue
         except (ValueError, errors.RPCError) as exc:
             note = f"its username no longer resolves: {exc}"
             _refuse_candidate(rdb, session, current, "unavailable", note, report)
+            continue
+        found = getattr(entity, "access_hash", None)
+        if found is not None:
+            research_db.update_candidate(rdb, current.id, access_hash=int(found))
     return False
 
 
@@ -3473,7 +3499,7 @@ async def run(
     if not flooded:
         flooded = await _join_all(client, rdb, conn, session, work, report, budget, stamp)
     if not flooded and not budget.expired:
-        flooded = await _confirm_public(client, rdb, session, work, report)
+        flooded = await _address_public(client, rdb, session, work, report)
     registered: list[ChatKey] = []
     if not flooded and not budget.expired:
         try:

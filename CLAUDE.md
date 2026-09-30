@@ -697,8 +697,14 @@ never change the git identity.
   peer (`_OtherChat`), `_mark_joined` never overwrites `peer_id` from a join answer and fails the
   candidate when Telegram answered with another chat, an invite no probe tied to a peer takes
   only the one chat of the answer that is the probed type (and title, between two alike) and
-  fails otherwise (`_joined_entity` → `None`), never the answer's first chat blindly, a member's source names the chat by id,
-  and a public chat read without joining is re-resolved before it is added (`_confirm_public`).
+  fails otherwise (`_joined_entity` → `None`), never the answer's first chat blindly. **Every
+  source a run adds names the chat by its peer id** (`_planned_source`), a public chat read
+  without joining included, so no later ordinary sync follows a freed `@name` to whoever
+  registers it (a user's own `chat = "@name"` source keeps following its handle: the user named
+  the handle, research approved a chat); such a chat has no dialog, so `_address_public` seeds
+  the probe's access hash into the run's client (`sources.seed_peers`) — or, probed without
+  one, resolves the username, which must still name the probed peer — and the sync stores it in
+  `chat_access`, which every later sync seeds from. A candidate with no peer id gets no source.
   `research.grant` validates and writes in one `research.db` transaction; each session action is
   its own grant row, and a paid search pays only after `consume_grant` (one conditional
   `UPDATE`) succeeded, so one approval never pays twice. `global_search` sends the session's

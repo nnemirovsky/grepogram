@@ -14,7 +14,7 @@ import pytest
 from telethon import errors, utils
 from telethon.tl import functions, types
 
-from grepogram import config, db, leads, research, research_db, sync, tg
+from grepogram import config, db, leads, research, research_db, sources, sync, tg
 from grepogram.filters import UnknownChat
 from grepogram.models import (
     AccountCfg,
@@ -1921,7 +1921,7 @@ async def test_sources_a_run_added_survive_stop_and_a_stopped_session_refuses_to
 
     research.stop(rdb, CFG, session.id)
 
-    assert [s.id for s in config.load(paths).sources] == ["chat:@tb_flats"]
+    assert [s.id for s in config.load(paths).sources] == [f"chat:{_marked(FLATS)}"]
     assert _stored(conn, _marked(FLATS)) == [1, 2, 3]
     with pytest.raises(research.SessionStopped):
         await _run(rdb, conn, paths, client, session)
@@ -2479,12 +2479,75 @@ async def test_a_username_that_now_names_another_chat_is_never_joined(
     assert _read(client) == set()
 
 
-async def test_a_public_chat_read_without_joining_is_checked_before_it_is_added(
+async def test_a_public_chat_read_without_joining_is_added_by_its_id_after_its_name_moved(
     rdb: sqlite3.Connection, conn: sqlite3.Connection, paths: Paths
 ) -> None:
+    """The approval named the chat the probe saw: it is read through the access hash the probe
+    stored, whatever its username does meanwhile, and the chat that took the name is not."""
     client = _run_client(_impostor_world())
     session, found = await _discovered(rdb, conn, client, "@tb_flats")
     flats = found["@tb_flats"]
+    _approve(rdb, conn, session, _item(flats, "fetch", "add_source"))
+    _hand_over_username(client)
+
+    report = await _run(rdb, conn, paths, client, session)
+
+    assert report.fetched == [flats.id] and report.joined == []
+    (source,) = config.load(paths).sources
+    assert source.chat == _marked(FLATS) and _marked(FLATS) not in client.members
+    assert _read(client) == {_marked(FLATS)} and _stored(conn, _marked(IMPOSTOR)) == []
+
+
+def _post(client: FakeClient, entity: Any, msg_id: int, text: str) -> None:
+    client.messages.setdefault(_marked(entity), []).append(
+        tl.message(_marked(entity), msg_id, text, date=tl.at(msg_id))
+    )
+
+
+async def test_a_research_source_read_without_joining_stays_the_approved_chat_for_good(
+    rdb: sqlite3.Connection, conn: sqlite3.Connection, paths: Paths
+) -> None:
+    """An ordinary sync long after the run — a fresh client, no research code involved — still
+    reads the approved chat by its id and never the chat that registered its freed username;
+    the pinned source lists and removes like any other."""
+    client = _run_client(_impostor_world())
+    session, found = await _discovered(rdb, conn, client, "@tb_flats")
+    flats = found["@tb_flats"]
+    _approve(rdb, conn, session, _item(flats, "fetch", "add_source"))
+    first = await _run(rdb, conn, paths, client, session)
+    assert first.fetched == [flats.id] and _stored(conn, _marked(FLATS)) == [1, 2, 3]
+
+    _hand_over_username(client)
+    _post(client, FLATS, 4, "a new flat, same chat")
+    _post(client, IMPOSTOR, 2, "the name's new owner")
+    client.forget_entities()
+    client.calls.clear()
+
+    report = await sync.sync_all(
+        {"default": client}, conn, functools.partial(config.load, paths), paths, sync.SyncBudget()
+    )
+
+    assert report.warnings == []
+    assert _stored(conn, _marked(FLATS)) == [1, 2, 3, 4]
+    assert _read(client) == {_marked(FLATS)}, "only the approved chat is read"
+    assert _stored(conn, _marked(IMPOSTOR)) == [] and db.get_chat(conn, _marked(IMPOSTOR)) is None
+    assert not [c for c in client.calls if c[0] == "get_entity" and c[1].get("key") == "@tb_flats"]
+    cfg = config.load(paths)
+    (status,) = sources.sources_status(cfg, conn)
+    assert status.source_id == f"chat:{_marked(FLATS)}"
+    assert [chat.id for chat in status.chats] == [_marked(FLATS)]
+    removed = sources.remove_source(cfg, conn, sources.parse_target(status.source_id))
+    assert removed.config.sources == [] and removed.chat_ids == [_marked(FLATS)]
+
+
+async def test_a_public_chat_probed_without_an_access_hash_is_checked_before_it_is_added(
+    rdb: sqlite3.Connection, conn: sqlite3.Connection, paths: Paths
+) -> None:
+    """With no access hash to address the probed peer by, the username is resolved — and a name
+    that now leads to another chat adds and fetches nothing."""
+    client = _run_client(_impostor_world())
+    session, found = await _discovered(rdb, conn, client, "@tb_flats")
+    flats = research_db.update_candidate(rdb, found["@tb_flats"].id, access_hash=None)
     _approve(rdb, conn, session, _item(flats, "fetch", "add_source"))
     _hand_over_username(client)
 
@@ -2495,19 +2558,20 @@ async def test_a_public_chat_read_without_joining_is_checked_before_it_is_added(
     assert config.load(paths).sources == [] and _read(client) == set()
 
 
-async def test_an_unmoved_public_chat_read_without_joining_is_added_by_its_username(
+async def test_a_public_chat_probed_without_an_access_hash_takes_the_one_its_name_gives(
     rdb: sqlite3.Connection, conn: sqlite3.Connection, paths: Paths
 ) -> None:
     client = _run_client(_impostor_world())
     session, found = await _discovered(rdb, conn, client, "@tb_flats")
-    flats = found["@tb_flats"]
+    flats = research_db.update_candidate(rdb, found["@tb_flats"].id, access_hash=None)
     _approve(rdb, conn, session, _item(flats, "fetch", "add_source"))
 
     report = await _run(rdb, conn, paths, client, session)
 
-    assert report.fetched == [flats.id] and report.joined == []
+    assert report.fetched == [flats.id]
+    assert _status(rdb, flats).access_hash == FakeWorld.access_hash("default", _marked(FLATS))
     (source,) = config.load(paths).sources
-    assert source.chat == "@tb_flats" and _marked(FLATS) not in client.members
+    assert source.chat == _marked(FLATS)
 
 
 def _moved_folder(client: FakeClient, world: FakeWorld) -> None:

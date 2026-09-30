@@ -550,8 +550,11 @@ grepogram research stop 1            # explores no further; the sources it added
   — and joins or requests exactly the approved chats.
   It adds each as a source of the session's account, with history back to the session's horizon
   (`since_days` before the session started) and comments for a channel. It joins and adds the
-  very chat the probe saw: a joined chat's source names it by its id, and a chat whose username
-  has since moved to another chat is refused rather than followed — when a later discover,
+  very chat the probe saw: every source it adds names the chat by its id — a public chat read
+  without joining too, through the access hash the probe got — so later syncs keep reading that
+  chat whatever its username does, and a freed name registered by someone else is never
+  followed (a source you add yourself as `@name` keeps following the name). A chat whose
+  username has since moved to another chat is never joined through it — when a later discover,
   search or admission check sees that name on another chat, the approved candidate is set aside
   (`failed`, its approval voided) and the other chat is proposed on its own. It fetches exactly those
   chats through an ordinary sync, bounded by `run_budget_s` and `max_messages_per_run`. If
