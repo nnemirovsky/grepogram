@@ -737,6 +737,7 @@ admission_timeout_days = 30            # an unanswered admission request is give
 | `research.since_days` | how far back a source added by a research run fetches history |
 | `research.max_messages_per_run`, `research.run_budget_s` | the message and time budget of one research run; a run stopped by either resumes next time |
 | `research.admission_timeout_days` | how long a run keeps asking about an admission request no admin answered; after that the candidate is `failed` with a note, and a new approval may send the request again |
+| (every research limit above) | a whole number from 1 to a ceiling far above any real session: 10 hops, 1,000 candidates or probes per discover call, 100,000 candidates per session, 36,500 days of history, 1,000,000 messages and 86,400 s per run, 3,650 days of admission wait. The overrides `research start` and `research_start` take are held to the same bounds |
 | `accounts[].name` | an account signed in besides the implicit `default` one: 1 to 32 of `a-z`, `0-9`, `_` and `-`, unique, and never `default`; its session lives in `sessions/<name>.session` next to the config, while `default` keeps `session.session` |
 | `accounts[].label` | optional free text describing the account, for your own reference |
 | `sources[].folder` | a Telegram folder by name; its membership (included and pinned chats minus excluded ones, plus category flags) is re-resolved on every sync |

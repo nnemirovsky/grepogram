@@ -25,6 +25,7 @@ import tomli_w
 from grepogram.models import (
     ACCOUNT_NAME,
     DEFAULT_ACCOUNT,
+    RESEARCH_LIMIT_MAX,
     AccountCfg,
     Config,
     MediaCfg,
@@ -112,21 +113,10 @@ admission_timeout_days = 30            # an unanswered admission request is give
 _SECTIONS = ("telegram", "models", "search", "units", "sync", "media", "research")
 _SOURCE_KEYS = ("folder", "chat", "account", "since", "comments")
 _ACCOUNT_KEYS = ("name", "label")
-_POSITIVE_KEYS = frozenset(
-    {
-        "models.max_seq_length",
-        "media.max_download_mb",
-        "research.max_depth",
-        "research.max_candidates",
-        "research.probe_limit",
-        "research.since_days",
-        "research.max_messages_per_run",
-        "research.run_budget_s",
-        "research.max_session_candidates",
-        "research.admission_timeout_days",
-    }
-)
+_POSITIVE_KEYS = frozenset({"models.max_seq_length", "media.max_download_mb"})
 """Integer settings a zero or a negative value is meaningless for, checked after the type."""
+_BOUNDED_KEYS = {f"research.{name}": high for name, high in RESEARCH_LIMIT_MAX.items()}
+"""The research limits, whole numbers from 1 to :data:`~grepogram.models.RESEARCH_LIMIT_MAX`."""
 _NON_NEGATIVE_KEYS = frozenset({"research.paid_stars_max"})
 """Integer settings where zero means "never" and only a negative value is meaningless."""
 
@@ -296,6 +286,11 @@ def _section[
         checked = _checked(value, hints[key], where)
         if where in _POSITIVE_KEYS and isinstance(checked, int) and checked < 1:
             raise ConfigError(f"invalid value for {where}: expected a positive int, got {checked}")
+        high = _BOUNDED_KEYS.get(where)
+        if high is not None and isinstance(checked, int) and not 1 <= checked <= high:
+            raise ConfigError(
+                f"invalid value for {where}: expected an int from 1 to {high}, got {checked}"
+            )
         if where in _NON_NEGATIVE_KEYS and isinstance(checked, int) and checked < 0:
             raise ConfigError(
                 f"invalid value for {where}: expected a non-negative int, got {checked}"

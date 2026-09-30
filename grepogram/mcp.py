@@ -1091,12 +1091,7 @@ def research_start(
         "max_messages_per_run": max_messages_per_run,
         "run_budget_s": run_budget_s,
     }
-    given = {key: value for key, value in overrides.items() if value is not None}
-    bad = [key for key, value in given.items() if value < 1]
-    if bad:
-        raise ValueError(f"{', '.join(bad)} must be a positive number")
-    limits = dataclasses.replace(cfg.research.limits(), **given)
-    session = research.start_session(rdb, state.conn, cfg, question, seeds, name, limits)
+    session = research.start_session(rdb, state.conn, cfg, question, seeds, name, overrides)
     return research.session_document(session)
 
 

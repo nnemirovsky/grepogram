@@ -1528,24 +1528,24 @@ def research_start(
     ],
     account: AccountOption = None,
     max_depth: Annotated[
-        int | None, typer.Option("--max-depth", min=1, help="Hops from a seed (\\[research]).")
+        int | None, typer.Option("--max-depth", help="Hops from a seed (\\[research]).")
     ] = None,
     max_candidates: Annotated[
         int | None,
-        typer.Option("--max-candidates", min=1, help="New candidates per discover call."),
+        typer.Option("--max-candidates", help="New candidates per discover call."),
     ] = None,
     probe_limit: Annotated[
-        int | None, typer.Option("--probe-limit", min=1, help="Probes per discover call.")
+        int | None, typer.Option("--probe-limit", help="Probes per discover call.")
     ] = None,
     since_days: Annotated[
         int | None,
-        typer.Option("--since-days", min=1, help="History horizon of the sources a run adds."),
+        typer.Option("--since-days", help="History horizon of the sources a run adds."),
     ] = None,
     max_messages: Annotated[
-        int | None, typer.Option("--max-messages", min=1, help="Messages one run may store.")
+        int | None, typer.Option("--max-messages", help="Messages one run may store.")
     ] = None,
     budget: Annotated[
-        int | None, typer.Option("--budget", min=1, help="Seconds one run may take.")
+        int | None, typer.Option("--budget", help="Seconds one run may take.")
     ] = None,
     as_json: JsonOption = False,
 ) -> None:
@@ -1562,10 +1562,7 @@ def research_start(
     with _research_store() as (_, cfg, conn, rdb):
         try:
             name = _known_account(cfg, account or DEFAULT_ACCOUNT)
-            limits = dataclasses.replace(
-                cfg.research.limits(), **{k: v for k, v in overrides.items() if v is not None}
-            )
-            session = research.start_session(rdb, conn, cfg, question, seed, name, limits)
+            session = research.start_session(rdb, conn, cfg, question, seed, name, overrides)
         except _RESEARCH_ERRORS as exc:
             fail(str(exc), hint=getattr(exc, "hint", None))
     if as_json:

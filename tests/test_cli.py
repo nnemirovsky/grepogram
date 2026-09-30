@@ -2068,6 +2068,23 @@ def test_research_start_refuses_an_unknown_seed_or_account(tmp_home: Path) -> No
     assert account.exit_code == 1 and "unknown account 'work'" in account.stderr
 
 
+def test_research_start_refuses_a_limit_outside_its_bounds(tmp_home: Path) -> None:
+    """The limits are checked where the session is made, so the CLI and the tool say the same,
+    and a huge horizon never reaches the date arithmetic of a stored session."""
+    _research_home(tmp_home)
+
+    huge = runner.invoke(
+        cli.app, ["research", "start", "q", "-s", "@tbrent", "--since-days", str(10**30)]
+    )
+    zero = runner.invoke(cli.app, ["research", "start", "q", "-s", "@tbrent", "--budget", "0"])
+
+    assert huge.exit_code == 1, huge.output
+    assert "since_days must be a whole number from 1 to 36500" in huge.stderr
+    assert zero.exit_code == 1 and "run_budget_s must be a whole number from 1" in zero.stderr
+    status = runner.invoke(cli.app, ["research", "status", "--json"])
+    assert json.loads(status.stdout) == {"sessions": []}
+
+
 def test_research_start_refuses_a_question_that_could_forge_a_summary(tmp_home: Path) -> None:
     _research_home(tmp_home)
 

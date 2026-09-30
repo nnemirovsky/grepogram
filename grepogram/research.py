@@ -128,7 +128,7 @@ import unicodedata
 from collections import Counter
 from collections.abc import Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from typing import Any, NoReturn, get_args
 
 from telethon import errors, utils
@@ -139,6 +139,7 @@ from grepogram.embed import Embedder
 from grepogram.filters import resolve_chats
 from grepogram.leads import LeadTarget
 from grepogram.models import (
+    RESEARCH_LIMIT_MAX,
     ApprovalItem,
     Candidate,
     CandidateAction,
@@ -243,7 +244,7 @@ def start_session(
     question: str,
     seeds: Sequence[str],
     account: str,
-    limits: ResearchLimits | None = None,
+    overrides: Mapping[str, int | None] | None = None,
     *,
     now: int | None = None,
 ) -> ResearchSession:
@@ -252,8 +253,10 @@ def start_session(
     ``seeds`` are chat specs as ``search --chat`` takes them (:func:`grepogram.filters.
     resolve_chats`: an id, ``@name``, a link, a folder, free text, ``account:<name>``); one that
     selects nothing raises :class:`~grepogram.filters.UnknownChat`. ``account`` is the account a
-    later run joins and fetches as, and must be one the config knows. ``limits`` default to the
-    ``[research]`` section's. The question is shown in every approval summary, so it is one
+    later run joins and fetches as, and must be one the config knows. The limits are the
+    ``[research]`` section's with ``overrides`` (:class:`ResearchLimits` field → value, ``None``
+    for "keep the config's") applied — the one place a front end's limits are checked
+    (:func:`session_limits`). The question is shown in every approval summary, so it is one
     line of plain text of at most :data:`QUESTION_MAX_CHARS` characters. Nothing touches
     Telegram.
     """
@@ -276,8 +279,9 @@ def start_session(
     if account not in known:
         raise ResearchError(
             f"unknown account {account!r}; known: {', '.join(known)}",
-            f"sign it in with `grepogram auth --account {account}` first",
+            f"sign it in with `{tg.auth_command(account)}` first",
         )
+    limits = session_limits(cfg, overrides)
     if not seeds:
         raise ResearchError(
             "a research session needs at least one seed chat",
@@ -289,13 +293,31 @@ def start_session(
         question=question,
         account=account,
         seeds=[chat_key(chat) for chat in chosen if chat is not None],
-        limits=limits or cfg.research.limits(),
+        limits=limits,
         now=now,
     )
     log.info(
         "research session %d started as %s from %d seed chat(s)", session.id, account, len(chosen)
     )
     return session
+
+
+def session_limits(
+    cfg: Config, overrides: Mapping[str, int | None] | None = None
+) -> ResearchLimits:
+    """The ``[research]`` limits with ``overrides`` applied; each given value must be a whole
+    number from 1 to its :data:`~grepogram.models.RESEARCH_LIMIT_MAX`, or
+    :class:`ResearchError` says which one is not."""
+    given = {name: value for name, value in (overrides or {}).items() if value is not None}
+    for name, value in given.items():
+        high = RESEARCH_LIMIT_MAX.get(name)
+        if high is None:
+            raise ResearchError(
+                f"unknown research limit {name!r}", f"limits: {', '.join(RESEARCH_LIMIT_MAX)}"
+            )
+        if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= high:
+            raise ResearchError(f"{name} must be a whole number from 1 to {high}, not {value!r}")
+    return dataclasses.replace(cfg.research.limits(), **given)
 
 
 def active_session(rdb: sqlite3.Connection, session_id: int) -> ResearchSession:
@@ -1899,9 +1921,13 @@ class UnknownCandidate(ResearchError):
 
 def horizon(session: ResearchSession) -> str:
     """The date a source a run adds for ``session`` starts from: ``since_days`` before the
-    session started, so the date an approval names is the one the run uses, whenever it runs."""
+    session started, so the date an approval names is the one the run uses, whenever it runs.
+
+    Never before the first date there is: a session stored before ``since_days`` had a ceiling
+    may ask for more days than the calendar holds, and must still answer rather than raise."""
     started = datetime.fromtimestamp(session.created_at, UTC).date()
-    return (started - timedelta(days=session.limits.since_days)).isoformat()
+    days = min(session.limits.since_days, (started - date.min).days)
+    return (started - timedelta(days=days)).isoformat()
 
 
 def authorized(

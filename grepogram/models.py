@@ -165,7 +165,8 @@ class ResearchLimits:
     ``probe_limit`` cap one discover call and ``max_session_candidates`` the whole session;
     ``since_days`` is the history horizon a source added by a run gets;
     ``max_messages_per_run`` and ``run_budget_s`` bound one run; an admission request no admin
-    answered within ``admission_timeout_days`` is given up (``failed``).
+    answered within ``admission_timeout_days`` is given up (``failed``). Each is a whole number
+    from 1 to its :data:`RESEARCH_LIMIT_MAX`.
     """
 
     max_depth: int = 2
@@ -178,41 +179,42 @@ class ResearchLimits:
     admission_timeout_days: int = 30
 
 
+RESEARCH_LIMIT_MAX: dict[str, int] = {
+    "max_depth": 10,
+    "max_candidates": 1000,
+    "probe_limit": 1000,
+    "since_days": 36_500,
+    "max_messages_per_run": 1_000_000,
+    "run_budget_s": 86_400,
+    "max_session_candidates": 100_000,
+    "admission_timeout_days": 3650,
+}
+"""The largest value each :class:`ResearchLimits` field takes — far above any sensible
+session, and low enough that no date, clock or SQL arithmetic on it can overflow (a
+``since_days`` of a million would not fit a date). ``[research]``, ``research start`` and the
+``research_start`` tool are all checked against it."""
+
+
 @dataclass(frozen=True, slots=True)
-class ResearchCfg:
+class ResearchCfg(ResearchLimits):
     """``[research]``: whether research runs at all, what it may ask Telegram, and its limits.
 
     ``enabled`` is off by default and every research entry point refuses while it is. The two
     search switches let discovery reach Telegram's own chat search (``contacts.search``) and
     public-post search (``channels.searchPosts``), each still behind a grant; ``paid_stars_max``
-    at 0 means post search never pays. The remaining keys are the defaults of
-    :class:`ResearchLimits` a new session copies.
+    at 0 means post search never pays. The inherited :class:`ResearchLimits` fields are the
+    defaults a new session copies (:meth:`limits`).
     """
 
     enabled: bool = False
     chat_search: bool = False
     post_search: bool = False
     paid_stars_max: int = 0
-    max_depth: int = 2
-    max_candidates: int = 50
-    probe_limit: int = 20
-    since_days: int = 365
-    max_messages_per_run: int = 5000
-    run_budget_s: int = 300
-    max_session_candidates: int = 500
-    admission_timeout_days: int = 30
 
     def limits(self) -> ResearchLimits:
         """The limits a session started under this config gets unless it overrides them."""
         return ResearchLimits(
-            max_depth=self.max_depth,
-            max_candidates=self.max_candidates,
-            probe_limit=self.probe_limit,
-            since_days=self.since_days,
-            max_messages_per_run=self.max_messages_per_run,
-            run_budget_s=self.run_budget_s,
-            max_session_candidates=self.max_session_candidates,
-            admission_timeout_days=self.admission_timeout_days,
+            **{name: getattr(self, name) for name in ResearchLimits.__dataclass_fields__}
         )
 
 

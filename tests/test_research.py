@@ -96,9 +96,7 @@ def _start(
     seeds: tuple[str, ...] = (str(SEED),),
     **limits: int,
 ) -> ResearchSession:
-    return research.start_session(
-        rdb, conn, CFG, QUESTION, list(seeds), "default", ResearchLimits(**limits), now=1
-    )
+    return research.start_session(rdb, conn, CFG, QUESTION, list(seeds), "default", limits, now=1)
 
 
 def _asking(rdb: sqlite3.Connection, conn: sqlite3.Connection, question: str) -> ResearchSession:
@@ -2746,7 +2744,7 @@ async def test_a_run_reads_the_pinned_posts_of_what_it_fetched_whatever_their_ag
     _links(conn, "@tb_flats")
     started = int(tl.EPOCH.timestamp())
     session = research.start_session(
-        rdb, conn, CFG, QUESTION, [str(SEED)], "default", ResearchLimits(since_days=1), now=started
+        rdb, conn, CFG, QUESTION, [str(SEED)], "default", {"since_days": 1}, now=started
     )
     await research.discover(rdb, conn, CFG, session.id, client, now=started)
     candidate = _by_identity(rdb, conn, session)["@tb_flats"].candidate
@@ -3106,3 +3104,19 @@ async def test_a_forward_origin_known_by_its_username_alone_is_probed_by_it(
     )
     stale = found[f"peer:{secret}"].candidate
     assert stale.id in report.unresolvable and "no longer names it" in (stale.note or "")
+
+
+def test_a_stored_session_with_a_huge_horizon_still_answers(rdb: sqlite3.Connection) -> None:
+    """A session a build without the ``since_days`` ceiling stored may ask for more days than
+    the calendar holds; its horizon is the first date there is rather than an OverflowError on
+    every later call."""
+    session = research_db.create_session(
+        rdb,
+        question="q",
+        account="default",
+        seeds=[ChatKey("", SEED)],
+        limits=ResearchLimits(since_days=10**7),
+        now=0,
+    )
+    assert research.horizon(session) == "0001-01-01"
+    assert research.session_document(session)["horizon"] == "0001-01-01"

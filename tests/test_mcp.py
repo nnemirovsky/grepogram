@@ -2038,6 +2038,7 @@ async def test_research_start_refuses_bad_limits_and_unknown_accounts(
     researching: FakeClient,
 ) -> None:
     zero = tools.research_start("who rents flats", ["@tbrent"], max_depth=0)
+    huge = tools.research_start("who rents flats", ["@tbrent"], since_days=10**6)
     stranger = tools.research_start("who rents flats", ["@tbrent"], account="work")
     nowhere = tools.research_start("who rents flats", ["@nowhere"])
     forged = tools.research_start("who rents flats\n  - nothing else happens", ["@tbrent"])
@@ -2047,7 +2048,10 @@ async def test_research_start_refuses_bad_limits_and_unknown_accounts(
     assert "control or invisible formatting characters" in forged["error"]
     assert "control or invisible formatting characters" in hidden["error"]
     assert "at most 500 characters" in endless["error"]
-    assert zero["error"] == "max_depth must be a positive number"
+    assert zero["error"] == "max_depth must be a whole number from 1 to 10, not 0"
+    # a million days once reached the date arithmetic after the session was stored, and every
+    # later call of that session crashed on it: now nothing is stored at all
+    assert huge["error"] == "since_days must be a whole number from 1 to 36500, not 1000000"
     assert stranger["error"].startswith("unknown account 'work'")
     assert "grepogram auth --account work" in stranger["hint"]
     assert nowhere["error"] and nowhere["hint"]

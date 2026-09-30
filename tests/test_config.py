@@ -16,6 +16,7 @@ from grepogram.config import TEMPLATE, ConfigError
 from grepogram.log import redact, setup_logging, shutdown_logging
 from grepogram.models import (
     DEFAULT_ACCOUNT,
+    RESEARCH_LIMIT_MAX,
     AccountCfg,
     Config,
     MediaCfg,
@@ -559,21 +560,17 @@ def test_research_limits_copy_the_configured_bounds() -> None:
     assert ResearchCfg().limits() == ResearchLimits()
 
 
-@pytest.mark.parametrize(
-    "key",
-    [
-        "max_depth",
-        "max_candidates",
-        "probe_limit",
-        "since_days",
-        "max_messages_per_run",
-        "run_budget_s",
-    ],
-)
-@pytest.mark.parametrize("value", [0, -1])
-def test_research_bounds_reject_non_positive(key: str, value: int) -> None:
-    with pytest.raises(ConfigError, match=rf"invalid value for research\.{key}: .*positive"):
-        config.loads(f"[research]\n{key} = {value}\n")
+@pytest.mark.parametrize("key", sorted(RESEARCH_LIMIT_MAX))
+def test_research_bounds_reject_a_value_outside_one_to_the_ceiling(key: str) -> None:
+    """A huge ``since_days`` once reached date arithmetic and crashed every later call of the
+    session it started; every limit is a whole number from 1 to its ceiling."""
+    high = RESEARCH_LIMIT_MAX[key]
+    for value in (0, -1, high + 1, 10**30):
+        with pytest.raises(
+            ConfigError, match=rf"invalid value for research\.{key}: expected an int from 1 to"
+        ):
+            config.loads(f"[research]\n{key} = {value}\n")
+    assert getattr(config.loads(f"[research]\n{key} = {high}\n").research, key) == high
 
 
 def test_paid_stars_max_takes_zero_and_refuses_a_negative() -> None:
