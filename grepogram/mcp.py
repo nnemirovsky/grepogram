@@ -1174,18 +1174,17 @@ async def research_approve(
     state = _app()
     cfg = state.config()
     rdb = state.research_store(cfg)
-    wanted = research.with_default_actions(rdb, session_id, research.parse_approval(items))
-    summary = research.approval_summary(rdb, state.conn, cfg, session_id, wanted)
-    command = research.approve_command(session_id, wanted)
+    approval = research.prepare_approval(rdb, state.conn, cfg, session_id, items)
+    summary = approval.summary
     asked: ToolResult = {
         "session_id": session_id,
-        "items": research.approval_args(wanted),
+        "items": research.approval_args(approval.items),
         "summary": summary,
         "approved": False,
     }
     terminal_hint = (
         "the user must type this in their own terminal themselves and confirm there; never run "
-        f"it for them: {command}"
+        f"it for them: {approval.command}"
     )
     if not _can_elicit(ctx):
         return {**asked, "error": NO_ELICITATION, "hint": terminal_hint}
@@ -1203,7 +1202,7 @@ async def research_approve(
         log.info("research session %d: the user did not approve (%s)", session_id, answer.action)
         return {**asked, "answer": answer.action, "hint": DECLINED_HINT}
     granted = research.grant(
-        rdb, state.conn, cfg, session_id, wanted, via="elicitation", summary=summary
+        rdb, state.conn, cfg, session_id, approval.items, via="elicitation", summary=summary
     )
     return {
         **asked,

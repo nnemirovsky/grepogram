@@ -3398,6 +3398,31 @@ def with_default_actions(
     return filled
 
 
+@dataclass(frozen=True, slots=True)
+class Approval:
+    """An approval ready to put to a human: the items with their default actions filled in,
+    the exact :func:`approval_summary` to show, and the terminal command that asks for it."""
+
+    items: tuple[ApprovalItem, ...]
+    summary: str
+    command: str
+
+
+def prepare_approval(
+    rdb: sqlite3.Connection,
+    conn: sqlite3.Connection,
+    cfg: Config,
+    session_id: int,
+    tokens: Sequence[str],
+) -> Approval:
+    """What both consent channels show before :func:`grant`: ``tokens`` in the approval grammar
+    (:func:`parse_approval`) with :func:`with_default_actions` applied, their summary, and the
+    command (:func:`approve_command`) the terminal channel asks through."""
+    items = with_default_actions(rdb, session_id, parse_approval(tokens))
+    summary = approval_summary(rdb, conn, cfg, session_id, items)
+    return Approval(tuple(items), summary, approve_command(session_id, items))
+
+
 def known_session(rdb: sqlite3.Connection, session_id: int) -> ResearchSession:
     """The session ``session_id``, active or stopped; :class:`UnknownSession` when there is none."""
     session = research_db.get_session(rdb, session_id)

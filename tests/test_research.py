@@ -3120,3 +3120,23 @@ def test_a_stored_session_with_a_huge_horizon_still_answers(rdb: sqlite3.Connect
     )
     assert research.horizon(session) == "0001-01-01"
     assert research.session_document(session)["horizon"] == "0001-01-01"
+
+
+def test_prepare_approval_is_what_both_consent_channels_show(
+    rdb: sqlite3.Connection, conn: sqlite3.Connection
+) -> None:
+    """The CLI and the MCP tool both put this to the human: the defaults a bare id stands for,
+    the summary :func:`research.grant` checks against, and the command that asks on a terminal."""
+    session = _start(rdb, conn)
+    flats = _flats(rdb, session)
+
+    approval = research.prepare_approval(rdb, conn, CFG, session.id, [str(flats.id)])
+
+    assert approval.items == (_item(flats, "join", "fetch", "add_source"),)
+    assert approval.summary == research.approval_summary(rdb, conn, CFG, session.id, approval.items)
+    assert (
+        approval.command
+        == f"grepogram research approve {session.id} {flats.id}:join,fetch,add_source"
+    )
+    with pytest.raises(research.ResearchError, match="not an approval item"):
+        research.prepare_approval(rdb, conn, CFG, session.id, ["nine"])

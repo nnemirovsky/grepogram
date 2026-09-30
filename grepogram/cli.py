@@ -130,7 +130,7 @@ class NoTerminal(Exception):
     """A command that must ask a human first has no terminal to ask on."""
 
     def __init__(self, command: str) -> None:
-        self.hint = f"the user must run `grepogram {command}` in their own terminal themselves"
+        self.hint = f"the user must run `{command}` in their own terminal themselves"
         super().__init__(f"{command} asks for a confirmation on a terminal, and there is none")
 
 
@@ -1331,7 +1331,7 @@ def accounts_rm(
         typer.echo("  forget which chats this account reaches")
         typer.echo("  stop its research sessions and void their unused approvals")
         typer.echo(f"  delete its session file {session}")
-        with _terminal("accounts rm") as tty:
+        with _terminal("grepogram accounts rm") as tty:
             confirmed = _ask(tty, f"remove account {name}?")
         if not confirmed:
             typer.echo("nothing removed")
@@ -1425,7 +1425,7 @@ def leave_cmd(
             )
         name = _known_account(cfg, account or parsed.account or DEFAULT_ACCOUNT)
         tg.ensure_session_mode(paths, name)
-        with _terminal("leave") as tty:
+        with _terminal("grepogram leave") as tty:
             client = tg.make_client(cfg, paths, name)
             left = asyncio.run(_leave(client, parsed, name, functools.partial(_ask, tty)))
     except NoTerminal as exc:
@@ -1765,18 +1765,16 @@ def research_approve(
     """
     with _research_store() as (_, cfg, conn, rdb):
         try:
-            wanted = research.with_default_actions(rdb, session_id, research.parse_approval(items))
-            summary = research.approval_summary(rdb, conn, cfg, session_id, wanted)
-            command = " ".join(
-                ["research approve", str(session_id), *research.approval_args(wanted)]
-            )
-            with _terminal(command) as tty:
-                tty.write(f"{summary}\n\n")
+            approval = research.prepare_approval(rdb, conn, cfg, session_id, items)
+            with _terminal(approval.command) as tty:
+                tty.write(f"{approval.summary}\n\n")
                 confirmed = _ask(tty, "approve all of the above?")
             if not confirmed:
                 typer.echo("nothing approved")
                 return
-            granted = research.grant(rdb, conn, cfg, session_id, wanted, via="cli", summary=summary)
+            granted = research.grant(
+                rdb, conn, cfg, session_id, approval.items, via="cli", summary=approval.summary
+            )
         except NoTerminal as exc:
             fail(str(exc), hint=exc.hint)
         except _RESEARCH_ERRORS as exc:
