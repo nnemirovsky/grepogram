@@ -331,7 +331,17 @@ def test_make_clients_reports_a_damaged_session_and_keeps_the_rest(tmp_path: Pat
     assert list(built.clients) == ["work"]
     damaged = built.unavailable["default"]
     assert isinstance(damaged, tg.SessionError)
-    assert damaged.path == paths.session_file
+    assert damaged.path == paths.session_file and damaged.account == "default"
+
+
+def test_a_damaged_named_session_names_its_account(tmp_path: Path) -> None:
+    """So the hint an MCP tool gives is that account's sign-in, not the default one's."""
+    paths = _paths(tmp_path)
+    _signed_in(paths).close()
+    tg.prepare_session(paths, "work").write_bytes(b"not a database, not at all, just bytes " * 4)
+    built = tg.make_clients(TWO_ACCOUNTS, paths)
+    damaged = built.unavailable["work"]
+    assert isinstance(damaged, tg.SessionError) and damaged.account == "work"
 
 
 def test_make_clients_builds_only_the_accounts_asked_for(tmp_path: Path) -> None:

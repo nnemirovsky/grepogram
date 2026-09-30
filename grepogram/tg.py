@@ -83,11 +83,12 @@ class SessionMissing(AuthRequired):
 
 
 class SessionError(Exception):
-    """The session file exists but cannot be read: another process is writing it (a
-    ``grepogram auth`` in progress) or the file is damaged."""
+    """The session file of ``account`` exists but cannot be read: another process is writing it
+    (a ``grepogram auth`` in progress) or the file is damaged."""
 
-    def __init__(self, path: Path, reason: Exception) -> None:
+    def __init__(self, path: Path, reason: Exception, account: str = DEFAULT_ACCOUNT) -> None:
         self.path = path
+        self.account = account
         super().__init__(f"cannot read the Telegram session at {path}: {reason}")
 
 
@@ -105,7 +106,7 @@ def load_session(paths: Paths, account: str = DEFAULT_ACCOUNT) -> MemorySession:
     try:
         stored = SQLiteSession(str(path))
     except sqlite3.Error as exc:
-        raise SessionError(path, exc) from exc
+        raise SessionError(path, exc, account) from exc
     try:
         session = MemorySession()
         if stored.server_address:
@@ -162,7 +163,7 @@ def make_login_client(cfg: Config, paths: Paths, account: str = DEFAULT_ACCOUNT)
     try:
         return _client(str(path), cfg)
     except sqlite3.Error as exc:
-        raise SessionError(path, exc) from exc
+        raise SessionError(path, exc, account) from exc
 
 
 def _client(session: MemorySession | str, cfg: Config) -> TelegramClient:

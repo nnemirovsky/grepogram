@@ -578,7 +578,7 @@ def hint_for(exc: BaseException) -> str | None:
     if isinstance(exc, ConfigError):
         return exc.hint or CONFIG_HINT
     if isinstance(exc, SessionError):
-        return SESSION_HINT
+        return session_hint(exc.account)
     if isinstance(exc, SyncInProgress):
         return LOCK_HINT
     if isinstance(exc, ModelUnavailable):

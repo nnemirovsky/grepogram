@@ -1447,6 +1447,10 @@ def test_session_hints_name_the_account() -> None:
         "error": "account work: Telegram session is not authorized",
         "hint": tools.auth_hint(WORK),
     }
+    unreadable = SessionError(
+        Path("/x/sessions/work.session"), sqlite3.OperationalError("database is locked"), WORK
+    )
+    assert tools.hint_for(unreadable) == tools.session_hint(WORK), "not the default's hint"
 
 
 # --- server ----------------------------------------------------------------------------------
