@@ -887,11 +887,16 @@ class Resolution:
     through whichever account can). ``flooded`` maps an account whose resolve Telegram stopped
     with a flood wait to the seconds asked, and ``failed`` one another Telegram error stopped to
     the error: that account's sources were all skipped, keeping what they covered.
+    ``unresolved`` is ``(account, source id, reason)`` of each source that did not resolve on
+    its own (:class:`SourceError`: its chat or folder no longer names anything this account
+    reaches), so a sync can say so in its report — a source that silently never syncs looks
+    exactly like one with nothing new.
     """
 
     chats: list[ChatRow] = dataclasses.field(default_factory=list)
     flooded: dict[str, int] = dataclasses.field(default_factory=dict)
     failed: dict[str, str] = dataclasses.field(default_factory=dict)
+    unresolved: list[tuple[str, str, str]] = dataclasses.field(default_factory=list)
 
 
 async def resolve_sources(
@@ -903,10 +908,14 @@ async def resolve_sources(
     its own account's (one :class:`~grepogram.dialogs.DialogCatalog` per account): folder
     membership and entities are re-read from Telegram each time. Before an account's first
     source, its client's session is handed every access hash the index stores for it
-    (:func:`seed_peers`), so a chat outside its dialog list — a ``chat:<id>`` of a group it no
-    longer shows, a public chat it reads without joining — is addressed by that hash rather than
-    not at all, and a ``chat = "@name"`` source whose chat the index already holds is re-read by
-    its id instead of by a ``contacts.resolveUsername`` on every sync (:func:`source_dialogs`).
+    (:func:`seed_peers`): the ``chat_access`` hashes of the chats it reached, then the
+    ``peer_cache`` ones it was handed for peers no row holds yet
+    (:func:`grepogram.db.cached_peers` — a research source for a public chat read without
+    joining is one until its first fetch). So a chat outside its dialog list — a ``chat:<id>``
+    of a group it no longer shows, a public chat it reads without joining — is addressed by
+    that hash rather than not at all; and a ``chat = "@name"`` source whose chat the index
+    already holds is re-read by its id instead of by a ``contacts.resolveUsername`` on every
+    sync (:func:`source_dialogs`).
     Sync state on existing rows is preserved, and so is a stored ``discussion_of``
     (:func:`grepogram.db.upsert_chat`): a channel's discussion group listed by a source is
     synced as a chat of its own and keeps holding the channel's comments.
@@ -950,6 +959,7 @@ async def resolve_sources(
     coverage: dict[str, set[int]] = {}
     flooded: dict[str, int] = {}
     failed: dict[str, str] = {}
+    unresolved: list[tuple[str, str, str]] = []
 
     def keep(source: Source) -> None:
         _keep_primary(conn, source, stored, rows)
@@ -972,12 +982,16 @@ async def resolve_sources(
             continue
         catalog = catalogs.get(source.account)
         if catalog is None:
-            seed_peers(client, db.stored_peers(conn, source.account))
+            seed_peers(
+                client,
+                [*db.stored_peers(conn, source.account), *db.cached_peers(conn, source.account)],
+            )
             catalog = catalogs[source.account] = DialogCatalog(client)
         try:
             infos, named = await _source_listing(source, catalog, conn)
         except SourceError as exc:
             log.warning("skipping source %s: %s", source.id, exc)
+            unresolved.append((source.account, source.id, str(exc)))
             keep(source)
             continue
         except errors.UnauthorizedError as exc:
@@ -1044,7 +1058,7 @@ async def resolve_sources(
     for source_id, chat_ids in coverage.items():
         db.set_source_chats(conn, source_id, chat_ids)
     log.info("resolved %d chats from %d sources", len(rows), len(cfg.sources))
-    return Resolution(chats=rows, flooded=flooded, failed=failed)
+    return Resolution(chats=rows, flooded=flooded, failed=failed, unresolved=unresolved)
 
 
 def _keep_primary(

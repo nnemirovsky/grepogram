@@ -3703,9 +3703,12 @@ async def test_a_primary_account_that_cannot_resolve_the_chat_at_all_keeps_it(
         stored = db.get_chat(conn, PRIV_ID)
         assert stored is not None and stored.source_id == source.id
         assert report.warnings == [
+            f"account {DEFAULT_ACCOUNT}: source {source.id} did not resolve (no dialog with id "
+            f"{PRIV_ID}: Could not find the input entity for {PRIV_ID}); it keeps the chats it "
+            "already covered",
             f"account {DEFAULT_ACCOUNT}: chat {PRIV_ID} (Private club): Could not find the input "
             f"entity for {PRIV_ID} through account {DEFAULT_ACCOUNT}; fetched through account "
-            f"{WORK} instead"
+            f"{WORK} instead",
         ]
     assert _texts(conn, PRIV_ID) == {1: "club 1", 2: "club 2", 3: "club 3"}
     assert [name for name, _ in work.calls if name in ("get_dialogs", "get_entity")] == []

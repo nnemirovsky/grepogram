@@ -1767,6 +1767,19 @@ def cached_peer_hash(conn: sqlite3.Connection, peer_id: int, account: str) -> in
     return None if row is None or row["access_hash"] is None else int(row["access_hash"])
 
 
+def cached_peers(conn: sqlite3.Connection, account: str) -> list[tuple[int, int]]:
+    """``(peer_id, access_hash)`` of every peer ``account`` was handed an access hash for and
+    ``peer_cache`` keeps — a forward's origin, or a public chat a research run added as a source
+    without the account joining it (:func:`grepogram.research._remember_read_without_joining`),
+    which no ``chat_access`` row holds until a sync first reaches it."""
+    rows = conn.execute(
+        "SELECT peer_id, access_hash FROM peer_cache "
+        "WHERE account = ? AND access_hash IS NOT NULL ORDER BY peer_id",
+        (account,),
+    )
+    return [(int(row["peer_id"]), int(row["access_hash"])) for row in rows]
+
+
 def cached_peer_username(conn: sqlite3.Connection, peer_id: int) -> str | None:
     """The username any account saw ``peer_id`` under while fetching, the most recent first — a
     username is public, whoever read it."""

@@ -2030,7 +2030,9 @@ async def _sync_chats(
     wait or a Telegram error on one account's ``get_me`` or resolve stops *that* account with a
     warning — its sources keep what they covered and stay the primary of their chats — and a
     rejected session is raised as :class:`~grepogram.tg.AuthRequired` naming the account it
-    belongs to.
+    belongs to. A source that does not resolve on its own (its chat or folder no longer names
+    anything its account reaches) is a warning in the report too, never only a log line: an
+    approved source that never syncs would otherwise look like one with nothing new.
 
     Every chat goes to the queue of the first account :func:`reaching_accounts` names that is in
     the run and not stopped — its primary source's account when that one can — so a channel two
@@ -2085,6 +2087,11 @@ async def _sync_chats(
         tally.warn(account, _flood_text(seconds))
     for account, error in resolution.failed.items():
         tally.warn(account, f"its sources could not be resolved ({error}); they keep what they had")
+    for account, source_id, reason in resolution.unresolved:
+        tally.warn(
+            account,
+            f"source {source_id} did not resolve ({reason}); it keeps the chats it already covered",
+        )
     run = _SyncPass(
         conn=conn,
         cfg=cfg,

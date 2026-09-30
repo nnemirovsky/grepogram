@@ -3224,9 +3224,10 @@ def _planned_source(
     username does: a ``chat = "@name"`` source follows the handle, and whoever registers a
     freed name would be fetched by every ordinary sync after it. A public chat outside the
     account's dialogs is addressed through the access hash the probe stored
-    (:func:`_address_public` seeds it for this run; the sync stores it in ``chat_access`` for
-    every later one). A candidate no probe tied to a peer id is ``failed``. Comments come along
-    for a channel and nothing else.
+    (:func:`_address_public` seeds it for this run; :func:`_remember_read_without_joining` keeps
+    it in ``peer_cache`` for every later one, fetched this run or not, and the first sync that
+    reaches it stores it in ``chat_access``). A candidate no probe tied to a peer id is
+    ``failed``. Comments come along for a channel and nothing else.
     """
     if candidate.source_id is not None or not authorized(rdb, candidate, "add_source"):
         return None
@@ -3279,8 +3280,9 @@ async def _address_public(
     Such a chat's source names it by its peer id (:func:`_planned_source`) and the account has
     no dialog for it, so the sync reaches it only through an access hash its client already
     holds. The one the probe stored for this account is handed to the client's session
-    (:func:`grepogram.sources.seed_peers`) with no request at all, and the sync then stores it
-    in ``chat_access``, where every later sync seeds it from. Only a candidate probed without
+    (:func:`grepogram.sources.seed_peers`) with no request at all; :func:`_add_sources` keeps
+    it in ``peer_cache`` (:func:`_remember_read_without_joining`) and the sync in
+    ``chat_access``, and every later sync seeds from both. Only a candidate probed without
     one has its username resolved, and that answer counts only while the name still names the
     probed peer: one that moved since makes the candidate ``unavailable`` and voids its grants
     — the chat approved is not the one the name leads to now.
@@ -3336,11 +3338,13 @@ def _add_sources(
     lock. :class:`~grepogram.sync.SyncInProgress` propagates."""
     planned: list[tuple[Candidate, Source]] = []
     for candidate in work:
-        source = _planned_source(rdb, conn, session, _fresh(rdb, candidate), report)
+        current = _fresh(rdb, candidate)
+        source = _planned_source(rdb, conn, session, current, report)
         if source is not None:
-            planned.append((candidate, source))
+            planned.append((current, source))
     if not planned:
         return
+    _remember_read_without_joining(conn, session, [candidate for candidate, _ in planned])
     chosen: dict[int, tuple[str, bool]] = {}
 
     def change(current: Config) -> Config:
@@ -3363,6 +3367,33 @@ def _add_sources(
             if added:
                 report.sources_added.append(candidate.id)
     log.info("research session %d: %d source(s) added", session.id, len(report.sources_added))
+
+
+def _remember_read_without_joining(
+    conn: sqlite3.Connection, session: ResearchSession, planned: Sequence[Candidate]
+) -> None:
+    """Keep in ``peer_cache``, under the session's account, the access hash of every public chat
+    among ``planned`` that the account reads without joining, before its source is written.
+
+    Such a source names the chat by peer id (:func:`_planned_source`) and the account has no
+    dialog for it, so a fresh client reaches it only through an access hash its session was
+    handed. :func:`_address_public` hands the probe's to this run's client alone, and the sync
+    stores it in ``chat_access`` only once it resolves the source — a run that adds the source
+    and fetches nothing (an ``add_source`` approval alone, or a fetch the budget, a busy sync or
+    a flood wait deferred to a session that is then stopped) would leave every later sync
+    unable to address the chat at all. :func:`grepogram.sources.resolve_sources` seeds these
+    (:func:`grepogram.db.cached_peers`), so the source syncs from then on whatever the run did.
+    Written first, so a failed config write leaves one spare hash rather than a source nothing
+    can address. The hash is the account's own: the probe ran as it."""
+    peers = [
+        (candidate.peer_id, candidate.username, candidate.access_hash)
+        for candidate in planned
+        if not _is_member(candidate)
+        and candidate.peer_id is not None
+        and candidate.access_hash is not None
+    ]
+    if peers:
+        db.remember_peers(conn, session.account, peers, research_db.clock())
 
 
 def _to_fetch(

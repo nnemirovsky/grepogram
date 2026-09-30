@@ -712,8 +712,13 @@ never change the git identity.
   registers it (a user's own `chat = "@name"` source keeps following its handle: the user named
   the handle, research approved a chat); such a chat has no dialog, so `_address_public` seeds
   the probe's access hash into the run's client (`sources.seed_peers`) — or, probed without
-  one, resolves the username, which must still name the probed peer — and the sync stores it in
-  `chat_access`, which every later sync seeds from. A candidate with no peer id gets no source.
+  one, resolves the username, which must still name the probed peer — and `_add_sources` keeps
+  it in `peer_cache` for the session's account before the config write
+  (`_remember_read_without_joining`), because a run that adds the source and fetches nothing
+  (`ID:add_source` alone, or a fetch deferred and the session stopped) leaves no `chat_access`
+  row behind; `sources.resolve_sources` seeds both (`db.stored_peers`, `db.cached_peers`), and a
+  source that still does not resolve is a warning in the sync report, never only a log line. A
+  candidate with no peer id gets no source.
   `research.grant` validates and writes in one `research.db` transaction; each session action is
   its own grant row, and a paid search pays only after `consume_grant` (one conditional
   `UPDATE`) succeeded, so one approval never pays twice. `global_search` sends the session's

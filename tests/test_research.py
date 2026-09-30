@@ -33,6 +33,7 @@ from grepogram.models import (
     ResearchSession,
     RunReport,
     Source,
+    SyncReport,
 )
 from grepogram.paths import Paths
 from tests.conftest import scan_cursor
@@ -2628,6 +2629,77 @@ async def test_a_research_source_read_without_joining_stays_the_approved_chat_fo
     assert [chat.id for chat in status.chats] == [_marked(FLATS)]
     removed = sources.remove_source(cfg, conn, sources.parse_target(status.source_id))
     assert removed.config.sources == [] and removed.chat_ids == [_marked(FLATS)]
+
+
+async def _fresh_sync(client: FakeClient, conn: sqlite3.Connection, paths: Paths) -> SyncReport:
+    """An ordinary sync long after the run: a fresh client whose session knows no peer, and no
+    research code involved."""
+    client.forget_entities()
+    client.calls.clear()
+    return await sync.sync_all(
+        {"default": client}, conn, functools.partial(config.load, paths), paths, sync.SyncBudget()
+    )
+
+
+async def test_a_public_chat_added_as_a_source_alone_syncs_on_every_later_sync(
+    rdb: sqlite3.Connection, conn: sqlite3.Connection, paths: Paths
+) -> None:
+    """``ID:add_source`` alone fetches nothing in the run, so no sync has stored the chat's
+    access hash yet: the run keeps the probe's in ``peer_cache`` and the next ordinary sync
+    reads the pinned chat through it."""
+    client = _run_client(_impostor_world())
+    session, found = await _discovered(rdb, conn, client, "@tb_flats")
+    flats = found["@tb_flats"]
+    _approve(rdb, conn, session, _item(flats, "add_source"))
+    first = await _run(rdb, conn, paths, client, session)
+    assert first.sources_added == [flats.id] and first.fetched == []
+    assert _stored(conn, _marked(FLATS)) == []
+    assert db.cached_peer_hash(conn, _marked(FLATS), "default") == flats.access_hash
+
+    report = await _fresh_sync(client, conn, paths)
+
+    assert report.warnings == []
+    assert _stored(conn, _marked(FLATS)) == [1, 2, 3]
+    assert _read(client) == {_marked(FLATS)}
+    assert db.access_hash(conn, _marked(FLATS), "default") == flats.access_hash
+
+
+async def test_a_deferred_fetch_of_a_stopped_session_still_syncs_its_public_source_later(
+    rdb: sqlite3.Connection, conn: sqlite3.Connection, paths: Paths
+) -> None:
+    """The run adds the source but its message allowance is gone before the fetch, and the
+    session is stopped before any other run: the source it left still syncs."""
+    client = _run_client(_impostor_world())
+    session, found = await _discovered(rdb, conn, client, "@tb_flats")
+    flats = found["@tb_flats"]
+    _approve(rdb, conn, session, _item(flats, "fetch", "add_source"))
+    first = await _run(rdb, conn, paths, client, session, sync.SyncBudget(60, messages=0))
+    assert first.sources_added == [flats.id] and first.fetched == []
+    research.stop(rdb, CFG, session.id)
+
+    report = await _fresh_sync(client, conn, paths)
+
+    assert report.warnings == []
+    assert _stored(conn, _marked(FLATS)) == [1, 2, 3]
+
+
+async def test_a_source_that_does_not_resolve_is_a_warning_of_the_sync(
+    rdb: sqlite3.Connection, conn: sqlite3.Connection, paths: Paths
+) -> None:
+    """A source no route addresses any more is said in the report, not only in the log: an
+    approved source that never syncs would otherwise look like one with nothing new."""
+    client = _run_client(_impostor_world())
+    session, found = await _discovered(rdb, conn, client, "@tb_flats")
+    _approve(rdb, conn, session, _item(found["@tb_flats"], "add_source"))
+    await _run(rdb, conn, paths, client, session)
+    conn.execute("DELETE FROM peer_cache")
+
+    report = await _fresh_sync(client, conn, paths)
+
+    assert _stored(conn, _marked(FLATS)) == []
+    [warning] = report.warnings
+    assert f"source chat:{_marked(FLATS)} did not resolve" in warning
+    assert "it keeps the chats it already covered" in warning
 
 
 async def test_a_public_chat_probed_without_an_access_hash_is_checked_before_it_is_added(

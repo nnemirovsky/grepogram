@@ -245,7 +245,8 @@ Decisions taken with the user before planning:
   `admission_timeout_days` (30) is `failed` with a note. A run acts on the peer the probe saw: a
   join goes by the stored id and access hash, and every source it adds names the chat by peer id
   — a public chat read without joining too, addressed through the probe's access hash (seeded
-  into the run's client, then kept in `chat_access` for every later sync) — so no later sync
+  into the run's client and kept in `peer_cache` when the source is added, fetched then or
+  not; the first sync that reaches it keeps it in `chat_access`) — so no later sync
   follows a freed username to another chat. If another sync holds the
   lock the run adds and fetches nothing and reports `stopped_by: sync_busy`. The run is
   resumable from `research.db` alone.

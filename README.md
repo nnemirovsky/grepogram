@@ -441,7 +441,9 @@ local user and every source is opt-in, so a scope decides what you search, not w
 use every signed-in account. Each chat goes through the account of the source that owns it. When Telegram refuses a
 shared chat to that account, or that account is not signed in, the chat is tried through another
 account that reaches it, and it stays the first source's chat either way. A flood wait stops
-only the account it hit, even while its sources are being read, and the others carry on.
+only the account it hit, even while its sources are being read, and the others carry on. A
+source whose chat or folder no longer resolves for its account is a warning of the sync, and it
+keeps the chats it already covered.
 `prune-deleted` is stricter, because an account that joined a group late can see older messages
 as deleted while another still reads them: it removes a message only when every account that
 reaches the chat says it is gone, and leaves the chat alone while one of them is signed out.
@@ -555,7 +557,8 @@ grepogram research stop 1            # explores no further; the sources it added
   It adds each as a source of the session's account, with history back to the session's horizon
   (`since_days` before the session started) and comments for a channel. It joins and adds the
   very chat the probe saw: every source it adds names the chat by its id — a public chat read
-  without joining too, through the access hash the probe got — so later syncs keep reading that
+  without joining too, through the access hash the probe got, which the index keeps from the
+  moment the source is added, fetched in that run or not — so later syncs keep reading that
   chat whatever its username does, and a freed name registered by someone else is never
   followed (a source you add yourself as `@name` keeps following the name). A chat whose
   username has since moved to another chat is never joined through it — when a later discover,
