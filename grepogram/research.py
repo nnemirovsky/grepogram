@@ -95,10 +95,11 @@ import functools
 import logging
 import sqlite3
 import time
+from collections import Counter
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
-from typing import Any, NoReturn
+from typing import Any, NoReturn, get_args
 
 from telethon import errors, utils
 from telethon.tl import functions, types
@@ -2598,3 +2599,215 @@ async def run(
         "" if report.stopped_by is None else f", stopped by {report.stopped_by}",
     )
     return report
+
+
+# --- what the CLI and the MCP server answer with ---------------------------------------------
+
+APPROVE_COMMAND = "grepogram research approve"
+APPROVAL_GRAMMAR = (
+    "name each target as ID:action,action (actions: join, request, fetch, add_source; a bare ID "
+    "approves what indexing it needs) or a session action (global_search, paid_search)"
+)
+_STATUS_NAMES: tuple[CandidateStatus, ...] = get_args(CandidateStatus)
+
+
+def parse_approval(tokens: Sequence[str]) -> list[ApprovalItem]:
+    """The approval items a command line names, the inverse of :func:`approval_args`.
+
+    ``ID:join,fetch,add_source`` names candidate ``ID`` and those actions, a bare ``ID`` the
+    candidate with no action yet (:func:`with_default_actions` fills them in), and
+    ``global_search`` / ``paid_search`` a session-wide action. Nothing is checked against the
+    session here; :func:`approval_summary` does that.
+    """
+    items: list[ApprovalItem] = []
+    for token in tokens:
+        text = token.strip()
+        head, sep, tail = text.partition(":")
+        if not sep and head in _SESSION_ORDER:
+            items.append(ApprovalItem(candidate_id=None, actions=(head,)))
+            continue
+        actions = tuple(action.strip() for action in tail.split(",") if action.strip())
+        if not head.isdigit() or (sep and not actions):
+            raise ResearchError(f"{token!r} is not an approval item", APPROVAL_GRAMMAR)
+        items.append(ApprovalItem(candidate_id=int(head), actions=actions))
+    if not items:
+        raise ResearchError("nothing to approve", APPROVAL_GRAMMAR)
+    return items
+
+
+def approval_args(items: Sequence[ApprovalItem]) -> list[str]:
+    """``items`` as the arguments :func:`parse_approval` reads back."""
+    args: list[str] = []
+    for item in items:
+        if item.candidate_id is None:
+            args.extend(item.actions)
+        elif item.actions:
+            args.append(f"{item.candidate_id}:{','.join(item.actions)}")
+        else:
+            args.append(str(item.candidate_id))
+    return args
+
+
+def approve_command(session_id: int, items: Sequence[ApprovalItem]) -> str:
+    """The command a human runs in a terminal to approve exactly ``items``."""
+    return " ".join([APPROVE_COMMAND, str(session_id), *approval_args(items)])
+
+
+def default_actions(candidate: Candidate) -> tuple[CandidateAction, ...]:
+    """What indexing ``candidate`` takes: fetching it and adding it as a source, and — for a
+    private chat the account is not in — the one way in it offers (``request`` where its admins
+    approve who joins, ``join`` otherwise). A public chat is read without joining it."""
+    inside = candidate.member is True or candidate.status in ("joined", "pending_admission")
+    if inside or candidate.username:
+        return ("fetch", "add_source")
+    if candidate.request_needed:
+        return ("request", "fetch", "add_source")
+    return ("join", "fetch", "add_source")
+
+
+def with_default_actions(
+    rdb: sqlite3.Connection, session_id: int, items: Sequence[ApprovalItem]
+) -> list[ApprovalItem]:
+    """``items`` with :func:`default_actions` given to every candidate named without actions."""
+    filled: list[ApprovalItem] = []
+    for item in items:
+        if item.candidate_id is None or item.actions:
+            filled.append(item)
+            continue
+        candidate = research_db.get_candidate(rdb, item.candidate_id)
+        if candidate is None or candidate.session_id != session_id:
+            raise UnknownCandidate(session_id, item.candidate_id)
+        filled.append(dataclasses.replace(item, actions=default_actions(candidate)))
+    return filled
+
+
+def known_session(rdb: sqlite3.Connection, session_id: int) -> ResearchSession:
+    """The session ``session_id``, active or stopped; :class:`UnknownSession` when there is none."""
+    session = research_db.get_session(rdb, session_id)
+    if session is None:
+        raise UnknownSession(session_id)
+    return session
+
+
+def authorized_actions(rdb: sqlite3.Connection, candidate: Candidate) -> list[CandidateAction]:
+    """The actions :func:`authorized` allows for ``candidate`` right now, in the order a run
+    takes them."""
+    return [action for action in _CANDIDATE_ORDER if authorized(rdb, candidate, action)]
+
+
+def session_document(session: ResearchSession) -> dict[str, Any]:
+    """A session as the CLI's ``--json`` and the MCP tools show it, with its history
+    :func:`horizon`."""
+    return {**dataclasses.asdict(session), "horizon": horizon(session)}
+
+
+def candidate_document(rdb: sqlite3.Connection, view: CandidateView) -> dict[str, Any]:
+    """One candidate with the three facts kept apart — ``member`` (a probe's answer), ``cached``
+    (the index holds it, through ``cached_accounts``) and ``authorized`` (the actions a live
+    grant allows) — and every piece of evidence. The acting account's access hash stays out."""
+    document = dataclasses.asdict(view.candidate)
+    del document["access_hash"]
+    document.update(
+        corroboration=view.corroboration,
+        overlap=view.overlap,
+        cached=view.cached,
+        cached_chats=list(view.cached_chats),
+        cached_accounts=list(view.cached_accounts),
+        authorized=authorized_actions(rdb, view.candidate),
+        evidence=[dataclasses.asdict(evidence) for evidence in view.evidence],
+    )
+    return document
+
+
+def candidates_document(
+    rdb: sqlite3.Connection,
+    conn: sqlite3.Connection,
+    cfg: Config,
+    session_id: int,
+    statuses: Sequence[str] | None = None,
+) -> dict[str, Any]:
+    """A session's candidates, best first (:func:`candidate_views`), narrowed to ``statuses``.
+    A stopped session still lists what it found."""
+    require_enabled(cfg)
+    session = known_session(rdb, session_id)
+    wanted: list[CandidateStatus] | None = None
+    if statuses:
+        unknown = [status for status in statuses if status not in _STATUS_NAMES]
+        if unknown:
+            raise ResearchError(
+                f"unknown candidate status {', '.join(map(repr, unknown))}",
+                f"statuses: {', '.join(_STATUS_NAMES)}",
+            )
+        wanted = [status for status in _STATUS_NAMES if status in statuses]
+    views = candidate_views(rdb, conn, session, wanted)
+    return {
+        "session_id": session.id,
+        "question": session.question,
+        "account": session.account,
+        "state": session.state,
+        "candidates": [candidate_document(rdb, view) for view in views],
+    }
+
+
+def status_document(
+    rdb: sqlite3.Connection, cfg: Config, session_id: int | None = None
+) -> dict[str, Any]:
+    """Every session in brief, newest first, or one session in full: its limits and progress,
+    how many candidates are in each status, the approvals a run has yet to carry out, and the
+    admission requests waiting for a chat's admins."""
+    require_enabled(cfg)
+    if session_id is None:
+        listed = []
+        for session in research_db.list_sessions(rdb):
+            counts = _status_counts(rdb, session.id)
+            listed.append(
+                {
+                    "id": session.id,
+                    "question": session.question,
+                    "account": session.account,
+                    "state": session.state,
+                    "created_at": session.created_at,
+                    "stopped_at": session.stopped_at,
+                    "candidates": sum(counts.values()),
+                    "runs": session.progress.get("runs", 0),
+                }
+            )
+        return {"sessions": listed}
+    session = known_session(rdb, session_id)
+    candidates = {c.id: c for c in research_db.list_candidates(rdb, session.id)}
+    grants = []
+    for live in research_db.list_grants(rdb, session.id, live_only=True):
+        target = None if live.candidate_id is None else candidates.get(live.candidate_id)
+        grants.append(
+            {
+                "id": live.id,
+                "candidate_id": live.candidate_id,
+                "identity": None if target is None else target.identity,
+                "title": None if target is None else target.title,
+                "account": live.account,
+                "actions": list(live.actions),
+                "via": live.via,
+                "granted_at": live.granted_at,
+            }
+        )
+    waiting = [
+        {"id": c.id, "identity": c.identity, "title": c.title}
+        for c in candidates.values()
+        if c.status == "pending_admission"
+    ]
+    return {
+        "session": session_document(session),
+        "candidates": _status_counts(rdb, session.id),
+        "pending_grants": grants,
+        "pending_admission": waiting,
+    }
+
+
+def _status_counts(rdb: sqlite3.Connection, session_id: int) -> dict[str, int]:
+    counts = Counter(c.status for c in research_db.list_candidates(rdb, session_id))
+    return {status: counts[status] for status in _STATUS_NAMES if counts[status]}
+
+
+def report_document(report: DiscoverReport | RunReport) -> dict[str, Any]:
+    """A discover or run report as the CLI's ``--json`` and the MCP tools answer with it."""
+    return dataclasses.asdict(report)

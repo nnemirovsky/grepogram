@@ -69,6 +69,25 @@ def make_channel(
     )
 
 
+def no_discussion(request: Any) -> Any:
+    """``channels.getFullChannel`` of a channel with no discussion group, for ``responses=``."""
+    return tl_messages.ChatFull(
+        full_chat=types.ChannelFull(
+            id=0,
+            about="",
+            read_inbox_max_id=0,
+            read_outbox_max_id=0,
+            unread_count=0,
+            chat_photo=types.PhotoEmpty(id=0),
+            notify_settings=types.PeerNotifySettings(),
+            bot_info=[],
+            pts=0,
+        ),
+        chats=[],
+        users=[],
+    )
+
+
 def make_group(chat_id: int, title: str, *, migrated_to: int | None = None) -> types.Chat:
     """A legacy (small) group; ``migrated_to`` marks it as upgraded to that supergroup."""
     return types.Chat(

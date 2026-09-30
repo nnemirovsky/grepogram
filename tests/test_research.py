@@ -35,6 +35,7 @@ from tests.fakes import (
     make_channel,
     make_group,
     make_user,
+    no_discussion,
 )
 from tests.fixtures import tl
 
@@ -1620,27 +1621,8 @@ def _run_world(flats_posts: int = 3, **kwargs: Any) -> FakeWorld:
     return world
 
 
-def _no_discussion(request: Any) -> Any:
-    """``channels.getFullChannel`` of a channel with no discussion group."""
-    return types.messages.ChatFull(
-        full_chat=types.ChannelFull(
-            id=0,
-            about="",
-            read_inbox_max_id=0,
-            read_outbox_max_id=0,
-            unread_count=0,
-            chat_photo=types.PhotoEmpty(id=0),
-            notify_settings=types.PeerNotifySettings(),
-            bot_info=[],
-            pts=0,
-        ),
-        chats=[],
-        users=[],
-    )
-
-
 def _run_client(world: FakeWorld, **kwargs: Any) -> FakeClient:
-    responses = {functions.channels.GetFullChannelRequest: _no_discussion}
+    responses = {functions.channels.GetFullChannelRequest: no_discussion}
     responses.update(kwargs.pop("responses", {}))
     return world.client("default", me=make_user(9, "Me"), responses=responses, **kwargs)
 
@@ -1964,3 +1946,122 @@ async def test_a_run_with_nothing_granted_touches_nothing(
     assert report == RunReport(session_id=session.id)
     assert len(client.requests) == sent and _history_calls(client) == []
     assert config.load(paths).sources == []
+
+
+# --- what the CLI and the MCP server answer with ---------------------------------------------
+
+
+def test_approval_items_read_back_what_they_print() -> None:
+    items = research.parse_approval(
+        ["12:join,fetch,add_source", "7", "global_search", "paid_search", " 3:fetch, add_source"]
+    )
+
+    assert items == [
+        ApprovalItem(candidate_id=12, actions=("join", "fetch", "add_source")),
+        ApprovalItem(candidate_id=7, actions=()),
+        ApprovalItem(candidate_id=None, actions=("global_search",)),
+        ApprovalItem(candidate_id=None, actions=("paid_search",)),
+        ApprovalItem(candidate_id=3, actions=("fetch", "add_source")),
+    ]
+    assert research.parse_approval(research.approval_args(items)) == items
+    assert research.approve_command(4, items[:2]) == (
+        "grepogram research approve 4 12:join,fetch,add_source 7"
+    )
+
+
+@pytest.mark.parametrize("tokens", [[], ["abc"], ["12:"], ["-3:fetch"], ["global_search:x"]])
+def test_a_malformed_approval_item_is_refused(tokens: list[str]) -> None:
+    with pytest.raises(research.ResearchError) as caught:
+        research.parse_approval(tokens)
+    assert caught.value.hint == research.APPROVAL_GRAMMAR
+
+
+def test_a_bare_id_approves_what_indexing_the_chat_takes(
+    rdb: sqlite3.Connection, conn: sqlite3.Connection
+) -> None:
+    session = _start(rdb, conn)
+    public = _flats(rdb, session)
+    open_invite = _probed(rdb, session, "+OpenDoor", "invite", type="supergroup", member=False)
+    gated = _probed(
+        rdb, session, "+JoinMe", "invite", type="supergroup", member=False, request_needed=True
+    )
+    inside = _probed(rdb, session, "+Already", "invite", type="supergroup", member=True)
+    named = [str(c.id) for c in (public, open_invite, gated, inside)]
+
+    filled = research.with_default_actions(rdb, session.id, research.parse_approval(named))
+
+    assert [item.actions for item in filled] == [
+        ("fetch", "add_source"),
+        ("join", "fetch", "add_source"),
+        ("request", "fetch", "add_source"),
+        ("fetch", "add_source"),
+    ]
+    research.approval_summary(rdb, conn, CFG, session.id, filled)  # every one is grantable
+    with pytest.raises(research.UnknownCandidate):
+        research.with_default_actions(rdb, session.id, research.parse_approval(["999"]))
+
+
+def test_a_candidate_document_keeps_member_cached_and_authorized_apart(
+    rdb: sqlite3.Connection, conn: sqlite3.Connection
+) -> None:
+    session = _start(rdb, conn)
+    _store(conn, SEED, 1, "rentals at @cachedchan", links=(("mention", "@cachedchan"),))
+    research.discover_offline(rdb, conn, CFG, session.id, now=2)
+    cached = research_db.candidate_by_identity(rdb, session.id, "@cachedchan")
+    assert cached is not None
+    research_db.update_candidate(
+        rdb, cached.id, probed_at=3, type="channel", member=False, access_hash=77
+    )
+    _approve(rdb, conn, session, _item(cached, "fetch", "add_source"))
+
+    document = research.candidates_document(rdb, conn, CFG, session.id)
+
+    (entry,) = document["candidates"]
+    assert (document["session_id"], document["account"], document["state"]) == (
+        session.id,
+        "default",
+        "active",
+    )
+    assert (entry["identity"], entry["member"], entry["cached"]) == ("@cachedchan", False, True)
+    assert (entry["cached_chats"], entry["cached_accounts"]) == ([CACHED], ["work"])
+    assert entry["authorized"] == ["fetch", "add_source"]
+    assert entry["evidence"][0]["via"] == "mention" and entry["evidence"][0]["msg_id"] == 1
+    assert "access_hash" not in entry, "the account's access hash never leaves the store"
+    assert research.candidates_document(rdb, conn, CFG, session.id, ["proposed"]) == {
+        **document,
+        "candidates": [],
+    }
+    with pytest.raises(research.ResearchError, match="unknown candidate status"):
+        research.candidates_document(rdb, conn, CFG, session.id, ["maybe"])
+    with pytest.raises(research.ResearchDisabled):
+        research.candidates_document(rdb, conn, Config(), session.id)
+
+
+def test_the_status_document_lists_sessions_and_what_waits(
+    rdb: sqlite3.Connection, conn: sqlite3.Connection
+) -> None:
+    first = _start(rdb, conn)
+    second = _start(rdb, conn)
+    flats = _flats(rdb, session=second)
+    gated = _probed(rdb, second, "+JoinMe", "invite", type="supergroup", status="pending_admission")
+    _approve(rdb, conn, second, _item(flats, "fetch", "add_source"))
+
+    listed = research.status_document(rdb, CFG)
+    one = research.status_document(rdb, CFG, second.id)
+
+    assert [(s["id"], s["candidates"], s["runs"]) for s in listed["sessions"]] == [
+        (second.id, 2, 0),
+        (first.id, 0, 0),
+    ]
+    assert one["session"]["id"] == second.id and one["session"]["horizon"] == "1969-01-01"
+    assert one["candidates"] == {"approved": 1, "pending_admission": 1}
+    (pending,) = one["pending_grants"]
+    assert (pending["candidate_id"], pending["identity"], pending["actions"], pending["via"]) == (
+        flats.id,
+        "@tb_flats",
+        ["fetch", "add_source"],
+        "cli",
+    )
+    assert one["pending_admission"] == [{"id": gated.id, "identity": "+JoinMe", "title": None}]
+    with pytest.raises(research.UnknownSession):
+        research.status_document(rdb, CFG, 999)
