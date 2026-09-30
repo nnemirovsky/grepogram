@@ -43,6 +43,11 @@ CHANNEL_42 = -1000000000042
         # shared folders
         ("https://t.me/addlist/XyZ_123", "addlist/XyZ_123"),
         ("tg://addlist?slug=XyZ_123", "addlist/XyZ_123"),
+        # Telegram's routes open whatever their case; the hash and the slug keep theirs
+        ("https://t.me/JoinChat/AbC-d_12345", "+AbC-d_12345"),
+        ("https://t.me/AddList/XyZ_123", "addlist/XyZ_123"),
+        ("https://t.me/C/42/9", "c/42/9"),
+        ("https://t.me/S/News_Chat/123", "@news_chat/123"),
         # peers by id
         ("https://t.me/c/42", f"peer:{CHANNEL_42}"),
         ("tg://user?id=777", "peer:777"),

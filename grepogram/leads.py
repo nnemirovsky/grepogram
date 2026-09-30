@@ -225,15 +225,16 @@ def _web_url(text: str) -> LeadTarget | None:
     if not segments:
         return None
     head, rest = segments[0], segments[1:]
+    route = head.lower()  # Telegram's own routes open whatever their case: t.me/JoinChat/…
     if head.startswith("+"):
         return invite(head[1:])
-    if head == "joinchat":
+    if route == "joinchat":
         return invite(rest[0]) if rest else None
-    if head == "addlist":
+    if route == "addlist":
         return addlist(rest[0]) if rest else None
-    if head == "c":
+    if route == "c":
         return _private_path(rest)
-    if head == "s":  # the web preview of a public channel: t.me/s/<name>[/<post>]
+    if route == "s":  # the web preview of a public channel: t.me/s/<name>[/<post>]
         head, rest = (rest[0], rest[1:]) if rest else ("", [])
     return _public_path(head, rest)
 
