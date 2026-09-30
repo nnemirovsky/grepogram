@@ -144,9 +144,9 @@ Decisions taken with the user before planning:
   again" is not an acceptable upgrade path. CLAUDE.md is amended to say so: steps may *fill new
   columns deterministically from existing ones*, never rewrite existing values.
 - **Sync across accounts.** `sync_all` takes an account→client mapping. Each resolved chat is
-  fetched once, by the first account of its route (`sync.reaching_accounts`: the primary
+  fetched once, by the first account of its route (`accounts.reaching_accounts`: the primary
   source's account, then the others `chat_access` records) that is in the run and not stopped;
-  `sync.through_accounts` is the one retry walk down that route, shared by sync, `extract`,
+  `accounts.through_accounts` is the one retry walk down that route, shared by sync, `extract`,
   `prune-deleted` and `recapture-links`. A source that does not resolve keeps being the primary
   of its chats, which are still fetched through another account, so primaries never flip for a
   run. Account queues run concurrently (an `asyncio.TaskGroup`) under the one `SyncLock` and one
@@ -256,7 +256,11 @@ Decisions taken with the user before planning:
 
 ### Interfaces
 
-CLI and MCP share `grepogram/research.py` and `research.db`.
+CLI and MCP share the `grepogram/research/` package and `research.db`. (Built as one
+`research.py`; review phase 2 split it into modules along its passes — `collect`, `sessions`,
+`grants`, `offline`, `pins`, `probing`, `searching`, `discovery`, `approval`, `joining`,
+`running`, `documents` — with `__init__` re-exporting the public API, and moved the account
+identity and routing layer out of `sync.py` into `grepogram/accounts.py`.)
 
 | CLI | MCP | does |
 |---|---|---|
