@@ -137,7 +137,9 @@ from grepogram.embed import Embedder
 from grepogram.filters import resolve_chats
 from grepogram.leads import LeadTarget
 from grepogram.models import (
+    PEOPLE_CHAT_TYPES,
     RESEARCH_LIMIT_MAX,
+    SHARED_CHAT_TYPES,
     ApprovalItem,
     Candidate,
     CandidateAction,
@@ -2062,7 +2064,6 @@ _SKIPPABLE: frozenset[CandidateStatus] = frozenset(
 )
 """Statuses skip takes: all but the settled ones. A joined or waiting candidate stays in the chat
 on Telegram, but what is still approved for it — its fetch, its source — is withdrawn."""
-_PEOPLE: tuple[ChatType, ...] = ("user", "bot")
 APPROVE_HINT = "review the summary and approve again"
 DESCENDANTS_NOTE = (
     "Nothing found inside these chats is approved by this: every chat discovered through them "
@@ -2161,7 +2162,7 @@ def _way_in_route(rdb: sqlite3.Connection, candidate: Candidate, action: str) ->
         parent = research_db.get_candidate(rdb, candidate.parent_id)
         if parent is not None and parent.kind == "addlist" and parent.addlist_slug:
             return f"{research_db.FOLDER_ROUTE}{parent.id}"
-    if candidate.type in ("channel", "supergroup") and candidate.access_hash is not None:
+    if candidate.type in SHARED_CHAT_TYPES and candidate.access_hash is not None:
         return "id"
     return None
 
@@ -2230,7 +2231,7 @@ def _candidate_entry(
             "not probed yet, so there is nothing to show what it is",
             f"run `grepogram research discover {session.id}` first",
         )
-    if candidate.type in _PEOPLE:
+    if candidate.type in PEOPLE_CHAT_TYPES:
         refuse("a person's account, not a group or channel")
     live = _live_actions(rdb, session, candidate.id)
     effective = live | set(requested)

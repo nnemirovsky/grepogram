@@ -78,6 +78,7 @@ from grepogram.filters import FilterError
 from grepogram.log import setup_logging
 from grepogram.models import (
     DEFAULT_ACCOUNT,
+    PEOPLE_CHAT_TYPES,
     AccountCfg,
     AccountRow,
     ChatRow,
@@ -1535,7 +1536,7 @@ async def _leave(
             raise sources.InvalidTarget(
                 f"{found.title!r} is a folder; leave takes one group or channel"
             )
-        if found.type in ("user", "bot"):
+        if found.type in PEOPLE_CHAT_TYPES:
             raise sources.InvalidTarget(
                 f"{found.title!r} is a private chat with a {found.type}; there is nothing to leave"
             )

@@ -283,6 +283,9 @@ SHARED_CHAT_TYPES: frozenset[ChatType] = frozenset({"channel", "supergroup"})
 the same peer id and the same ``msg_id`` for each message, so the index holds one row for all of
 them. Users, bots and legacy groups number their messages per account and get a row per account.
 """
+PEOPLE_CHAT_TYPES: frozenset[ChatType] = frozenset({"user", "bot"})
+"""Chat types that are a person or a bot rather than a group or a channel: nothing to join,
+leave or read the members of."""
 
 
 def chat_scope(chat_type: ChatType, account: str) -> str:
