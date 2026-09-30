@@ -217,6 +217,7 @@ diagnostics and logs to stderr and the log file.
 | `grepogram sync [--budget S]` | fetch new messages from every source of every signed-in account, rebuild units, index and embed; stops cleanly after `S` seconds (at least 1) |
 | `grepogram extract [--budget S] [--retry-failed]` | read text out of the media already stored — photos through OCR, PDF and DOCX attachments — and re-cut the units holding it; a network pass, run after `sync`, resumable; `--retry-failed` queues what an earlier run could not read, and what this build had no extractor for, again. See [Reading Text Out of Media](#reading-text-out-of-media) |
 | `grepogram prune-deleted [--chat X] [--budget S]` | ask Telegram about every indexed message and drop the ones it no longer has, the discussion group of a channel included; about one request per hundred stored messages, so it is run by hand, resumes where it stopped and is never started by a sync |
+| `grepogram recapture-links [--chat X] [--budget S]` | re-read the indexed messages stored without their links — every message an index built before link capture holds — and store their hidden hyperlinks, URL buttons and forward origins, so research sees them; about one request per hundred such messages, run by hand, resumable, and it changes nothing else of a message and moves no sync cursor |
 | `grepogram import <dir> [--chat-title T] [--account NAME]` | index a Telegram Desktop JSON export — one chat's `messages.json` or a whole account's `result.json`, every chat in it — of history this account can no longer open; offline, idempotent, and the chats it creates are marked unavailable so no sync fetches them and no prune offers them. `--chat-title` names the one chat of a single-chat export and is refused for an export holding several, which carry their own titles; `--account` names the account the export was made from, whose private chats and legacy groups it holds |
 | `grepogram embed [--reembed]` | embed units the dense index does not hold yet; `--reembed` drops every vector and starts over (needed after changing `[models] embed`); refuses while a sync is running |
 | `grepogram search <query> …` | search the index, see below |
@@ -279,6 +280,15 @@ channel to its discussion group so a deleted *comment* is caught too. That is ab
 per hundred stored messages, which is why it is yours to run and never a sync's; a run stopped by
 `--budget` or a flood wait keeps every batch it finished and the next one carries on from its
 cursor. Anything Telegram declines for some other reason is left where it is.
+
+`recapture-links` fills in what an older index never kept. Messages stored before grepogram
+captured links carry only their text: their hidden hyperlinks, URL buttons and forward origins
+were not stored, and a sync re-reads only the newest messages of a chat. This command asks
+Telegram about exactly those messages, a hundred per request, through an account that reaches the
+chat, and stores their links and forward origins — nothing else of a message changes, no unit is
+re-cut, no sync resumes from anywhere else, and a message Telegram no longer has is left to
+`prune-deleted`. Like `prune-deleted` it is yours to run and resumes from where a budget or a
+flood wait stopped it. An imported chat is never re-read.
 
 `import` reads a Telegram Desktop export — Settings → Advanced → Export Telegram data, in the
 machine-readable JSON format — of history this account can no longer open. Point it at the
@@ -403,16 +413,16 @@ spec `account:work` narrow a query to the chats that account reaches, a channel'
 group included. A channel both accounts reach is in both scopes. Every account belongs to the same
 local user and every source is opt-in, so a scope decides what you search, not who may read it.
 
-**How the commands split the work.** `sync`, `extract` and `prune-deleted` use every signed-in
-account. Each chat goes through the account of the source that owns it. When Telegram refuses a
+**How the commands split the work.** `sync`, `extract`, `prune-deleted` and `recapture-links`
+use every signed-in account. Each chat goes through the account of the source that owns it. When Telegram refuses a
 shared chat to that account, or that account is not signed in, the chat is tried through another
 account that reaches it, and it stays the first source's chat either way. A flood wait stops
 only the account it hit, even while its sources are being read, and the others carry on.
 `prune-deleted` is stricter, because an account that joined a group late can see older messages
 as deleted while another still reads them: it removes a message only when every account that
 reaches the chat says it is gone, and leaves the chat alone while one of them is signed out.
-`extract` and `prune-deleted` report a chat that no connected account reaches as unreachable, not
-as an error. An account with no session, or one Telegram has signed out, is left out with a
+`extract`, `prune-deleted` and `recapture-links` report a chat that no connected account reaches
+as unreachable, not as an error. An account with no session, or one Telegram has signed out, is left out with a
 warning (the MCP `sync` lists it under `accounts_skipped`) and the rest still sync. `dialogs`, `sources add`, `import` and `leave` act as
 one account, `default` unless `--account` names another.
 
@@ -429,7 +439,8 @@ and folders, and touches neither the config nor the index.
 
 Research starts from a question and chats you already index and looks for the chats they lead
 to. It collects the links, mentions, hidden hyperlinks, URL buttons, link previews, forward
-origins and shared-folder links in your chats. After you approve specific chats and specific
+origins and shared-folder links in your chats and in their pinned posts, and notices which of
+your chats are directories. After you approve specific chats and specific
 actions, it joins them, requests admission, and fetches them as ordinary sources. It is **off
 until you switch it on**: set `enabled = true` under `[research]` in `config.toml`, and until
 then every research command and tool refuses.
@@ -450,12 +461,22 @@ grepogram research stop 1            # explores no further; the sources it added
   that will later join and fetch (`--account`, `default` otherwise). It also fixes the session's
   limits from `[research]`, and the flags override any of them.
 - **discover** reads the indexed messages of the seeds, and of every chat a run fetched for the
-  session one hop further out, and proposes each chat they name as a candidate. A candidate is a
-  chat: a link to a post leads to its channel, and a mention of a person is not a candidate.
-  Messages stored before this version were stored without their hidden hyperlinks and buttons,
-  so for them discovery falls back to the URLs and `@mentions` visible in their text and reports
-  how many it read that way. Then it **probes** the best `probe_limit` candidates as the
-  session's account. A probe reads metadata only: title, type, size, whether the account is a
+  session one hop further out — a channel's discussion group always with its channel — and
+  proposes each chat they name as a candidate. A candidate is a chat: a link to a post leads to
+  its channel, and a mention of a person is not a candidate. It picks up where it stopped, and a
+  comment that arrives late or a message that gains a link since is read too. Messages stored
+  without their hidden hyperlinks and buttons (before this version, or by an import of an export
+  that kept no formatting) are read by the URLs and `@mentions` visible in their text, and the
+  report says how many were read that way; `grepogram recapture-links` fetches what they hid.
+  It also reads the **pinned posts** of those chats, once each and whatever their age, since a
+  directory often keeps its index in a post pinned years ago: what they lead to is kept as
+  evidence (`pinned`) and never stored as messages of the index. A chat whose messages name at
+  least ten distinct chats is a **directory**: every chat found in it carries a `directory` path
+  in its evidence, and approving the directory approves none of them. A forward from a channel
+  the index does not hold is probed with what the sync learned about that channel when it
+  fetched the forward — its username and the account's access hash — so it is not a dead end.
+  `max_candidates` bounds one call and `max_session_candidates` the whole session. Then it
+  **probes** the best `probe_limit` candidates as the session's account. A probe reads metadata only: title, type, size, whether the account is a
   member, and whether joining needs the admins' approval. It never reads history. A shared-folder
   (`addlist`) link turns into one candidate per chat in the folder. `--offline` skips the probing
   and asks Telegram nothing.
@@ -477,15 +498,17 @@ grepogram research stop 1            # explores no further; the sources it added
   the question are printed on one line with any control or invisible formatting character shown
   as `�`, so a chat's name cannot forge or hide a line. The question itself is limited to one
   line of plain text of at most 500 characters.
-- **run** re-checks pending admission requests and joins or requests exactly the approved chats.
+- **run** re-checks pending admission requests — one no admin answered within
+  `admission_timeout_days` is given up as `failed`, and approving `request` again sends a new one
+  — and joins or requests exactly the approved chats.
   It adds each as a source of the session's account, with history back to the session's horizon
   (`since_days` before the session started) and comments for a channel. It joins and adds the
   very chat the probe saw: a joined chat's source names it by its id, and a chat whose username
   has since moved to another chat is refused rather than followed. It fetches exactly those
   chats through an ordinary sync, bounded by `run_budget_s` and `max_messages_per_run`. If
   another sync is already running, the fetch waits for the next run and the report says so
-  (`stopped_by: sync_busy`). Then it reads the new messages one hop deeper and
-  only *proposes* what they lead to. A run stopped by a budget or a flood wait resumes on the
+  (`stopped_by: sync_busy`). Then it reads the new messages and the pinned posts of what it
+  fetched one hop deeper and only *proposes* what they lead to. A run stopped by a budget or a flood wait resumes on the
   next `run`, and approvals it has not carried out yet stay valid.
 - **skip**, **exclude** and **unexclude** only narrow the session and need no confirmation.
   Skipping sets candidates aside and voids their approvals, including the fetch still pending for
@@ -527,7 +550,9 @@ search, even when two searches run at once; it is a grant of its own, so spendin
 
 Research keeps its sessions, candidates, evidence, approvals and exclusions in `research.db`, a
 file of its own next to `index.db`. The index can be deleted and rebuilt with one sync, and your
-decisions are not lost with it.
+decisions are not lost with it: `research.db` names every chat as Telegram does — its scope and
+peer id, never an index row id — so a rebuilt index, or a private chat stored again under
+another row, is still the same conversation to a session, which then reads it from the start.
 
 ## MCP Tools
 
@@ -548,13 +573,13 @@ advisory; the data next to them is valid.
 | `sources_add` | `target`, `since=null`, `comments=false`, `account=null` | `{source, kind, title, chats, hint}` after saving the config; the source belongs to `account`, else to the account an `<account>/` prefix on `target` names, else to the default one |
 | `sources_remove` | `target` | `{source_id, removed_chat_ids, kept_chat_ids, config_updated}` after deleting the data of the chats no other source covers; `target` is a source id from `sources` (`folder:<name>`, `chat:<value>`, `<account>/chat:<value>`), a folder name, a chat id, `@username` or a fuzzy title; `error` while a sync is running |
 | `accounts` | — | `{accounts, hint}`: every account (offline) with `name`, `label`, `session` (`missing` / `present` / `authorized`), `user_id`, `display_name`, `sources`, `chats` and, for a missing session, the `hint` that signs it in; accounts are signed in and removed from a terminal only |
-| `research_start` | `question`, `seeds: list[str]`, `account=null`, `max_depth`, `max_candidates`, `probe_limit`, `since_days`, `max_messages_per_run`, `run_budget_s` (each `null` = the `[research]` default) | the session, as `grepogram research start --json` prints it: `id`, `question`, `account`, `seeds` (chat ids), `limits`, `state`, `progress`, `horizon` (the date the sources a run adds start from) |
-| `research_discover` | `session_id`, `offline=false` | the discover report: `leads`, `new_candidates`, `updated_candidates`, what was left out (`beyond_depth`, `excluded`, `over_cap`), `probe` (read-only metadata of the best candidates, as the session's account) and `searches` (the global searches the user approved); `offline` asks Telegram nothing |
-| `research_candidates` | `session_id`, `status: list[str] \| null` | `{session_id, question, account, state, candidates}`, best corroborated first; each candidate keeps three facts apart — `member`, `cached` (with `cached_accounts`) and `authorized` — next to `corroboration` (distinct origins: forwards of one post count once), `overlap` and every piece of `evidence` |
+| `research_start` | `question`, `seeds: list[str]`, `account=null`, `max_depth`, `max_candidates`, `probe_limit`, `since_days`, `max_messages_per_run`, `run_budget_s` (each `null` = the `[research]` default) | the session, as `grepogram research start --json` prints it: `id`, `question`, `account`, `seeds` (each `{scope, peer_id}`, the chat as Telegram names it), `limits`, `state`, `progress`, `horizon` (the date the sources a run adds start from) |
+| `research_discover` | `session_id`, `offline=false` | the discover report: `leads`, `new_candidates`, `updated_candidates`, what was left out (`beyond_depth`, `excluded`, `over_cap`, `session_full`), `directories`, `pins` (the pinned posts of the session's chats, read once each for leads and never indexed), `probe` (read-only metadata of the best candidates, as the session's account) and `searches` (the global searches the user approved); `offline` asks Telegram nothing |
+| `research_candidates` | `session_id`, `status: list[str] \| null` | `{session_id, question, account, state, candidates}`, best corroborated first; each candidate keeps three facts apart — `member`, `cached` (with `cached_accounts`) and `authorized` — next to `corroboration` (distinct origins: forwards of one post count once), `overlap` and every piece of `evidence`: its `via`, the chat it was found in as `scope` and `peer_id`, and as `chat_id` — that chat's index row now, what `thread` and `context` take, `null` for a chat the index does not hold — with `msg_id`, `origin_key` and a `snippet` |
 | `research_approve` | `session_id`, `items: list[str]` (`ID:join,fetch,…`, a bare `ID`, `global_search`, `paid_search`) | asks the user through MCP elicitation with the exact approval `summary`; `{approved: true, grants, …}` only when they accept and tick approve, `{approved: false, answer, …}` otherwise; a client without elicitation gets `error` and a `hint` naming the `grepogram research approve …` command for the user to type in their own terminal |
 | `research_skip` | `session_id`, `candidate_ids: list[int]` | `{session_id, skipped}`; approvals they held are voided — narrowing needs no approval |
 | `research_exclude` | `targets: list[str]`, `session_id=null`, `reason=null` | `{excluded, hint}`: never proposed again in any session; lifting an exclusion is `grepogram research unexclude`, in a terminal |
-| `research_run` | `session_id` | the run report as `grepogram research run --json` prints it (`admitted`, `joined`, `pending_admission`, `sources_added`, `fetched`, `partial`, `unavailable`, `failed`, `messages`, `stopped_by`, `discovery`, `warnings`) plus `accounts_skipped` |
+| `research_run` | `session_id` | the run report as `grepogram research run --json` prints it (`admitted`, `joined`, `pending_admission`, `sources_added`, `fetched`, `partial`, `unavailable`, `failed`, `messages`, `stopped_by`, `pins`, `discovery`, `warnings`) plus `accounts_skipped` |
 | `research_status` | `session_id=null` | `{sessions}` in brief, or one session in full: `session`, `candidates` by status, `pending_grants`, `pending_admission` |
 | `research_stop` | `session_id` | `{session_id, stopped, grants_voided, hint}`; the sources its runs added stay |
 
@@ -575,7 +600,8 @@ terminal; it asks on the controlling terminal and nowhere else, and an agent mus
 for them.
 
 Several CLI commands have **no tool here, deliberately**: `sources prune` and `prune-deleted`
-delete indexed history, `extract` is a long flood-exposed network pass, `import` reads a
+delete indexed history, `extract` and `recapture-links` are long flood-exposed network passes,
+`import` reads a
 directory the server has no reason to be looking at, `auth` and `accounts rm` sign accounts in
 and out (the `accounts` tool only lists them), `leave` is the one command that changes an account
 on Telegram, and `research unexclude` lifts a decision the user made. They stay in the terminal,
@@ -1071,11 +1097,13 @@ connections are held open rather than refused — a firewall prompt nobody answe
 - Messages stored before links and forward origins were captured carry neither: their hidden
   hyperlinks, URL buttons and link previews were never kept, so research reads only the URLs and
   `@mentions` visible in their text, and says how many messages it read that way. A sync re-reads
-  the newest `edit_refetch` messages of each chat and stores what it finds there; older history
-  gains them only by being fetched afresh (removing the source and adding it back).
-- A forward whose origin is a private channel the acting account holds no access to is recorded
-  as `unresolvable` and never guessed at; probing it would need the account to reach that
-  channel first.
+  the newest `edit_refetch` messages of each chat and stores what it finds there; for the older
+  history, run `grepogram recapture-links`. A Telegram Desktop export keeps visible links,
+  hidden hyperlinks and mentions but no buttons or link previews, and an imported chat cannot be
+  re-read.
+- A forward whose origin is a private channel the acting account holds no access to, and whose
+  username Telegram did not hand over with the forward, is recorded as `unresolvable` and never
+  guessed at; probing it would need the account to reach that channel first.
 - Only one session at a time can be written: `grepogram auth` while another client has an
   uncommitted write open on the session file (a sync in another Telethon-based tool, say) can
   fail with `database is locked`; grepogram's own clients only read it.
