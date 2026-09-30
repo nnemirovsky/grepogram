@@ -2,8 +2,8 @@
 
 Telegram addresses a message differently per chat type. Public channels and supergroups have a
 web link, ``https://t.me/<username>/<msg>``; private ones use ``https://t.me/c/<id>/<msg>``,
-where ``<id>`` is Telegram's bare channel id — the marked ``-(1000000000000 + id)`` form the
-``chats`` table stores is a Telethon convention no Telegram URL understands, so
+where ``<id>`` is Telegram's bare channel id — the marked ``-(1000000000000 + id)`` form
+``chats.peer_id`` stores is a Telethon convention no Telegram URL understands, so
 :func:`strip_channel_prefix` undoes it. Forum supergroups insert the topic: ``…/<topic>/<msg>``.
 Private chats and legacy groups have no web form at all; the ``tg://openmessage`` scheme reaches
 the message on mobile, and the desktop clients at least open the conversation through
