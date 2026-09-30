@@ -3556,9 +3556,11 @@ def candidates_document(
 def status_document(
     rdb: sqlite3.Connection, cfg: Config, session_id: int | None = None
 ) -> dict[str, Any]:
-    """Every session in brief, newest first, or one session in full: its limits and progress,
-    how many candidates are in each status, the approvals a run has yet to carry out, and the
-    admission requests waiting for a chat's admins."""
+    """Every session in brief, newest first, with every exclusion (``identity``, the ``reason``
+    it was given, ``created_at``) — exclusions hold across sessions, so this is where they are
+    seen — or one session in full: its limits and progress, how many candidates are in each
+    status, the approvals a run has yet to carry out, and the admission requests waiting for a
+    chat's admins."""
     require_enabled(cfg)
     if session_id is None:
         listed = []
@@ -3576,7 +3578,8 @@ def status_document(
                     "runs": session.progress.get("runs", 0),
                 }
             )
-        return {"sessions": listed}
+        exclusions = [dataclasses.asdict(e) for e in research_db.list_exclusions(rdb)]
+        return {"sessions": listed, "exclusions": exclusions}
     session = known_session(rdb, session_id)
     candidates = {c.id: c for c in research_db.list_candidates(rdb, session.id)}
     grants = []

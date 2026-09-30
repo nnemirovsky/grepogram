@@ -1234,8 +1234,8 @@ def research_exclude(
 ) -> ToolResult:
     """Never propose these chats again, in any research session (offline); their approvals are
     voided. `targets` are candidate ids (with `session_id`), `@usernames`, t.me links or marked
-    chat ids; `reason` is kept for later. Needs no confirmation: it only narrows. Returns
-    `excluded`: each identity with how many candidates it set aside."""
+    chat ids; `reason` is kept and listed by `research_status`. Needs no confirmation: it only
+    narrows. Returns `excluded`: each identity with how many candidates it set aside."""
     state = _app()
     cfg = state.config()
     rdb = state.research_store(cfg)
@@ -1282,7 +1282,8 @@ async def research_run(session_id: int) -> ToolResult:
 @guarded
 def research_status(session_id: int | None = None) -> ToolResult:
     """Every research session in brief (`sessions`: id, question, account, state, candidates,
-    runs), or one in full (offline): the `session` with its limits, progress and `horizon`,
+    runs) and every exclusion (`exclusions`: `identity`, the `reason` given, `created_at`), or
+    one in full (offline): the `session` with its limits, progress and `horizon`,
     `candidates` counted by status, `pending_grants` (approved, not carried out yet) and
     `pending_admission` (admission requests a chat's admins have not answered)."""
     state = _app()

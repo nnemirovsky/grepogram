@@ -1925,8 +1925,9 @@ def research_status(
     ] = None,
     as_json: JsonOption = False,
 ) -> None:
-    """Every research session in brief, or one in full: its progress, the approvals a run has
-    yet to carry out and the admission requests still waiting (offline)."""
+    """Every research session in brief with the chats excluded from all of them (and why), or
+    one session in full: its progress, the approvals a run has yet to carry out and the
+    admission requests still waiting (offline)."""
     with _research_store() as (_, cfg, _conn, rdb):
         try:
             document = research.status_document(rdb, cfg, session_id)
@@ -1937,6 +1938,7 @@ def research_status(
         return
     if session_id is None:
         _print_sessions(document["sessions"])
+        _print_exclusions(document["exclusions"])
     else:
         _print_session_status(document)
 
@@ -1959,6 +1961,16 @@ def _print_sessions(sessions: Sequence[Mapping[str, Any]]) -> None:
         for s in sessions
     ]
     _print_table(("session", "state", "account", "candidates", "runs", "question"), rows)
+
+
+def _print_exclusions(exclusions: Sequence[Mapping[str, Any]]) -> None:
+    if not exclusions:
+        return
+    typer.echo("")
+    typer.echo("excluded from every session (grepogram research unexclude lifts one):")
+    for excluded in exclusions:
+        reason = f": {excluded['reason']}" if excluded["reason"] else ""
+        typer.echo(f"  {excluded['identity']}{reason}")
 
 
 def _print_session_status(document: Mapping[str, Any]) -> None:

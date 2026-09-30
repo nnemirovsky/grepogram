@@ -515,7 +515,8 @@ grepogram research stop 1            # explores no further; the sources it added
   a chat a run already joined. An exclusion is global and permanent: that chat is never proposed
   again, in any session, until you `unexclude` it. It covers the chat under every name it is
   known by (`@name`, its id, an invite link), and it withdraws whatever is still approved for
-  it. A chat found under two names in one session is one candidate.
+  it. `research status` lists every exclusion with the `--reason` it was given. A chat found
+  under two names in one session is one candidate.
 - **stop** ends the exploring and voids the approvals no run used. **Every source a run added
   stays**: it is an ordinary source now, synced and searched like the rest. Take one out with
   `grepogram sources rm`, which, like every removal, never leaves the chat on Telegram. Leaving
@@ -580,7 +581,7 @@ advisory; the data next to them is valid.
 | `research_skip` | `session_id`, `candidate_ids: list[int]` | `{session_id, skipped}`; approvals they held are voided — narrowing needs no approval |
 | `research_exclude` | `targets: list[str]`, `session_id=null`, `reason=null` | `{excluded, hint}`: never proposed again in any session; lifting an exclusion is `grepogram research unexclude`, in a terminal |
 | `research_run` | `session_id` | the run report as `grepogram research run --json` prints it (`admitted`, `joined`, `pending_admission`, `sources_added`, `fetched`, `partial`, `unavailable`, `failed`, `messages`, `stopped_by`, `pins`, `discovery`, `warnings`) plus `accounts_skipped` |
-| `research_status` | `session_id=null` | `{sessions}` in brief, or one session in full: `session`, `candidates` by status, `pending_grants`, `pending_admission` |
+| `research_status` | `session_id=null` | `{sessions, exclusions}` in brief (each exclusion with its `reason`), or one session in full: `session`, `candidates` by status, `pending_grants`, `pending_admission` |
 | `research_stop` | `session_id` | `{session_id, stopped, grants_voided, hint}`; the sources its runs added stay |
 
 Messages in `thread` and `context` have `chat_id`, `peer_id`, `msg_id`, `date`, `from_name`,

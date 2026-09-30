@@ -2020,6 +2020,7 @@ def test_research_skip_exclude_and_unexclude_need_no_terminal(
 
     skipped = runner.invoke(cli.app, ["research", "skip", "1", "1"])
     excluded = runner.invoke(cli.app, ["research", "exclude", "@tb_flats", "--reason", "spam"])
+    status = runner.invoke(cli.app, ["research", "status"])
     lifted = runner.invoke(cli.app, ["research", "unexclude", "1", "--session", "1"])
     again = runner.invoke(cli.app, ["research", "unexclude", "@tb_flats"])
 
@@ -2027,6 +2028,11 @@ def test_research_skip_exclude_and_unexclude_need_no_terminal(
     assert (
         excluded.stdout.strip() == "excluded @tb_flats from every session (1 candidates set aside)"
     )
+    # what is excluded, and why, is seen where the sessions are listed
+    assert status.stdout.splitlines()[-2:] == [
+        "excluded from every session (grepogram research unexclude lifts one):",
+        "  @tb_flats: spam",
+    ]
     assert "no longer excluded: @tb_flats" in lifted.stdout
     assert again.stdout.strip() == "none of them was excluded"
     listed = runner.invoke(cli.app, ["research", "candidates", "1", "--status", "proposed"])
@@ -2082,7 +2088,7 @@ def test_research_start_refuses_a_limit_outside_its_bounds(tmp_home: Path) -> No
     assert "since_days must be a whole number from 1 to 36500" in huge.stderr
     assert zero.exit_code == 1 and "run_budget_s must be a whole number from 1" in zero.stderr
     status = runner.invoke(cli.app, ["research", "status", "--json"])
-    assert json.loads(status.stdout) == {"sessions": []}
+    assert json.loads(status.stdout) == {"sessions": [], "exclusions": []}
 
 
 def test_research_start_refuses_a_question_that_could_forge_a_summary(tmp_home: Path) -> None:
@@ -2097,7 +2103,7 @@ def test_research_start_refuses_a_question_that_could_forge_a_summary(tmp_home: 
         assert result.exit_code == 1
         assert "control or invisible formatting characters" in result.stderr
     status = runner.invoke(cli.app, ["research", "status", "--json"])
-    assert json.loads(status.stdout) == {"sessions": []}
+    assert json.loads(status.stdout) == {"sessions": [], "exclusions": []}
 
 
 def test_research_discover_offline_asks_telegram_nothing(

@@ -2032,6 +2032,8 @@ async def test_research_skip_and_exclude_need_no_approval(researching: FakeClien
     }
     assert unknown["error"] == "no candidate 9 in research session 1"
     assert tools.research_candidates(1)["candidates"][0]["status"] == "excluded"
+    (listed,) = tools.research_status()["exclusions"]
+    assert (listed["identity"], listed["reason"]) == ("@tb_flats", "spam")
 
 
 async def test_research_start_refuses_bad_limits_and_unknown_accounts(
@@ -2055,7 +2057,7 @@ async def test_research_start_refuses_bad_limits_and_unknown_accounts(
     assert stranger["error"].startswith("unknown account 'work'")
     assert "grepogram auth --account work" in stranger["hint"]
     assert nowhere["error"] and nowhere["hint"]
-    assert tools.research_status() == {"sessions": []}
+    assert tools.research_status() == {"sessions": [], "exclusions": []}
 
 
 async def test_research_discover_without_a_session_offers_the_offline_read(
