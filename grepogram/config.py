@@ -23,6 +23,9 @@ from typing import Any, get_type_hints
 import tomli_w
 
 from grepogram.models import (
+    ACCOUNT_NAME,
+    DEFAULT_ACCOUNT,
+    AccountCfg,
     Config,
     MediaCfg,
     ModelsCfg,
@@ -31,6 +34,7 @@ from grepogram.models import (
     SyncCfg,
     TelegramCfg,
     UnitsCfg,
+    is_account_name,
 )
 from grepogram.paths import PRIVATE_FILE_MODE, FileLock, Paths
 
@@ -71,6 +75,13 @@ ocr = true                             # photos through macOS Vision (the `media
 documents = true                       # pdf and docx
 max_download_mb = 20                   # anything larger is skipped, never downloaded
 
+# The account `grepogram auth` signs in is "default" and needs no entry. Every other account
+# signed in at the same time is listed here; all of them share the [telegram] app:
+#
+# [[accounts]]
+# name = "work"                        # a-z, 0-9, _ and -; session in sessions/work.session
+# label = "work phone"                 # optional, for your own reference
+
 # Sources are opt-in. Add them with `grepogram sources add <target>` or by hand:
 #
 # [[sources]]
@@ -78,18 +89,24 @@ max_download_mb = 20                   # anything larger is skipped, never downl
 #
 # [[sources]]
 # chat = "@ru_georgia"                 # or "https://t.me/…" or 123456789
+# account = "work"                     # optional: the account that fetches it (default: "default")
 # since = "2024-01-01"                 # optional: skip older history on first sync
 # comments = false                     # channels only: also index linked discussion threads
 """
 
 _SECTIONS = ("telegram", "models", "search", "units", "sync", "media")
-_SOURCE_KEYS = ("folder", "chat", "since", "comments")
+_SOURCE_KEYS = ("folder", "chat", "account", "since", "comments")
+_ACCOUNT_KEYS = ("name", "label")
 _POSITIVE_KEYS = frozenset({"models.max_seq_length", "media.max_download_mb"})
 """Integer settings a zero or a negative value is meaningless for, checked after the type."""
 
 
 UNKNOWN_SECTION_HINT = (
-    f"known sections: {', '.join(f'[{name}]' for name in _SECTIONS)} and [[sources]]"
+    f"known sections: {', '.join(f'[{name}]' for name in _SECTIONS)}, [[accounts]] and [[sources]]"
+)
+RESERVED_ACCOUNT_HINT = (
+    f"{DEFAULT_ACCOUNT!r} is the implicit account `grepogram auth` signs in; a source without "
+    "`account` uses it, so it needs no [[accounts]] entry"
 )
 
 
@@ -136,8 +153,10 @@ def loads(text: str) -> Config:
 
 def from_dict(raw: dict[str, Any]) -> Config:
     for key in raw:
-        if key not in _SECTIONS and key != "sources":
+        if key not in _SECTIONS and key not in ("accounts", "sources"):
             raise ConfigError(f"unknown key: {key}", UNKNOWN_SECTION_HINT)
+    accounts = _accounts(raw.get("accounts", []))
+    known = frozenset((DEFAULT_ACCOUNT, *(account.name for account in accounts)))
     return Config(
         telegram=_section(TelegramCfg, raw, "telegram"),
         models=_section(ModelsCfg, raw, "models"),
@@ -145,8 +164,26 @@ def from_dict(raw: dict[str, Any]) -> Config:
         units=_section(UnitsCfg, raw, "units"),
         sync=_section(SyncCfg, raw, "sync"),
         media=_section(MediaCfg, raw, "media"),
-        sources=_sources(raw.get("sources", [])),
+        accounts=accounts,
+        sources=_sources(raw.get("sources", []), known),
     )
+
+
+def check_account_name(name: str) -> str:
+    """``name`` if it can name an ``[[accounts]]`` entry, else :class:`ConfigError`.
+
+    The name becomes a file name and a source-id prefix, so it must match
+    :data:`~grepogram.models.ACCOUNT_NAME`; :data:`~grepogram.models.DEFAULT_ACCOUNT` is
+    reserved, being the implicit account that exists without an entry.
+    """
+    if name == DEFAULT_ACCOUNT:
+        raise ConfigError(f"the account name {name!r} is reserved", RESERVED_ACCOUNT_HINT)
+    if not is_account_name(name):
+        raise ConfigError(
+            f"invalid account name {name!r}: expected {ACCOUNT_NAME.pattern}",
+            "use 1 to 32 lowercase letters, digits, '_' or '-'",
+        )
+    return name
 
 
 def save(cfg: Config, paths: Paths) -> None:
@@ -192,6 +229,8 @@ def dumps(cfg: Config) -> str:
 
 def to_dict(cfg: Config) -> dict[str, Any]:
     out: dict[str, Any] = {name: dataclasses.asdict(getattr(cfg, name)) for name in _SECTIONS}
+    if cfg.accounts:
+        out["accounts"] = [_account_dict(account) for account in cfg.accounts]
     if cfg.sources:
         out["sources"] = [_source_dict(source) for source in cfg.sources]
     return out
@@ -250,7 +289,46 @@ def _checked(value: object, expected: type, key: str) -> object:
     return value
 
 
-def _sources(raw: object) -> list[Source]:
+def _string(value: object, key: str) -> str:
+    """``value`` if it is a string, else the error :func:`_checked` raises for ``key``."""
+    if not isinstance(value, str):
+        raise ConfigError(f"invalid value for {key}: expected str, got {type(value).__name__}")
+    return value
+
+
+def _accounts(raw: object) -> list[AccountCfg]:
+    if not isinstance(raw, list):
+        raise ConfigError("invalid value for accounts: expected an array of tables")
+    accounts: list[AccountCfg] = []
+    seen: set[str] = set()
+    for index, entry in enumerate(raw):
+        where = f"accounts[{index}]"
+        if not isinstance(entry, dict):
+            raise ConfigError(f"invalid value for {where}: expected a table")
+        for key in entry:
+            if key not in _ACCOUNT_KEYS:
+                raise ConfigError(
+                    f"unknown key: {where}.{key}",
+                    f"an account takes only {', '.join(_ACCOUNT_KEYS)}",
+                )
+        if "name" not in entry:
+            raise ConfigError(f"{where}: an account needs a 'name'")
+        name = _string(entry["name"], f"{where}.name")
+        try:
+            check_account_name(name)
+        except ConfigError as exc:
+            raise ConfigError(f"{where}: {exc}", exc.hint) from exc
+        if name in seen:
+            raise ConfigError(f"{where}: duplicate account {name!r}")
+        seen.add(name)
+        label = entry.get("label")
+        accounts.append(
+            AccountCfg(name=name, label=None if label is None else _string(label, f"{where}.label"))
+        )
+    return accounts
+
+
+def _sources(raw: object, accounts: frozenset[str]) -> list[Source]:
     if not isinstance(raw, list):
         raise ConfigError("invalid value for sources: expected an array of tables")
     sources: list[Source] = []
@@ -260,6 +338,11 @@ def _sources(raw: object) -> list[Source]:
         if not isinstance(entry, dict):
             raise ConfigError(f"invalid value for {where}: expected a table")
         source = _source(entry, where)
+        if source.account not in accounts:
+            raise ConfigError(
+                f"{where}.account: unknown account {source.account!r}",
+                "list it under [[accounts]], or drop `account` to use the default account",
+            )
         if source.id in seen:
             raise ConfigError(f"{where}: duplicate source {source.id!r}")
         seen.add(source.id)
@@ -302,8 +385,17 @@ def _source_dict(source: Source) -> dict[str, Any]:
         out["folder"] = source.folder
     else:
         out["chat"] = source.chat
+    if source.account != DEFAULT_ACCOUNT:
+        out["account"] = source.account
     if source.since is not None:
         out["since"] = source.since
     if source.comments:
         out["comments"] = True
+    return out
+
+
+def _account_dict(account: AccountCfg) -> dict[str, Any]:
+    out: dict[str, Any] = {"name": account.name}
+    if account.label is not None:
+        out["label"] = account.label
     return out

@@ -328,19 +328,24 @@ voided_at)`, `exclusions(identity PRIMARY KEY, reason, created_at)`,
 
 **Files:**
 - Modify: `grepogram/models.py`, `grepogram/config.py`, `grepogram/paths.py`
-- Modify: `tests/test_config.py`, `tests/test_smoke.py` (paths), `tests/conftest.py` if needed
+- Modify: `tests/test_config.py` (the paths tests live there, not in `tests/test_smoke.py`),
+  `tests/test_mcp.py` (`sources_add` returns the source's `account`)
+- Modify: `README.md` — `test_readme_config_block_is_the_template_verbatim` pins the `TEMPLATE`
+  mirror, so the new `[[accounts]]` / `account` lines and their key rows land here, not in task 20
 
-- [ ] `models.AccountCfg(name, label)`, `DEFAULT_ACCOUNT = "default"`, `Config.accounts`,
+- [x] `models.AccountCfg(name, label)`, `DEFAULT_ACCOUNT = "default"`, `Config.accounts`,
   `Config.account_names()` (default first); `Source.account: str = DEFAULT_ACCOUNT` and the
   `Source.id` scheme (`<account>/` prefix for non-default)
-- [ ] `config.py`: parse/validate `[[accounts]]` (name regex, duplicates, `default` reserved),
+- [x] `config.py`: parse/validate `[[accounts]]` (name regex, duplicates, `default` reserved),
   `account` on sources (must name a known account), `_source_dict` omits a default account;
-  `TEMPLATE` documents both
-- [ ] `paths.Paths.session_file_for(account)` (`default` → `session_file`, else
+  `TEMPLATE` documents both. The name rule is `models.ACCOUNT_NAME` / `is_account_name` (so
+  `paths` can refuse a bad name without importing `config`) and `config.check_account_name` is
+  the validator task 8's `auth --account` reuses
+- [x] `paths.Paths.session_file_for(account)` (`default` → `session_file`, else
   `<config dir>/sessions/<name>.session`), `sessions` dir in `directories`
-- [ ] tests: round trip, unknown account on a source, invalid/duplicate names, ids of default vs
+- [x] tests: round trip, unknown account on a source, invalid/duplicate names, ids of default vs
   named-account sources, session paths under `GREPOGRAM_HOME` and macOS defaults
-- [ ] run checks — must pass before task 2
+- [x] run checks — must pass before task 2
 
 ### Task 2: Per-account Telegram clients and sessions
 

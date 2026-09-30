@@ -5,6 +5,7 @@ mirror the SQLite tables; the remaining types are the shapes returned by search,
 tools. Everything is an immutable, slotted dataclass so it serialises with ``dataclasses.asdict``.
 """
 
+import re
 from dataclasses import dataclass, field
 from typing import Literal
 
@@ -26,6 +27,19 @@ MediaKind = Literal[
     "webpage",
     "other",
 ]
+
+
+DEFAULT_ACCOUNT = "default"
+"""The implicit account: always present, signed in by ``grepogram auth``, session in
+``session.session``. A config without ``[[accounts]]`` names this one alone."""
+ACCOUNT_NAME = re.compile(r"[a-z0-9_-]{1,32}")
+"""What an account name may be: it becomes a file name (``sessions/<name>.session``) and a
+prefix of source ids, so it is kept to a safe, lowercase alphabet."""
+
+
+def is_account_name(name: str) -> bool:
+    """Whether ``name`` is a valid account name (:data:`ACCOUNT_NAME`, matched in full)."""
+    return ACCOUNT_NAME.fullmatch(name) is not None
 
 
 @dataclass(frozen=True, slots=True)
@@ -96,13 +110,26 @@ class MediaCfg:
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
+class AccountCfg:
+    """One ``[[accounts]]`` entry: a Telegram account signed in besides :data:`DEFAULT_ACCOUNT`.
+
+    Every account shares ``[telegram]``'s API app; what sets one apart is its session file
+    (:meth:`grepogram.paths.Paths.session_file_for`) and the sources that name it.
+    """
+
+    name: str
+    label: str | None = None
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
 class Source:
-    """One ``[[sources]]`` entry: a Telegram folder or a single chat."""
+    """One ``[[sources]]`` entry: a Telegram folder or a single chat, fetched by ``account``."""
 
     folder: str | None = None
     chat: str | int | None = None
     since: str | None = None
     comments: bool = False
+    account: str = DEFAULT_ACCOUNT
 
     def __post_init__(self) -> None:
         has_folder = bool(self.folder)
@@ -112,10 +139,17 @@ class Source:
 
     @property
     def id(self) -> str:
-        """Stable identifier stored in ``chats.source_id``."""
-        if self.folder is not None:
-            return f"folder:{self.folder}"
-        return f"chat:{self.chat}"
+        """Stable identifier stored in ``chats.source_id``.
+
+        ``folder:<title>`` / ``chat:<value>`` for :data:`DEFAULT_ACCOUNT`, so every id stored
+        before accounts existed still names its source; ``<account>/folder:<title>`` /
+        ``<account>/chat:<value>`` for any other, so two accounts can each hold ``chat = 12345``
+        — two different private chats.
+        """
+        target = f"folder:{self.folder}" if self.folder is not None else f"chat:{self.chat}"
+        if self.account == DEFAULT_ACCOUNT:
+            return target
+        return f"{self.account}/{target}"
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -126,7 +160,12 @@ class Config:
     units: UnitsCfg = field(default_factory=UnitsCfg)
     sync: SyncCfg = field(default_factory=SyncCfg)
     media: MediaCfg = field(default_factory=MediaCfg)
+    accounts: list[AccountCfg] = field(default_factory=list)
     sources: list[Source] = field(default_factory=list)
+
+    def account_names(self) -> tuple[str, ...]:
+        """Every account this config knows: :data:`DEFAULT_ACCOUNT` first, then ``accounts``."""
+        return (DEFAULT_ACCOUNT, *(account.name for account in self.accounts))
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)

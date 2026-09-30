@@ -14,7 +14,16 @@ import pytest
 from grepogram import config
 from grepogram.config import TEMPLATE, ConfigError
 from grepogram.log import redact, setup_logging, shutdown_logging
-from grepogram.models import Config, MediaCfg, ModelsCfg, SearchCfg, Source, TelegramCfg
+from grepogram.models import (
+    DEFAULT_ACCOUNT,
+    AccountCfg,
+    Config,
+    MediaCfg,
+    ModelsCfg,
+    SearchCfg,
+    Source,
+    TelegramCfg,
+)
 from grepogram.paths import Paths, env_flag
 from tests.conftest import file_mode
 
@@ -30,6 +39,7 @@ def paths(tmp_home: Path) -> Paths:
 def test_paths_follow_grepogram_home(tmp_home: Path, paths: Paths) -> None:
     assert paths.config_file == tmp_home / "config.toml"
     assert paths.session_file == tmp_home / "session.session"
+    assert paths.sessions_dir == tmp_home / "sessions"
     assert paths.db_file == tmp_home / "index.db"
     assert paths.lock_file == tmp_home / "sync.lock"
     assert paths.config_lock_file == tmp_home / "config.lock"
@@ -49,6 +59,7 @@ def test_paths_macos_defaults_without_override(monkeypatch: pytest.MonkeyPatch) 
     home = Path.home()
     assert paths.config_file == home / ".config" / "grepogram" / "config.toml"
     assert paths.session_file == home / ".config" / "grepogram" / "session.session"
+    assert paths.sessions_dir == home / ".config" / "grepogram" / "sessions"
     assert paths.db_file == home / "Library" / "Application Support" / "grepogram" / "index.db"
     assert paths.lock_file == home / "Library" / "Application Support" / "grepogram" / "sync.lock"
     assert paths.config_lock_file == home / ".config" / "grepogram" / "config.lock"
@@ -88,7 +99,29 @@ def test_ensure_dirs_creates_private_directories(tmp_path: Path) -> None:
     for directory in paths.directories:
         assert directory.is_dir()
         assert file_mode(directory) == 0o700
-    assert len(paths.directories) == 3
+    assert len(paths.directories) == 4
+    assert paths.sessions_dir in paths.directories
+
+
+def test_the_default_account_keeps_the_existing_session_file(tmp_home: Path, paths: Paths) -> None:
+    assert paths.session_file_for(DEFAULT_ACCOUNT) == paths.session_file
+    assert paths.session_file_for("work") == tmp_home / "sessions" / "work.session"
+
+
+def test_named_account_sessions_live_next_to_the_macos_config(tmp_path: Path) -> None:
+    paths = Paths.macos_default(tmp_path)
+    config_dir = tmp_path / ".config" / "grepogram"
+    assert paths.session_file_for(DEFAULT_ACCOUNT) == config_dir / "session.session"
+    assert paths.session_file_for("work") == config_dir / "sessions" / "work.session"
+    assert paths.session_file_for("work").suffix == ".session"
+
+
+@pytest.mark.parametrize("name", ["", "../evil", "a/b", "Work", "x" * 33, "wörk"])
+def test_session_file_for_refuses_a_name_that_is_not_an_account_name(
+    paths: Paths, name: str
+) -> None:
+    with pytest.raises(ValueError, match="invalid account name"):
+        paths.session_file_for(name)
 
 
 # --- config ----------------------------------------------------------------------------------
@@ -119,6 +152,103 @@ def test_save_load_round_trip(paths: Paths) -> None:
     )
     config.save(cfg, paths)
     assert config.load(paths) == cfg
+
+
+def test_accounts_round_trip_and_a_default_account_is_not_written(paths: Paths) -> None:
+    cfg = Config(
+        accounts=[AccountCfg(name="work", label="work phone"), AccountCfg(name="spare")],
+        sources=[
+            Source(chat=12345),
+            Source(chat=12345, account="work", since="2025-01-01"),
+            Source(folder="News", account="spare", comments=True),
+            Source(chat="@explicit", account=DEFAULT_ACCOUNT),
+        ],
+    )
+    config.save(cfg, paths)
+    assert config.load(paths) == cfg
+    stored = paths.config_file.read_text()
+    assert stored.count("account = ") == 2
+    assert '{ name = "spare" }' in stored
+    assert config.to_dict(cfg)["sources"][3] == {"chat": "@explicit"}
+
+
+def test_a_config_without_accounts_is_the_default_account_alone() -> None:
+    cfg = config.loads("[[sources]]\nchat = 1\n")
+    assert cfg.accounts == []
+    assert cfg.account_names() == (DEFAULT_ACCOUNT,)
+    assert cfg.sources[0].account == DEFAULT_ACCOUNT
+    assert "accounts" not in config.to_dict(cfg)
+
+
+def test_account_names_list_the_default_account_first() -> None:
+    cfg = config.loads("[[accounts]]\nname = 'work'\n[[accounts]]\nname = 'alt'\n")
+    assert cfg.account_names() == (DEFAULT_ACCOUNT, "work", "alt")
+    assert cfg.accounts[0] == AccountCfg(name="work", label=None)
+
+
+def test_a_source_must_name_a_known_account() -> None:
+    with pytest.raises(ConfigError, match=r"sources\[0\]\.account: unknown account 'work'") as info:
+        config.loads("[[sources]]\nchat = 1\naccount = 'work'\n")
+    assert info.value.hint is not None and "[[accounts]]" in info.value.hint
+    cfg = config.loads("[[accounts]]\nname = 'work'\n[[sources]]\nchat = 1\naccount = 'work'\n")
+    assert cfg.sources[0].account == "work"
+
+
+@pytest.mark.parametrize("name", ["", "Work", "x" * 33, "a/b", "../x", "wörk", "a b"])
+def test_an_invalid_account_name_is_refused(name: str) -> None:
+    with pytest.raises(ConfigError, match=r"accounts\[0\]: invalid account name") as info:
+        config.loads(f"[[accounts]]\nname = {name!r}\n")
+    assert info.value.hint is not None
+
+
+@pytest.mark.parametrize("name", ["a", "work_2", "x" * 32, "my-phone", "0"])
+def test_a_valid_account_name_is_accepted(name: str) -> None:
+    assert config.check_account_name(name) == name
+    assert config.loads(f"[[accounts]]\nname = {name!r}\n").accounts[0].name == name
+
+
+def test_the_default_account_name_is_reserved() -> None:
+    with pytest.raises(ConfigError, match=r"accounts\[0\]: .*'default' is reserved") as info:
+        config.loads("[[accounts]]\nname = 'default'\n")
+    assert info.value.hint == config.RESERVED_ACCOUNT_HINT
+
+
+def test_duplicate_accounts_rejected() -> None:
+    with pytest.raises(ConfigError, match=r"accounts\[1\]: duplicate account 'work'"):
+        config.loads("[[accounts]]\nname = 'work'\n[[accounts]]\nname = 'work'\n")
+
+
+@pytest.mark.parametrize(
+    ("text", "match"),
+    [
+        ("accounts = 1\n", r"invalid value for accounts: expected an array"),
+        ("accounts = [1]\n", r"invalid value for accounts\[0\]: expected a table"),
+        ("[[accounts]]\nlabel = 'x'\n", r"accounts\[0\]: an account needs a 'name'"),
+        ("[[accounts]]\nname = 1\n", r"invalid value for accounts\[0\]\.name: expected str"),
+        ("[[accounts]]\nname = 'a'\nlabel = 2\n", r"accounts\[0\]\.label: expected str"),
+        ("[[sources]]\nchat = 1\naccount = 2\n", r"sources\[0\]\.account: expected str"),
+    ],
+)
+def test_malformed_accounts_name_the_key(text: str, match: str) -> None:
+    with pytest.raises(ConfigError, match=match):
+        config.loads(text)
+
+
+def test_an_unknown_account_key_names_the_keys_an_account_takes() -> None:
+    with pytest.raises(ConfigError, match=r"unknown key: accounts\[0\]\.session") as info:
+        config.loads("[[accounts]]\nname = 'a'\nsession = 'x'\n")
+    assert info.value.hint is not None and "name" in info.value.hint and "label" in info.value.hint
+    assert "[[accounts]]" in config.UNKNOWN_SECTION_HINT
+
+
+def test_one_chat_value_may_be_a_source_of_two_accounts_but_not_twice_of_one() -> None:
+    both = "[[accounts]]\nname = 'work'\n[[sources]]\nchat = 1\n[[sources]]\nchat = 1\n"
+    with pytest.raises(ConfigError, match=r"sources\[1\]: duplicate source 'chat:1'"):
+        config.loads(both)
+    cfg = config.loads(both + "account = 'work'\n")
+    assert [source.id for source in cfg.sources] == ["chat:1", "work/chat:1"]
+    with pytest.raises(ConfigError, match=r"duplicate source 'work/chat:1'"):
+        config.loads(both.replace("chat = 1\n", "chat = 1\naccount = 'work'\n"))
 
 
 def test_save_writes_mode_0600_even_over_a_permissive_file(paths: Paths) -> None:
@@ -241,6 +371,10 @@ def test_source_ids_are_stable() -> None:
     assert Source(folder="Argentina").id == "folder:Argentina"
     assert Source(chat="@ru_georgia").id == "chat:@ru_georgia"
     assert Source(chat=123456789).id == "chat:123456789"
+    assert Source(chat=123456789, account=DEFAULT_ACCOUNT).id == "chat:123456789"
+    assert Source(chat=123456789, account="work").id == "work/chat:123456789"
+    assert Source(chat="https://t.me/x", account="work").id == "work/chat:https://t.me/x"
+    assert Source(folder="Argentina", account="work").id == "work/folder:Argentina"
     with pytest.raises(ValueError):
         Source()
 
@@ -248,6 +382,20 @@ def test_source_ids_are_stable() -> None:
 def test_template_parses_to_defaults() -> None:
     assert config.loads(TEMPLATE) == Config()
     assert "[[sources]]" in TEMPLATE
+
+
+def test_template_documents_accounts_and_the_account_of_a_source() -> None:
+    """The commented examples are valid config once uncommented, accounts and all."""
+    examples = [
+        line.removeprefix("# ")
+        for line in TEMPLATE.splitlines()
+        if re.match(r"# (\[\[\w+\]\]$|\w+ = )", line)
+    ]
+    cfg = config.loads("\n".join(examples))
+    assert cfg.accounts == [AccountCfg(name="work", label="work phone")]
+    assert cfg.sources[1] == Source(
+        chat="@ru_georgia", account="work", since="2024-01-01", comments=False
+    )
 
 
 # --- models.max_seq_length -------------------------------------------------------------------

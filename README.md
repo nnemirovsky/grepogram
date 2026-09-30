@@ -446,6 +446,13 @@ ocr = true                             # photos through macOS Vision (the `media
 documents = true                       # pdf and docx
 max_download_mb = 20                   # anything larger is skipped, never downloaded
 
+# The account `grepogram auth` signs in is "default" and needs no entry. Every other account
+# signed in at the same time is listed here; all of them share the [telegram] app:
+#
+# [[accounts]]
+# name = "work"                        # a-z, 0-9, _ and -; session in sessions/work.session
+# label = "work phone"                 # optional, for your own reference
+
 # Sources are opt-in. Add them with `grepogram sources add <target>` or by hand:
 #
 # [[sources]]
@@ -453,6 +460,7 @@ max_download_mb = 20                   # anything larger is skipped, never downl
 #
 # [[sources]]
 # chat = "@ru_georgia"                 # or "https://t.me/…" or 123456789
+# account = "work"                     # optional: the account that fetches it (default: "default")
 # since = "2024-01-01"                 # optional: skip older history on first sync
 # comments = false                     # channels only: also index linked discussion threads
 ```
@@ -481,13 +489,16 @@ max_download_mb = 20                   # anything larger is skipped, never downl
 | `media.ocr` | read text off photos with macOS Vision; needs the `media` extra and a Mac, and is simply unavailable elsewhere |
 | `media.documents` | read text out of PDF and DOCX attachments; needs the `media` extra |
 | `media.max_download_mb` | a file Telegram reports as larger than this is skipped without being downloaded |
+| `accounts[].name` | an account signed in besides the implicit `default` one: 1 to 32 of `a-z`, `0-9`, `_` and `-`, unique, and never `default`; its session lives in `sessions/<name>.session` next to the config, while `default` keeps `session.session` |
+| `accounts[].label` | optional free text describing the account, for your own reference |
 | `sources[].folder` | a Telegram folder by name; its membership (included and pinned chats minus excluded ones, plus category flags) is re-resolved on every sync |
 | `sources[].chat` | one chat: `@username`, `https://t.me/…` link or the id printed by `grepogram dialogs` (Telethon's marked form, `-100…` for channels and supergroups) |
+| `sources[].account` | the account that fetches the source: `default` when omitted, otherwise a name listed under `[[accounts]]`. A source of another account has the id `<account>/chat:…` or `<account>/folder:…`, so two accounts can each list the same `chat` value |
 | `sources[].since` | `YYYY-MM-DD`; history before this date is skipped on the first sync of the chat |
 | `sources[].comments` | channels only: index the comment threads of the linked discussion group as well; on a folder source it applies to every channel in the folder. The comments are stored under the group, each naming the channel and the post it hangs under; a source that lists the group itself (the folder holding both, or a `chat` entry) indexes its whole history on top, and the two share one set of rows |
 
 `GREPOGRAM_HOME=<dir>` puts every file (`config.toml`, `config.lock`, `session.session`,
-`index.db`, `sync.lock`, `logs/`) under one directory; the tests use it. `GREPOGRAM_FAKE_MODELS=1`
+`sessions/`, `index.db`, `sync.lock`, `logs/`) under one directory; the tests use it. `GREPOGRAM_FAKE_MODELS=1`
 swaps both models for deterministic fakes (tests and CI only).
 
 ## How Search Works

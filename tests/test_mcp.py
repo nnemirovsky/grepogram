@@ -819,6 +819,7 @@ async def test_sources_add_fuzzy_writes_config_and_reads_dialogs_afresh(
         "chat": GEO,
         "since": None,
         "comments": False,
+        "account": "default",
     }
     assert added["kind"] == "chat" and added["title"] == "Грузия | Georgia chat"
     assert [c["id"] for c in added["chats"]] == [GEO]

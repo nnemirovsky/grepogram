@@ -1,11 +1,13 @@
 """Filesystem locations used by grepogram, the flags that steer them and the lock over a file.
 
 ``GREPOGRAM_HOME=<dir>`` redirects everything under one directory (``config.toml``,
-``config.lock``, ``session.session``, ``index.db``, ``sync.lock``, ``logs/``); tests rely on this.
-Without it the macOS conventions apply: config, its lock and the session under
-``~/.config/grepogram``, index and sync lock under ``~/Library/Application Support/grepogram``,
-logs under ``~/Library/Logs/grepogram``. :func:`env_flag` reads a boolean switch such as
-``GREPOGRAM_FAKE_MODELS`` the same way everywhere.
+``config.lock``, ``session.session``, ``sessions/``, ``index.db``, ``sync.lock``, ``logs/``);
+tests rely on this. Without it the macOS conventions apply: config, its lock and the sessions
+under ``~/.config/grepogram``, index and sync lock under
+``~/Library/Application Support/grepogram``, logs under ``~/Library/Logs/grepogram``. The
+default account's session is ``session.session``; every other account's is
+``sessions/<name>.session`` next to the config (:meth:`Paths.session_file_for`).
+:func:`env_flag` reads a boolean switch such as ``GREPOGRAM_FAKE_MODELS`` the same way everywhere.
 
 :class:`FileLock` is the ``flock`` both cross-process locks are built on —
 :class:`grepogram.sync.SyncLock` over ``sync.lock`` and :class:`grepogram.config.ConfigLock` over
@@ -20,8 +22,11 @@ from pathlib import Path
 from types import TracebackType
 from typing import Self
 
+from grepogram.models import DEFAULT_ACCOUNT, is_account_name
+
 ENV_HOME = "GREPOGRAM_HOME"
 SESSION_SUFFIX = ".session"
+SESSIONS_DIR_NAME = "sessions"
 CONFIG_LOCK_NAME = "config.lock"
 LOG_FILE_NAME = "grepogram.log"
 DIR_MODE = 0o700
@@ -61,12 +66,33 @@ class Paths:
         return self.config_file.with_name(CONFIG_LOCK_NAME)
 
     @property
+    def sessions_dir(self) -> Path:
+        """Where the sessions of every account but the default one live, next to the config."""
+        return self.config_file.parent / SESSIONS_DIR_NAME
+
+    def session_file_for(self, account: str) -> Path:
+        """The Telethon session file of ``account``.
+
+        :data:`~grepogram.models.DEFAULT_ACCOUNT` keeps ``session_file`` — the one file an
+        install from before accounts existed already has — and any other account gets
+        ``sessions/<name>.session``. The name must be a valid account name
+        (:func:`~grepogram.models.is_account_name`): it becomes a path component, so anything
+        else is refused here rather than trusted to have been checked upstream.
+        """
+        if account == DEFAULT_ACCOUNT:
+            return self.session_file
+        if not is_account_name(account):
+            raise ValueError(f"invalid account name: {account!r}")
+        return self.sessions_dir / f"{account}{SESSION_SUFFIX}"
+
+    @property
     def directories(self) -> tuple[Path, ...]:
         """Every directory grepogram writes into, deduplicated, in a stable order."""
         ordered: dict[Path, None] = {}
         for directory in (
             self.config_file.parent,
             self.session_file.parent,
+            self.sessions_dir,
             self.db_file.parent,
             self.lock_file.parent,
             self.log_dir,
