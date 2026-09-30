@@ -83,6 +83,7 @@ from grepogram.models import (
 from grepogram.paths import FileLock, Paths
 from grepogram.sources import (
     IMPORT_PREFIX,
+    Resolution,
     discussion_source_id,
     imported_tag,
     parse_since,
@@ -2067,38 +2068,11 @@ async def _sync_chats(
     :func:`_record_failure`'s to describe; the tally becomes the report.
     """
     tally = _Tally(labelled=labels_accounts(clients))
-    lanes: dict[str, _Lane] = {}
-    stopped: set[str] = set()
-    for account, client in clients.items():
-        _cap_flood_sleep(client, cfg.sync, budget)
-        answer = await ask_account(conn, account, client, always=True)
-        if answer.left_out is not None:
-            tally.warn(account, answer.left_out)
-            if not answer.other_user:  # a Telegram error: its chats are the next run's
-                lanes[account] = _Lane(account=account, client=client, me=None)
-                stopped.add(account)
-            continue
-        me = None if answer.me is None else _self_row(answer.me)
-        lanes[account] = _Lane(account=account, client=client, me=me)
-        _record_account(conn, lanes[account])
+    lanes, stopped = await _open_lanes(clients, conn, cfg, budget, tally)
     usable = {account: lane.client for account, lane in lanes.items() if account not in stopped}
     resolution = await resolve_sources(cfg, usable, conn)
     stopped |= set(resolution.flooded)
-    for account, seconds in resolution.flooded.items():
-        tally.warn(account, _flood_text(seconds))
-    for account, error in resolution.failed.items():
-        tally.warn(account, f"its sources could not be resolved ({error}); they keep what they had")
-    unresolved: set[str] = set()
-    for missed in resolution.unresolved:
-        # every source is resolved whatever ``only`` says; a run limited to some reports theirs
-        if only is not None and missed.source_id not in only:
-            continue
-        unresolved.add(missed.source_id)
-        tally.warn(
-            missed.account,
-            f"source {missed.source_id} did not resolve ({missed.reason}); it keeps the chats it "
-            "already covered",
-        )
+    unresolved = _report_resolution(resolution, only, tally)
     run = _SyncPass(
         conn=conn,
         cfg=cfg,
@@ -2135,6 +2109,61 @@ async def _sync_chats(
         await index_pending(conn, cfg, chat)
     await index_stranded(conn, cfg)
     return run.tally.report()
+
+
+async def _open_lanes(
+    clients: Mapping[str, Any],
+    conn: sqlite3.Connection,
+    cfg: Config,
+    budget: SyncBudget,
+    tally: _Tally,
+) -> tuple[dict[str, _Lane], set[str]]:
+    """One lane per account of the run, and the accounts stopped before their first chat.
+
+    Each client gets the flood-sleep cap first and is then asked who it is
+    (:func:`ask_account`, ``always``): one that is another Telegram user than the index recorded
+    gets no lane at all, one a Telegram error kept from answering gets a stopped lane — its
+    chats are the next run's — and every other records its first sign-in
+    (:func:`_record_account`). Every account left out is a warning in ``tally``."""
+    lanes: dict[str, _Lane] = {}
+    stopped: set[str] = set()
+    for account, client in clients.items():
+        _cap_flood_sleep(client, cfg.sync, budget)
+        answer = await ask_account(conn, account, client, always=True)
+        if answer.left_out is not None:
+            tally.warn(account, answer.left_out)
+            if not answer.other_user:  # a Telegram error: its chats are the next run's
+                lanes[account] = _Lane(account=account, client=client, me=None)
+                stopped.add(account)
+            continue
+        me = None if answer.me is None else _self_row(answer.me)
+        lanes[account] = _Lane(account=account, client=client, me=me)
+        _record_account(conn, lanes[account])
+    return lanes, stopped
+
+
+def _report_resolution(
+    resolution: Resolution, only: Collection[str] | None, tally: _Tally
+) -> set[str]:
+    """Warn in ``tally`` about every account whose resolve Telegram stopped and every source
+    that did not resolve on its own — of those, only the ones ``only`` names when a run is
+    limited to some; every source is resolved whatever ``only`` says. Returns the ids of the
+    sources the report warned about."""
+    for account, seconds in resolution.flooded.items():
+        tally.warn(account, _flood_text(seconds))
+    for account, error in resolution.failed.items():
+        tally.warn(account, f"its sources could not be resolved ({error}); they keep what they had")
+    unresolved: set[str] = set()
+    for missed in resolution.unresolved:
+        if only is not None and missed.source_id not in only:
+            continue
+        unresolved.add(missed.source_id)
+        tally.warn(
+            missed.account,
+            f"source {missed.source_id} did not resolve ({missed.reason}); it keeps the chats it "
+            "already covered",
+        )
+    return unresolved
 
 
 def _record_account(conn: sqlite3.Connection, lane: _Lane) -> None:

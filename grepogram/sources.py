@@ -1039,47 +1039,60 @@ async def resolve_sources(
             continue
         covered = coverage.setdefault(source.id, set())
         covered |= _still_named(conn, source, named)
-        for info in infos:
-            key = ChatKey(chat_scope(info.type, source.account), info.id)
-            if key in held_back:
-                continue
-            chat = stored.get(key)
-            if chat is None:
-                held = imported_tag(conn, info.id, scope=key.scope)
-                if held is not None:
-                    held_back.add(key)
-                    log.info(
-                        "chat %s (%s) is held as %s, a Telegram Desktop import; source %s does "
-                        "not take it over — run `grepogram sources rm %s` first to sync it from "
-                        "Telegram",
-                        info.id,
-                        info.title,
-                        held,
-                        source.id,
-                        held,
-                    )
-                    continue
-                chat = db.upsert_chat(conn, _source_chat(info, source), source.account)
-                stored[key] = chat
-                rows.append(chat)
-            else:
-                log.debug(
-                    "chat %s is also covered by %s; %s stays its primary source",
-                    info.id,
-                    source.id,
-                    chat.source_id,
-                )
-            covered.add(chat.id)
-            db.set_chat_access(
-                conn,
-                chat.id,
-                source.account,
-                access_hash=catalog.access_hash(info.id),
-            )
+        covered |= _store_listed(conn, source, catalog, infos, stored, held_back, rows)
     for source_id, chat_ids in coverage.items():
         db.set_source_chats(conn, source_id, chat_ids)
     log.info("resolved %d chats from %d sources", len(rows), len(cfg.sources))
     return Resolution(chats=rows, flooded=flooded, failed=failed, unresolved=unresolved)
+
+
+def _store_listed(
+    conn: sqlite3.Connection,
+    source: Source,
+    catalog: DialogCatalog,
+    infos: Sequence[DialogInfo],
+    stored: dict[ChatKey, ChatRow],
+    held_back: set[ChatKey],
+    rows: list[ChatRow],
+) -> set[int]:
+    """Store the chats ``source`` resolved to this run and record its account's access hash for
+    each; returns the row ids it covers. The first source in config order to reach a chat is
+    its primary (``stored``, shared across the run, and ``rows`` in the order they came); a
+    chat held as a Telegram Desktop import is left alone (``held_back``, see
+    :func:`resolve_sources`)."""
+    covered: set[int] = set()
+    for info in infos:
+        key = ChatKey(chat_scope(info.type, source.account), info.id)
+        if key in held_back:
+            continue
+        chat = stored.get(key)
+        if chat is None:
+            held = imported_tag(conn, info.id, scope=key.scope)
+            if held is not None:
+                held_back.add(key)
+                log.info(
+                    "chat %s (%s) is held as %s, a Telegram Desktop import; source %s does not "
+                    "take it over — run `grepogram sources rm %s` first to sync it from Telegram",
+                    info.id,
+                    info.title,
+                    held,
+                    source.id,
+                    held,
+                )
+                continue
+            chat = db.upsert_chat(conn, _source_chat(info, source), source.account)
+            stored[key] = chat
+            rows.append(chat)
+        else:
+            log.debug(
+                "chat %s is also covered by %s; %s stays its primary source",
+                info.id,
+                source.id,
+                chat.source_id,
+            )
+        covered.add(chat.id)
+        db.set_chat_access(conn, chat.id, source.account, access_hash=catalog.access_hash(info.id))
+    return covered
 
 
 def _keep_primary(
