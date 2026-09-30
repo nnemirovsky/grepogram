@@ -93,14 +93,14 @@ never change the git identity.
   re-store a row.
 - Never `async with client` on a Telethon client (it calls `start()` and prompts on stdin); use
   `tg.connected(client, account)`, or `tg.connected_all(clients)` for several, which leaves a
-  signed-out account out (`Live.refused`) and raises only when none connects. Every account has
+  signed-out account out (in `tg.Accounts.skipped`) and raises only when none connects. Every account has
   a session file of its own (`paths.session_file_for`: `default` keeps `session.session`, any
   other account `sessions/<name>.session`) and every `tg` function takes the account, so an
   auth failure names whose session died (`tg.auth_hint(account)`). Only `grepogram auth` opens a
   session file for writing (`tg.make_login_client`); every other client works on an in-memory
   copy (`tg.make_client` → `tg.load_session`; `tg.make_clients` for every account, reporting a
-  missing or unreadable session per account in `AccountClients.unavailable` instead of
-  raising), because two Telethon clients on one session database block each other and fail
+  missing or unreadable session of an account that owns a source in `Accounts.skipped`
+  instead of raising), because two Telethon clients on one session database block each other and fail
   with `database is locked`. **That copy carries the data centre and the auth key and
   nothing else, so its entity cache starts empty and no chat is addressable by its stored id
   until something warms it.** A pass that walks a source list gets that for free
@@ -203,9 +203,11 @@ never change the git identity.
   multi-account commands and `AppState.telegrams()` leave out an account with no session (warned
   about only when it owns a source) or one Telegram signed out, and fail only when no account is
   left; the MCP `sync` reports the skipped ones in `accounts_skipped`.
-- Every confirmation — `accounts rm`, `leave`, `research approve` — is read from the controlling
-  terminal (`cli._terminal` over `/dev/tty`), never stdin, and refused without one
-  (`cli.NoTerminal`); there is no `--yes`. The yes is a random code the question shows, typed
+- Every confirmation of consent or of a change a config edit cannot undo — `accounts rm`,
+  `leave`, `research approve` — is read from the controlling terminal (`cli._terminal` over
+  `/dev/tty`), never stdin, and refused without one (`cli.NoTerminal`); there is no `--yes`.
+  `sources prune` is the one question still asked through `typer.confirm` on stdin: it deletes
+  indexed rows only, after printing them, and changes nothing on Telegram or in the config. The yes is a random code the question shows, typed
   back (`cli._ask`), never `y`: a pipe or a blind `yes` cannot guess it. `cli._open_terminal`
   opens the tty unbuffered in binary and wraps it for text, because a text-mode `r+` open wants
   a seekable file and fails on every real terminal. None of this stops an agent with a shell,
@@ -450,7 +452,9 @@ never change the git identity.
   at that group would store live comments into a chat marked `unavailable` whose rows came from
   an export. `_check_migration` is the fourth writer and needs no guard — it copies the chat's
   own `source_id` onto the supergroup it migrated to, and only when that supergroup is not
-  already stored. Lose the tag and `sources rm` of the live source deletes the import,
+  already stored. `sources.remove_source_id` → `db.set_primary_source` is the fifth, and its
+  guard is `_successor`: the new primary is always a configured source covering the chat,
+  never an `import:` tag. Lose the tag and `sources rm` of the live source deletes the import,
   `prunable` offers it, and the `import:` handle every refusal tells the user to remove is gone.
   The tag is looked up by identity, `imported_tag(conn, id, scope=…)` finding the row by
   `(scope, peer_id)`, and `import --account` files an export's private chats and legacy groups
@@ -560,8 +564,11 @@ never change the git identity.
 - Research state lives in `research.db` (`paths.research_db_file`, next to `index.db`) and never
   in the index: the index is derived and may be deleted and rebuilt, while approvals, exclusions
   and session history are the user's decisions and nothing rebuilds them. It has its own version
-  (`research_db.SCHEMA_VERSION`); its `SchemaError` subclasses `db.SchemaError`, so the existing
-  handlers catch it, and never advises deleting the file. Whether a candidate is *cached* is
+  (`research_db.SCHEMA_VERSION`, now 2) and its own append-only `research_db.MIGRATIONS`: step 2
+  moved seeds, scan cursors and evidence from index row ids to `(scope, peer_id)` and walks a
+  development build's version 1 up rather than refusing it — a file of decisions is migrated,
+  never re-derived. Its `SchemaError` subclasses `db.SchemaError`, so the existing handlers
+  catch it, and never advises deleting the file. Whether a candidate is *cached* is
   asked of the index every time and never stored there, and global-search results are
   candidates and evidence in `research.db`, never `messages` rows, so no sync cursor moves. Every
   research entry point refuses before opening the file while `[research] enabled` is false
@@ -635,7 +642,19 @@ never change the git identity.
   sources in one `config.update` under `SyncLock` → `ConfigLock` with no Telegram request under
   either, syncs through `sync_all(…, recut=False, only=…)`, and discovery over what it stored
   only proposes. Sources a run added are ordinary sources and survive `stop`, which voids the
-  unconsumed grants and nothing else.
+  unconsumed grants and nothing else. A grant's lifecycle: `research._consume_done` consumes it
+  only once **every** action it names is done, so a run stopped by a budget, a flood wait or a
+  busy sync leaves it live for the next run and nobody is asked twice; a refusal
+  (`_refuse_candidate`) sets `failed` or `unavailable` and voids the candidate's grants — a
+  `failed` candidate takes a new approval once the cause is gone, an `unavailable` one none
+  (`_REFUSED`); an exclusion, a skip and a source removed from the config before its fetch void
+  them too.
+- Corroboration counts **origins**, not messages: `research.origin_key` gives a forwarded post
+  `post:<origin peer>/<origin msg>` and the same post where the index holds it in its channel
+  the same key (a channel or supergroup's `msg_id` is global), a forward known only by its
+  author `fwd:<author>@<date>`, and anything else `msg:<scope>:<peer>/<msg>`. Global-search
+  post results and `directory` evidence reuse the key of the lead they stand for, so neither a
+  forward chain nor a directory listing a chat ever counts twice.
 - The approval text is the consent, so it says what the run will really do and nothing anyone
   else wrote can bend it. Every value someone else chose — the question, titles, usernames,
   folder titles — goes through `research.shown` (control, format and separator characters as
