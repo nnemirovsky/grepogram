@@ -377,6 +377,17 @@ async def _match_dialogs(
     return dialogs.match(query, found, folders, limit=limit)
 
 
+def _warn_all(warnings: Iterable[str]) -> None:
+    """Every warning of a report on stderr, one ``warning:`` line each."""
+    for warning in warnings:
+        typer.echo(f"warning: {warning}", err=True)
+
+
+def _echo_json(document: object) -> None:
+    """The document a matching MCP tool returns, as ``--json`` prints it."""
+    typer.echo(json.dumps(document, ensure_ascii=False, indent=2))
+
+
 def _print_table(headers: Sequence[str], rows: Sequence[Sequence[str]]) -> None:
     widths = [len(h) for h in headers]
     for row in rows:
@@ -461,8 +472,7 @@ def _print_report(report: SyncReport) -> None:
     if report.unavailable:
         ids = ", ".join(str(chat_id) for chat_id in report.unavailable)
         typer.echo(f"chats unavailable: {len(report.unavailable)} ({ids})")
-    for warning in report.warnings:
-        typer.echo(f"warning: {warning}", err=True)
+    _warn_all(report.warnings)
 
 
 @app.command("extract")
@@ -543,8 +553,7 @@ def _print_media_report(report: MediaReport) -> None:
         typer.echo(f"media pending: {report.remaining}; run extract again")
     if report.extracted:
         typer.echo("next: grepogram sync (to re-cut and embed the units that changed)")
-    for warning in report.warnings:
-        typer.echo(f"warning: {warning}", err=True)
+    _warn_all(report.warnings)
 
 
 @app.command("prune-deleted")
@@ -620,8 +629,7 @@ def _print_prune_report(report: PruneReport) -> None:
     if report.chats_unreachable:
         ids = ", ".join(str(chat_id) for chat_id in report.chats_unreachable)
         typer.echo(f"chats no signed-in account reaches: {len(report.chats_unreachable)} ({ids})")
-    for warning in report.warnings:
-        typer.echo(f"warning: {warning}", err=True)
+    _warn_all(report.warnings)
 
 
 @app.command("recapture-links")
@@ -700,8 +708,7 @@ def _print_recapture_report(report: RecaptureReport) -> None:
         typer.echo(f"chats no signed-in account reaches: {len(report.chats_unreachable)} ({ids})")
     if report.remaining:
         typer.echo(f"messages whose links are still unread: {report.remaining}")
-    for warning in report.warnings:
-        typer.echo(f"warning: {warning}", err=True)
+    _warn_all(report.warnings)
 
 
 @app.command("import")
@@ -744,8 +751,7 @@ def import_cmd(
     try:
         name = _known_account(cfg, account or DEFAULT_ACCOUNT)
         export = tdesktop.read_export(path)
-        for warning in export.warnings:
-            typer.echo(f"warning: {warning}", err=True)
+        _warn_all(export.warnings)
         entries = _retitled(export.chats, chat_title)
         embedder = _optional_embedder(cfg)
         with sync.SyncLock(paths):
@@ -967,14 +973,13 @@ def search_cmd(
     finally:
         conn.close()
     if as_json:
-        typer.echo(json.dumps(asdict(result), ensure_ascii=False, indent=2))
+        _echo_json(asdict(result))
         return
     _print_hits(result, cfg)
 
 
 def _print_hits(result: SearchResult, cfg: Config) -> None:
-    for warning in result.warnings:
-        typer.echo(f"warning: {warning}", err=True)
+    _warn_all(result.warnings)
     age = result.index_age_min
     if age is not None and age > cfg.search.auto_sync_after_min:
         typer.echo(f"note: the index is {age} min old; run: grepogram sync", err=True)
@@ -1077,7 +1082,7 @@ def _print_messages(
             "msg_id": msg_id,
             "messages": [asdict(view) for view in views],
         }
-        typer.echo(json.dumps(document, ensure_ascii=False, indent=2))
+        _echo_json(document)
         return
     for n, view in enumerate(views, start=1):
         if n > 1:
@@ -1318,8 +1323,7 @@ async def _folder_membership(
         return await sources.folder_membership(cfg, {})
     async with _connected(accounts) as live:
         checked, left_out = await sync.checked_accounts(conn, live)
-        for name, reason in left_out.items():
-            typer.echo(f"warning: account {name}: {reason}", err=True)
+        _warn_all(f"account {name}: {reason}" for name, reason in left_out.items())
         catalogs = {name: dialogs.DialogCatalog(client) for name, client in checked.items()}
         return await sources.folder_membership(cfg, catalogs)
 
@@ -1590,10 +1594,6 @@ def _research_store() -> Iterator[tuple[Paths, Config, sqlite3.Connection, sqlit
         conn.close()
 
 
-def _echo_json(document: object) -> None:
-    typer.echo(json.dumps(document, ensure_ascii=False, indent=2))
-
-
 def _ids(values: Iterable[int]) -> str:
     return ", ".join(str(value) for value in values) or "-"
 
@@ -1737,16 +1737,14 @@ def _print_discover(report: DiscoverReport) -> None:
             f"pinned posts: {pins.messages} read in {len(pins.chats)} chats, "
             f"{len(pins.new_candidates)} new candidates; {pins.remaining} chats left"
         )
-        for warning in pins.warnings:
-            typer.echo(f"warning: {warning}", err=True)
+        _warn_all(pins.warnings)
     for search_report in report.searches:
         state = f"{search_report.results} results" if search_report.ran else "not run"
         typer.echo(
             f"{search_report.kind} {search_report.query!r}: {state}, "
             f"{len(search_report.new_candidates)} new candidates"
         )
-        for warning in search_report.warnings:
-            typer.echo(f"warning: {warning}", err=True)
+        _warn_all(search_report.warnings)
     probe = report.probe
     if probe is not None:
         typer.echo(
@@ -1761,8 +1759,7 @@ def _print_discover(report: DiscoverReport) -> None:
                 f"{probe.in_session} the session already reads, {probe.over_cap} over the "
                 "candidate cap"
             )
-        for warning in probe.warnings:
-            typer.echo(f"warning: {warning}", err=True)
+        _warn_all(probe.warnings)
     typer.echo(f"next: grepogram research candidates {report.session_id}")
 
 
@@ -1994,12 +1991,10 @@ def _print_run(report: RunReport) -> None:
         typer.echo(f"stopped by: {report.stopped_by}; run it again to go on")
     if report.pins is not None and report.pins.new_candidates:
         typer.echo(f"proposed from pinned posts: {len(report.pins.new_candidates)}")
-        for warning in report.pins.warnings:
-            typer.echo(f"warning: {warning}", err=True)
+        _warn_all(report.pins.warnings)
     if report.discovery is not None:
         typer.echo(f"new candidates proposed: {len(report.discovery.new_candidates)}")
-    for warning in report.warnings:
-        typer.echo(f"warning: {warning}", err=True)
+    _warn_all(report.warnings)
     typer.echo(f"next: grepogram research candidates {report.session_id}")
 
 
