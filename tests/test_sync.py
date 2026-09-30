@@ -3901,9 +3901,9 @@ async def test_a_flood_wait_on_one_accounts_get_me_leaves_the_others_running(
 
     assert report.chats_done == [NEWS_ID] and report.chats_remaining == [bob.id]
     assert report.warnings == [
-        f"account {WORK}: flood wait: Telegram asks to wait 45s before more history requests; "
-        "run sync again later"
-    ]
+        f"account {WORK}: flood wait: Telegram asks to wait 45s before asking who the account "
+        "is; it sat this pass out"
+    ], "worded like every other pass that asks who an account is (sync.ask_account)"
     assert [name for name, _ in work.calls] == ["connect", "is_user_authorized", "disconnect"]
 
 

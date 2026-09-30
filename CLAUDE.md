@@ -113,11 +113,12 @@ never change the git identity.
   (fail closed); a refused sign-in leaves the old session, logs the staged one out on Telegram's
   side (`tg.log_out`, only when this sign-in made the authorization: `SignedIn.fresh`) and
   deletes the copy. **Every Telegram-facing pass holds the same line through one check**,
-  `sync.check_account` (`get_me` against `db.conflicting_account`, raising `tg.OtherUser`, an
-  `AuthRequired` whose hint is `accounts rm`): `sync._record_account` in a sync,
-  `StoredPass.start` (`prune-deleted`, `extract`, `recapture-links` — through
-  `sync.checked_accounts`, which leaves the account out with a warning), the folder read of
-  `sources prune`, and `research.run` / `discover` / `global_search` and `grepogram leave`
+  `sync.signed_in_user` (`get_me` against `db.conflicting_account`, raising `tg.OtherUser`, an
+  `AuthRequired` whose hint is `accounts rm`), put by `sync.check_account` or — for a pass that
+  goes on without the account, with the one wording of why — `sync.ask_account`: a sync
+  (`always=True`, then `sync._record_account` records a first sign-in), `StoredPass.start`
+  (`prune-deleted`, `extract`, `recapture-links`) and the folder read of `sources prune`
+  (both through `sync.checked_accounts`, which leaves the account out with a warning), and `research.run` / `discover` / `global_search` and `grepogram leave`
   (before it resolves or asks; its question names the Telegram user), which refuse. A session
   swapped by hand never deletes, joins or asks as a user nobody chose. Every other client works on an in-memory
   copy (`tg.make_client` → `tg.load_session`; `tg.make_clients` for every account, reporting a

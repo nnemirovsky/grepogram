@@ -2061,26 +2061,16 @@ async def _sync_chats(
     stopped: set[str] = set()
     for account, client in clients.items():
         _cap_flood_sleep(client, cfg.sync, budget)
-        lanes[account] = _Lane(account=account, client=client, me=None)
-        try:
-            me = await client.get_me()
-        except errors.UnauthorizedError as exc:
-            tg.reraise_unauthorized(exc, account)
-        except errors.FloodWaitError as exc:
-            log.warning(
-                "flood wait of %ss on account %s; it sits this run out", exc.seconds, account
-            )
-            tally.warn(account, _flood_text(exc.seconds))
-            stopped.add(account)
+        answer = await ask_account(conn, account, client, always=True)
+        if answer.left_out is not None:
+            tally.warn(account, answer.left_out)
+            if not answer.other_user:  # a Telegram error: its chats are the next run's
+                lanes[account] = _Lane(account=account, client=client, me=None)
+                stopped.add(account)
             continue
-        except errors.RPCError as exc:
-            log.warning("account %s could not be read: %s; it sits this run out", account, exc)
-            tally.warn(account, f"could not be read ({exc}); its chats wait for the next run")
-            stopped.add(account)
-            continue
-        lanes[account].me = _self_row(me)
-        if not _record_account(conn, lanes[account], tally):
-            del lanes[account]
+        me = None if answer.me is None else _self_row(answer.me)
+        lanes[account] = _Lane(account=account, client=client, me=me)
+        _record_account(conn, lanes[account])
     usable = {account: lane.client for account, lane in lanes.items() if account not in stopped}
     resolution = await resolve_sources(cfg, usable, conn)
     stopped |= set(resolution.flooded)
@@ -2136,22 +2126,14 @@ async def _sync_chats(
     return run.tally.report()
 
 
-def _record_account(conn: sqlite3.Connection, lane: _Lane, tally: _Tally) -> bool:
-    """Remember who ``lane.account`` turned out to be, when Telegram said; ``False`` — with a
-    warning, and the account left out of the run — when its session is a Telegram user other
-    than the one recorded under that name (:func:`other_user`, the one comparison every pass
-    makes).
-
-    ``grepogram auth`` refuses such a sign-in, so only a session file swapped by hand gets here;
-    fetching with it would store another user's private chats over the recorded user's, under
-    the same scoped rows, and address peers with access hashes that are not its own."""
+def _record_account(conn: sqlite3.Connection, lane: _Lane) -> None:
+    """Remember who ``lane.account`` turned out to be — its first sign-in, or a display name
+    that changed. :func:`ask_account` has already refused a session of a Telegram user other
+    than the one recorded under that name: fetching with it would store another user's private
+    chats over the recorded user's, under the same scoped rows, and address peers with access
+    hashes that are not its own."""
     if lane.me is None:
-        return True
-    refused = other_user(conn, lane.account, lane.me.id)
-    if refused is not None:
-        log.warning("%s; it sits this run out", refused.reason)
-        tally.warn(lane.account, _other_user_text(refused))
-        return False
+        return
     db.upsert_account(
         conn,
         AccountRow(
@@ -2160,7 +2142,6 @@ def _record_account(conn: sqlite3.Connection, lane: _Lane, tally: _Tally) -> boo
             display_name=lane.me.display_name,
         ),
     )
-    return True
 
 
 def other_user(conn: sqlite3.Connection, account: str, user_id: int) -> tg.OtherUser | None:
@@ -2176,11 +2157,26 @@ def other_user(conn: sqlite3.Connection, account: str, user_id: int) -> tg.Other
 
 
 def _other_user_text(refused: tg.OtherUser) -> str:
-    return (
-        f"its session is Telegram user {refused.user_id}, not user {refused.recorded} this index "
-        f"recorded for it; nothing was done as it — `grepogram accounts rm {refused.account}` "
-        "and sign it in again if the change is meant"
-    )
+    """How a report words an account left out for being another Telegram user: the refusal's
+    own reason and hint (:class:`~grepogram.tg.OtherUser`), not a second phrasing of them."""
+    return f"{refused.reason} — {refused.hint}"
+
+
+async def signed_in_user(conn: sqlite3.Connection, account: str, client: Any) -> Any | None:
+    """Ask Telegram who ``client`` — connected, signed in as ``account`` — is, and return that
+    user, or ``None`` when Telegram names none; raises :class:`~grepogram.tg.OtherUser` when the
+    index recorded someone else under that name, and :class:`~grepogram.tg.AuthRequired` naming
+    ``account`` for a rejected session. The question every identity check puts
+    (:func:`check_account`, :func:`ask_account`); any other Telegram error propagates."""
+    try:
+        me = await client.get_me()
+    except errors.UnauthorizedError as exc:
+        tg.reraise_unauthorized(exc, account)
+    if me is not None:
+        refused = other_user(conn, account, int(me.id))
+        if refused is not None:
+            raise refused
+    return me
 
 
 async def check_account(conn: sqlite3.Connection, account: str, client: Any) -> None:
@@ -2189,54 +2185,84 @@ async def check_account(conn: sqlite3.Connection, account: str, client: Any) -> 
     :class:`~grepogram.tg.OtherUser` when it is someone else.
 
     The one identity check every Telegram-facing pass goes through: a sync
-    (:func:`_record_account`, which also records a first sign-in), the passes over stored chats
-    (:meth:`StoredPass.start`: ``prune-deleted``, ``extract``, ``recapture-links``), the folder
-    read of ``sources prune``, ``grepogram leave``, and every research pass that talks to
+    (:func:`ask_account` with ``always``, which then records a first sign-in), the passes over
+    stored chats (:meth:`StoredPass.start`: ``prune-deleted``, ``extract``,
+    ``recapture-links``), the folder read of ``sources prune`` (both through
+    :func:`checked_accounts`), ``grepogram leave``, and every research pass that talks to
     Telegram — a run, a discover, a global search. A session file copied into place by hand, or
     one ``grepogram auth`` committed before this index recorded anyone, would otherwise delete,
     join, leave or ask as a user no one chose. Nothing is sent when no user is recorded yet; a
     rejected session is :class:`~grepogram.tg.AuthRequired` naming ``account``, and any other
     Telegram error propagates."""
-    if db.get_account(conn, account) is None:
-        return
-    try:
-        me = await client.get_me()
-    except errors.UnauthorizedError as exc:
-        tg.reraise_unauthorized(exc, account)
+    if db.get_account(conn, account) is not None:
+        await _recorded_user(conn, account, client)
+
+
+async def _recorded_user(conn: sqlite3.Connection, account: str, client: Any) -> Any:
+    """:func:`signed_in_user` for an account the index recorded: a session that names no user
+    cannot be checked, and is :class:`~grepogram.tg.AuthRequired`."""
+    me = await signed_in_user(conn, account, client)
     if me is None:
         raise tg.AuthRequired(account=account)
-    refused = other_user(conn, account, int(me.id))
-    if refused is not None:
-        raise refused
+    return me
+
+
+@dataclass(frozen=True, slots=True)
+class AccountAnswer:
+    """What asking who an account is came to (:func:`ask_account`): ``me``, the Telegram user
+    it is, when it may act and was asked; otherwise ``left_out``, why it sits the pass out, with
+    ``other_user`` set when that is because it is another Telegram user than the index recorded
+    — refused for good — rather than a Telegram error on the question itself."""
+
+    me: Any | None = None
+    left_out: str | None = None
+    other_user: bool = False
+
+
+async def ask_account(
+    conn: sqlite3.Connection, account: str, client: Any, *, always: bool = False
+) -> AccountAnswer:
+    """:func:`check_account` for a pass that goes on without the account it refuses: the
+    refusal — a session of another Telegram user, or a Telegram error (a flood wait included) on
+    the question itself, since an account that cannot say who it is is not trusted to act — is
+    logged and worded for the report instead of raised. ``always`` asks even when no user is
+    recorded under ``account`` yet, for the sync that records the first sign-in — which takes a
+    session naming no user as one with nothing to record. A rejected session is still raised as
+    :class:`~grepogram.tg.AuthRequired`."""
+    try:
+        if always:
+            return AccountAnswer(me=await signed_in_user(conn, account, client))
+        if db.get_account(conn, account) is not None:
+            return AccountAnswer(me=await _recorded_user(conn, account, client))
+    except tg.OtherUser as exc:
+        log.warning("%s; it sits this pass out", exc.reason)
+        return AccountAnswer(left_out=_other_user_text(exc), other_user=True)
+    except errors.FloodWaitError as exc:
+        log.warning("flood wait of %ss asking who account %s is", exc.seconds, account)
+        return AccountAnswer(
+            left_out=flood_warning(
+                int(exc.seconds), "asking who the account is", "it sat this pass out"
+            )
+        )
+    except errors.RPCError as exc:
+        log.warning("account %s could not say who it is: %s", account, exc)
+        return AccountAnswer(left_out=f"it could not say who it is ({exc}); it sat this pass out")
+    return AccountAnswer()
 
 
 async def checked_accounts(
     conn: sqlite3.Connection, clients: Mapping[str, Any]
 ) -> tuple[dict[str, Any], dict[str, str]]:
-    """``clients`` without the accounts :func:`check_account` refuses or cannot ask, and why
-    each one was left out: a session of another Telegram user, or a Telegram error (a flood
-    wait included) on the question itself — an account that cannot say who it is is not
-    trusted to act. A rejected session is raised as :class:`~grepogram.tg.AuthRequired`."""
+    """``clients`` without the accounts :func:`ask_account` leaves out, and why each one was.
+    A rejected session is raised as :class:`~grepogram.tg.AuthRequired`."""
     kept: dict[str, Any] = {}
     left_out: dict[str, str] = {}
     for account, client in clients.items():
-        try:
-            await check_account(conn, account, client)
-        except tg.OtherUser as exc:
-            log.warning("%s; it sits this pass out", exc.reason)
-            left_out[account] = _other_user_text(exc)
-            continue
-        except errors.FloodWaitError as exc:
-            log.warning("flood wait of %ss asking who account %s is", exc.seconds, account)
-            left_out[account] = flood_warning(
-                int(exc.seconds), "asking who the account is", "it sat this pass out"
-            )
-            continue
-        except errors.RPCError as exc:
-            log.warning("account %s could not say who it is: %s", account, exc)
-            left_out[account] = f"it could not say who it is ({exc}); it sat this pass out"
-            continue
-        kept[account] = client
+        answer = await ask_account(conn, account, client)
+        if answer.left_out is not None:
+            left_out[account] = answer.left_out
+        else:
+            kept[account] = client
     return kept, left_out
 
 
