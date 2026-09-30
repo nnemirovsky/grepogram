@@ -24,7 +24,6 @@ import datetime as dt
 import logging
 import re
 import sqlite3
-import time
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Literal
@@ -947,7 +946,6 @@ async def resolve_sources(
     coverage: dict[str, set[int]] = {}
     flooded: dict[str, int] = {}
     failed: dict[str, str] = {}
-    now = int(time.time())
 
     def keep(source: Source) -> None:
         _keep_primary(conn, source, stored, rows)
@@ -1038,8 +1036,6 @@ async def resolve_sources(
                 chat.id,
                 source.account,
                 access_hash=catalog.access_hash(info.id),
-                via="source",
-                checked_at=now,
             )
     for source_id, chat_ids in coverage.items():
         db.set_source_chats(conn, source_id, chat_ids)

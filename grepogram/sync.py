@@ -2053,7 +2053,6 @@ async def _sync_chats(
     leads to any more but that still hold flagged rows — once, after every queue. Failures are
     :func:`_record_failure`'s to describe; the tally becomes the report.
     """
-    now = int(time.time())
     tally = _Tally(labelled=labels_accounts(clients))
     lanes: dict[str, _Lane] = {}
     stopped: set[str] = set()
@@ -2077,7 +2076,7 @@ async def _sync_chats(
             stopped.add(account)
             continue
         lanes[account].me = _self_row(me)
-        _record_account(conn, lanes[account], now)
+        _record_account(conn, lanes[account])
     usable = {account: lane.client for account, lane in lanes.items() if account not in stopped}
     resolution = await resolve_sources(cfg, usable, conn)
     stopped |= set(resolution.flooded)
@@ -2122,7 +2121,7 @@ async def _sync_chats(
     return run.tally.report()
 
 
-def _record_account(conn: sqlite3.Connection, lane: _Lane, now: int) -> None:
+def _record_account(conn: sqlite3.Connection, lane: _Lane) -> None:
     """Remember who ``lane.account`` turned out to be, when Telegram said."""
     if lane.me is None:
         return
@@ -2132,7 +2131,6 @@ def _record_account(conn: sqlite3.Connection, lane: _Lane, now: int) -> None:
             name=lane.account,
             user_id=lane.me.id,
             display_name=lane.me.display_name,
-            added_at=now,
         ),
     )
 

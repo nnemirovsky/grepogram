@@ -43,7 +43,6 @@ import json
 import logging
 import secrets
 import sqlite3
-import time
 from collections.abc import AsyncIterator, Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import asdict
 from enum import StrEnum
@@ -254,7 +253,6 @@ def _remember_account(paths: Paths, account: str, who: tg.SignedIn) -> None:
                     name=account,
                     user_id=who.user_id,
                     display_name=who.name,
-                    added_at=int(time.time()),
                 ),
             )
         finally:

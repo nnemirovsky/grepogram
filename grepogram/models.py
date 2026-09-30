@@ -355,7 +355,6 @@ class AccountRow:
     name: str
     user_id: int | None = None
     display_name: str | None = None
-    added_at: int | None = None
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)

@@ -564,8 +564,8 @@ def _work_access(conn: sqlite3.Connection) -> ChatRow:
     the link alone); the default account reaches its own Alice."""
     work_alice = _work_chats(conn)
     for chat_id in (work_alice.id, WORK_NEWS, ARG_NEWS):
-        db.set_chat_access(conn, chat_id, "work", via="source")
-    db.set_chat_access(conn, ALICE, "default", via="source")
+        db.set_chat_access(conn, chat_id, "work")
+    db.set_chat_access(conn, ALICE, "default")
     return work_alice
 
 

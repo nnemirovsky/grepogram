@@ -915,7 +915,7 @@ def upsert_chat(conn: sqlite3.Connection, chat: ChatRow, account: str | None = N
     a source never rewinds a synced chat; change it with :func:`set_chat_progress`,
     :func:`set_chat_unavailable` and :func:`set_chat_migrated`. Neither ``chat_access`` nor
     ``chat_sources`` is written here: which account reaches a chat and which sources cover it are
-    the callers' to record (:func:`set_chat_access`, :func:`set_chat_sources`).
+    the callers' to record (:func:`set_chat_access`, :func:`set_source_chats`).
     """
     owner = account if account is not None else (chat.scope or DEFAULT_ACCOUNT)
     scope = chat_scope(chat.type, owner)
@@ -1024,23 +1024,19 @@ def set_chat_access(
     account: str,
     *,
     access_hash: int | None = None,
-    via: str | None = None,
-    checked_at: int | None = None,
 ) -> None:
     """Record that ``account`` reaches chat ``chat_id``.
 
-    A value left ``None`` keeps what is stored, so confirming access without an entity at hand
-    never drops the access hash an earlier resolve recorded.
+    An ``access_hash`` left ``None`` keeps what is stored, so confirming access without an
+    entity at hand never drops the one an earlier resolve recorded. The table's ``via`` and
+    ``checked_at`` columns are no longer written: nothing reads them.
     """
     with transaction(conn):
         conn.execute(
-            """INSERT INTO chat_access(chat_id, account, access_hash, via, checked_at)
-               VALUES (?, ?, ?, ?, ?)
+            """INSERT INTO chat_access(chat_id, account, access_hash) VALUES (?, ?, ?)
                ON CONFLICT(chat_id, account) DO UPDATE SET
-                   access_hash = COALESCE(excluded.access_hash, chat_access.access_hash),
-                   via = COALESCE(excluded.via, chat_access.via),
-                   checked_at = COALESCE(excluded.checked_at, chat_access.checked_at)""",
-            (chat_id, account, access_hash, via, checked_at),
+                   access_hash = COALESCE(excluded.access_hash, chat_access.access_hash)""",
+            (chat_id, account, access_hash),
         )
 
 
@@ -1117,20 +1113,6 @@ def stored_peers(conn: sqlite3.Connection, account: str) -> list[tuple[int, int]
     return [(int(row["peer_id"]), int(row["access_hash"])) for row in rows]
 
 
-def set_chat_sources(conn: sqlite3.Connection, chat_id: int, source_ids: Iterable[str]) -> None:
-    """Make ``source_ids`` the whole set of sources covering chat ``chat_id``.
-
-    ``chats.source_id`` is not touched: it stays the primary owner the import and
-    discussion-ownership rules read, and moving it is the caller's decision.
-    """
-    with transaction(conn):
-        conn.execute("DELETE FROM chat_sources WHERE chat_id = ?", (chat_id,))
-        conn.executemany(
-            "INSERT INTO chat_sources(chat_id, source_id) VALUES (?, ?)",
-            [(chat_id, source_id) for source_id in dict.fromkeys(source_ids)],
-        )
-
-
 def chat_source_ids(conn: sqlite3.Connection, chat_id: int) -> list[str]:
     """Every source recorded as covering chat ``chat_id``, ordered by id."""
     rows = conn.execute(
@@ -1140,9 +1122,9 @@ def chat_source_ids(conn: sqlite3.Connection, chat_id: int) -> list[str]:
 
 
 def set_source_chats(conn: sqlite3.Connection, source_id: str, chat_ids: Iterable[int]) -> None:
-    """Make ``chat_ids`` the whole set of chats source ``source_id`` covers — the other side of
-    :func:`set_chat_sources`, for a resolve that has just read what one source lists. An empty
-    set drops the source from every chat's coverage."""
+    """Make ``chat_ids`` the whole set of chats source ``source_id`` covers, for a resolve that
+    has just read what one source lists. An empty set drops the source from every chat's
+    coverage; ``chats.source_id``, the primary owner, is not touched."""
     with transaction(conn):
         conn.execute("DELETE FROM chat_sources WHERE source_id = ?", (source_id,))
         conn.executemany(
@@ -1192,15 +1174,15 @@ def set_primary_source(conn: sqlite3.Connection, chat_id: int, source_id: str) -
 
 
 def upsert_account(conn: sqlite3.Connection, account: AccountRow) -> AccountRow:
-    """Record who ``account.name`` is; ``added_at`` is kept from the first time it was stored."""
+    """Record who ``account.name`` is. ``accounts.added_at`` is no longer written: nothing
+    reads it."""
     with transaction(conn):
         conn.execute(
-            """INSERT INTO accounts(name, user_id, display_name, added_at) VALUES (?, ?, ?, ?)
+            """INSERT INTO accounts(name, user_id, display_name) VALUES (?, ?, ?)
                ON CONFLICT(name) DO UPDATE SET
                    user_id = excluded.user_id,
-                   display_name = excluded.display_name,
-                   added_at = COALESCE(accounts.added_at, excluded.added_at)""",
-            (account.name, account.user_id, account.display_name, account.added_at),
+                   display_name = excluded.display_name""",
+            (account.name, account.user_id, account.display_name),
         )
         row = conn.execute("SELECT * FROM accounts WHERE name = ?", (account.name,)).fetchone()
         return _account_row(row)
@@ -2549,7 +2531,6 @@ def _account_row(row: sqlite3.Row) -> AccountRow:
         name=row["name"],
         user_id=row["user_id"],
         display_name=row["display_name"],
-        added_at=row["added_at"],
     )
 
 

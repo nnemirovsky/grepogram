@@ -1003,18 +1003,15 @@ def test_a_channel_reached_by_two_accounts_is_one_row_with_two_access_entries(
     assert second.scope == ""
     assert second.title == "News"
     assert conn.execute("SELECT count(*) FROM chats").fetchone()[0] == 1
-    db.set_chat_access(conn, -1001, "work", access_hash=222, via="source", checked_at=10)
-    db.set_chat_access(conn, -1001, "default", access_hash=111, via="source", checked_at=10)
+    db.set_chat_access(conn, -1001, "work", access_hash=222)
+    db.set_chat_access(conn, -1001, "default", access_hash=111)
     assert db.chat_accounts(conn, -1001) == ["default", "work"]
     assert db.access_hash(conn, -1001, "work") == 222
     assert db.access_hash(conn, -1001, "default") == 111
     assert db.access_hash(conn, -1001, "home") is None
     # confirming access without an entity at hand keeps what an earlier resolve recorded
-    db.set_chat_access(conn, -1001, "work", checked_at=20)
-    row = conn.execute(
-        "SELECT access_hash, via, checked_at FROM chat_access WHERE account = 'work'"
-    ).fetchone()
-    assert tuple(row) == (222, "source", 20)
+    db.set_chat_access(conn, -1001, "work")
+    assert db.access_hash(conn, -1001, "work") == 222
     assert db.chat_accounts(conn, 404) == []
 
 
@@ -1028,26 +1025,27 @@ def test_a_shared_chat_is_never_stored_off_its_peer_id(conn: sqlite3.Connection)
     assert not conn.in_transaction
 
 
-def test_set_chat_sources_replaces_the_set_and_leaves_the_primary(
+def test_set_source_chats_replaces_the_set_and_leaves_the_primary(
     conn: sqlite3.Connection,
 ) -> None:
     db.upsert_chat(conn, _chat(-1001, source_id="chat:@news"))
-    db.set_chat_sources(conn, -1001, ["work/chat:@news", "chat:@news", "chat:@news"])
+    db.upsert_chat(conn, _chat(-1002, source_id="chat:@news"))
+    db.set_source_chats(conn, "work/chat:@news", [-1001, -1002, -1001])
+    db.set_source_chats(conn, "chat:@news", [-1001])
     assert db.chat_source_ids(conn, -1001) == ["chat:@news", "work/chat:@news"]
-    db.set_chat_sources(conn, -1001, ["work/chat:@news"])
-    assert db.chat_source_ids(conn, -1001) == ["work/chat:@news"]
+    db.set_source_chats(conn, "work/chat:@news", [-1002])
+    assert db.chat_source_ids(conn, -1001) == ["chat:@news"]
+    assert db.source_chat_ids(conn, "work/chat:@news") == [-1002]
     assert db.get_chat(conn, -1001).source_id == "chat:@news"  # type: ignore[union-attr]
-    db.set_chat_sources(conn, -1001, [])
+    db.set_source_chats(conn, "chat:@news", [])
     assert db.chat_source_ids(conn, -1001) == []
 
 
 def test_accounts_are_recorded_once_and_listed_default_first(conn: sqlite3.Connection) -> None:
-    db.upsert_account(conn, AccountRow(name="work", user_id=7, display_name="W", added_at=100))
-    db.upsert_account(conn, AccountRow(name="default", user_id=5, added_at=200))
-    again = db.upsert_account(
-        conn, AccountRow(name="work", user_id=8, display_name="Work", added_at=300)
-    )
-    assert again == AccountRow(name="work", user_id=8, display_name="Work", added_at=100)
+    db.upsert_account(conn, AccountRow(name="work", user_id=7, display_name="W"))
+    db.upsert_account(conn, AccountRow(name="default", user_id=5))
+    again = db.upsert_account(conn, AccountRow(name="work", user_id=8, display_name="Work"))
+    assert again == AccountRow(name="work", user_id=8, display_name="Work")
     assert [row.name for row in db.list_accounts(conn)] == ["default", "work"]
 
 
@@ -1071,7 +1069,8 @@ def test_delete_chat_cascades_access_and_coverage(conn: sqlite3.Connection) -> N
         db.upsert_chat(conn, _chat(chat_id))
         db.set_chat_access(conn, chat_id, "default", access_hash=1)
         db.set_chat_access(conn, chat_id, "work", access_hash=2)
-        db.set_chat_sources(conn, chat_id, ["folder:Test", "work/folder:Test"])
+    db.set_source_chats(conn, "folder:Test", [-1001, -1002])
+    db.set_source_chats(conn, "work/folder:Test", [-1001, -1002])
     db.delete_chat(conn, -1001)
     assert db.chat_accounts(conn, -1001) == []
     assert db.chat_source_ids(conn, -1001) == []
