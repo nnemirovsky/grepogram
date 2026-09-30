@@ -39,6 +39,7 @@ from grepogram.models import (
     SearchKind,
     Source,
     SyncReport,
+    WayIn,
 )
 from grepogram.paths import Paths
 from tests.conftest import scan_cursor
@@ -1686,7 +1687,7 @@ def test_a_grant_for_another_account_is_never_written(
             actions=["join"],
             via="cli",
             summary="join as work",
-            join_route="username",
+            join_route=WayIn("username"),
         )
 
     assert not research.authorized(rdb, flats, "join")
@@ -2128,7 +2129,7 @@ async def test_a_chat_approved_to_join_by_its_id_is_never_joined_through_a_folde
     summary = research.approval_summary(rdb, conn, CFG, session.id, [_item(private, "join")])
     assert "join it as default by its id;" in summary
     (grant,) = _approve(rdb, conn, session, _item(private, "join"))
-    assert grant.join_route == "id"
+    assert grant.join_route == WayIn("id")
     _store(conn, SEED, 1, "see t.me/addlist/Tbilisi1", links=(("link", "addlist/Tbilisi1"),))
 
     await research.discover(rdb, conn, CFG, session.id, client, now=6)
@@ -2157,7 +2158,7 @@ async def test_a_run_takes_the_folder_route_its_approval_recorded(
     folder = found["addlist/Tbilisi1"]
     private = found[f"peer:{_marked(FOLDER_PRIVATE)}"]
     (grant,) = _approve(rdb, conn, session, _item(private, "join"))
-    assert grant.join_route == f"folder:{folder.id}"
+    assert grant.join_route == WayIn("folder", folder.id)
 
     report = await _run(rdb, conn, paths, client, session)
 

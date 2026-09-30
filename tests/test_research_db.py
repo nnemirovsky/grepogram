@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 
 from grepogram import db, research_db
-from grepogram.models import ChatKey, Grant, ResearchLimits, ScanCursor
+from grepogram.models import ChatKey, Grant, ResearchLimits, ScanCursor, WayIn
 from grepogram.paths import Paths
 from tests.conftest import file_mode, scan_cursor
 
@@ -308,7 +308,7 @@ def _grant(
         summary="join @a as default",
         search_kinds=["chat_search"] if "global_search" in actions else [],
         stars_max=10 if "paid_search" in actions else None,
-        join_route="username" if {"join", "request"} & set(actions) else None,
+        join_route=WayIn("username") if {"join", "request"} & set(actions) else None,
         now=1,
     )
 
@@ -333,11 +333,11 @@ def test_grants_record_the_channel_and_stay_live_until_used(rdb: sqlite3.Connect
         actions=["join", "fetch", "join", "add_source"],
         via="elicitation",
         summary="join @a",
-        join_route="username",
+        join_route=WayIn("username"),
         now=3,
     )
     assert grant.via == "elicitation" and grant.actions == ("join", "fetch", "add_source")
-    assert grant.join_route == "username"
+    assert grant.join_route == WayIn("username")
     assert grant.live and grant.granted_at == 3 and grant.summary == "join @a"
     assert research_db.live_grants(rdb, sid, cand.id) == [grant]
     assert research_db.live_grants(rdb, sid, None) == []
@@ -621,16 +621,16 @@ def test_step_four_leaves_an_earlier_join_grant_with_no_route(rdb: sqlite3.Conne
     [
         (["join"], None, "names the route"),
         (["request"], None, "names the route"),
-        (["fetch", "add_source"], "id", "names the route"),
-        (["join"], "folder", "unknown join route"),
-        (["join"], "folder:x", "unknown join route"),
-        (["join"], "folder:0", "unknown join route"),
-        (["join"], f"folder:{2**70}", "unknown join route"),
-        (["join"], "by-magic", "unknown join route"),
+        (["fetch", "add_source"], WayIn("id"), "names the route"),
+        (["join"], WayIn("folder"), "names the folder's candidate id"),
+        (["join"], WayIn("folder", 0), "names the folder's candidate id"),
+        (["join"], WayIn("folder", 2**70), "names the folder's candidate id"),
+        (["join"], WayIn("id", 7), "only a folder route names a folder"),
+        (["join"], WayIn("by-magic"), "unknown join route"),  # type: ignore[arg-type]
     ],
 )
 def test_a_join_grant_names_a_real_route_and_only_it_does(
-    rdb: sqlite3.Connection, actions: list[str], route: str | None, match: str
+    rdb: sqlite3.Connection, actions: list[str], route: WayIn | None, match: str
 ) -> None:
     sid = _session(rdb)
     cand = research_db.add_candidate(rdb, sid, "@a", "username", 1)
@@ -647,7 +647,8 @@ def test_a_join_grant_names_a_real_route_and_only_it_does(
             join_route=route,
         )
     assert research_db.list_grants(rdb, sid) == []
-    for good in ("invite", "username", "id", "folder:7"):
+    stored = {"invite": "invite", "username": "username", "id": "id", "folder": "folder:7"}
+    for good in (WayIn("invite"), WayIn("username"), WayIn("id"), WayIn("folder", 7)):
         grant = research_db.add_grant(
             rdb,
             session_id=sid,
@@ -659,6 +660,11 @@ def test_a_join_grant_names_a_real_route_and_only_it_does(
             join_route=good,
         )
         assert grant.join_route == good
+        # stored as every earlier build wrote it, so a grant from before reads back the same
+        (column,) = rdb.execute(
+            "SELECT join_route FROM grants WHERE id = ?", (grant.id,)
+        ).fetchone()
+        assert column == stored[good.route]
 
 
 @pytest.mark.parametrize("decided", ["granted", "approved", "skipped", "joined"])

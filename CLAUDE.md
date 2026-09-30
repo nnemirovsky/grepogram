@@ -598,10 +598,13 @@ never change the git identity.
   development build's version 1 up rather than refusing it — a file of decisions is migrated,
   never re-derived. Step 3 adds `grants.search_kinds` / `grants.stars_max`, the terms a
   session-wide grant was given on; a grant from before it names none and authorizes no search.
-  Step 4 adds `grants.join_route` — `invite`, `username`, `id` or `folder:<candidate id>`
-  (`research_db.check_join_route`), the way in a `join` / `request` grant's summary named
-  (`research._way_in_route`, required by `add_grant` for those two actions and only them).
-  **A run takes that route and no other** (`research._granted_route` → `_join_all`): one it can
+  Step 4 adds `grants.join_route` — `invite`, `username`, `id` or `folder:<candidate id>` —
+  the way in a `join` / `request` grant's summary named (`research._way_in`, required by
+  `add_grant` for those two actions and only them). In code it is a `models.WayIn` (a
+  `JoinRoute` plus the folder's candidate id), checked by `research_db.check_way_in`; that
+  text form is `research_db._stored_way_in` / `_read_way_in`'s alone, so every grant any build
+  wrote reads back the same. **A run takes that route and no other**
+  (`research._granted_way_in` → `_join_all`): one it can
   no longer take, or a grant from before step 4 that names none, fails the candidate for a new
   approval — never a swap to another way in. `add_candidate` never gives a parent to a
   candidate with a grant (ever) or any status but `proposed`, so a shared folder found after a

@@ -741,6 +741,22 @@ class Evidence:
     found_at: int = 0
 
 
+JoinRoute = Literal["invite", "username", "id", "folder"]
+"""How a ``join`` or ``request`` gets an account into a chat: through its invite link, its
+public username, its id and the access hash a probe stored, or the shared folder it was found in
+(a join only)."""
+
+
+@dataclass(frozen=True, slots=True)
+class WayIn:
+    """The way into one chat a ``join`` or ``request`` grant names: ``route``, and for a
+    ``folder`` route the candidate id of that shared folder (``folder_id``, ``None`` for every
+    other route)."""
+
+    route: JoinRoute
+    folder_id: int | None = None
+
+
 @dataclass(frozen=True, slots=True, kw_only=True)
 class Grant:
     """One human approval: ``actions`` on one candidate (or the session, when ``candidate_id``
@@ -760,10 +776,9 @@ class Grant:
     """The searches a ``global_search`` grant covers, as its summary named them."""
     stars_max: int | None = None
     """The most a ``paid_search`` grant may pay, as its summary named it."""
-    join_route: str | None = None
-    """How a ``join`` or ``request`` grant gets the account in, as its summary named it:
-    ``invite``, ``username``, ``id`` or ``folder:<candidate id>``
-    (:func:`grepogram.research_db.check_join_route`)."""
+    join_route: "WayIn | None" = None
+    """How a ``join`` or ``request`` grant gets the account in, as its summary named it
+    (:func:`grepogram.research_db.check_way_in`)."""
 
     @property
     def live(self) -> bool:

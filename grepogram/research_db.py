@@ -72,6 +72,7 @@ from grepogram.models import (
     Grant,
     GrantAction,
     GrantChannel,
+    JoinRoute,
     ResearchLimits,
     ResearchSession,
     ResearchState,
@@ -79,6 +80,7 @@ from grepogram.models import (
     SearchKind,
     SearchRecord,
     SessionAction,
+    WayIn,
 )
 from grepogram.paths import PRIVATE_FILE_MODE, Paths
 
@@ -990,7 +992,7 @@ def _grant(row: sqlite3.Row) -> Grant:
         voided_at=row["voided_at"],
         search_kinds=tuple(json.loads(row["search_kinds"] or "[]")),
         stars_max=row["stars_max"],
-        join_route=row["join_route"],
+        join_route=None if row["join_route"] is None else _read_way_in(row["join_route"]),
     )
 
 
@@ -1005,7 +1007,7 @@ def add_grant(
     summary: str,
     search_kinds: Sequence[SearchKind] = (),
     stars_max: int | None = None,
-    join_route: str | None = None,
+    join_route: WayIn | None = None,
     now: int | None = None,
 ) -> Grant:
     """Record one human approval — the only way a grant comes to exist.
@@ -1022,7 +1024,7 @@ def add_grant(
     used: ``search_kinds`` — the searches a ``global_search`` covers, at least one — and
     ``stars_max``, the most a ``paid_search`` may pay. Neither goes on a grant without the
     action it bounds. So does a ``join`` or ``request``: ``join_route`` is the way in its
-    summary named (:func:`check_join_route`), and the only one a run may take.
+    summary named (:func:`check_way_in`), and the only one a run may take.
     """
     _check(via, _CHANNELS, "grant channel")
     if not summary.strip():
@@ -1046,7 +1048,7 @@ def add_grant(
     if bool({"join", "request"} & set(wanted)) != (join_route is not None):
         raise ValueError("a join or request grant names the route it takes, and only it does")
     if join_route is not None:
-        check_join_route(join_route)
+        check_way_in(join_route)
     with db.transaction(conn):
         session = get_session(conn, session_id)
         if session is None:
@@ -1076,25 +1078,45 @@ def add_grant(
                 clock(now),
                 json.dumps(kinds) if kinds else None,
                 stars_max,
-                join_route,
+                None if join_route is None else _stored_way_in(join_route),
             ),
         ).fetchone()
     return _grant(row)
 
 
-JOIN_ROUTES: frozenset[str] = frozenset({"invite", "username", "id"})
-"""The ways into a chat a grant can name besides a shared folder, ``folder:<candidate id>``."""
-FOLDER_ROUTE = "folder:"
+_JOIN_ROUTES: dict[str, JoinRoute] = {route: route for route in get_args(JoinRoute)}
+_FOLDER_PREFIX = "folder:"
+"""How ``grants.join_route`` stores a ``folder`` route: ``folder:<candidate id>``. The other
+routes are stored by their name alone; :func:`_stored_way_in` and :func:`_read_way_in` are the
+only two places that know it, so a grant written by any earlier build reads back the same."""
 
 
-def check_join_route(route: str) -> None:
-    """Refuse a ``join_route`` that is none of :data:`JOIN_ROUTES` or ``folder:<id>``."""
-    if route in JOIN_ROUTES:
-        return
-    folder = route.removeprefix(FOLDER_ROUTE)
-    if folder != route and folder.isascii() and folder.isdigit() and _row_id(int(folder)):
-        return
-    raise ValueError(f"unknown join route {route!r}")
+def check_way_in(way_in: WayIn) -> None:
+    """Refuse a way in that names no :data:`~grepogram.models.JoinRoute`, a ``folder`` route
+    without the row id of its folder, or a folder id on any other route."""
+    if way_in.route not in _JOIN_ROUTES:
+        raise ValueError(f"unknown join route {way_in.route!r}")
+    if way_in.route == "folder":
+        if way_in.folder_id is None or not _row_id(way_in.folder_id):
+            raise ValueError(f"a folder route names the folder's candidate id, not {way_in!r}")
+    elif way_in.folder_id is not None:
+        raise ValueError(f"only a folder route names a folder: {way_in!r}")
+
+
+def _stored_way_in(way_in: WayIn) -> str:
+    if way_in.route == "folder":
+        return f"{_FOLDER_PREFIX}{way_in.folder_id}"
+    return way_in.route
+
+
+def _read_way_in(stored: str) -> WayIn:
+    folder = stored.removeprefix(_FOLDER_PREFIX)
+    if folder != stored:
+        return WayIn("folder", int(folder))
+    route = _JOIN_ROUTES.get(stored)
+    if route is None:
+        raise ValueError(f"unknown join route {stored!r} stored in research.db")
+    return WayIn(route)
 
 
 def list_grants(
