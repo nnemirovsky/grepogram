@@ -46,7 +46,7 @@ from telethon import errors
 
 from grepogram import db, extract, index, sync, units
 from grepogram.extract import ExtractError, Extractor
-from grepogram.models import ChatRow, Config, MediaKind, MediaReport, MessageRow
+from grepogram.models import DEFAULT_ACCOUNT, ChatRow, Config, MediaKind, MediaReport, MessageRow
 
 log = logging.getLogger(__name__)
 
@@ -180,7 +180,7 @@ async def run(
         chats = _fetchable_rows(conn)
         if not budget.expired:
             sync._cap_flood_sleep(client, cfg.sync, budget)
-            await sync.warm_peer_cache(client, chats)
+            await sync.warm_peer_cache(client, chats, conn, DEFAULT_ACCOUNT)
         for chat in chats:
             if budget.expired:
                 break

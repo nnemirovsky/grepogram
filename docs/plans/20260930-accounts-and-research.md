@@ -460,21 +460,38 @@ voided_at)`, `exclusions(identity PRIMARY KEY, reason, created_at)`,
 
 **Files:**
 - Modify: `grepogram/sync.py`, `tests/fakes.py`, `tests/test_sync.py`
+- Modify: `grepogram/cli.py`, `grepogram/mcp.py` — pass `{DEFAULT_ACCOUNT: client}` to
+  `sync_all` until tasks 8 and 9 hand it every signed-in account; `grepogram/media.py` — the
+  new `warm_peer_cache` signature with the default account until task 7 routes per account
+- Modify: `tests/test_mcp.py`, `tests/test_media.py`, `tests/test_index_dense.py`,
+  `tests/test_index_lexical.py`, `tests/test_units_incremental.py` — callers of the new signatures
 
-- [ ] `tests/fakes.py`: a `FakeWorld` shared by several `FakeClient(account=…)` with
-  per-account membership, DM histories and access hashes
-- [ ] `sync_all(clients: Mapping[str, client], …, only: Collection[str] | None = None)`:
+- [x] `tests/fakes.py`: a `FakeWorld` shared by several `FakeClient(account=…)` with
+  per-account membership, DM histories and access hashes (`FakeWorld.client(account, members=…)`
+  builds one; a private channel refuses a non-member; `FakeClient.session.process_entities`
+  seeds stored hashes, and a hash that is not the account's own is refused like Telegram does)
+- [x] `sync_all(clients: Mapping[str, client], …, only: Collection[str] | None = None)`:
   resolve once, assign each chat to its fetching account (primary source's account, then other
   `chat_access` accounts on `ChannelPrivateError` / `ChatForbiddenError` / missing peer), run one
   queue per account concurrently; `_record_failure` stops only that account's queue on a flood
-  wait; `me` per account; `index_pending` / `index_stranded` / re-cut / embed once
-- [ ] `warm_peer_cache(client, chats, conn, account)` seeds Telethon's session with stored
-  `chat_access.access_hash` before falling back to dialogs / username / discussion routes
-- [ ] `SyncReport` gains per-account `warnings` context (account name in each warning)
-- [ ] tests: two accounts sync concurrently into one index; a shared channel is fetched once;
+  wait; `me` per account; `index_pending` / `index_stranded` / re-cut / embed once. The queues
+  run in an `asyncio.TaskGroup`; a fallback is only for shared chats, warms the other client
+  first and a flood wait there stops *that* account's queue; `only` narrows the fetch to the
+  chats the named sources cover (every source is still resolved, so the primary never moves);
+  each account's `me` is recorded in `accounts`; a rejected session raises `AuthRequired`
+  naming its account; an unaddressable peer (`ValueError`) costs a chat its turn instead of
+  ending the run
+- [x] `warm_peer_cache(client, chats, conn, account)` seeds Telethon's session with stored
+  `chat_access.access_hash` before falling back to dialogs / username / discussion routes (a
+  legacy group counts as addressable, a discussion group's channel is seeded too; nothing left
+  unseeded means no request at all)
+- [x] `SyncReport` gains per-account `warnings` context (account name in each warning): every
+  warning reads `account <name>: …` whenever the run holds an account other than `default`, so a
+  single-account install's report is unchanged
+- [x] tests: two accounts sync concurrently into one index; a shared channel is fetched once;
   fallback to the second account when the first is refused; a flood wait on one account leaves
   the other finishing; `only=` limits the run to named sources
-- [ ] run checks — must pass before task 7
+- [x] run checks — must pass before task 7
 
 ### Task 7: Per-account extraction and deletion sweeps
 

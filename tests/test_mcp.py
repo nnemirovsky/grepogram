@@ -30,6 +30,7 @@ from grepogram import sync as syncing
 from grepogram.embed import FakeEmbedder, ModelUnavailable
 from grepogram.filters import InvalidDate, UnknownChat
 from grepogram.models import (
+    DEFAULT_ACCOUNT,
     ChatRow,
     Config,
     MessageRow,
@@ -289,7 +290,8 @@ async def test_auto_sync_under_a_held_lock_is_a_warning(
     assert result["synced"] is False
     assert result["warnings"] == ["auto-sync skipped: another sync is running (lock held)"]
     assert len(calls) == 1
-    assert calls[0][0] is fake and calls[0][1] is stale.conn and calls[0][3] is paths
+    assert calls[0][0] == {DEFAULT_ACCOUNT: fake}
+    assert calls[0][1] is stale.conn and calls[0][3] is paths
     budget = calls[0][4]
     assert isinstance(budget, syncing.SyncBudget)
     assert budget.seconds == CFG.search.auto_sync_budget_s

@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 import dataclasses
 import datetime as dt
 import logging
@@ -35,7 +36,15 @@ from grepogram.models import (
 )
 from grepogram.paths import Paths
 from grepogram.sync import SyncBudget, SyncInProgress, SyncLock
-from tests.fakes import FakeClient, make_channel, make_dialog, make_folder, make_group, make_user
+from tests.fakes import (
+    FakeClient,
+    FakeWorld,
+    make_channel,
+    make_dialog,
+    make_folder,
+    make_group,
+    make_user,
+)
 from tests.fixtures import tl
 
 runner = CliRunner()
@@ -267,7 +276,12 @@ async def _run(
 ) -> SyncReport:
     async with tg.connected(client):
         return await sync.sync_all(
-            client, conn, cfg, paths, SyncBudget(seconds, clock=clock), recut=recut
+            {DEFAULT_ACCOUNT: client},
+            conn,
+            cfg,
+            paths,
+            SyncBudget(seconds, clock=clock),
+            recut=recut,
         )
 
 
@@ -829,6 +843,12 @@ async def _prune(
         )
 
 
+def _forget_access_hashes(conn: sqlite3.Connection) -> None:
+    """Drop every stored access hash, as an index synced before they were recorded has none, so
+    a warm-up has to take the routes that cost requests: the dialog list, a handle, a channel."""
+    conn.execute("UPDATE chat_access SET access_hash = NULL")
+
+
 def _swept(client: FakeClient) -> list[int]:
     """The chats the sweep asked Telegram about, first asked first."""
     asked = [kw["chat_id"] for name, kw in client.calls if name == "get_messages"]
@@ -1069,11 +1089,13 @@ async def test_the_sweep_resolves_its_chats_before_it_asks_about_stored_ids(
     Every id it asks about is a bare stored id and nothing else, which Telethon can only turn
     into a peer once the session knows that peer; without the dialog list read first the very
     first chat raises ``ValueError: Could not find the input entity`` and the sweep removes
-    nothing at all.
+    nothing at all. An index with no access hash stored for the chat has only the dialog list
+    to learn it from.
     """
     client = _client(messages={ARG_ID: _talk(101, 102)})
     cfg = _cfg(ARG_SOURCE)
     await _run(client, conn, paths, cfg)
+    _forget_access_hashes(conn)
     client.calls.clear()
     del client.messages[ARG_ID][1]
 
@@ -1083,6 +1105,48 @@ async def test_the_sweep_resolves_its_chats_before_it_asks_about_stored_ids(
     assert asked[0] == "get_dialogs", "the dialog list comes before any id is asked about"
     assert (report.removed, report.warnings) == (1, [])
     assert _texts(conn, ARG_ID) == {101: "m101"}
+
+
+async def test_the_sweep_addresses_its_chats_by_their_stored_access_hash_first(
+    conn: sqlite3.Connection, paths: Paths
+) -> None:
+    """Every resolve stores the access hash the account addresses a chat by, and that is all a
+    by-id request needs: a sweep over chats that carry one reads no dialog list, resolves no
+    handle, and asks about its ids straight away on a client that has never seen a peer."""
+    client = _client(
+        entities=[DISC, OTHER],
+        messages={ARG_ID: _talk(101, 102), OTHER_ID: [tl.channel_post(OTHER_ID, 1, "post 1")]},
+    )
+    cfg = _cfg(ARG_SOURCE, Source(chat="@other_news"))
+    await _run(client, conn, paths, cfg)
+    assert db.access_hash(conn, OTHER_ID, DEFAULT_ACCOUNT) == OTHER.access_hash
+    client.calls.clear()
+    del client.messages[ARG_ID][1]
+
+    report = await _prune(client, conn, paths, cfg)
+
+    assert [name for name, _ in client.calls if name in ("get_dialogs", "get_entity")] == []
+    assert sorted(report.chats_done) == sorted([ARG_ID, OTHER_ID])
+    assert (report.removed, report.warnings) == (1, [])
+    assert {ARG_ID, OTHER_ID} <= client.resolved
+
+
+async def test_a_stored_access_hash_of_another_account_does_not_address_the_chat(
+    conn: sqlite3.Connection, paths: Paths
+) -> None:
+    """An access hash is per account: seeding one the account does not own addresses the peer as
+    someone else's, Telegram refuses the request, and the chat costs its turn with nothing
+    removed — it is never read as a hundred deletions."""
+    client = _client(messages={ARG_ID: _talk(101, 102)})
+    cfg = _cfg(ARG_SOURCE)
+    await _run(client, conn, paths, cfg)
+    conn.execute("UPDATE chat_access SET access_hash = 7 WHERE chat_id = ?", (ARG_ID,))
+    del client.messages[ARG_ID][1]
+
+    report = await _prune(client, conn, paths, cfg)
+
+    assert report.removed == 0 and report.chats_remaining == [ARG_ID]
+    assert _texts(conn, ARG_ID) == {101: "m101", 102: "m102"}
 
 
 async def test_the_sweep_caps_the_flood_sleep_before_the_warm_up_asks_anything(
@@ -1097,6 +1161,7 @@ async def test_the_sweep_caps_the_flood_sleep_before_the_warm_up_asks_anything(
     client = _client(messages={ARG_ID: _talk(101, 102)})
     cfg = _cfg(ARG_SOURCE)
     await _run(client, conn, paths, cfg)
+    _forget_access_hashes(conn)
     listed = client.get_dialogs
     seen: list[float] = []
 
@@ -1154,7 +1219,7 @@ async def test_a_session_revoked_mid_sweep_stops_it_with_the_auth_hint(
 
 @pytest.mark.parametrize("at", ["dialogs", "username", "channel"])
 async def test_the_warm_up_reraises_a_revoked_session_and_swallows_the_rest(
-    at: str, monkeypatch: pytest.MonkeyPatch
+    at: str, conn: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The warm-up is worth failing a pass for in one case only.
 
@@ -1187,12 +1252,12 @@ async def test_the_warm_up_reraises_a_revoked_session_and_swallows_the_rest(
     arm(revoked)
     with pytest.raises(tg.AuthRequired):
         async with tg.connected(client):
-            await sync.warm_peer_cache(client, chats)
+            await sync.warm_peer_cache(client, chats, conn, DEFAULT_ACCOUNT)
 
     arm(other)
     async with tg.connected(client):
         # anything else is still swallowed: the chat is left to the caller's per-chat handler
-        await sync.warm_peer_cache(client, chats)
+        await sync.warm_peer_cache(client, chats, conn, DEFAULT_ACCOUNT)
 
 
 async def test_the_sweep_resolves_a_public_chat_the_dialog_list_never_lists(
@@ -1216,6 +1281,7 @@ async def test_the_sweep_resolves_a_public_chat_the_dialog_list_never_lists(
     stored = db.get_chat(conn, OTHER_ID)
     assert stored is not None and stored.username == "other_news"
     assert OTHER_ID not in {dialog.id for dialog in client.dialogs}, "and never a dialog"
+    _forget_access_hashes(conn)
     client.calls.clear()
     del client.messages[OTHER_ID][1]
 
@@ -1227,7 +1293,9 @@ async def test_the_sweep_resolves_a_public_chat_the_dialog_list_never_lists(
     assert _texts(conn, OTHER_ID) == {1: "post 1"}
 
 
-async def test_the_warm_up_resolves_a_channel_before_asking_it_for_its_discussion_group() -> None:
+async def test_the_warm_up_resolves_a_channel_before_asking_it_for_its_discussion_group(
+    conn: sqlite3.Connection,
+) -> None:
     """``GetFullChannelRequest`` names the channel, so a channel outside the dialog list cannot
     be asked about either — and the group hanging off it stays unresolvable with it.
 
@@ -1253,7 +1321,7 @@ async def test_the_warm_up_resolves_a_channel_before_asking_it_for_its_discussio
     ]
 
     async with tg.connected(client):
-        await sync.warm_peer_cache(client, chats)
+        await sync.warm_peer_cache(client, chats, conn, DEFAULT_ACCOUNT)
 
     assert {OTHER_ID, group_id} <= client.resolved
 
@@ -3228,6 +3296,308 @@ def test_a_chat_built_from_an_entity_carries_the_account_it_came_through() -> No
     assert (channel.peer_id, channel.scope) == (NEWS_ID, "")
 
 
+# --- several accounts ------------------------------------------------------------------------
+
+
+WORK_ME = make_user(43, "Worker", username="worker")
+PRIV = make_channel(300, "Private club", megagroup=True)
+PRIV_ID = -1000000000300
+BOB_ID = 2
+
+
+def _world() -> FakeWorld:
+    """Two accounts' Telegram: a public channel, a private group, and two people.
+
+    The channel and the group have one history whichever account reads them; the private chats
+    are each account's own and are handed to :meth:`FakeWorld.client` per account.
+    """
+    return FakeWorld(
+        entities=[NEWS, PRIV, ALICE, BOB],
+        messages={
+            NEWS_ID: [tl.channel_post(NEWS_ID, i, f"news {i}") for i in (1, 2)],
+            PRIV_ID: [tl.message(PRIV_ID, i, f"club {i}", sender=1) for i in (1, 2, 3)],
+        },
+    )
+
+
+def _home(world: FakeWorld, *, members: list[Any] | None = None, **kwargs: Any) -> FakeClient:
+    return world.client(
+        DEFAULT_ACCOUNT,
+        members=[NEWS, PRIV, ALICE] if members is None else members,
+        me=ME,
+        messages={ALICE_ID: [tl.message(ALICE_ID, 1, "home hello", sender=1)]},
+        **kwargs,
+    )
+
+
+def _work(world: FakeWorld, *, members: list[Any] | None = None, **kwargs: Any) -> FakeClient:
+    return world.client(
+        WORK,
+        members=[NEWS, PRIV, ALICE, BOB] if members is None else members,
+        me=WORK_ME,
+        messages={
+            ALICE_ID: [
+                tl.message(ALICE_ID, 7, "work hello", sender=1),
+                tl.message(ALICE_ID, 8, "work reply", out=True),
+            ],
+            BOB_ID: [tl.message(BOB_ID, 1, "bob here", sender=2)],
+        },
+        **kwargs,
+    )
+
+
+async def _run_accounts(
+    clients: dict[str, FakeClient],
+    conn: sqlite3.Connection,
+    paths: Paths,
+    cfg: Config,
+    *,
+    only: list[str] | None = None,
+) -> SyncReport:
+    async with contextlib.AsyncExitStack() as stack:
+        for account, client in clients.items():
+            await stack.enter_async_context(tg.connected(client, account))
+        return await sync.sync_all(clients, conn, cfg, paths, SyncBudget(), only=only)
+
+
+def _meet(
+    monkeypatch: pytest.MonkeyPatch, client: FakeClient, mine: asyncio.Event, theirs: asyncio.Event
+) -> None:
+    """Make ``client``'s every fetch wait until the other account has started one: two queues
+    run one after the other would wait here for good (and time out)."""
+    inner = client.iter_messages
+
+    async def iter_messages(*args: Any, **kwargs: Any) -> AsyncIterator[Any]:
+        mine.set()
+        await asyncio.wait_for(theirs.wait(), 5)
+        async for message in inner(*args, **kwargs):
+            yield message
+
+    monkeypatch.setattr(client, "iter_messages", iter_messages)
+
+
+def _history_fetches(client: FakeClient, chat_id: int) -> list[dict[str, object]]:
+    return [kw for kw in _fetch_calls(client, chat_id) if kw["reverse"]]
+
+
+async def test_two_accounts_sync_concurrently_into_one_index(
+    conn: sqlite3.Connection, paths: Paths, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """One run, two sessions: each account's sources through its own client, both queues at
+    once, and the shared channel both cover fetched once — by its primary source's account."""
+    world = _world()
+    home, work = _home(world), _work(world)
+    started = {DEFAULT_ACCOUNT: asyncio.Event(), WORK: asyncio.Event()}
+    _meet(monkeypatch, home, started[DEFAULT_ACCOUNT], started[WORK])
+    _meet(monkeypatch, work, started[WORK], started[DEFAULT_ACCOUNT])
+    cfg = _cfg(
+        Source(chat="@news"),
+        Source(chat="@alice"),
+        Source(chat="@news", account=WORK),
+        Source(chat="@alice", account=WORK),
+        Source(chat=BOB_ID, account=WORK),
+    )
+
+    report = await _run_accounts({DEFAULT_ACCOUNT: home, WORK: work}, conn, paths, cfg)
+
+    assert report.warnings == [] and report.unavailable == []
+    assert len(_history_fetches(home, NEWS_ID)) == 1 and _fetch_calls(work, NEWS_ID) == []
+    assert _texts(conn, NEWS_ID) == {1: "news 1", 2: "news 2"}
+    assert db.chat_accounts(conn, NEWS_ID) == [DEFAULT_ACCOUNT, WORK]
+    assert db.access_hash(conn, NEWS_ID, WORK) == FakeWorld.access_hash(WORK, NEWS_ID)
+    assert db.access_hash(conn, NEWS_ID, WORK) != db.access_hash(conn, NEWS_ID, DEFAULT_ACCOUNT)
+    home_alice = db.get_chat_by_peer(conn, ALICE_ID, DEFAULT_ACCOUNT)
+    work_alice = db.get_chat_by_peer(conn, ALICE_ID, WORK)
+    assert home_alice is not None and work_alice is not None and home_alice.id != work_alice.id
+    assert _texts(conn, home_alice.id) == {1: "home hello"}
+    assert _texts(conn, work_alice.id) == {7: "work hello", 8: "work reply"}
+    reply = db.get_message(conn, work_alice.id, 8)
+    assert reply is not None and (reply.from_id, reply.from_name) == (43, "Worker")
+    bob = db.get_chat_by_peer(conn, BOB_ID, WORK)
+    assert bob is not None and bob.scope == WORK
+    assert db.get_chat_by_peer(conn, BOB_ID, DEFAULT_ACCOUNT) is None
+    assert sorted(report.chats_done) == sorted([NEWS_ID, home_alice.id, work_alice.id, bob.id])
+    assert report.new == 2 + 1 + 2 + 1
+    assert [(a.name, a.user_id) for a in db.list_accounts(conn)] == [
+        (DEFAULT_ACCOUNT, 42),
+        (WORK, 43),
+    ]
+    assert db.unindexed_message_ids(conn, work_alice.id) == []
+
+
+async def test_a_refused_primary_account_falls_back_to_another_that_reaches_the_chat(
+    conn: sqlite3.Connection, paths: Paths
+) -> None:
+    """The default account left the private group; the work account is still in it. The group
+    is one shared row whose primary source is the default account's, so its fetch is refused —
+    and the run takes it through the work account instead of reporting it unavailable."""
+    world = _world()
+    home = _home(world, members=[NEWS, ALICE])
+    work = _work(world)
+    cfg = _cfg(Source(chat=PRIV_ID), Source(chat=PRIV_ID, account=WORK))
+
+    report = await _run_accounts({DEFAULT_ACCOUNT: home, WORK: work}, conn, paths, cfg)
+
+    assert _texts(conn, PRIV_ID) == {1: "club 1", 2: "club 2", 3: "club 3"}
+    assert report.chats_done == [PRIV_ID] and report.unavailable == []
+    stored = db.get_chat(conn, PRIV_ID)
+    assert (
+        stored is not None and not stored.unavailable and stored.source_id == "chat:-1000000000300"
+    )
+    assert len(_history_fetches(work, PRIV_ID)) == 1
+    assert report.warnings == [
+        f"account {DEFAULT_ACCOUNT}: chat {PRIV_ID} (Private club): Telegram refused it through "
+        f"account {DEFAULT_ACCOUNT}; fetched through account {WORK} instead"
+    ]
+
+
+async def test_a_fallback_account_addresses_the_chat_by_its_stored_access_hash(
+    conn: sqlite3.Connection, paths: Paths
+) -> None:
+    """The work account has no source of its own this run, so its client never reads a dialog —
+    yet the index remembers the access hash it reaches the group by, and that is enough."""
+    world = _world()
+    home = _home(world, members=[NEWS, ALICE])
+    work = _work(world)
+    source = Source(chat=PRIV_ID)
+    db.upsert_chat(conn, ChatRow(id=PRIV_ID, type="supergroup", source_id=source.id))
+    db.set_chat_access(conn, PRIV_ID, WORK, access_hash=FakeWorld.access_hash(WORK, PRIV_ID))
+
+    report = await _run_accounts({DEFAULT_ACCOUNT: home, WORK: work}, conn, paths, _cfg(source))
+
+    assert report.chats_done == [PRIV_ID]
+    assert _texts(conn, PRIV_ID) == {1: "club 1", 2: "club 2", 3: "club 3"}
+    assert [name for name, _ in work.calls if name in ("get_dialogs", "get_entity")] == []
+    assert PRIV_ID in work.resolved
+
+
+async def test_a_chat_every_account_is_refused_stays_unavailable(
+    conn: sqlite3.Connection, paths: Paths
+) -> None:
+    """Nobody reaches the group any more: it is reported unavailable, as a single account's run
+    would report it, and nothing is fetched."""
+    world = _world()
+    home = _home(world, members=[NEWS, ALICE])
+    work = _work(world, members=[NEWS, ALICE, BOB])
+    cfg = _cfg(Source(chat=PRIV_ID), Source(chat=PRIV_ID, account=WORK))
+
+    report = await _run_accounts({DEFAULT_ACCOUNT: home, WORK: work}, conn, paths, cfg)
+
+    assert report.unavailable == [PRIV_ID] and report.chats_done == []
+    assert _texts(conn, PRIV_ID) == {}
+    stored = db.get_chat(conn, PRIV_ID)
+    assert stored is not None and stored.unavailable
+
+
+async def test_a_private_chat_is_never_fetched_through_another_account(
+    conn: sqlite3.Connection, paths: Paths
+) -> None:
+    """Only a shared chat falls back: a private chat refused to its own account is that
+    account's alone, and another account's history with the same person is another chat."""
+    world = _world()
+    home = _home(world, failures={ALICE_ID: errors.ChatForbiddenError(request=None)})
+    work = _work(world)
+    cfg = _cfg(Source(chat="@alice"), Source(chat="@alice", account=WORK))
+
+    report = await _run_accounts({DEFAULT_ACCOUNT: home, WORK: work}, conn, paths, cfg)
+
+    home_alice = db.get_chat_by_peer(conn, ALICE_ID, DEFAULT_ACCOUNT)
+    work_alice = db.get_chat_by_peer(conn, ALICE_ID, WORK)
+    assert home_alice is not None and work_alice is not None
+    assert report.unavailable == [home_alice.id]
+    assert _texts(conn, home_alice.id) == {}
+    assert _texts(conn, work_alice.id) == {7: "work hello", 8: "work reply"}
+    assert len(_history_fetches(work, ALICE_ID)) == 1, "its own chat, once"
+
+
+async def test_a_flood_wait_stops_one_account_while_the_other_finishes(
+    conn: sqlite3.Connection, paths: Paths
+) -> None:
+    """A flood wait is about the account: the default account's queue stops at the chat it hit
+    and leaves the rest for the next run, while the work account's queue runs to its end."""
+    world = _world()
+    home = _home(world, failures={NEWS_ID: errors.FloodWaitError(request=None, capture=600)})
+    work = _work(world)
+    cfg = _cfg(
+        Source(chat="@news"),
+        Source(chat="@alice"),
+        Source(chat=BOB_ID, account=WORK),
+        Source(chat="@alice", account=WORK),
+    )
+
+    report = await _run_accounts({DEFAULT_ACCOUNT: home, WORK: work}, conn, paths, cfg)
+
+    home_alice = db.get_chat_by_peer(conn, ALICE_ID, DEFAULT_ACCOUNT)
+    work_alice = db.get_chat_by_peer(conn, ALICE_ID, WORK)
+    bob = db.get_chat_by_peer(conn, BOB_ID, WORK)
+    assert home_alice is not None and work_alice is not None and bob is not None
+    assert report.chats_remaining == [NEWS_ID, home_alice.id]
+    assert sorted(report.chats_done) == sorted([bob.id, work_alice.id])
+    assert _fetch_calls(home, ALICE_ID) == [], "the rest of the stopped queue waits"
+    assert _texts(conn, bob.id) == {1: "bob here"}
+    assert report.warnings == [
+        f"account {DEFAULT_ACCOUNT}: flood wait: Telegram asks to wait 600s before more history "
+        "requests; run sync again later"
+    ]
+
+
+async def test_only_limits_the_run_to_the_chats_the_named_sources_cover(
+    conn: sqlite3.Connection, paths: Paths
+) -> None:
+    """``only`` narrows the fetch, not the resolve: the named sources' chats are fetched through
+    their primary source's account — the channel the work source names is the default
+    account's to fetch — and everything else is left for a full run."""
+    world = _world()
+    home, work = _home(world), _work(world)
+    work_news = Source(chat="@news", account=WORK)
+    cfg = _cfg(
+        Source(chat="@news"),
+        Source(chat="@alice"),
+        work_news,
+        Source(chat=BOB_ID, account=WORK),
+    )
+
+    report = await _run_accounts(
+        {DEFAULT_ACCOUNT: home, WORK: work}, conn, paths, cfg, only=[work_news.id]
+    )
+
+    assert report.chats_done == [NEWS_ID]
+    assert _texts(conn, NEWS_ID) == {1: "news 1", 2: "news 2"}
+    assert _fetch_calls(work, NEWS_ID) == [] and len(_history_fetches(home, NEWS_ID)) == 1
+    bob = db.get_chat_by_peer(conn, BOB_ID, WORK)
+    assert bob is not None, "resolved like every source"
+    assert db.message_counts(conn) == {NEWS_ID: 2}
+    news = db.get_chat(conn, NEWS_ID)
+    assert news is not None and news.source_id == "chat:@news", "the primary did not move"
+
+
+async def test_a_rejected_session_names_its_account(conn: sqlite3.Connection, paths: Paths) -> None:
+    """Several clients run inside one ``connected`` block each, and none of them can tell whose
+    session a rejection came from — so the run says it, with that account's ``auth`` hint."""
+    world = _world()
+    home = _home(world)
+    work = _work(world, failures={BOB_ID: errors.AuthKeyUnregisteredError(request=None)})
+    cfg = _cfg(Source(chat="@news"), Source(chat=BOB_ID, account=WORK))
+
+    with pytest.raises(tg.AuthRequired) as raised:
+        await _run_accounts({DEFAULT_ACCOUNT: home, WORK: work}, conn, paths, cfg)
+
+    assert raised.value.account == WORK
+    assert raised.value.hint == "run: grepogram auth --account work"
+
+
+async def test_a_world_client_reads_as_its_account() -> None:
+    """The fake itself: per-account access hashes, and a private group refused to a
+    non-member while a public channel reads without joining."""
+    world = _world()
+    outsider = world.client(WORK, members=[], me=WORK_ME, strict_entities=False)
+    assert outsider.entities[NEWS_ID].access_hash == FakeWorld.access_hash(WORK, NEWS_ID)
+    assert NEWS.access_hash != outsider.entities[NEWS_ID].access_hash
+    assert [m.id async for m in outsider.iter_messages(NEWS_ID) if m is not None] == [2, 1]
+    with pytest.raises(errors.ChannelPrivateError):
+        [m async for m in outsider.iter_messages(PRIV_ID)]
+
+
 # --- sync_all --------------------------------------------------------------------------------
 
 
@@ -3283,7 +3653,7 @@ async def test_sync_all_budget_leaves_chats_remaining(
     cfg = _cfg(ARG_SOURCE, ALICE_SOURCE)
     async with tg.connected(client):
         report = await sync.sync_all(
-            client, conn, cfg, paths, SyncBudget(10, clock=_clock(0, 0, 100))
+            {DEFAULT_ACCOUNT: client}, conn, cfg, paths, SyncBudget(10, clock=_clock(0, 0, 100))
         )
     assert report.new == sync.BATCH_SIZE
     assert report.chats_done == []
@@ -3380,7 +3750,7 @@ async def test_sync_all_reads_a_config_loader_once_the_lock_is_held(
         return _cfg(ALICE_SOURCE)
 
     async with tg.connected(client):
-        report = await sync.sync_all(client, conn, current, paths, SyncBudget())
+        report = await sync.sync_all({DEFAULT_ACCOUNT: client}, conn, current, paths, SyncBudget())
     assert loads == [True]
     assert report.chats_done == [ALICE_ID] and report.new == 1
     assert [c.id for c in db.list_chats(conn)] == [ALICE_ID]
@@ -3462,7 +3832,7 @@ async def test_sync_all_caps_the_flood_sleep_at_the_budget(
         sources=[ALICE_SOURCE],
     )
     async with tg.connected(client):
-        await sync.sync_all(client, conn, cfg, paths, SyncBudget(seconds))
+        await sync.sync_all({DEFAULT_ACCOUNT: client}, conn, cfg, paths, SyncBudget(seconds))
     assert client.flood_sleep_threshold == expected
 
 

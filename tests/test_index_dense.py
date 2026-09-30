@@ -13,6 +13,7 @@ from grepogram import cli, db, embed, filters, index, sync, tg, units
 from grepogram.embed import FAKE_DIM, FakeEmbedder, ModelUnavailable
 from grepogram.index import EmbeddingSpaceMismatch
 from grepogram.models import (
+    DEFAULT_ACCOUNT,
     ChatRow,
     Config,
     Filters,
@@ -558,7 +559,9 @@ async def _run(
     budget: SyncBudget | None = None,
 ) -> SyncReport:
     async with tg.connected(client):
-        return await sync.sync_all(client, conn, SYNC_CFG, paths, budget or SyncBudget(), embedder)
+        return await sync.sync_all(
+            {DEFAULT_ACCOUNT: client}, conn, SYNC_CFG, paths, budget or SyncBudget(), embedder
+        )
 
 
 async def test_sync_all_embeds_the_units_it_built(

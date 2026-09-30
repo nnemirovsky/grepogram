@@ -61,7 +61,7 @@ from grepogram.dialogs import match as match_dialogs
 from grepogram.embed import Embedder, ModelUnavailable
 from grepogram.filters import FilterError, UnknownChat
 from grepogram.log import setup_logging
-from grepogram.models import Config, Filters, MessageView, SearchMode, SearchResult
+from grepogram.models import DEFAULT_ACCOUNT, Config, Filters, MessageView, SearchMode, SearchResult
 from grepogram.paths import Paths
 from grepogram.rerank import Reranker
 from grepogram.search import UnknownMessage
@@ -533,7 +533,7 @@ async def _auto_sync(state: AppState, cfg: Config) -> tuple[bool, list[str]]:
         embedder = await asyncio.to_thread(state.embedder)
         async with state.telegram() as client:
             report = await syncing.sync_all(
-                client,
+                {DEFAULT_ACCOUNT: client},
                 state.conn,
                 state.config,
                 state.paths,
@@ -654,7 +654,12 @@ async def sync(budget_s: int = 45) -> ToolResult:
     embedder = await asyncio.to_thread(state.embedder)
     async with state.sync_lock, state.telegram() as client:
         report = await syncing.sync_all(
-            client, state.conn, state.config, state.paths, SyncBudget(budget_s), embedder
+            {DEFAULT_ACCOUNT: client},
+            state.conn,
+            state.config,
+            state.paths,
+            SyncBudget(budget_s),
+            embedder,
         )
     warnings = list(report.warnings)
     if embedder is None:

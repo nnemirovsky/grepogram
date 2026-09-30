@@ -16,6 +16,7 @@ from telethon.tl import functions, types
 from grepogram import db, extract, index, media, search, sync, tg, units
 from grepogram.extract import ExtractError
 from grepogram.models import (
+    DEFAULT_ACCOUNT,
     ChatRow,
     Config,
     Filters,
@@ -1165,7 +1166,7 @@ async def test_a_sync_after_an_extraction_keeps_the_text_and_finds_nothing_to_re
         downloads={(CHAT_ID, 2): b"jpeg bytes"},
     )
     async with tg.connected(client):
-        await sync.sync_all(client, conn, cfg, paths, SyncBudget())
+        await sync.sync_all({DEFAULT_ACCOUNT: client}, conn, cfg, paths, SyncBudget())
     assert "[photo]" in _units(conn)[(1, 2, 3)]
 
     monkeypatch.setattr(extract, "registry", lambda: {"photo": _stub("ОТКРЫТО с 9:00")})
@@ -1173,7 +1174,7 @@ async def test_a_sync_after_an_extraction_keeps_the_text_and_finds_nothing_to_re
     assert db.chats_with_unindexed(conn) == [], "no backlog is handed to the next sync"
 
     async with tg.connected(client):
-        await sync.sync_all(client, conn, cfg, paths, SyncBudget())
+        await sync.sync_all({DEFAULT_ACCOUNT: client}, conn, cfg, paths, SyncBudget())
     assert "[photo] ОТКРЫТО с 9:00" in _units(conn)[(1, 2, 3)]
     assert _msg_fts(conn)[2] == "ОТКРЫТО с 9:00"
     assert _text(conn, 2) == "ОТКРЫТО с 9:00"

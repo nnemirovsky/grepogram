@@ -52,6 +52,7 @@ from grepogram.embed import Embedder, ModelUnavailable
 from grepogram.filters import FilterError
 from grepogram.log import setup_logging
 from grepogram.models import (
+    DEFAULT_ACCOUNT,
     ChatRow,
     Config,
     MediaReport,
@@ -252,7 +253,9 @@ async def _run_sync(
     sources come from the file as it is once the sync lock is held, not from the snapshot the
     command started with (a ``sources rm`` may have run while the model loaded)."""
     async with tg.connected(client):
-        return await sync.sync_all(client, conn, cfg, paths, sync.SyncBudget(budget), embedder)
+        return await sync.sync_all(
+            {DEFAULT_ACCOUNT: client}, conn, cfg, paths, sync.SyncBudget(budget), embedder
+        )
 
 
 def _print_report(report: SyncReport) -> None:
