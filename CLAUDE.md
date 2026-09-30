@@ -578,10 +578,11 @@ never change the git identity.
 - Research state lives in `research.db` (`paths.research_db_file`, next to `index.db`) and never
   in the index: the index is derived and may be deleted and rebuilt, while approvals, exclusions
   and session history are the user's decisions and nothing rebuilds them. It has its own version
-  (`research_db.SCHEMA_VERSION`, now 2) and its own append-only `research_db.MIGRATIONS`: step 2
+  (`research_db.SCHEMA_VERSION`, now 3) and its own append-only `research_db.MIGRATIONS`: step 2
   moved seeds, scan cursors and evidence from index row ids to `(scope, peer_id)` and walks a
   development build's version 1 up rather than refusing it — a file of decisions is migrated,
-  never re-derived. Its `SchemaError` subclasses `db.SchemaError`, so the existing handlers
+  never re-derived. Step 3 adds `grants.search_kinds` / `grants.stars_max`, the terms a
+  session-wide grant was given on; a grant from before it names none and authorizes no search. Its `SchemaError` subclasses `db.SchemaError`, so the existing handlers
   catch it, and never advises deleting the file. Whether a candidate is *cached* is
   asked of the index every time and never stored there, and global-search results are
   candidates and evidence in `research.db`, never `messages` rows, so no sync cursor moves. Every
@@ -652,7 +653,12 @@ never change the git identity.
   moves the cursor on, since no later call could propose it. An admission request no admin
   answered within `admission_timeout_days` (`candidates.requested_at`) is `failed` with a note. Global search needs the
   `[research]` switch *and* a `global_search` grant; paying needs `paid_stars_max > 0`, a price
-  within it and a `paid_search` grant, consumed before the request is sent. A run adds its
+  within it and a `paid_search` grant, consumed before the request is sent. **A session grant
+  holds the terms its summary named** (`research_db.add_grant(search_kinds=, stars_max=)`,
+  written by `research.grant` from the config the human read): a search switched on since is not
+  covered (`research.granted_kinds`), a price above the approved ceiling is refused
+  (`_paid_ceiling`, `_consume_paid_grant(price)`), and `_session_entry` asks again rather than
+  calling such an approval "already given" — raising a config value never widens a live grant. A run adds its
   sources in one `config.update` under `SyncLock` → `ConfigLock` with no Telegram request under
   either, syncs through `sync_all(…, recut=False, only=…)`, and discovery over what it stored
   only proposes. Sources a run added are ordinary sources and survive `stop`, which voids the

@@ -1558,6 +1558,31 @@ def search_granted(rdb: sqlite3.Connection, session_id: int, action: SessionActi
     return session is not None and authorized(rdb, session, action)
 
 
+def _session_grants(rdb: sqlite3.Connection, session_id: int, action: SessionAction) -> list[Grant]:
+    """The live session-wide grants of an active session that hold ``action``."""
+    session = research_db.get_session(rdb, session_id)
+    if session is None or session.state != "active":
+        return []
+    return [g for g in research_db.live_grants(rdb, session.id, None) if action in g.actions]
+
+
+def granted_kinds(rdb: sqlite3.Connection, session_id: int) -> list[SearchKind]:
+    """The searches the session's live ``global_search`` approvals cover — the kinds their
+    summaries named, whatever ``[research]`` switches on since."""
+    covered = {
+        kind for g in _session_grants(rdb, session_id, "global_search") for kind in g.search_kinds
+    }
+    return [kind for kind in _SEARCH_KINDS if kind in covered]
+
+
+def _paid_ceiling(rdb: sqlite3.Connection, session_id: int) -> int:
+    """The most a live ``paid_search`` approval of the session pays, as its summary named it;
+    0 without one."""
+    return max(
+        (g.stars_max or 0 for g in _session_grants(rdb, session_id, "paid_search")), default=0
+    )
+
+
 async def global_search(
     client: Any,
     rdb: sqlite3.Connection,
@@ -1586,14 +1611,26 @@ async def global_search(
     require_enabled(cfg)
     session = active_session(rdb, session_id)
     enabled = search_kinds(cfg)
-    wanted: list[SearchKind] = list(dict.fromkeys(kinds)) if kinds is not None else enabled
+    granted = granted_kinds(rdb, session.id)
+    wanted: list[SearchKind] = (
+        list(dict.fromkeys(kinds))
+        if kinds is not None
+        else [kind for kind in enabled if kind in granted]
+    )
     off = [kind for kind in wanted if kind not in enabled]
     if not enabled or off:
         raise ResearchError(
             f"global search is off: {', '.join(off or _SEARCH_KINDS)}", SEARCH_OFF_HINT
         )
-    if not search_granted(rdb, session.id, "global_search"):
+    if not granted:
         raise ResearchError("global search is not approved for this session", SEARCH_GRANT_HINT)
+    uncovered = [kind for kind in wanted if kind not in granted]
+    if uncovered or not wanted:
+        raise ResearchError(
+            f"this session's global_search approval does not cover "
+            f"{', '.join(uncovered or enabled)}: it names {', '.join(granted)}",
+            SEARCH_GRANT_HINT,
+        )
     text = " ".join(query.split())
     if not text:
         raise ResearchError("a global search needs a query")
@@ -1863,7 +1900,7 @@ async def _post_search(
         if refusal is not None:
             report.warnings.append(f"post_search: free searches are used up; {refusal}")
             return
-        if not _consume_paid_grant(rdb, session, stamp):
+        if not _consume_paid_grant(rdb, session, price, stamp):
             report.warnings.append(
                 "post_search: free searches are used up and the paid_search approval was used "
                 "by another search meanwhile; nothing was paid"
@@ -1914,14 +1951,17 @@ async def _post_search(
             )
 
 
-def _consume_paid_grant(rdb: sqlite3.Connection, session: ResearchSession, stamp: int) -> bool:
-    """Use up one live ``paid_search`` grant of ``session``; ``False`` when none is left.
+def _consume_paid_grant(
+    rdb: sqlite3.Connection, session: ResearchSession, price: int, stamp: int
+) -> bool:
+    """Use up one live ``paid_search`` grant of ``session`` that allows ``price`` stars;
+    ``False`` when none is left.
 
     :func:`grepogram.research_db.consume_grant` is one conditional ``UPDATE``, so of two
     searches racing for the same grant exactly one gets it, and only that one may pay.
     """
-    for grant in research_db.live_grants(rdb, session.id, None):
-        if "paid_search" in grant.actions and research_db.consume_grant(rdb, grant.id, now=stamp):
+    for grant in _session_grants(rdb, session.id, "paid_search"):
+        if (grant.stars_max or 0) >= price and research_db.consume_grant(rdb, grant.id, now=stamp):
             return True
     return False
 
@@ -1929,7 +1969,8 @@ def _consume_paid_grant(rdb: sqlite3.Connection, session: ResearchSession, stamp
 def _paid_refusal(
     rdb: sqlite3.Connection, cfg: Config, session: ResearchSession, price: int
 ) -> str | None:
-    """Why a post search that costs ``price`` stars may not be paid for, or ``None``."""
+    """Why a post search that costs ``price`` stars may not be paid for, or ``None``: the price
+    must fit both ``paid_stars_max`` as it is now and the ceiling the approval named."""
     ceiling = cfg.research.paid_stars_max
     if ceiling <= 0:
         return "paid search is off (paid_stars_max = 0)"
@@ -1939,6 +1980,12 @@ def _paid_refusal(
         return f"the next one costs {price} stars, above paid_stars_max = {ceiling}"
     if not search_granted(rdb, session.id, "paid_search"):
         return f"paying {price} stars needs a separate paid_search approval"
+    approved = _paid_ceiling(rdb, session.id)
+    if price > approved:
+        return (
+            f"the next one costs {price} stars, above the {approved} the paid_search approval "
+            "allows; approve paid_search again to pay more"
+        )
     return None
 
 
@@ -1971,14 +2018,17 @@ async def discover(
     if pins.flood_wait_s is not None:
         return dataclasses.replace(report, pins=pins)
     searches: list[GlobalSearchReport] = []
-    if search_kinds(cfg) and search_granted(rdb, session.id, "global_search"):
+    granted = granted_kinds(rdb, session.id)
+    if granted:
         done = {
             (record.kind, record.query)
             for record in research_db.list_searches(rdb, session.id)
             if record.note is None
         }
         question = " ".join(session.question.split())
-        kinds = [kind for kind in search_kinds(cfg) if (kind, question) not in done]
+        kinds = [
+            kind for kind in search_kinds(cfg) if kind in granted and (kind, question) not in done
+        ]
         if kinds:
             searches = await _search_telegram(client, rdb, conn, cfg, session, question, kinds, now)
     flooded = any(search.flood_wait_s is not None for search in searches)
@@ -2195,6 +2245,11 @@ def _session_entry(
         if action not in _SESSION_ORDER:
             refuse(f"unknown action {action!r}; expected {', '.join(_SESSION_ORDER)}")
     live = _live_actions(rdb, session, None)
+    if not set(search_kinds(cfg)) <= set(granted_kinds(rdb, session.id)):
+        # a search switched on since was never approved: asking again names every search
+        live.discard("global_search")
+    if _paid_ceiling(rdb, session.id) < cfg.research.paid_stars_max:
+        live.discard("paid_search")  # paying more than approved needs a new approval
     effective = live | set(requested)
     new = [action for action in _SESSION_ORDER if action in requested and action not in live]
     if "global_search" in new and not search_kinds(cfg):
@@ -2481,6 +2536,8 @@ def grant(
             # paid_search grant and must leave the global_search approval standing
             groups = [entry.actions] if candidate is not None else [(a,) for a in entry.actions]
             for actions in groups:
+                # a session grant keeps the terms the summary named (_session_line): the kinds
+                # of search and the stars, read from the config at the time the human read them
                 granted.append(
                     research_db.add_grant(
                         rdb,
@@ -2490,6 +2547,10 @@ def grant(
                         actions=actions,
                         via=via,
                         summary=summary,
+                        search_kinds=search_kinds(cfg) if "global_search" in actions else (),
+                        stars_max=(
+                            cfg.research.paid_stars_max if "paid_search" in actions else None
+                        ),
                         now=stamp,
                     )
                 )

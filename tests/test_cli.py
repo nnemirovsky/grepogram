@@ -1686,6 +1686,7 @@ def test_accounts_rm_stops_that_accounts_research_and_voids_its_grants(
             actions=["global_search"],
             via="cli",
             summary="s",
+            search_kinds=["chat_search"],
         )
     rdb.close()
     _answer(monkeypatch, YES)

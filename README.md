@@ -598,7 +598,9 @@ A search sends the session's question and nothing else. Post search has a small 
 quota, which grepogram asks about before every search. Past that quota Telegram charges Stars,
 and grepogram never pays unless `paid_stars_max` is above `0` *and* you approved `paid_search`
 separately. The price must also fit under `paid_stars_max`, and one such approval pays for one
-search, even when two searches run at once; it is a grant of its own, so spending it leaves the
+search, even when two searches run at once. An approval keeps what its text named: raising
+`paid_stars_max`, or switching on the other kind of search, after approving covers nothing until
+you approve again; it is a grant of its own, so spending it leaves the
 `global_search` approval standing.
 
 Research keeps its sessions, candidates, evidence, approvals and exclusions in `research.db`, a

@@ -725,6 +725,10 @@ class Grant:
     granted_at: int
     consumed_at: int | None = None
     voided_at: int | None = None
+    search_kinds: tuple[SearchKind, ...] = ()
+    """The searches a ``global_search`` grant covers, as its summary named them."""
+    stars_max: int | None = None
+    """The most a ``paid_search`` grant may pay, as its summary named it."""
 
     @property
     def live(self) -> bool:

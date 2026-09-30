@@ -238,7 +238,15 @@ _V2: tuple[str, ...] = (
         WHERE status = 'pending_admission'""",
 )
 
-MIGRATIONS: dict[int, tuple[str, ...]] = {1: _V1, 2: _V2}
+_V3: tuple[str, ...] = (
+    # the terms a session-wide approval was given on, as its summary named them: the searches a
+    # global_search grant covers and the stars a paid_search grant may pay — so raising either in
+    # the config later widens nothing a human already approved
+    "ALTER TABLE grants ADD COLUMN search_kinds TEXT",
+    "ALTER TABLE grants ADD COLUMN stars_max INTEGER",
+)
+
+MIGRATIONS: dict[int, tuple[str, ...]] = {1: _V1, 2: _V2, 3: _V3}
 """Schema version → the step that brings the file to it, from 1 without a gap (the test suite
 checks that); append-only."""
 SCHEMA_VERSION = max(MIGRATIONS)
@@ -246,6 +254,7 @@ SCHEMA_VERSION = max(MIGRATIONS)
 _CANDIDATE_ACTIONS: frozenset[str] = frozenset(get_args(CandidateAction))
 _SESSION_ACTIONS: frozenset[str] = frozenset(get_args(SessionAction))
 _CHANNELS: frozenset[str] = frozenset(get_args(GrantChannel))
+_SEARCH_KINDS: frozenset[str] = frozenset(get_args(SearchKind))
 _EXCLUDABLE = ("proposed", "approved", "skipped")
 """Statuses an exclusion moves to ``excluded``: decisions not acted on yet. A chat already
 joined or fetched keeps its status — excluding it undoes nothing on Telegram — but loses every
@@ -957,6 +966,8 @@ def _grant(row: sqlite3.Row) -> Grant:
         granted_at=row["granted_at"],
         consumed_at=row["consumed_at"],
         voided_at=row["voided_at"],
+        search_kinds=tuple(json.loads(row["search_kinds"] or "[]")),
+        stars_max=row["stars_max"],
     )
 
 
@@ -969,6 +980,8 @@ def add_grant(
     actions: Sequence[GrantAction],
     via: GrantChannel,
     summary: str,
+    search_kinds: Sequence[SearchKind] = (),
+    stars_max: int | None = None,
     now: int | None = None,
 ) -> Grant:
     """Record one human approval — the only way a grant comes to exist.
@@ -980,6 +993,11 @@ def add_grant(
     active, ``account`` its own, and the candidate one of its own. Whether the actions suit the
     candidate's state is the caller's to decide; this checks only that they are real actions of
     the right kind.
+
+    A session-wide grant carries the terms its summary named, and only those count when it is
+    used: ``search_kinds`` — the searches a ``global_search`` covers, at least one — and
+    ``stars_max``, the most a ``paid_search`` may pay. Neither goes on a grant without the
+    action it bounds.
     """
     _check(via, _CHANNELS, "grant channel")
     if not summary.strip():
@@ -991,6 +1009,15 @@ def add_grant(
     what = "session action" if candidate_id is None else "candidate action"
     for action in wanted:
         _check(action, allowed, what)
+    kinds = list(dict.fromkeys(search_kinds))
+    for kind in kinds:
+        _check(kind, _SEARCH_KINDS, "search kind")
+    if ("global_search" in wanted) != bool(kinds):
+        raise ValueError("a global_search grant names the searches it covers, and only it does")
+    if ("paid_search" in wanted) != (stars_max is not None):
+        raise ValueError("a paid_search grant names the most it may pay, and only it does")
+    if stars_max is not None and stars_max <= 0:
+        raise ValueError(f"a paid_search grant pays at least one star, not {stars_max}")
     with db.transaction(conn):
         session = get_session(conn, session_id)
         if session is None:
@@ -1008,9 +1035,19 @@ def add_grant(
                 raise KeyError(f"no candidate {candidate_id} in research session {session_id}")
         row = conn.execute(
             """INSERT INTO grants(session_id, candidate_id, account, actions, via, summary,
-                   granted_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?) RETURNING *""",
-            (session_id, candidate_id, account, json.dumps(wanted), via, summary, clock(now)),
+                   granted_at, search_kinds, stars_max)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING *""",
+            (
+                session_id,
+                candidate_id,
+                account,
+                json.dumps(wanted),
+                via,
+                summary,
+                clock(now),
+                json.dumps(kinds) if kinds else None,
+                stars_max,
+            ),
         ).fetchone()
     return _grant(row)
 

@@ -955,7 +955,13 @@ async def test_a_dead_session_while_probing_names_the_account(
 SEARCH_CFG = Config(research=ResearchCfg(enabled=True, chat_search=True, post_search=True))
 
 
-def _grant(rdb: sqlite3.Connection, session: ResearchSession, *actions: Any) -> None:
+def _grant(
+    rdb: sqlite3.Connection,
+    session: ResearchSession,
+    *actions: Any,
+    kinds: tuple[Any, ...] = ("chat_search", "post_search"),
+    stars_max: int = 100,
+) -> None:
     research_db.add_grant(
         rdb,
         session_id=session.id,
@@ -964,6 +970,8 @@ def _grant(rdb: sqlite3.Connection, session: ResearchSession, *actions: Any) -> 
         actions=list(actions),
         via="cli",
         summary="search Telegram for the question",
+        search_kinds=kinds if "global_search" in actions else (),
+        stars_max=stars_max if "paid_search" in actions else None,
     )
 
 
@@ -2791,6 +2799,56 @@ async def test_approving_both_searches_leaves_global_search_after_one_paid_searc
     assert paid.ran and paid.paid_stars == 50
     assert research.search_granted(rdb, session.id, "global_search"), "reused, not burned"
     assert not research.search_granted(rdb, session.id, "paid_search")
+
+
+async def test_a_search_switched_on_after_the_approval_is_not_covered_by_it(
+    rdb: sqlite3.Connection, conn: sqlite3.Connection
+) -> None:
+    session = _asking(rdb, conn, "apartment")
+    only_chats = Config(research=ResearchCfg(enabled=True, chat_search=True))
+    (grant,) = _approve(rdb, conn, session, _item(None, "global_search"), cfg=only_chats)
+    assert grant.search_kinds == ("chat_search",)
+    client = _posts_world().client("default")
+
+    report = await research.discover(rdb, conn, SEARCH_CFG, session.id, client, now=6)
+
+    assert [search.kind for search in report.searches] == ["chat_search"]
+    assert not any(isinstance(r, functions.channels.SearchPostsRequest) for r in client.requests)
+    with pytest.raises(research.ResearchError, match="does not cover post_search"):
+        await research.global_search(
+            client, rdb, conn, SEARCH_CFG, session.id, "apartment", kinds=["post_search"]
+        )
+    # approving again names both searches, and only then does the post search run
+    text = research.approval_summary(
+        rdb, conn, SEARCH_CFG, session.id, [_item(None, "global_search")]
+    )
+    assert "channels.searchPosts" in text
+    (wider,) = _approve(rdb, conn, session, _item(None, "global_search"), cfg=SEARCH_CFG)
+    assert wider.search_kinds == ("chat_search", "post_search")
+    assert research.granted_kinds(rdb, session.id) == ["chat_search", "post_search"]
+
+
+async def test_paid_stars_max_raised_after_the_approval_pays_no_more_than_it_named(
+    rdb: sqlite3.Connection, conn: sqlite3.Connection
+) -> None:
+    session = _asking(rdb, conn, "apartment")
+    cheap = Config(research=ResearchCfg(enabled=True, post_search=True, paid_stars_max=40))
+    granted = _approve(rdb, conn, session, _item(None, "global_search", "paid_search"), cfg=cheap)
+    assert [g.stars_max for g in granted] == [None, 40]
+    client = _posts_world().client("default", search_flood=SPENT)  # 50 stars a search
+
+    (report,) = await research.global_search(client, rdb, conn, PAYING, session.id, "apartment")
+
+    assert not report.ran and report.paid_stars == 0
+    assert "above the 40 the paid_search approval allows" in report.warnings[0]
+    assert research.search_granted(rdb, session.id, "paid_search"), "nothing was spent"
+    assert not any(isinstance(r, functions.channels.SearchPostsRequest) for r in client.requests)
+    # a new approval at the raised ceiling is asked for, not taken as already given
+    text = research.approval_summary(rdb, conn, PAYING, session.id, [_item(None, "paid_search")])
+    assert "pay up to 100 Telegram Stars" in text
+    _approve(rdb, conn, session, _item(None, "paid_search"), cfg=PAYING)
+    (paid,) = await research.global_search(client, rdb, conn, PAYING, session.id, "apartment")
+    assert paid.ran and paid.paid_stars == 50
 
 
 async def test_a_paid_approval_another_search_used_meanwhile_pays_nothing(

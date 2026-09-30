@@ -306,6 +306,8 @@ def _grant(
         actions=actions,  # type: ignore[arg-type]
         via="cli",
         summary="join @a as default",
+        search_kinds=["chat_search"] if "global_search" in actions else [],
+        stars_max=10 if "paid_search" in actions else None,
         now=1,
     )
 
@@ -339,6 +341,55 @@ def test_grants_record_the_channel_and_stay_live_until_used(rdb: sqlite3.Connect
     assert research_db.consume_grant(rdb, grant.id, now=4)
     assert not research_db.consume_grant(rdb, grant.id, now=5)
     assert research_db.live_grants(rdb, sid, cand.id) == []
+
+
+@pytest.mark.parametrize(
+    ("candidate", "actions", "kinds", "stars", "match"),
+    [
+        (False, ["global_search"], [], None, "names the searches"),
+        (False, ["paid_search"], [], None, "names the most it may pay"),
+        (False, ["paid_search"], [], 0, "at least one star"),
+        (False, ["global_search"], ["web_search"], None, "search kind"),
+        (True, ["fetch"], ["chat_search"], None, "names the searches"),
+        (True, ["fetch"], [], 5, "names the most it may pay"),
+    ],
+)
+def test_a_session_grant_carries_exactly_the_terms_of_its_actions(
+    rdb: sqlite3.Connection,
+    candidate: bool,
+    actions: list[str],
+    kinds: list[str],
+    stars: int | None,
+    match: str,
+) -> None:
+    sid = _session(rdb)
+    cand = research_db.add_candidate(rdb, sid, "@a", "username", 1)
+    assert cand is not None
+    with pytest.raises(ValueError, match=match):
+        research_db.add_grant(
+            rdb,
+            session_id=sid,
+            candidate_id=cand.id if candidate else None,
+            account="default",
+            actions=actions,  # type: ignore[arg-type]
+            via="cli",
+            summary="s",
+            search_kinds=kinds,  # type: ignore[arg-type]
+            stars_max=stars,
+        )
+    both = research_db.add_grant(
+        rdb,
+        session_id=sid,
+        candidate_id=None,
+        account="default",
+        actions=["global_search", "paid_search"],
+        via="cli",
+        summary="s",
+        search_kinds=["post_search", "chat_search", "post_search"],
+        stars_max=7,
+    )
+    assert (both.search_kinds, both.stars_max) == (("post_search", "chat_search"), 7)
+    assert research_db.list_grants(rdb, sid) == [both]
 
 
 @pytest.mark.parametrize("via", ["", "api", "tool", "yes"])
