@@ -1916,6 +1916,37 @@ async def test_research_approve_grants_nothing_unless_the_user_approves(
 
 
 @pytest.mark.parametrize(
+    ("meanwhile", "error"),
+    [
+        (lambda: tools.research_stop(1), "research session 1 is stopped"),
+        (lambda: tools.research_exclude(["@tb_flats"]), "candidate 1 (@tb_flats): it is excluded"),
+    ],
+)
+async def test_research_approve_grants_nothing_once_the_session_changed_under_the_question(
+    researching: FakeClient,
+    paths: Paths,
+    meanwhile: Callable[[], tools.ToolResult],
+    error: str,
+) -> None:
+    """The user answers yes while another call stopped the session or excluded the chat: the
+    grant is refused as a tool error, with nothing written and no traceback."""
+    await _discovered()
+
+    class ChangingContext(FakeContext):
+        async def elicit(self, message: str, schema: type) -> object:
+            assert "error" not in meanwhile()
+            return await super().elicit(message, schema)
+
+    ctx = ChangingContext(answer=_accept())
+    result = await tools.research_approve(1, ["1:fetch,add_source"], ctx)  # type: ignore[arg-type]
+
+    assert len(ctx.asked) == 1
+    assert result["error"].startswith(error), result
+    assert "grants" not in result
+    assert _grants(paths) == []
+
+
+@pytest.mark.parametrize(
     "failure", [TimeoutError("no answer"), McpError(mcp_types.ErrorData(code=-1, message="gone"))]
 )
 async def test_research_approve_that_cannot_ask_grants_nothing(
@@ -2048,6 +2079,29 @@ async def test_research_skip_and_exclude_need_no_approval(researching: FakeClien
     assert tools.research_candidates(1)["candidates"][0]["status"] == "excluded"
     (listed,) = tools.research_status()["exclusions"]
     assert (listed["identity"], listed["reason"]) == ("@tb_flats", "spam")
+
+
+async def test_a_newer_research_db_is_an_error_result_and_stdout_stays_empty(
+    bind: Callable[..., tools.AppState], paths: Paths, capfd: pytest.CaptureFixture[str]
+) -> None:
+    """A research.db a newer grepogram wrote is refused as a tool result carrying the advice to
+    upgrade, never a protocol error, and nothing reaches stdout."""
+    config.save(RESEARCH_CFG, paths)
+    bind(RESEARCH_CFG)
+    rdb = research_db.open_store(paths)
+    rdb.execute("UPDATE meta SET value = '99' WHERE key = 'schema_version'")
+    rdb.close()
+
+    results = [
+        tools.research_status(),
+        tools.research_candidates(1),
+        tools.research_start("who rents flats", ["@tbrent"]),
+    ]
+
+    for result in results:
+        assert "research.db schema v99 is newer than this grepogram supports" in result["error"]
+        assert "upgrade grepogram" in result["error"]
+    assert capfd.readouterr().out == ""
 
 
 async def test_research_start_refuses_bad_limits_and_unknown_accounts(

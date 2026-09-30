@@ -1,3 +1,4 @@
+import dataclasses
 import json
 import logging
 import os
@@ -11,6 +12,7 @@ import pytest
 import typer
 from telethon import errors as tg_errors
 from telethon import functions, types
+from telethon.tl.types import messages as tl_messages
 from typer.testing import CliRunner
 
 from grepogram import (
@@ -48,6 +50,7 @@ from tests.fakes import (
     FakeWorld,
     make_channel,
     make_dialog,
+    make_folder,
     make_group,
     make_user,
     no_discussion,
@@ -1572,6 +1575,24 @@ def test_accounts_rm_stops_that_accounts_research_and_voids_its_grants(
         assert len(research_db.live_grants(rdb, theirs.id, None)) == 1
     finally:
         rdb.close()
+    # what the research commands say about that session afterwards: it is history, run refuses
+    # it, and the removed account can start nothing new
+    config.update(
+        paths,
+        lambda cfg: dataclasses.replace(
+            cfg, research=dataclasses.replace(cfg.research, enabled=True)
+        ),
+    )
+    run = runner.invoke(cli.app, ["research", "run", str(mine.id)])
+    status = runner.invoke(cli.app, ["research", "status", str(mine.id)])
+    listed = runner.invoke(cli.app, ["research", "status", "--json"])
+    start = runner.invoke(cli.app, ["research", "start", "q", "-s", "@news", "-a", WORK])
+    assert run.exit_code == 1 and f"research session {mine.id} is stopped" in run.stderr
+    assert status.exit_code == 0 and f"research session {mine.id} (stopped)" in status.stdout
+    assert "approved, not carried out yet" not in status.stdout
+    brief = {s["id"]: (s["account"], s["state"]) for s in json.loads(listed.stdout)["sessions"]}
+    assert brief == {mine.id: (WORK, "stopped"), theirs.id: (DEFAULT_ACCOUNT, "active")}
+    assert start.exit_code == 1 and "unknown account 'work'" in start.stderr
 
 
 def test_accounts_rm_is_all_or_nothing(tmp_home: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1680,6 +1701,34 @@ def test_leave_answered_no_or_naming_a_private_chat_leaves_nothing(
     assert private.exit_code == 1
     assert "there is nothing to leave" in private.stderr
     assert _leaves(clients[WORK]) == []
+
+
+def test_leave_refuses_a_folder_and_a_bot_before_asking_anything(
+    tmp_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A folder is many chats and a bot's chat has nothing to leave: both are refused by name,
+    before the question, and nothing is sent to Telegram."""
+    _two_account_home(tmp_home)
+    clients = _leave_clients()
+    work = clients[WORK]
+    helper = make_user(77, "Helper", username="helper_bot", bot=True)
+    work.dialogs.append(make_dialog(helper))
+    work.entities[77] = helper
+    work.responses[functions.messages.GetDialogFiltersRequest] = tl_messages.DialogFilters(
+        filters=[types.DialogFilterDefault(), make_folder(9, "Work stuff", include=[NEWS_ENTITY])]
+    )
+    _per_account(monkeypatch, clients)
+    terminal = _answer(monkeypatch, YES)
+
+    folder = runner.invoke(cli.app, ["leave", "folder:Work stuff", "-a", WORK])
+    bot = runner.invoke(cli.app, ["leave", "@helper_bot", "-a", WORK])
+
+    assert folder.exit_code == 1
+    assert "'Work stuff' is a folder; leave takes one group or channel" in folder.stderr
+    assert bot.exit_code == 1
+    assert "is a private chat with a bot; there is nothing to leave" in bot.stderr
+    assert terminal.asked == []
+    assert _leaves(work) == []
 
 
 def test_leave_refuses_a_target_of_another_account_than_the_one_named(
@@ -2072,6 +2121,24 @@ def test_research_start_refuses_an_unknown_seed_or_account(tmp_home: Path) -> No
 
     assert seed.exit_code == 1 and "no indexed chat matches '@nowhere'" in seed.stderr
     assert account.exit_code == 1 and "unknown account 'work'" in account.stderr
+
+
+def test_a_newer_research_db_is_refused_with_its_hint_not_a_traceback(tmp_home: Path) -> None:
+    """research.db holds decisions nothing rebuilds, so a file from a newer grepogram is refused
+    with the advice to upgrade (never to delete it), as an error line and nothing on stdout."""
+    paths = _research_home(tmp_home)
+    rdb = research_db.open_store(paths)
+    rdb.execute("UPDATE meta SET value = '99' WHERE key = 'schema_version'")
+    rdb.close()
+
+    for args in (["research", "status"], ["research", "start", "q", "-s", "@tbrent"]):
+        result = runner.invoke(cli.app, args)
+        assert result.exit_code == 1, result.output
+        assert result.stdout == ""
+        assert "research.db schema v99 is newer than this grepogram supports" in result.stderr
+        assert "upgrade grepogram, or move the file aside" in result.stderr
+        assert "Traceback" not in result.output and result.exception is not None
+        assert isinstance(result.exception, SystemExit)
 
 
 def test_research_start_refuses_a_limit_outside_its_bounds(tmp_home: Path) -> None:
