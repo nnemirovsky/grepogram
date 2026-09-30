@@ -724,7 +724,8 @@ never change the git identity.
   (`_remember_read_without_joining`), because a run that adds the source and fetches nothing
   (`ID:add_source` alone, or a fetch deferred and the session stopped) leaves no `chat_access`
   row behind; `sources.resolve_sources` seeds both (`db.stored_peers`, `db.cached_peers`), and a
-  source that still does not resolve is a warning in the sync report, never only a log line. A
+  source that still does not resolve is a warning in the sync report, never only a log line
+  (a run limited by `only` — research's — reports the sources it names alone). A
   candidate with no peer id gets no source.
   `research.grant` validates and writes in one `research.db` transaction; each session action is
   its own grant row, and a paid search pays only after `consume_grant` (one conditional

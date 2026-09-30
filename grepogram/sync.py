@@ -1994,8 +1994,8 @@ class _Lane:
 @dataclass(slots=True, eq=False)
 class _SyncPass:
     """What every account's queue of one run shares: the index, the budget, the sources, the
-    lanes and the tally, the accounts a flood wait stopped, and the chat ids already taken so no
-    chat is fetched twice."""
+    lanes and the tally, the accounts a flood wait stopped, the chat ids already taken so no
+    chat is fetched twice, and the sources the report already says did not resolve."""
 
     conn: sqlite3.Connection
     cfg: Config
@@ -2008,6 +2008,7 @@ class _SyncPass:
     queued: set[int] = field(default_factory=set)
     deferred: list[ChatRow] = field(default_factory=list)
     unfetched: dict[str, int] = field(default_factory=dict)
+    unresolved: set[str] = field(default_factory=set)
 
     @property
     def clients(self) -> dict[str, Any]:
@@ -2032,7 +2033,9 @@ async def _sync_chats(
     rejected session is raised as :class:`~grepogram.tg.AuthRequired` naming the account it
     belongs to. A source that does not resolve on its own (its chat or folder no longer names
     anything its account reaches) is a warning in the report too, never only a log line: an
-    approved source that never syncs would otherwise look like one with nothing new.
+    approved source that never syncs would otherwise look like one with nothing new. A run
+    limited by ``only`` warns about the sources it names alone, and the chat such a source
+    keeps, fetched through another account, carries no second warning for the same cause.
 
     Every chat goes to the queue of the first account :func:`reaching_accounts` names that is in
     the run and not stopped — its primary source's account when that one can — so a channel two
@@ -2087,7 +2090,12 @@ async def _sync_chats(
         tally.warn(account, _flood_text(seconds))
     for account, error in resolution.failed.items():
         tally.warn(account, f"its sources could not be resolved ({error}); they keep what they had")
+    unresolved: set[str] = set()
     for account, source_id, reason in resolution.unresolved:
+        # every source is resolved whatever ``only`` says; a run limited to some reports theirs
+        if only is not None and source_id not in only:
+            continue
+        unresolved.add(source_id)
         tally.warn(
             account,
             f"source {source_id} did not resolve ({reason}); it keeps the chats it already covered",
@@ -2100,6 +2108,7 @@ async def _sync_chats(
         lanes=lanes,
         tally=tally,
         stopped=stopped,
+        unresolved=unresolved,
     )
     for chat in sorted(_only(conn, resolution.chats, only, run.sources), key=_sync_order):
         _enqueue(run, chat)
@@ -2424,8 +2433,12 @@ async def _fetch_chat(run: _SyncPass, lane: _Lane, chat: ChatRow, source: Source
         run.tally.warn(account, _flood_text(seconds))
     if outcome.account is not None:
         assert outcome.result is not None
-        if outcome.refusals:
-            first = outcome.refusals[0]
+        first = outcome.refusals[0] if outcome.refusals else None
+        # a source that did not resolve already has its warning: its own account failing to
+        # address the chat is that same fact, and the fetch that went through is the good news
+        if first is not None and not (
+            first.account == source.account and source.id in run.unresolved
+        ):
             run.tally.warn(
                 first.account,
                 f"chat {chat.id} ({chat.title}): {first.reason} through account "

@@ -3706,10 +3706,7 @@ async def test_a_primary_account_that_cannot_resolve_the_chat_at_all_keeps_it(
             f"account {DEFAULT_ACCOUNT}: source {source.id} did not resolve (no dialog with id "
             f"{PRIV_ID}: Could not find the input entity for {PRIV_ID}); it keeps the chats it "
             "already covered",
-            f"account {DEFAULT_ACCOUNT}: chat {PRIV_ID} (Private club): Could not find the input "
-            f"entity for {PRIV_ID} through account {DEFAULT_ACCOUNT}; fetched through account "
-            f"{WORK} instead",
-        ]
+        ], "one warning for one cause: the source's own account cannot address the chat"
     assert _texts(conn, PRIV_ID) == {1: "club 1", 2: "club 2", 3: "club 3"}
     assert [name for name, _ in work.calls if name in ("get_dialogs", "get_entity")] == []
     assert PRIV_ID in work.resolved and PRIV_ID not in home.resolved
@@ -3816,6 +3813,24 @@ async def test_only_limits_the_run_to_the_chats_the_named_sources_cover(
     assert db.message_counts(conn) == {NEWS_ID: 2}
     news = db.get_chat(conn, NEWS_ID)
     assert news is not None and news.source_id == "chat:@news", "the primary did not move"
+
+
+async def test_only_reports_no_unresolved_source_it_was_not_asked_about(
+    conn: sqlite3.Connection, paths: Paths
+) -> None:
+    """Every source is resolved whatever ``only`` names, but a run limited to some — a research
+    run fetching the chats it just added — warns about theirs alone; a full run still says a
+    source did not resolve."""
+    world = _world()
+    news, gone = Source(chat="@news"), Source(chat="@gone_for_good")
+    cfg = _cfg(news, gone)
+
+    limited = await _run_accounts({DEFAULT_ACCOUNT: _home(world)}, conn, paths, cfg, only=[news.id])
+    full = await _run_accounts({DEFAULT_ACCOUNT: _home(world)}, conn, paths, cfg)
+
+    assert limited.chats_done == [NEWS_ID] and limited.warnings == []
+    [warning] = full.warnings
+    assert f"source {gone.id} did not resolve" in warning
 
 
 async def test_a_rejected_session_names_its_account(conn: sqlite3.Connection, paths: Paths) -> None:
