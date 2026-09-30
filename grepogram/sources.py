@@ -110,6 +110,11 @@ class UnknownSource(SourceError):
     """No configured or indexed source matches the target."""
 
 
+class AccountRemoved(SourceError):
+    """The account a source is being added for is not in the config any more: ``accounts rm``
+    removed it while the target was being resolved."""
+
+
 class ImportConflict(SourceError):
     """A Telegram Desktop import and a live source would claim the same chat.
 
@@ -487,8 +492,15 @@ def with_source(cfg: Config, source: Source, dialog: DialogInfo | None) -> Confi
     fetches what it reaches, and a shared chat is stored once whichever does.
 
     Pure, so a caller that resolved the source over the network can re-read the config right
-    before saving and apply the source to that, not to the snapshot it started from.
+    before saving and apply the source to that, not to the snapshot it started from — which is
+    also where an account ``accounts rm`` removed in the meantime shows: :class:`AccountRemoved`,
+    since a source of an account the config does not list is a config no later load accepts.
     """
+    if source.account not in cfg.account_names():
+        raise AccountRemoved(
+            f"account {source.account!r} was removed while the source was being added; "
+            "nothing was saved"
+        )
     _reject_duplicate(cfg, source, dialog)
     return dataclasses.replace(cfg, sources=[*cfg.sources, source])
 

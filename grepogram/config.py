@@ -212,9 +212,21 @@ def save(cfg: Config, paths: Paths) -> None:
 
     Callers that derived ``cfg`` from an earlier :func:`load` go through :func:`update` instead,
     which holds :class:`ConfigLock` from the read to the write.
+
+    The text is parsed back before it is written, so no writer can save a config :func:`load`
+    refuses — a source of an account that is not listed, say — and lock every later command and
+    the MCP server out until the file is edited by hand: :class:`ConfigError`, and the file on
+    disk is left as it was.
     """
+    text = dumps(cfg)
+    try:
+        loads(text)
+    except ConfigError as exc:
+        raise ConfigError(
+            f"refusing to save a config that would not load: {exc}", exc.hint
+        ) from exc
     paths.ensure_dirs()
-    write_private(paths.config_file, dumps(cfg))
+    write_private(paths.config_file, text)
 
 
 class ConfigLock(FileLock):

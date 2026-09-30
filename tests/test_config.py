@@ -264,6 +264,22 @@ def test_save_writes_mode_0600_even_over_a_permissive_file(paths: Paths) -> None
     assert not paths.config_file.with_name(".config.toml.tmp").exists()
 
 
+def test_save_refuses_a_config_load_would_refuse_and_keeps_the_file(paths: Paths) -> None:
+    """No writer can leave a ``config.toml`` every later command fails on: a source of an
+    account the config does not list is refused before anything is written."""
+    kept = Config(sources=[Source(chat="@news")])
+    config.save(kept, paths)
+    orphan = dataclasses.replace(kept, sources=[*kept.sources, Source(chat=1, account="gone")])
+    with pytest.raises(ConfigError, match="refusing to save a config that would not load") as err:
+        config.save(orphan, paths)
+    assert "unknown account 'gone'" in str(err.value)
+    assert err.value.hint is not None and "[[accounts]]" in err.value.hint
+    assert config.load(paths) == kept
+    with pytest.raises(ConfigError, match="unknown account 'gone'"):
+        config.update(paths, lambda current: orphan)
+    assert config.load(paths) == kept
+
+
 def test_save_is_comment_lossy(paths: Paths) -> None:
     paths.config_file.write_text(TEMPLATE)
     config.save(config.load(paths), paths)

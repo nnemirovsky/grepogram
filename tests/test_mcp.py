@@ -1407,6 +1407,34 @@ async def test_sources_add_for_another_account(paths: Paths, conn: sqlite3.Conne
     assert len(two.built[WORK]) == 2 and len(two.built[DEFAULT_ACCOUNT]) == 2
 
 
+async def test_sources_add_for_an_account_removed_meanwhile_saves_nothing(
+    paths: Paths, conn: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``grepogram accounts rm work`` saves while the target resolves: the tool answers with an
+    error, and the server — and every later command — still loads the config."""
+    two = Accounts(paths)
+    cfg = dataclasses.replace(TWO_ACCOUNTS, sources=[])
+    state = tools.AppState(paths, cfg, conn, client_factory=two.factory)
+    state.save_config(state.cfg)
+    real_add = sourcing.add_source
+
+    async def add_then_lose_the_account(*args: Any, **kwargs: Any) -> sourcing.Added:
+        added = await real_add(*args, **kwargs)
+        config.update(paths, lambda current: dataclasses.replace(current, accounts=[]))
+        return added
+
+    monkeypatch.setattr(sourcing, "add_source", add_then_lose_the_account)
+    tools.bind(state)
+    try:
+        result = await tools.sources_add("@news", account=WORK)
+    finally:
+        tools.unbind()
+    assert "account 'work' was removed while the source was being added" in result["error"]
+    loaded = config.load(paths)
+    assert loaded.sources == [] and loaded.accounts == []
+    assert state.config() == loaded
+
+
 async def test_sources_carry_accounts_and_remove_keeps_a_shared_chat(
     accounts: Accounts, conn: sqlite3.Connection
 ) -> None:

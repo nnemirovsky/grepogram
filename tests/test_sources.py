@@ -1915,6 +1915,11 @@ WORK_ALICE = make_user(1, "Alice", "Liddell", username="alice")
 WORK_ALICE.access_hash = 7001
 
 
+def _work_cfg(*entries: Source) -> Config:
+    """A config that lists the work account, as one a source of it can be added to must."""
+    return Config(accounts=[AccountCfg(name=WORK)], sources=list(entries))
+
+
 def _work_client() -> FakeClient:
     """The second account: it reaches the same channel and the same person as the default one,
     under access hashes of its own, and has no folders."""
@@ -1952,12 +1957,15 @@ def test_split_source_id() -> None:
 
 async def test_add_source_for_another_account() -> None:
     added = await sources.add_source(
-        _cfg(), sources.parse_target("@news"), DialogCatalog(_work_client()), account=WORK
+        _work_cfg(), sources.parse_target("@news"), DialogCatalog(_work_client()), account=WORK
     )
     assert added.source == Source(chat="@news", account=WORK)
     assert added.source.id == "work/chat:@news"
     prefixed = await sources.add_source(
-        _cfg(), sources.parse_target("work/chat:@news"), DialogCatalog(_work_client()), account=WORK
+        _work_cfg(),
+        sources.parse_target("work/chat:@news"),
+        DialogCatalog(_work_client()),
+        account=WORK,
     )
     assert prefixed.source == added.source
     with pytest.raises(InvalidTarget, match="account work"):
@@ -1965,7 +1973,7 @@ async def test_add_source_for_another_account() -> None:
 
 
 async def test_the_same_chat_is_a_duplicate_only_within_one_account() -> None:
-    cfg = _cfg(Source(chat="@news"))
+    cfg = _work_cfg(Source(chat="@news"))
     news = dialog_info(NEWS)
     both = sources.with_source(cfg, Source(chat=NEWS_ID, account=WORK), news)
     assert [s.id for s in both.sources] == ["chat:@news", f"work/chat:{NEWS_ID}"]
@@ -1973,6 +1981,13 @@ async def test_the_same_chat_is_a_duplicate_only_within_one_account() -> None:
         sources.with_source(both, Source(chat="@NEWS", account=WORK), news)
     with pytest.raises(DuplicateSource):
         sources.with_source(both, Source(chat=NEWS_ID), news)
+
+
+def test_a_source_of_an_account_the_config_no_longer_lists_is_refused() -> None:
+    """The config ``with_source`` is handed is the one read under the lock; an account
+    ``accounts rm`` dropped from it since the target resolved takes no source."""
+    with pytest.raises(sources.AccountRemoved, match="account 'work' was removed"):
+        sources.with_source(_cfg(), Source(chat="@news", account=WORK), dialog_info(NEWS))
 
 
 async def test_resolve_sources_stores_a_shared_channel_once_for_two_accounts(

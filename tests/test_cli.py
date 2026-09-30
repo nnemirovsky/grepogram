@@ -1593,6 +1593,28 @@ def test_sources_add_for_an_account_writes_its_source(
     ]
 
 
+def test_sources_add_for_an_account_removed_meanwhile_saves_nothing(
+    tmp_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``accounts rm work`` saves while ``sources add`` resolves its target: the add is refused
+    on the config as it is by then, and the config still loads."""
+    paths = _two_account_home(tmp_home)
+    _per_account(monkeypatch, _two_clients())
+    resolve = cli._add_source
+
+    async def resolve_then_lose_the_account(*args: Any, **kwargs: Any) -> Any:
+        added = await resolve(*args, **kwargs)
+        config.update(paths, lambda current: dataclasses.replace(current, accounts=[]))
+        return added
+
+    monkeypatch.setattr(cli, "_add_source", resolve_then_lose_the_account)
+    result = runner.invoke(cli.app, ["sources", "add", "2", "--account", WORK])
+    assert result.exit_code == 1
+    assert "account 'work' was removed while the source was being added" in result.stderr
+    loaded = config.load(paths)
+    assert loaded.sources == [] and loaded.accounts == []
+
+
 def test_import_for_an_account_stores_its_private_chat_beside_the_default_one(
     tmp_home: Path,
 ) -> None:

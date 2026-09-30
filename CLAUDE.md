@@ -244,6 +244,10 @@ never change the git identity.
   `AppState.editing_config()` takes it inside the process-wide lock. Never save a config derived
   from a snapshot read before a network round trip; re-read under the lock and apply the delta
   (`sources.with_source`, drop by id). Lock order is `SyncLock` → `ConfigLock` → thread lock.
+  The delta is checked against the config it lands on: `with_source` refuses a source whose
+  account that config no longer lists (`sources.AccountRemoved` — `accounts rm` saved while
+  the target resolved), and `config.save` parses its own text back before writing, so no
+  writer can leave a file `config.load` refuses and lock every command and the server out.
 - A model loads from the Hugging Face cache and nothing else. Both `BgeM3Embedder` and
   `BgeReranker` go through `embed.load_cached_first(load, what)`, which calls the
   sentence-transformers constructor with `local_files_only=True` and retries with the network
