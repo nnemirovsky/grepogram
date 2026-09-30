@@ -755,19 +755,44 @@ voided_at)`, `exclusions(identity PRIMARY KEY, reason, created_at)`,
 ### Task 15: Grants and approval enforcement
 
 **Files:**
-- Modify: `grepogram/research.py`, `tests/test_research.py`
+- Modify: `grepogram/research.py`, `grepogram/models.py` (`ApprovalItem`), `tests/test_research.py`
 
-- [ ] `approval_summary(rdb, conn, session, items)` — the exact text a human sees (target,
+- [x] `approval_summary(rdb, conn, session, items)` — the exact text a human sees (target,
   account, membership, each action in words, "adds an ongoing source", search disclosure)
-- [ ] `grant(rdb, session, items, via)` where `via` is a `Literal["elicitation", "cli"]`
+  ➕ signature `approval_summary(rdb, conn, cfg, session_id, items: Sequence[ApprovalItem])`
+  (`cfg` for the search switches and `paid_stars_max`). Per target: title, handle, type, size,
+  "its admins approve who joins", the acting account's membership and what the index holds
+  (through which accounts); per action: the join route (username, invite link, by id, or the
+  shared folder — saying Telegram adds that folder to the account's folders), the admission
+  request, "fetch its history since <horizon>" (with discussion comments for a channel), "add it
+  as an ongoing source … regular sync and search will include it from now on, and stopping this
+  research session does not remove it"; for `global_search` the question, the Telegram methods,
+  that the query leaves the computer and may return snippets from unknown chats; for
+  `paid_search` the star ceiling. Ends with `DESCENDANTS_NOTE`. `research.horizon(session)` =
+  `created_at − since_days`, so the date shown is the one the run uses
+- [x] `grant(rdb, session, items, via)` where `via` is a `Literal["elicitation", "cli"]`
   produced only by the two entry points; validates actions against candidate state (no `join`
   for a member, `request` only when `request_needed`, `fetch` implies `add_source` must be
   explicit); `skip`, `exclude`, `unexclude`
-- [ ] `authorized(rdb, candidate, action)` — the single check the run uses; stop voids
+  ➕ signature `grant(rdb, conn, cfg, session_id, items, *, via, summary)`: re-validates, rebuilds
+  the summary and grants nothing unless it equals the text the human saw; one grant per target
+  with only the actions not already live; `proposed` / `skipped` / `failed` → `approved`. Also
+  refused: an unprobed candidate, a shared folder (approved chat by chat), a person, an
+  excluded / unavailable / fetched candidate, `join` + `request` together, `fetch` or
+  `add_source` on a private chat the account is not in without `join` / `request`, `join` with
+  no route, `paid_search` without `paid_stars_max`, post search or `global_search`, a search
+  approval while the switches are off, everything already approved. `skip(rdb, cfg, session_id,
+  ids)` voids the candidates' grants; `exclude` / `unexclude(rdb, cfg, refs, session_id=…)` take
+  candidate ids or any link / `@name` / marked id (`target_identities`); `stop(rdb, cfg,
+  session_id)`
+- [x] `authorized(rdb, candidate, action)` — the single check the run uses; stop voids
   unconsumed grants
-- [ ] tests: descendants of an approved directory stay unauthorized; a grant is reused across
+  ➕ `authorized(rdb, target: Candidate | ResearchSession, action)`; `search_granted` goes
+  through it. Only a grant naming the target itself counts, of the session's account, in an
+  active session, for a candidate not skipped or excluded since
+- [x] tests: descendants of an approved directory stay unauthorized; a grant is reused across
   runs; invalid action combinations refused; stopped session has no live grants
-- [ ] run checks — must pass before task 16
+- [x] run checks — must pass before task 16
 
 ### Task 16: Research run
 

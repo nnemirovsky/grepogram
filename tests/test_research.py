@@ -1,19 +1,23 @@
 import dataclasses
 import logging
+import re
 import sqlite3
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from typing import Any
 
 import pytest
 from telethon import errors, utils
 from telethon.tl import functions, types
 
-from grepogram import db, research, research_db, sync, tg
+from grepogram import db, leads, research, research_db, sync, tg
 from grepogram.filters import UnknownChat
 from grepogram.models import (
+    ApprovalItem,
+    Candidate,
     CandidateView,
     ChatRow,
     Config,
+    Grant,
     LinkKind,
     MessageRow,
     ResearchCfg,
@@ -1112,3 +1116,464 @@ async def test_discover_without_a_grant_or_a_client_never_searches(
         isinstance(r, functions.contacts.SearchRequest | functions.channels.SearchPostsRequest)
         for r in client.requests
     )
+
+
+# --- approval --------------------------------------------------------------------------------
+
+PAID_CFG = Config(
+    research=ResearchCfg(enabled=True, chat_search=True, post_search=True, paid_stars_max=5)
+)
+
+
+def _probed(
+    rdb: sqlite3.Connection,
+    session: ResearchSession,
+    identity: str,
+    kind: Any = "username",
+    *,
+    depth: int = 1,
+    parent_id: int | None = None,
+    **facts: Any,
+) -> Candidate:
+    """A candidate as a probe left it: ``facts`` are what Telegram answered."""
+    target = leads.normalize(identity)
+    assert target is not None
+    added = research_db.add_candidate(
+        rdb,
+        session.id,
+        identity,
+        kind,
+        depth,
+        peer_id=target.peer_id,
+        username=target.username,
+        invite_hash=target.invite_hash,
+        addlist_slug=target.slug,
+        parent_id=parent_id,
+        now=1,
+    )
+    assert added is not None
+    return research_db.update_candidate(rdb, added.id, **{"probed_at": 2, **facts})
+
+
+def _flats(rdb: sqlite3.Connection, session: ResearchSession, **facts: Any) -> Candidate:
+    known = {"title": "Tbilisi flats", "type": "channel", "participants": 1234, "member": False}
+    return _probed(rdb, session, "@tb_flats", **{**known, **facts})
+
+
+def _item(candidate: Candidate | None, *actions: str) -> ApprovalItem:
+    return ApprovalItem(candidate_id=None if candidate is None else candidate.id, actions=actions)
+
+
+def _approve(
+    rdb: sqlite3.Connection,
+    conn: sqlite3.Connection,
+    session: ResearchSession,
+    *items: ApprovalItem,
+    cfg: Config = CFG,
+) -> list[Grant]:
+    summary = research.approval_summary(rdb, conn, cfg, session.id, items)
+    return research.grant(rdb, conn, cfg, session.id, items, via="cli", summary=summary, now=5)
+
+
+def test_the_summary_names_target_account_membership_and_every_action(
+    rdb: sqlite3.Connection, conn: sqlite3.Connection
+) -> None:
+    session = _start(rdb, conn)
+    flats = _flats(rdb, session)
+
+    text = research.approval_summary(
+        rdb, conn, CFG, session.id, [_item(flats, "add_source", "fetch", "join")]
+    )
+
+    assert text == "\n".join(
+        [
+            f'Research session {session.id}: "{QUESTION}"',
+            "Acting account: default",
+            "",
+            f'Candidate {flats.id}: "Tbilisi flats" (@tb_flats), channel, 1,234 members',
+            "  account default is not a member; not in the index yet",
+            "  - join it as default through its public username @tb_flats; the account becomes "
+            "a member, visible to its admins",
+            "  - fetch its history since 1969-01-01 with the comments of its discussion group as "
+            "default into the local index",
+            "  - add it as an ongoing source of account default (since 1969-01-01): regular sync "
+            "and search will include it from now on, and stopping this research session does "
+            "not remove it",
+            "",
+            research.DESCENDANTS_NOTE,
+        ]
+    )
+    assert research_db.list_grants(rdb, session.id) == [], "a summary grants nothing"
+    assert research_db.get_candidate(rdb, flats.id).status == "proposed"  # type: ignore[union-attr]
+
+
+def test_the_summary_says_what_the_index_holds_and_how_a_request_works(
+    rdb: sqlite3.Connection, conn: sqlite3.Connection
+) -> None:
+    session = _start(rdb, conn)
+    cached = _probed(rdb, session, "@cachedchan", title="Already here", type="channel", member=True)
+    gated = _probed(
+        rdb,
+        session,
+        "+JoinMe",
+        "invite",
+        title="Gated",
+        type="supergroup",
+        participants=812,
+        member=False,
+        request_needed=True,
+    )
+
+    text = research.approval_summary(
+        rdb,
+        conn,
+        CFG,
+        session.id,
+        [_item(cached, "add_source"), _item(gated, "request", "fetch", "add_source")],
+    )
+
+    assert "account default is a member; already in the index through work" in text
+    assert (
+        f'Candidate {gated.id}: "Gated" (invite link t.me/+JoinMe), supergroup, 812 members, '
+        "its admins approve who joins"
+    ) in text
+    assert "send a request to join it as default; its admins see the request and decide" in text
+    assert "discussion group" not in text.split(f"Candidate {gated.id}")[1]
+
+
+def test_a_search_approval_discloses_where_the_query_goes_and_what_it_pays(
+    rdb: sqlite3.Connection, conn: sqlite3.Connection
+) -> None:
+    session = _start(rdb, conn)
+
+    text = research.approval_summary(
+        rdb, conn, PAID_CFG, session.id, [_item(None, "paid_search", "global_search")]
+    )
+
+    assert f'send this session\'s question "{QUESTION}" as default to' in text
+    assert "contacts.search" in text and "channels.searchPosts" in text
+    assert "the query leaves this computer and reaches Telegram" in text
+    assert "snippets from channels and groups you have never joined or indexed" in text
+    assert "pay up to 5 Telegram Stars from default's balance" in text
+    assert text.index("send this") < text.index("pay up to")
+    only_chats = Config(research=ResearchCfg(enabled=True, chat_search=True))
+    chats_text = research.approval_summary(
+        rdb, conn, only_chats, session.id, [_item(None, "global_search")]
+    )
+    assert "contacts.search" in chats_text and "searchPosts" not in chats_text
+
+
+def test_grant_records_the_channel_and_the_text_the_human_saw(
+    rdb: sqlite3.Connection, conn: sqlite3.Connection
+) -> None:
+    session = _start(rdb, conn)
+    flats = _flats(rdb, session)
+    items = [_item(flats, "join", "fetch", "add_source")]
+    summary = research.approval_summary(rdb, conn, CFG, session.id, items)
+
+    (granted,) = research.grant(
+        rdb, conn, CFG, session.id, items, via="elicitation", summary=summary, now=5
+    )
+
+    assert (granted.via, granted.summary, granted.account) == ("elicitation", summary, "default")
+    assert granted.actions == ("join", "fetch", "add_source") and granted.candidate_id == flats.id
+    stored = research_db.get_candidate(rdb, flats.id)
+    assert stored is not None and stored.status == "approved"
+    assert all(research.authorized(rdb, stored, a) for a in ("join", "fetch", "add_source"))
+    assert not research.authorized(rdb, stored, "request")
+
+
+def test_a_summary_that_no_longer_matches_grants_nothing(
+    rdb: sqlite3.Connection, conn: sqlite3.Connection
+) -> None:
+    session = _start(rdb, conn)
+    flats = _flats(rdb, session)
+    items = [_item(flats, "join", "fetch", "add_source")]
+    summary = research.approval_summary(rdb, conn, CFG, session.id, items)
+    research_db.update_candidate(rdb, flats.id, title="Tbilisi flats and more", participants=9)
+
+    with pytest.raises(research.ResearchError, match="changed since its summary was shown"):
+        research.grant(rdb, conn, CFG, session.id, items, via="cli", summary=summary)
+    with pytest.raises(research.ResearchError):
+        research.grant(rdb, conn, CFG, session.id, items, via="cli", summary="yes")
+    fresh = research.approval_summary(rdb, conn, CFG, session.id, items)
+    with pytest.raises(ValueError, match="grant channel"):
+        research.grant(rdb, conn, CFG, session.id, items, via="mcp", summary=fresh)  # type: ignore[arg-type]
+    assert research_db.list_grants(rdb, session.id) == []
+    assert research_db.get_candidate(rdb, flats.id).status == "proposed"  # type: ignore[union-attr]
+
+
+def test_invalid_action_combinations_are_refused(
+    rdb: sqlite3.Connection, conn: sqlite3.Connection
+) -> None:
+    session = _start(rdb, conn)
+    other = _start(rdb, conn)
+    member = _flats(rdb, session, member=True)
+    gated = _probed(rdb, session, "+JoinMe", "invite", type="supergroup", request_needed=True)
+    open_invite = _probed(rdb, session, "+OpenDoor", "invite", type="supergroup", member=False)
+    private = _probed(
+        rdb, session, f"peer:{ORIGIN}", "peer", type="channel", member=False, access_hash=77
+    )
+    old_group = _probed(rdb, session, "peer:-4242", "peer", type="group", member=False)
+    folder = _probed(rdb, session, "addlist/Tbilisi1", "addlist", title="Tbilisi housing")
+    unprobed = research_db.add_candidate(rdb, session.id, "@tb_new", "username", 1)
+    person = _probed(rdb, session, "@tom_rents", type="user")
+    excluded = _probed(rdb, session, "@tb_banned", type="channel", status="excluded")
+    unavailable = _probed(rdb, session, "@tb_gone", type="channel", status="unavailable")
+    fetched = _probed(rdb, session, "@tb_done", type="channel", status="fetched")
+    waiting = _probed(
+        rdb,
+        session,
+        "+Waiting",
+        "invite",
+        type="supergroup",
+        request_needed=True,
+        status="pending_admission",
+    )
+    elsewhere = _flats(rdb, other)
+    assert unprobed is not None
+
+    cases: list[tuple[ApprovalItem, str]] = [
+        (_item(member, "join"), "already a member"),
+        (_item(member, "fetch"), "approve `add_source` together with `fetch`"),
+        (_item(open_invite, "request"), "only for a chat whose invite asks"),
+        (_item(gated, "join"), "approve `request` instead of `join`"),
+        (_item(private, "fetch", "add_source"), "not a member of this private chat"),
+        (_item(old_group, "join"), "no way to join it"),
+        (_item(folder, "join"), "approved chat by chat"),
+        (_item(unprobed, "join"), "not probed yet"),
+        (_item(person, "fetch", "add_source"), "a person's account"),
+        (_item(excluded, "fetch", "add_source"), "it is excluded"),
+        (_item(unavailable, "join"), "Telegram refused it"),
+        (_item(fetched, "add_source"), "already fetched it"),
+        (_item(waiting, "request"), "already waiting"),
+        (_item(member, "delete"), "unknown action 'delete'"),
+        (_item(member, "global_search"), "approved for the session"),
+        (_item(elsewhere, "add_source"), f"no candidate {elsewhere.id} in research session"),
+        (_item(None, "fetch"), "approved for a candidate"),
+        (_item(None, "global_search"), "global search is off"),
+        (_item(member), "no action named"),
+    ]
+    for item, message in cases:
+        with pytest.raises(research.ResearchError, match=re.escape(message)):
+            research.approval_summary(rdb, conn, CFG, session.id, [item])
+    with pytest.raises(research.ResearchError, match="nothing to approve"):
+        research.approval_summary(rdb, conn, CFG, session.id, [])
+    searches = Config(research=ResearchCfg(enabled=True, post_search=True))
+    with pytest.raises(research.ResearchError, match=re.escape("paid_stars_max = 0")):
+        research.approval_summary(
+            rdb, conn, searches, session.id, [_item(None, "global_search", "paid_search")]
+        )
+    with pytest.raises(research.ResearchError, match="needs `global_search` approved too"):
+        research.approval_summary(rdb, conn, PAID_CFG, session.id, [_item(None, "paid_search")])
+    # a waiting request may still take what the run does once the admins let the account in
+    assert "fetch its history" in research.approval_summary(
+        rdb, conn, CFG, session.id, [_item(waiting, "fetch", "add_source")]
+    )
+    # join granted, then a new probe says the chat now asks for a request
+    _approve(rdb, conn, session, _item(open_invite, "join"))
+    research_db.update_candidate(rdb, open_invite.id, request_needed=True)
+    with pytest.raises(research.ResearchError, match="two ways in"):
+        research.approval_summary(rdb, conn, CFG, session.id, [_item(open_invite, "request")])
+    assert [g.candidate_id for g in research_db.list_grants(rdb, session.id)] == [open_invite.id]
+
+
+def test_descendants_of_an_approved_directory_stay_unauthorized(
+    rdb: sqlite3.Connection, conn: sqlite3.Connection
+) -> None:
+    db.upsert_chat(conn, ChatRow(id=HOP, type="channel", title="Directory", username="tb_dir"))
+    _store(conn, HOP, 1, "listing: @tb_deep", links=(("mention", "@tb_deep"),))
+    session = _start(rdb, conn)
+    directory = _probed(rdb, session, "@tb_dir", title="Directory", type="channel", member=False)
+    _approve(rdb, conn, session, _item(directory, "join", "fetch", "add_source"))
+    # the run fetched the directory: discovery now reads it one hop further out
+    research_db.set_scan_cursor(rdb, session.id, HOP, depth=1, msg_id=0)
+    research.discover_offline(rdb, conn, CFG, session.id)
+
+    child = _by_identity(rdb, conn, session)["@tb_deep"].candidate
+    assert child.depth == 2 and child.status == "proposed"
+    assert research.authorized(rdb, directory, "fetch")
+    for action in ("join", "request", "fetch", "add_source"):
+        assert not research.authorized(rdb, child, action)
+    assert research_db.live_grants(rdb, session.id, child.id) == []
+
+
+def test_a_shared_folder_grants_nothing_for_its_chats(
+    rdb: sqlite3.Connection, conn: sqlite3.Connection
+) -> None:
+    session = _start(rdb, conn)
+    folder = _probed(rdb, session, "addlist/Tbilisi1", "addlist", title="Tbilisi housing")
+    inside = _probed(
+        rdb,
+        session,
+        f"peer:{ORIGIN}",
+        "peer",
+        parent_id=folder.id,
+        title="Folder private",
+        type="channel",
+        member=False,
+    )
+    sibling = _probed(rdb, session, "@tb_folder_chan", parent_id=folder.id, type="channel")
+
+    with pytest.raises(research.ResearchError, match="approved chat by chat"):
+        research.approval_summary(rdb, conn, CFG, session.id, [_item(folder, "join")])
+    items = [_item(inside, "join", "fetch", "add_source")]
+    text = research.approval_summary(rdb, conn, CFG, session.id, items)
+    assert (
+        'through the shared folder "Tbilisi housing" (t.me/addlist/Tbilisi1); Telegram also adds '
+        "that folder to the account's chat folders"
+    ) in text
+    _approve(rdb, conn, session, *items)
+
+    assert research.authorized(rdb, inside, "join")
+    assert not any(
+        research.authorized(rdb, target, action)
+        for target in (folder, sibling)
+        for action in ("join", "request", "fetch", "add_source")
+    )
+
+
+def test_a_grant_is_reused_across_runs_and_never_asked_for_twice(
+    rdb: sqlite3.Connection, conn: sqlite3.Connection
+) -> None:
+    session = _start(rdb, conn)
+    flats = _flats(rdb, session)
+    _approve(rdb, conn, session, _item(flats, "join"))
+    _approve(rdb, conn, session, _item(None, "global_search"), cfg=SEARCH_CFG)
+
+    for _run in range(3):  # authorized never consumes: every run reads the same grant
+        assert research.authorized(rdb, flats, "join")
+        assert research.search_granted(rdb, session.id, "global_search")
+    with pytest.raises(research.ResearchError, match="already approved"):
+        research.approval_summary(rdb, conn, CFG, session.id, [_item(flats, "join")])
+    text = research.approval_summary(
+        rdb, conn, CFG, session.id, [_item(flats, "join", "fetch", "add_source")]
+    )
+    assert "join it as" not in text
+    assert "(already approved, not asked again: join)" in text
+    assert "fetch its history" in text
+    mixed = research.approval_summary(
+        rdb,
+        conn,
+        SEARCH_CFG,
+        session.id,
+        [_item(None, "global_search"), _item(flats, "fetch", "add_source")],
+    )
+    assert "Already approved and not asked again: session searches." in mixed
+
+
+def test_a_stopped_session_has_no_live_grants(
+    rdb: sqlite3.Connection, conn: sqlite3.Connection
+) -> None:
+    session = _start(rdb, conn)
+    flats = _flats(rdb, session)
+    _approve(rdb, conn, session, _item(flats, "join", "fetch", "add_source"))
+    _approve(rdb, conn, session, _item(None, "global_search"), cfg=SEARCH_CFG)
+
+    assert research.stop(rdb, CFG, session.id) == 2
+
+    assert research_db.list_grants(rdb, session.id, live_only=True) == []
+    assert not research.authorized(rdb, flats, "join")
+    assert not research.search_granted(rdb, session.id, "global_search")
+    with pytest.raises(research.SessionStopped):
+        research.approval_summary(rdb, conn, CFG, session.id, [_item(flats, "fetch")])
+    with pytest.raises(research.SessionStopped):
+        research.grant(rdb, conn, CFG, session.id, [_item(flats, "fetch")], via="cli", summary="x")
+    with pytest.raises(research.UnknownSession):
+        research.stop(rdb, CFG, 999)
+
+
+def test_a_grant_for_another_account_authorizes_nothing(
+    rdb: sqlite3.Connection, conn: sqlite3.Connection
+) -> None:
+    session = _start(rdb, conn)
+    flats = _flats(rdb, session)
+    research_db.add_grant(
+        rdb,
+        session_id=session.id,
+        candidate_id=flats.id,
+        account="work",
+        actions=["join"],
+        via="cli",
+        summary="join as work",
+    )
+
+    assert not research.authorized(rdb, flats, "join")
+
+
+def test_skip_and_exclude_narrow_without_consent_and_void_grants(
+    rdb: sqlite3.Connection, conn: sqlite3.Connection
+) -> None:
+    session = _start(rdb, conn)
+    other = _start(rdb, conn)
+    flats = _flats(rdb, session)
+    elsewhere = _flats(rdb, other)
+    gated = _probed(rdb, session, "+JoinMe", "invite", type="supergroup", request_needed=True)
+    done = _probed(rdb, session, "@tb_done", type="channel", status="fetched")
+    _approve(rdb, conn, session, _item(gated, "request"))
+    _approve(rdb, conn, other, _item(elsewhere, "join"))
+
+    assert research.skip(rdb, CFG, session.id, [gated.id]) == [gated.id]
+    assert research_db.get_candidate(rdb, gated.id).status == "skipped"  # type: ignore[union-attr]
+    assert not research.authorized(rdb, gated, "request")
+    assert research_db.live_grants(rdb, session.id, gated.id) == []
+    with pytest.raises(research.ResearchError, match="skipping it would undo nothing"):
+        research.skip(rdb, CFG, session.id, [done.id])
+    with pytest.raises(research.UnknownCandidate):
+        research.skip(rdb, CFG, session.id, [elsewhere.id])
+    # a skipped candidate can be approved again
+    _approve(rdb, conn, session, _item(gated, "request"))
+    assert research.authorized(rdb, gated, "request")
+
+    moved = research.exclude(rdb, CFG, ["https://t.me/tb_flats"], reason="spam")
+    assert moved == {"@tb_flats": 2}
+    assert not research.authorized(rdb, elsewhere, "join")
+    assert research_db.live_grants(rdb, other.id, elsewhere.id) == []
+    assert research.unexclude(rdb, CFG, [str(flats.id)], session_id=session.id) == ["@tb_flats"]
+    assert research_db.get_candidate(rdb, elsewhere.id).status == "proposed"  # type: ignore[union-attr]
+    assert not research.authorized(rdb, elsewhere, "join"), "lifting an exclusion approves nothing"
+    assert research.unexclude(rdb, CFG, ["@tb_flats"]) == []
+
+
+def test_targets_are_named_by_candidate_id_link_or_peer(rdb: sqlite3.Connection) -> None:
+    session = research_db.create_session(
+        rdb, question="q", account="default", seeds=[SEED], limits=ResearchLimits()
+    )
+    found = research_db.add_candidate(rdb, session.id, "+JoinMe", "invite", 1)
+    assert found is not None
+
+    assert research.target_identities(
+        rdb,
+        [str(found.id), "t.me/tb_flats/12", str(ORIGIN), "https://t.me/addlist/Tbilisi1"],
+        session.id,
+    ) == ["+JoinMe", "@tb_flats", f"peer:{ORIGIN}", "addlist/Tbilisi1"]
+    with pytest.raises(research.ResearchError, match="needs a session"):
+        research.target_identities(rdb, [str(found.id)])
+    with pytest.raises(research.ResearchError, match="names no chat"):
+        research.target_identities(rdb, ["peer:5"])
+    with pytest.raises(research.ResearchError, match="names no chat"):
+        research.target_identities(rdb, ["https://example.com"])
+    with pytest.raises(research.UnknownCandidate):
+        research.target_identities(rdb, ["999"], session.id)
+
+
+def test_approval_refuses_while_research_is_disabled(
+    rdb: sqlite3.Connection, conn: sqlite3.Connection
+) -> None:
+    session = _start(rdb, conn)
+    flats = _flats(rdb, session)
+    off = Config()
+    calls: list[Callable[[], object]] = [
+        lambda: research.approval_summary(rdb, conn, off, session.id, [_item(flats, "join")]),
+        lambda: research.grant(
+            rdb, conn, off, session.id, [_item(flats, "join")], via="cli", summary="x"
+        ),
+        lambda: research.skip(rdb, off, session.id, [flats.id]),
+        lambda: research.exclude(rdb, off, ["@tb_flats"]),
+        lambda: research.unexclude(rdb, off, ["@tb_flats"]),
+        lambda: research.stop(rdb, off, session.id),
+    ]
+    for call in calls:
+        with pytest.raises(research.ResearchDisabled):
+            call()
+    assert research_db.list_grants(rdb, session.id) == []

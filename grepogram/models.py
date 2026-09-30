@@ -670,6 +670,16 @@ class Grant:
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
+class ApprovalItem:
+    """One target a human is asked to approve: ``actions`` on the candidate ``candidate_id``, or
+    session-wide search actions when ``candidate_id`` is ``None``
+    (:func:`grepogram.research.approval_summary`, :func:`grepogram.research.grant`)."""
+
+    candidate_id: int | None
+    actions: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
 class Exclusion:
     """A target research never proposes again, in any session."""
 
