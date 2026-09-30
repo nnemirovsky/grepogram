@@ -19,6 +19,8 @@ from grepogram import (
     embed,
     index,
     media,
+    research,
+    research_db,
     search,
     sync,
     tg,
@@ -28,6 +30,7 @@ from grepogram.config import TEMPLATE
 from grepogram.embed import ModelUnavailable
 from grepogram.models import (
     DEFAULT_ACCOUNT,
+    ApprovalItem,
     ChatRow,
     Config,
     MediaReport,
@@ -37,7 +40,15 @@ from grepogram.models import (
 )
 from grepogram.paths import Paths
 from tests.conftest import file_mode
-from tests.fakes import FakeClient, FakeWorld, make_channel, make_dialog, make_group, make_user
+from tests.fakes import (
+    FakeClient,
+    FakeWorld,
+    make_channel,
+    make_dialog,
+    make_group,
+    make_user,
+    no_discussion,
+)
 from tests.fixtures import chat_ru, tl
 
 runner = CliRunner()
@@ -1546,3 +1557,320 @@ def test_leave_answered_no_or_naming_a_private_chat_leaves_nothing(
     assert private.exit_code == 1
     assert "there is nothing to leave" in private.stderr
     assert _leaves(clients[WORK]) == []
+
+
+# --- research --------------------------------------------------------------------------------
+
+
+RESEARCH_ON = "\n[research]\nenabled = true\n"
+RENT_PEER = -1000000000100
+FLATS = make_channel(3001, "Tbilisi flats", username="tb_flats")
+FLATS_PEER = -1000000003001
+
+
+def _research_home(tmp_home: Path, extra: str = RESEARCH_ON) -> Paths:
+    """A signed-in home with research switched on and one indexed channel, ``@tbrent``, whose
+    only message mentions ``@tb_flats``."""
+    paths = _signed_in(tmp_home, extra)
+    conn = db.connect(paths)
+    try:
+        db.migrate(conn)
+        db.upsert_chat(
+            conn, ChatRow(id=RENT_PEER, type="channel", title="Tbilisi rent", username="tbrent")
+        )
+        db.upsert_messages(
+            conn,
+            [
+                MessageRow(
+                    chat_id=RENT_PEER,
+                    msg_id=1,
+                    date=1_735_689_600,
+                    text="flats at @tb_flats",
+                    links=(("mention", "@tb_flats"),),
+                )
+            ],
+        )
+    finally:
+        conn.close()
+    return paths
+
+
+def _research_client(monkeypatch: pytest.MonkeyPatch) -> FakeClient:
+    """The default account, not a member of the public channel ``@tb_flats`` (two posts)."""
+    world = FakeWorld(
+        entities=[FLATS],
+        messages={FLATS_PEER: [tl.message(FLATS_PEER, i, f"flat {i}") for i in (1, 2)]},
+    )
+    client = world.client(
+        me=make_user(9, "Me"), responses={functions.channels.GetFullChannelRequest: no_discussion}
+    )
+    _per_account(monkeypatch, {DEFAULT_ACCOUNT: client})
+    return client
+
+
+def _started(paths: Paths) -> int:
+    """Start a session from ``@tbrent`` with a horizon reaching the fixture's 2025 posts."""
+    result = runner.invoke(
+        cli.app,
+        ["research", "start", "who rents flats", "-s", "@tbrent", "--since-days", "3650"],
+    )
+    assert result.exit_code == 0, result.output
+    assert "started research session 1 as account default" in result.stdout
+    return 1
+
+
+def _stores(paths: Paths) -> tuple[Any, Any]:
+    conn = db.connect(paths)
+    db.migrate(conn)
+    return conn, research_db.open_store(paths)
+
+
+def test_research_refuses_every_command_while_disabled(tmp_home: Path) -> None:
+    paths = _research_home(tmp_home, extra="")
+    for args in (["status"], ["candidates", "1"], ["approve", "1", "2"], ["stop", "1"]):
+        result = runner.invoke(cli.app, ["research", *args])
+        assert result.exit_code == 1, args
+        assert "error: research is disabled" in result.stderr
+        assert "enabled = true" in result.stderr
+    assert not paths.research_db_file.exists(), "a refusal opens no research store"
+
+
+def test_research_loop_through_the_cli(tmp_home: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    paths = _research_home(tmp_home)
+    client = _research_client(monkeypatch)
+    session_id = _started(paths)
+
+    discovered = runner.invoke(cli.app, ["research", "discover", str(session_id)])
+    assert discovered.exit_code == 0, discovered.output
+    assert "1 leads, 1 new candidates" in discovered.stdout
+    assert "probed 1: 0 unavailable" in discovered.stdout
+    assert [n for n, _ in client.calls if n in ("iter_messages", "get_messages")] == []
+
+    listed = runner.invoke(cli.app, ["research", "candidates", str(session_id)])
+    assert listed.exit_code == 0, listed.output
+    lines = listed.stdout.splitlines()
+    assert lines[0] == '1. @tb_flats  "Tbilisi flats"  channel'
+    assert lines[1] == "   status proposed, depth 1, corroboration 1, question overlap 1"
+    assert lines[2] == "   member: no  cached: no  authorized: -"
+    assert lines[3] == f"   mention {RENT_PEER}/1: flats at @tb_flats"
+
+    stopped = runner.invoke(cli.app, ["research", "run", str(session_id)])
+    assert stopped.exit_code == 0, stopped.output
+    assert "0 messages stored" in stopped.stdout, "nothing approved, nothing fetched"
+    assert config.load(paths).sources == []
+
+    terminal = _answer(monkeypatch, "y\n")
+    conn, rdb = _stores(paths)
+    try:
+        item = ApprovalItem(candidate_id=1, actions=("fetch", "add_source"))
+        cfg = config.load(paths)
+        summary = research.approval_summary(rdb, conn, cfg, session_id, [item])
+    finally:
+        rdb.close()
+        conn.close()
+    approved = runner.invoke(cli.app, ["research", "approve", str(session_id), "1"])
+    assert approved.exit_code == 0, approved.output
+    assert terminal.asked[0] == f"{summary}\n\n", "the terminal shows exactly the summary"
+    assert terminal.asked[1] == "approve all of the above? [y/N]: "
+    assert "approved for candidate 1: fetch, add_source" in approved.stdout
+
+    status = runner.invoke(cli.app, ["research", "status", str(session_id)])
+    assert status.exit_code == 0, status.output
+    assert "approved, not carried out yet: candidate 1 (@tb_flats): fetch, add_source" in (
+        status.stdout
+    )
+
+    ran = runner.invoke(cli.app, ["research", "run", str(session_id), "--json"])
+    assert ran.exit_code == 0, ran.output
+    report = json.loads(ran.stdout)
+    assert (report["sources_added"], report["fetched"], report["messages"]) == ([1], [1], 2)
+    assert [source.id for source in config.load(paths).sources] == ["chat:@tb_flats"]
+
+    listed_json = runner.invoke(cli.app, ["research", "candidates", "1", "--json"])
+    (candidate,) = json.loads(listed_json.stdout)["candidates"]
+    assert (candidate["status"], candidate["cached"], candidate["authorized"]) == (
+        "fetched",
+        True,
+        [],
+    )
+
+    ended = runner.invoke(cli.app, ["research", "stop", str(session_id)])
+    assert ended.exit_code == 0, ended.output
+    assert "stopped research session 1; 0 unused approvals voided" in ended.stdout
+    assert [source.id for source in config.load(paths).sources] == ["chat:@tb_flats"], (
+        "stopping keeps the sources a run added"
+    )
+    again = runner.invoke(cli.app, ["research", "run", str(session_id)])
+    assert again.exit_code == 1
+    assert "research session 1 is stopped" in again.stderr
+    brief = runner.invoke(cli.app, ["research", "status", "--json"])
+    assert [s["state"] for s in json.loads(brief.stdout)["sessions"]] == ["stopped"]
+
+
+def _discovered_home(tmp_home: Path, monkeypatch: pytest.MonkeyPatch) -> Paths:
+    paths = _research_home(tmp_home)
+    _research_client(monkeypatch)
+    _started(paths)
+    result = runner.invoke(cli.app, ["research", "discover", "1"])
+    assert result.exit_code == 0, result.output
+    return paths
+
+
+def _grants(paths: Paths) -> list[Any]:
+    conn, rdb = _stores(paths)
+    try:
+        return research_db.list_grants(rdb, 1)
+    finally:
+        rdb.close()
+        conn.close()
+
+
+def test_research_approve_refuses_without_a_terminal(
+    tmp_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    paths = _discovered_home(tmp_home, monkeypatch)
+
+    result = runner.invoke(cli.app, ["research", "approve", "1", "1"], input="y\n")
+
+    assert result.exit_code == 1
+    assert "asks for a confirmation on a terminal, and there is none" in result.stderr
+    assert "run `grepogram research approve 1 1:fetch,add_source` yourself" in result.stderr
+    assert _grants(paths) == [], "stdin never answers for the human"
+
+
+def test_research_approve_grants_nothing_on_a_no(
+    tmp_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    paths = _discovered_home(tmp_home, monkeypatch)
+    _answer(monkeypatch, "n\n")
+
+    result = runner.invoke(cli.app, ["research", "approve", "1", "1:fetch,add_source"])
+
+    assert result.exit_code == 0, result.output
+    assert result.stdout.strip() == "nothing approved"
+    assert _grants(paths) == []
+
+
+def test_research_approve_records_the_cli_channel_and_the_text_shown(
+    tmp_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    paths = _discovered_home(tmp_home, monkeypatch)
+    terminal = _answer(monkeypatch, "yes\n")
+
+    result = runner.invoke(cli.app, ["research", "approve", "1", "1:fetch,add_source"])
+
+    assert result.exit_code == 0, result.output
+    (grant,) = _grants(paths)
+    assert (grant.via, grant.actions) == ("cli", ("fetch", "add_source"))
+    assert terminal.asked[0] == f"{grant.summary}\n\n"
+    assert "next: grepogram research run 1" in result.stdout
+
+
+def test_research_approve_has_no_option_that_answers_for_the_human(
+    tmp_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    paths = _discovered_home(tmp_home, monkeypatch)
+    for flag in ("--yes", "-y", "--force"):
+        result = runner.invoke(cli.app, ["research", "approve", "1", "1", flag])
+        assert result.exit_code != 0, flag
+    assert _grants(paths) == []
+
+
+def test_research_approve_refuses_an_invalid_approval_before_asking(
+    tmp_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    paths = _discovered_home(tmp_home, monkeypatch)
+    terminal = _answer(monkeypatch, "y\n")
+
+    fetch_only = runner.invoke(cli.app, ["research", "approve", "1", "1:fetch"])
+    malformed = runner.invoke(cli.app, ["research", "approve", "1", "flats"])
+
+    assert fetch_only.exit_code == malformed.exit_code == 1
+    assert "approve `add_source` together with `fetch`" in fetch_only.stderr
+    assert "hint: approve it as 1:fetch,add_source" in fetch_only.stderr
+    assert "'flats' is not an approval item" in malformed.stderr
+    assert terminal.asked == [] and _grants(paths) == []
+
+
+def test_research_skip_exclude_and_unexclude_need_no_terminal(
+    tmp_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _discovered_home(tmp_home, monkeypatch)
+
+    skipped = runner.invoke(cli.app, ["research", "skip", "1", "1"])
+    excluded = runner.invoke(cli.app, ["research", "exclude", "@tb_flats", "--reason", "spam"])
+    lifted = runner.invoke(cli.app, ["research", "unexclude", "1", "--session", "1"])
+    again = runner.invoke(cli.app, ["research", "unexclude", "@tb_flats"])
+
+    assert skipped.stdout.strip() == "skipped: 1"
+    assert (
+        excluded.stdout.strip() == "excluded @tb_flats from every session (1 candidates set aside)"
+    )
+    assert "no longer excluded: @tb_flats" in lifted.stdout
+    assert again.stdout.strip() == "none of them was excluded"
+    listed = runner.invoke(cli.app, ["research", "candidates", "1", "--status", "proposed"])
+    assert listed.stdout.startswith("1. @tb_flats")
+    unknown = runner.invoke(cli.app, ["research", "candidates", "1", "--status", "maybe"])
+    assert unknown.exit_code == 1 and "unknown candidate status 'maybe'" in unknown.stderr
+
+
+def test_research_status_lists_sessions(tmp_home: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    paths = _research_home(tmp_home)
+    empty = runner.invoke(cli.app, ["research", "status"])
+    assert empty.exit_code == 0, empty.output
+    assert empty.stdout.startswith("no research sessions")
+    _started(paths)
+
+    listed = runner.invoke(cli.app, ["research", "status"])
+    one = runner.invoke(cli.app, ["research", "status", "1"])
+    unknown = runner.invoke(cli.app, ["research", "status", "9"])
+
+    assert listed.stdout.splitlines() == [
+        "session  state   account  candidates  runs  question",
+        "1        active  default  0           0     who rents flats",
+    ]
+    assert one.stdout.splitlines()[:2] == [
+        'research session 1 (active): "who rents flats"',
+        f"account: default; seed chats: {RENT_PEER}",
+    ]
+    assert "sources since" in one.stdout and "candidates: none yet" in one.stdout
+    assert unknown.exit_code == 1 and "no research session 9" in unknown.stderr
+
+
+def test_research_start_refuses_an_unknown_seed_or_account(tmp_home: Path) -> None:
+    _research_home(tmp_home)
+
+    seed = runner.invoke(cli.app, ["research", "start", "q", "-s", "@nowhere"])
+    account = runner.invoke(cli.app, ["research", "start", "q", "-s", "@tbrent", "-a", "work"])
+
+    assert seed.exit_code == 1 and "no indexed chat matches '@nowhere'" in seed.stderr
+    assert account.exit_code == 1 and "unknown account 'work'" in account.stderr
+
+
+def test_research_discover_offline_asks_telegram_nothing(
+    tmp_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    paths = _research_home(tmp_home)
+    _started(paths)
+
+    def no_client(*args: object) -> None:
+        raise AssertionError("an offline discover builds no client")
+
+    monkeypatch.setattr(tg, "make_client", no_client)
+    result = runner.invoke(cli.app, ["research", "discover", "1", "--offline", "--json"])
+
+    assert result.exit_code == 0, result.output
+    report = json.loads(result.stdout)
+    assert (report["new_candidates"], report["probe"]) == ([1], None)
+
+
+def test_research_discover_without_a_session_points_at_offline(tmp_home: Path) -> None:
+    paths = _research_home(tmp_home)
+    _started(paths)
+    paths.session_file.unlink()
+
+    result = runner.invoke(cli.app, ["research", "discover", "1"])
+
+    assert result.exit_code == 1
+    assert "run: grepogram auth" in result.stderr
+    assert "grepogram research discover 1 --offline" in result.stderr

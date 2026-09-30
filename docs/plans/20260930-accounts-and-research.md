@@ -849,14 +849,34 @@ voided_at)`, `exclusions(identity PRIMARY KEY, reason, created_at)`,
 
 **Files:**
 - Modify: `grepogram/cli.py`, `tests/test_cli.py`
+- Modify: `grepogram/research.py` (the approval grammar and the JSON documents the CLI and
+  task 18's MCP tools share), `tests/test_research.py`, `tests/fakes.py` (`no_discussion` moved
+  there from `tests/test_research.py`)
 
-- [ ] `research` sub-app: `start`, `discover`, `candidates` (evidence, member / cached /
+- [x] `research` sub-app: `start`, `discover`, `candidates` (evidence, member / cached /
   authorized columns), `approve SESSION ID[:actions]…` (prints the summary, reads the answer
   from `/dev/tty`, refuses with no TTY, no `--yes`), `skip`, `exclude`, `unexclude`, `run`,
   `status`, `stop`; `--json` where the readers have it
-- [ ] tests: approve refuses without a TTY and grants with a simulated TTY answer, candidates
+  ➕ `approve` writes the exact `approval_summary` to the controlling terminal it reads the
+  answer from (`cli._terminal`, Task 8), never stdout, so an agent capturing stdout cannot hide
+  the text from the human who answers; it grants with `via="cli"` and that summary. Without a
+  terminal the refusal's hint is the exact command (`research.approve_command`). Grammar
+  (`research.parse_approval` / `approval_args`): `ID:join,fetch,…`, a bare `ID` =
+  `research.default_actions` (fetch + add_source, plus `join` / `request` only for a private
+  chat the account is not in), `global_search` / `paid_search` for the session. `start` takes
+  `--seed/-s` (repeatable), `--account` and limit overrides; `discover --offline` asks Telegram
+  nothing; `candidates --status`, `--evidence N`. `--json` on `start`, `discover`, `candidates`,
+  `run`, `status`, printing `research.session_document` / `report_document` /
+  `candidates_document` / `status_document` (the MCP tools answer with the same). A candidate
+  document drops the account's `access_hash`. Every research command refuses before opening
+  `research.db` while research is disabled
+- [x] tests: approve refuses without a TTY and grants with a simulated TTY answer, candidates
   rendering, stop keeps sources
-- [ ] run checks — must pass before task 18
+  ➕ plus: stdin never answers, a "no" grants nothing, no `--yes` / `-y` / `--force`, invalid
+  approvals refused before asking, the whole loop start → discover → candidates → approve → run
+  → stop through the CLI, skip / exclude / unexclude, status listing, offline discover builds no
+  client, disabled refusal; library tests for the grammar, defaults and documents
+- [x] run checks — must pass before task 18
 
 ### Task 18: MCP research tools and consent through elicitation
 

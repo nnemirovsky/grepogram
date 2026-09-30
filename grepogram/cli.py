@@ -14,6 +14,12 @@ add`` and ``leave`` take ``--account`` (``default`` when omitted, the account a 
 prune`` use every signed-in account at once. ``accounts rm`` and ``leave`` change things a
 config edit cannot undo, so they ask on the controlling terminal (:func:`_terminal`) and refuse
 without one; no option answers for the human.
+``research`` drives :mod:`grepogram.research` over ``research.db`` and refuses every command while
+``[research] enabled`` is false. ``research approve`` is the CLI's consent channel: it writes the
+exact :func:`~grepogram.research.approval_summary` to the controlling terminal and reads the answer
+there, so the text the grant records is the text the human read; with no terminal it refuses, and
+no option approves in its place. Its ``--json`` readers print the documents the MCP research
+tools answer with (``research.*_document``).
 One search spans every account's chats: ``search --account`` scopes it to what an account reaches
 (a scope, not isolation) and every hit and message names the accounts its chat came through.
 
@@ -36,7 +42,7 @@ from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import asdict
 from enum import StrEnum
 from pathlib import Path
-from typing import Annotated, NoReturn, TextIO
+from typing import Annotated, Any, NoReturn, TextIO
 
 import typer
 from telethon import TelegramClient, functions, types, utils
@@ -51,6 +57,8 @@ from grepogram import (
     filters,
     index,
     media,
+    research,
+    research_db,
     search,
     sources,
     sync,
@@ -68,9 +76,12 @@ from grepogram.models import (
     AccountRow,
     ChatRow,
     Config,
+    DiscoverReport,
     MediaReport,
     MessageView,
     PruneReport,
+    ResearchSession,
+    RunReport,
     SearchResult,
     SyncReport,
 )
@@ -89,7 +100,12 @@ sources_app = typer.Typer(help="Manage indexed sources (folders and chats).", no
 accounts_app = typer.Typer(help="List or remove signed-in Telegram accounts.", no_args_is_help=True)
 app.add_typer(config_app, name="config")
 app.add_typer(sources_app, name="sources")
+research_app = typer.Typer(
+    help="Explore beyond the indexed chats: discover, approve and fetch new ones (opt-in).",
+    no_args_is_help=True,
+)
 app.add_typer(accounts_app, name="accounts")
+app.add_typer(research_app, name="research")
 
 TERMINAL = "/dev/tty"
 """Where :func:`_terminal` asks a confirmation: the controlling terminal, never stdin, so a
@@ -1367,6 +1383,514 @@ async def _leave(
             channel = await catalog.entity(found.id)
             await client(functions.channels.LeaveChannelRequest(channel=channel))
     return found
+
+
+# --- research ----------------------------------------------------------------------------------
+
+_SESSION_HELP = "The research session, as `grepogram research status` lists it."
+SessionArg = Annotated[int, typer.Argument(help=_SESSION_HELP, min=1)]
+JsonOption = Annotated[
+    bool, typer.Option("--json", help="Print the result as JSON and nothing else.")
+]
+_RESEARCH_ERRORS = (research.ResearchError, FilterError, ConfigError)
+
+
+@contextlib.contextmanager
+def _research_store() -> Iterator[tuple[Paths, Config, sqlite3.Connection, sqlite3.Connection]]:
+    """The paths, config, index and ``research.db`` a research command works on; refuses
+    before opening anything more while ``[research] enabled`` is false."""
+    paths, cfg, conn = _load()
+    try:
+        research.require_enabled(cfg)
+        rdb = research_db.open_store(paths)
+    except research.ResearchError as exc:
+        conn.close()
+        fail(str(exc), hint=exc.hint)
+    except (db.SchemaError, sqlite3.Error) as exc:
+        conn.close()
+        fail(str(exc))
+    try:
+        yield paths, cfg, conn, rdb
+    finally:
+        rdb.close()
+        conn.close()
+
+
+def _echo_json(document: object) -> None:
+    typer.echo(json.dumps(document, ensure_ascii=False, indent=2))
+
+
+def _ids(values: Iterable[int]) -> str:
+    return ", ".join(str(value) for value in values) or "-"
+
+
+@research_app.command("start")
+def research_start(
+    question: Annotated[str, typer.Argument(help="What the research is about, in your words.")],
+    seed: Annotated[
+        list[str],
+        typer.Option(
+            "--seed",
+            "-s",
+            help="An indexed chat to start from, as `search --chat` takes it (repeatable).",
+        ),
+    ],
+    account: AccountOption = None,
+    max_depth: Annotated[
+        int | None, typer.Option("--max-depth", min=1, help="Hops from a seed (\\[research]).")
+    ] = None,
+    max_candidates: Annotated[
+        int | None,
+        typer.Option("--max-candidates", min=1, help="New candidates per discover call."),
+    ] = None,
+    probe_limit: Annotated[
+        int | None, typer.Option("--probe-limit", min=1, help="Probes per discover call.")
+    ] = None,
+    since_days: Annotated[
+        int | None,
+        typer.Option("--since-days", min=1, help="History horizon of the sources a run adds."),
+    ] = None,
+    max_messages: Annotated[
+        int | None, typer.Option("--max-messages", min=1, help="Messages one run may store.")
+    ] = None,
+    budget: Annotated[
+        int | None, typer.Option("--budget", min=1, help="Seconds one run may take.")
+    ] = None,
+    as_json: JsonOption = False,
+) -> None:
+    """Start a research session: a question, the indexed chats to start from and the account
+    that later joins and fetches (offline). Limits default to the [research] section."""
+    overrides = {
+        "max_depth": max_depth,
+        "max_candidates": max_candidates,
+        "probe_limit": probe_limit,
+        "since_days": since_days,
+        "max_messages_per_run": max_messages,
+        "run_budget_s": budget,
+    }
+    with _research_store() as (_, cfg, conn, rdb):
+        try:
+            name = _known_account(cfg, account or DEFAULT_ACCOUNT)
+            limits = dataclasses.replace(
+                cfg.research.limits(), **{k: v for k, v in overrides.items() if v is not None}
+            )
+            session = research.start_session(rdb, conn, cfg, question, seed, name, limits)
+        except _RESEARCH_ERRORS as exc:
+            fail(str(exc), hint=getattr(exc, "hint", None))
+    if as_json:
+        _echo_json(research.session_document(session))
+        return
+    typer.echo(f"started research session {session.id} as account {session.account}")
+    typer.echo(f"seed chats: {_ids(session.seeds)}")
+    typer.echo(f"next: grepogram research discover {session.id}")
+
+
+@research_app.command("discover")
+def research_discover(
+    session_id: SessionArg,
+    offline: Annotated[
+        bool,
+        typer.Option(
+            "--offline",
+            help="Only read the indexed messages; ask Telegram nothing (no probing, no search).",
+        ),
+    ] = False,
+    as_json: JsonOption = False,
+) -> None:
+    """Find the chats the session's chats lead to, then probe the best of them on Telegram
+    (title, size, membership — never their history) and run the global searches a human
+    approved. Every find is only proposed."""
+    with _research_store() as (paths, cfg, conn, rdb):
+        try:
+            session = research.active_session(rdb, session_id)
+            if offline:
+                report = research.discover_offline(rdb, conn, cfg, session.id)
+            else:
+                _require_api_keys(cfg, paths)
+                tg.ensure_session_mode(paths, session.account)
+                client = tg.make_client(cfg, paths, session.account)
+                report = asyncio.run(_discover(client, rdb, conn, cfg, session))
+        except (tg.AuthRequired, tg.SessionError) as exc:
+            fail(
+                str(exc),
+                hint=f"to read the index alone: grepogram research discover {session_id} --offline",
+            )
+        except (tg_errors.RPCError, ConnectionError) as exc:
+            fail(f"telegram error: {exc}")
+        except _RESEARCH_ERRORS as exc:
+            fail(str(exc), hint=getattr(exc, "hint", None))
+    if as_json:
+        _echo_json(research.report_document(report))
+        return
+    _print_discover(report)
+
+
+async def _discover(
+    client: TelegramClient,
+    rdb: sqlite3.Connection,
+    conn: sqlite3.Connection,
+    cfg: Config,
+    session: ResearchSession,
+) -> DiscoverReport:
+    async with tg.connected(client, session.account):
+        return await research.discover(rdb, conn, cfg, session.id, client)
+
+
+def _print_discover(report: DiscoverReport) -> None:
+    typer.echo(
+        f"read {report.chats_scanned} chats ({report.messages_scanned} messages): "
+        f"{report.leads} leads, {len(report.new_candidates)} new candidates, "
+        f"{len(report.updated_candidates)} with new evidence"
+    )
+    if report.text_fallback:
+        typer.echo(
+            f"note: {report.text_fallback} messages stored before links were captured were read "
+            "by their visible text only; their hidden links and buttons were not seen"
+        )
+    if report.beyond_depth or report.excluded or report.over_cap:
+        more = "; the next discover reads the rest again" if report.truncated else ""
+        typer.echo(
+            f"left out: {report.beyond_depth} beyond the depth limit, {report.excluded} "
+            f"excluded, {report.over_cap} over the candidate cap{more}"
+        )
+    for search_report in report.searches:
+        state = f"{search_report.results} results" if search_report.ran else "not run"
+        typer.echo(
+            f"{search_report.kind} {search_report.query!r}: {state}, "
+            f"{len(search_report.new_candidates)} new candidates"
+        )
+        for warning in search_report.warnings:
+            typer.echo(f"warning: {warning}", err=True)
+    probe = report.probe
+    if probe is not None:
+        typer.echo(
+            f"probed {len(probe.probed)}: {len(probe.unavailable)} unavailable, "
+            f"{len(probe.unresolvable)} unresolvable, {len(probe.children)} found in shared "
+            f"folders; {probe.remaining} left to probe"
+        )
+        for warning in probe.warnings:
+            typer.echo(f"warning: {warning}", err=True)
+    typer.echo(f"next: grepogram research candidates {report.session_id}")
+
+
+@research_app.command("candidates")
+def research_candidates(
+    session_id: SessionArg,
+    status: Annotated[
+        list[str] | None,
+        typer.Option("--status", help="Only candidates in this status (repeatable)."),
+    ] = None,
+    evidence: Annotated[
+        int, typer.Option("--evidence", min=0, help="Evidence lines shown per candidate.")
+    ] = 3,
+    as_json: JsonOption = False,
+) -> None:
+    """List a session's candidates, best corroborated first, with the evidence that led to each
+    and three separate facts: member (the account is in it), cached (the index holds it) and
+    authorized (what a human approved) (offline)."""
+    with _research_store() as (_, cfg, conn, rdb):
+        try:
+            document = research.candidates_document(rdb, conn, cfg, session_id, status)
+        except _RESEARCH_ERRORS as exc:
+            fail(str(exc), hint=getattr(exc, "hint", None))
+    if as_json:
+        _echo_json(document)
+        return
+    _print_candidates(document, evidence)
+
+
+_YES_NO = {True: "yes", False: "no", None: "unknown"}
+
+
+def _print_candidates(document: Mapping[str, Any], shown: int) -> None:
+    candidates: list[dict[str, Any]] = document["candidates"]
+    if not candidates:
+        typer.echo(f"no candidates; run: grepogram research discover {document['session_id']}")
+        return
+    for n, c in enumerate(candidates):
+        if n:
+            typer.echo("")
+        facts = [c["type"] or "not probed yet"]
+        if c["participants"] is not None:
+            facts.append(f"{c['participants']:,} members")
+        if c["request_needed"]:
+            facts.append("admins approve who joins")
+        title = f'  "{c["title"]}"' if c["title"] else ""
+        typer.echo(f"{c['id']}. {c['identity']}{title}  {', '.join(facts)}")
+        typer.echo(
+            f"   status {c['status']}, depth {c['depth']}, corroboration {c['corroboration']}, "
+            f"question overlap {c['overlap']}"
+        )
+        if c["cached"]:
+            via = ", ".join(c["cached_accounts"]) or "an import"
+            cached = f"yes (via {via})"
+        else:
+            cached = "no"
+        typer.echo(
+            f"   member: {_YES_NO[c['member']]}  cached: {cached}  "
+            f"authorized: {', '.join(c['authorized']) or '-'}"
+        )
+        if c["note"]:
+            typer.echo(f"   note: {c['note']}")
+        found: list[dict[str, Any]] = c["evidence"]
+        for item in found[:shown]:
+            where = "" if item["chat_id"] is None else f" {item['chat_id']}/{item['msg_id']}"
+            text = " ".join((item["snippet"] or "").split())
+            typer.echo(f"   {item['via']}{where}: {text or '-'}")
+        if len(found) > shown:
+            typer.echo(f"   … {len(found) - shown} more (--evidence or --json)")
+
+
+@research_app.command("approve")
+def research_approve(
+    session_id: SessionArg,
+    items: Annotated[
+        list[str],
+        typer.Argument(
+            help="ID:action,… per candidate (join, request, fetch, add_source; a bare ID "
+            "approves what indexing it takes), or global_search / paid_search for the session."
+        ),
+    ],
+) -> None:
+    """Approve named candidates and actions, after reading exactly what they do.
+
+    The summary is shown and the answer read on the controlling terminal, never stdin, so no
+    pipe and no agent can answer for you; without a terminal this refuses. Approving a chat
+    approves nothing found inside it.
+    """
+    with _research_store() as (_, cfg, conn, rdb):
+        try:
+            wanted = research.with_default_actions(rdb, session_id, research.parse_approval(items))
+            summary = research.approval_summary(rdb, conn, cfg, session_id, wanted)
+            command = " ".join(
+                ["research approve", str(session_id), *research.approval_args(wanted)]
+            )
+            with _terminal(command) as tty:
+                tty.write(f"{summary}\n\n")
+                confirmed = _ask(tty, "approve all of the above?")
+            if not confirmed:
+                typer.echo("nothing approved")
+                return
+            granted = research.grant(rdb, conn, cfg, session_id, wanted, via="cli", summary=summary)
+        except NoTerminal as exc:
+            fail(str(exc), hint=exc.hint)
+        except _RESEARCH_ERRORS as exc:
+            fail(str(exc), hint=getattr(exc, "hint", None))
+    for approved in granted:
+        target = (
+            "the session"
+            if approved.candidate_id is None
+            else (f"candidate {approved.candidate_id}")
+        )
+        typer.echo(f"approved for {target}: {', '.join(approved.actions)}")
+    typer.echo(f"next: grepogram research run {session_id}")
+
+
+@research_app.command("skip")
+def research_skip(
+    session_id: SessionArg,
+    candidate_ids: Annotated[list[int], typer.Argument(help="Candidates to set aside.")],
+) -> None:
+    """Set candidates aside; their approvals are voided. Needs no confirmation: it only
+    narrows what the session does."""
+    with _research_store() as (_, cfg, _conn, rdb):
+        try:
+            skipped = research.skip(rdb, cfg, session_id, candidate_ids)
+        except _RESEARCH_ERRORS as exc:
+            fail(str(exc), hint=getattr(exc, "hint", None))
+    typer.echo(f"skipped: {_ids(skipped)}")
+
+
+_REFS_HELP = "Candidate ids (with --session), @usernames, t.me links or marked chat ids."
+_SESSION_OPTION_HELP = "The session the candidate ids belong to."
+
+
+@research_app.command("exclude")
+def research_exclude(
+    refs: Annotated[list[str], typer.Argument(help=_REFS_HELP)],
+    session_id: Annotated[
+        int | None, typer.Option("--session", "-s", min=1, help=_SESSION_OPTION_HELP)
+    ] = None,
+    reason: Annotated[
+        str | None, typer.Option("--reason", help="Why, for `research status` later.")
+    ] = None,
+) -> None:
+    """Never propose these chats again, in any session; their approvals are voided."""
+    with _research_store() as (_, cfg, _conn, rdb):
+        try:
+            excluded = research.exclude(rdb, cfg, refs, session_id=session_id, reason=reason)
+        except _RESEARCH_ERRORS as exc:
+            fail(str(exc), hint=getattr(exc, "hint", None))
+    for identity, moved in excluded.items():
+        typer.echo(f"excluded {identity} from every session ({moved} candidates set aside)")
+
+
+@research_app.command("unexclude")
+def research_unexclude(
+    refs: Annotated[list[str], typer.Argument(help=_REFS_HELP)],
+    session_id: Annotated[
+        int | None, typer.Option("--session", "-s", min=1, help=_SESSION_OPTION_HELP)
+    ] = None,
+) -> None:
+    """Lift exclusions: the chats are proposed again, and nothing is approved."""
+    with _research_store() as (_, cfg, _conn, rdb):
+        try:
+            lifted = research.unexclude(rdb, cfg, refs, session_id=session_id)
+        except _RESEARCH_ERRORS as exc:
+            fail(str(exc), hint=getattr(exc, "hint", None))
+    if not lifted:
+        typer.echo("none of them was excluded")
+    for identity in lifted:
+        typer.echo(f"no longer excluded: {identity} (proposed again, nothing approved)")
+
+
+@research_app.command("run")
+def research_run(session_id: SessionArg, as_json: JsonOption = False) -> None:
+    """Carry out what a human approved — joins, admission requests, new sources and their
+    history — within the session's time and message budgets, then look one hop further (and
+    only propose). Resumable: run it again to go on."""
+    with _research_store() as (paths, cfg, conn, rdb):
+        try:
+            session = research.active_session(rdb, session_id)
+            _require_api_keys(cfg, paths)
+            clients = _signed_in_clients(cfg, paths)
+            embedder = _optional_embedder(cfg)
+            report = asyncio.run(_research_run(clients, rdb, conn, cfg, paths, session, embedder))
+        except (tg.AuthRequired, tg.SessionError) as exc:
+            fail(str(exc), hint=getattr(exc, "hint", None))
+        except (tg_errors.RPCError, ConnectionError) as exc:
+            fail(f"telegram error: {exc}")
+        except _RESEARCH_ERRORS as exc:
+            fail(str(exc), hint=getattr(exc, "hint", None))
+    if as_json:
+        _echo_json(research.report_document(report))
+        return
+    _print_run(report)
+
+
+async def _research_run(
+    clients: Mapping[str, TelegramClient],
+    rdb: sqlite3.Connection,
+    conn: sqlite3.Connection,
+    cfg: Config,
+    paths: Paths,
+    session: ResearchSession,
+    embedder: Embedder | None,
+) -> RunReport:
+    async with tg.connected_all(clients) as live:
+        _warn_refused(live.refused)
+        return await research.run(
+            rdb, conn, cfg, paths, live.clients, session.id, embedder=embedder
+        )
+
+
+def _print_run(report: RunReport) -> None:
+    typer.echo(f"research session {report.session_id}: {report.messages} messages stored")
+    for label, ids in (
+        ("admitted", report.admitted),
+        ("joined", report.joined),
+        ("waiting for admission", report.pending_admission),
+        ("sources added", report.sources_added),
+        ("fetched", report.fetched),
+        ("partly fetched, the next run goes on", report.partial),
+        ("unavailable", report.unavailable),
+        ("failed", report.failed),
+    ):
+        if ids:
+            typer.echo(f"{label}: {_ids(ids)}")
+    if report.stopped_by is not None:
+        typer.echo(f"stopped by: {report.stopped_by}; run it again to go on")
+    if report.discovery is not None:
+        typer.echo(f"new candidates proposed: {len(report.discovery.new_candidates)}")
+    for warning in report.warnings:
+        typer.echo(f"warning: {warning}", err=True)
+    typer.echo(f"next: grepogram research candidates {report.session_id}")
+
+
+@research_app.command("status")
+def research_status(
+    session_id: Annotated[
+        int | None, typer.Argument(help="One session in full; every session when omitted.")
+    ] = None,
+    as_json: JsonOption = False,
+) -> None:
+    """Every research session in brief, or one in full: its progress, the approvals a run has
+    yet to carry out and the admission requests still waiting (offline)."""
+    with _research_store() as (_, cfg, _conn, rdb):
+        try:
+            document = research.status_document(rdb, cfg, session_id)
+        except _RESEARCH_ERRORS as exc:
+            fail(str(exc), hint=getattr(exc, "hint", None))
+    if as_json:
+        _echo_json(document)
+        return
+    if session_id is None:
+        _print_sessions(document["sessions"])
+    else:
+        _print_session_status(document)
+
+
+def _print_sessions(sessions: Sequence[Mapping[str, Any]]) -> None:
+    if not sessions:
+        typer.echo(
+            'no research sessions; start one: grepogram research start "<question>" -s <chat>'
+        )
+        return
+    rows = [
+        (
+            str(s["id"]),
+            s["state"],
+            s["account"],
+            str(s["candidates"]),
+            str(s["runs"]),
+            s["question"],
+        )
+        for s in sessions
+    ]
+    _print_table(("session", "state", "account", "candidates", "runs", "question"), rows)
+
+
+def _print_session_status(document: Mapping[str, Any]) -> None:
+    session = document["session"]
+    limits = session["limits"]
+    progress = session["progress"]
+    typer.echo(f'research session {session["id"]} ({session["state"]}): "{session["question"]}"')
+    typer.echo(f"account: {session['account']}; seed chats: {_ids(session['seeds'])}")
+    typer.echo(
+        f"limits: depth {limits['max_depth']}, {limits['max_candidates']} candidates and "
+        f"{limits['probe_limit']} probes per discover, sources since {session['horizon']}, "
+        f"{limits['max_messages_per_run']} messages and {limits['run_budget_s']} s per run"
+    )
+    counts = ", ".join(f"{n} {status}" for status, n in document["candidates"].items())
+    typer.echo(f"candidates: {counts or 'none yet'}")
+    runs = progress.get("runs", 0)
+    if runs:
+        last = progress.get("last_run", {})
+        stopped = last.get("stopped_by")
+        tail = f", last stopped by {stopped}" if stopped else ""
+        typer.echo(f"runs: {runs}, {progress.get('messages', 0)} messages stored{tail}")
+    for pending in document["pending_grants"]:
+        target = (
+            "the session"
+            if pending["candidate_id"] is None
+            else f"candidate {pending['candidate_id']} ({pending['identity']})"
+        )
+        typer.echo(f"approved, not carried out yet: {target}: {', '.join(pending['actions'])}")
+    for waiting in document["pending_admission"]:
+        typer.echo(f"waiting for admission: candidate {waiting['id']} ({waiting['identity']})")
+
+
+@research_app.command("stop")
+def research_stop(session_id: SessionArg) -> None:
+    """Stop a session: it explores no further and approvals it has not used are voided. Every
+    source its runs added stays; remove one with `grepogram sources rm`."""
+    with _research_store() as (_, cfg, _conn, rdb):
+        try:
+            voided = research.stop(rdb, cfg, session_id)
+        except _RESEARCH_ERRORS as exc:
+            fail(str(exc), hint=getattr(exc, "hint", None))
+    typer.echo(f"stopped research session {session_id}; {voided} unused approvals voided")
+    typer.echo("the sources its runs added stay configured")
 
 
 @config_app.command("path")
