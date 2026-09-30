@@ -60,7 +60,6 @@ from telethon.tl import functions, types
 
 from grepogram import db, dialogs, index, leads, tg, units
 from grepogram.accounts import (
-    REROUTE_ERRORS,
     UNAVAILABLE_ERRORS,
     Refusal,
     StoredPass,
@@ -2747,9 +2746,11 @@ async def _confirmed_gone(
     before it answered empty, so a chat one account reaches costs what it always did. A flood
     wait stops the account (:meth:`StoredPass.stop`) and a Telegram error is reported, both
     ending the turn. A shared chat Telegram refuses to one account outright
-    (:data:`REROUTE_ERRORS`) drops that account from ``witnesses`` for the rest of the chat: it
-    sees nothing, so it hides nothing either — but when no witness answered at all, nothing is
-    removed.
+    (:data:`UNAVAILABLE_ERRORS`) drops that account from ``witnesses`` for the rest of the chat:
+    it sees nothing, so it hides nothing either — but when no witness answered at all, nothing
+    is removed. A peer the account's client cannot address (``ValueError``: its cache was never
+    warmed for it) is no such answer — the account is unknown, not refused, and may still hold
+    what the others answer empty — so it ends the turn with nothing removed, like any error.
     """
     asked = list(page)
     answered = False
@@ -2769,10 +2770,12 @@ async def _confirmed_gone(
             tg.reraise_unauthorized(exc, account)
         except (errors.RPCError, ValueError) as exc:
             log.warning("chat %s (%s) through account %s: %s", chat.id, chat.title, account, exc)
-            if chat.is_shared and isinstance(exc, REROUTE_ERRORS):
+            if chat.is_shared and isinstance(exc, UNAVAILABLE_ERRORS):
                 witnesses.remove(account)
                 refusal = Refusal(account, str(exc), exc)
                 continue
+            # a ValueError is the client failing to address the peer — a local miss, never
+            # Telegram's word — so that account stays a witness and the turn ends here
             route.warn(account, f"chat {chat.id} ({chat.title}): {exc}")
             return None
         empty = _empty_slots(asked, answer)

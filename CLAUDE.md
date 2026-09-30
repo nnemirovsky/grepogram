@@ -213,8 +213,9 @@ never change the git identity.
   that account's queue; a scoped chat never falls back. `prune-deleted` removes a message only
   when **every** account `recorded_reach` names answers it empty (`sync._confirmed_gone`): an
   account that joined late may see history as empty that another still reads, so one of them
-  absent or flood-stopped leaves the chat untouched, and only an account refused the chat
-  outright is passed over. `only=` narrows the fetch to the chats
+  absent or flood-stopped leaves the chat untouched, and only an account Telegram refused the
+  chat outright (`UNAVAILABLE_ERRORS`) is passed over — a peer its client cannot address
+  (`ValueError`) is a local miss, not a refusal, and ends the chat's turn with nothing removed. `only=` narrows the fetch to the chats
   the named sources cover while every source is still resolved, so a narrowed run never moves a
   primary. `index_pending`, `index_stranded`, the re-cut and embedding stay once per run, and a
   report's warnings read `account <name>: …` only when an account other than `default` is in

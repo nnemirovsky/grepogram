@@ -4293,6 +4293,28 @@ async def test_an_account_refused_the_chat_outright_is_no_witness(
     assert _texts(conn, PRIV_ID) == {1: "club 1", 3: "club 3"}
 
 
+async def test_an_account_whose_client_cannot_address_the_chat_is_still_a_witness(
+    conn: sqlite3.Connection, paths: Paths
+) -> None:
+    """A ``ValueError`` is the client failing to address the peer — a cache never warmed for
+    it — and not Telegram refusing the account: that account may still read the message the
+    other one answers empty, so nothing of the chat is removed this run."""
+    world = _world()
+    cfg = _shared_club()
+    await _run_accounts({DEFAULT_ACCOUNT: _home(world), WORK: _work(world)}, conn, paths, cfg)
+    lost = _home(world, failures={PRIV_ID: ValueError("Could not find the input entity")})
+    work = _work(world)
+    work.messages[PRIV_ID] = [m for m in work.messages[PRIV_ID] if m.id != 2]
+
+    report = await _prune_accounts({DEFAULT_ACCOUNT: lost, WORK: work}, conn, paths, cfg)
+
+    assert report.removed == 0 and report.chats_remaining == [PRIV_ID]
+    assert report.warnings == [
+        f"account {DEFAULT_ACCOUNT}: chat {PRIV_ID} (Private club): Could not find the input entity"
+    ]
+    assert _texts(conn, PRIV_ID) == {1: "club 1", 2: "club 2", 3: "club 3"}
+
+
 async def test_a_world_client_reads_as_its_account() -> None:
     """The fake itself: per-account access hashes, and a private group refused to a
     non-member while a public channel reads without joining."""
