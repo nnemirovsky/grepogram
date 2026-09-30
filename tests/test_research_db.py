@@ -308,6 +308,7 @@ def _grant(
         summary="join @a as default",
         search_kinds=["chat_search"] if "global_search" in actions else [],
         stars_max=10 if "paid_search" in actions else None,
+        join_route="username" if {"join", "request"} & set(actions) else None,
         now=1,
     )
 
@@ -332,9 +333,11 @@ def test_grants_record_the_channel_and_stay_live_until_used(rdb: sqlite3.Connect
         actions=["join", "fetch", "join", "add_source"],
         via="elicitation",
         summary="join @a",
+        join_route="username",
         now=3,
     )
     assert grant.via == "elicitation" and grant.actions == ("join", "fetch", "add_source")
+    assert grant.join_route == "username"
     assert grant.live and grant.granted_at == 3 and grant.summary == "join @a"
     assert research_db.live_grants(rdb, sid, cand.id) == [grant]
     assert research_db.live_grants(rdb, sid, None) == []
@@ -581,6 +584,117 @@ def test_pins_and_directories_are_remembered_beside_the_cursor(rdb: sqlite3.Conn
     assert (cursor.depth, cursor.lead_seq, cursor.pins_read_at, cursor.directory) == (1, 7, 5, True)
     fresh = research_db.mark_pins_read(rdb, sid, ChatKey("work", 3), depth=0, now=8)
     assert (fresh.depth, fresh.lead_seq, fresh.index_id, fresh.directory) == (0, 0, None, False)
+
+
+def test_step_four_leaves_an_earlier_join_grant_with_no_route(rdb: sqlite3.Connection) -> None:
+    """A v3 file's join grants recorded no way in: step 4 adds the column and fills nothing, so
+    a run fails such a candidate for a new approval rather than choose a route for it."""
+    v3 = research_db.connect(":memory:")
+    try:
+        for version in (1, 2, 3):
+            for statement in research_db.MIGRATIONS[version]:
+                v3.execute(statement)
+        v3.execute("INSERT INTO meta(key, value) VALUES ('schema_version', '3')")
+        v3.execute(
+            "INSERT INTO sessions(id, question, account, limits, created_at) "
+            "VALUES (1, 'q', 'default', '{}', 1)"
+        )
+        v3.execute(
+            "INSERT INTO candidates(id, session_id, identity, kind, depth, created_at) "
+            "VALUES (1, 1, '@x', 'username', 1, 1)"
+        )
+        v3.execute(
+            "INSERT INTO grants(session_id, candidate_id, account, actions, via, summary, "
+            "granted_at) VALUES (1, 1, 'default', '[\"join\"]', 'cli', 'join @x', 2)"
+        )
+
+        assert research_db.migrate(v3) == research_db.SCHEMA_VERSION
+
+        (grant,) = research_db.list_grants(v3, 1)
+        assert grant.actions == ("join",) and grant.join_route is None
+    finally:
+        v3.close()
+
+
+@pytest.mark.parametrize(
+    ("actions", "route", "match"),
+    [
+        (["join"], None, "names the route"),
+        (["request"], None, "names the route"),
+        (["fetch", "add_source"], "id", "names the route"),
+        (["join"], "folder", "unknown join route"),
+        (["join"], "folder:x", "unknown join route"),
+        (["join"], "folder:0", "unknown join route"),
+        (["join"], f"folder:{2**70}", "unknown join route"),
+        (["join"], "by-magic", "unknown join route"),
+    ],
+)
+def test_a_join_grant_names_a_real_route_and_only_it_does(
+    rdb: sqlite3.Connection, actions: list[str], route: str | None, match: str
+) -> None:
+    sid = _session(rdb)
+    cand = research_db.add_candidate(rdb, sid, "@a", "username", 1)
+    assert cand is not None
+    with pytest.raises(ValueError, match=match):
+        research_db.add_grant(
+            rdb,
+            session_id=sid,
+            candidate_id=cand.id,
+            account="default",
+            actions=actions,  # type: ignore[arg-type]
+            via="cli",
+            summary="s",
+            join_route=route,
+        )
+    assert research_db.list_grants(rdb, sid) == []
+    for good in ("invite", "username", "id", "folder:7"):
+        grant = research_db.add_grant(
+            rdb,
+            session_id=sid,
+            candidate_id=cand.id,
+            account="default",
+            actions=["join"],
+            via="cli",
+            summary="s",
+            join_route=good,
+        )
+        assert grant.join_route == good
+
+
+@pytest.mark.parametrize("decided", ["granted", "approved", "skipped", "joined"])
+def test_a_candidate_carrying_a_decision_is_never_given_a_parent(
+    rdb: sqlite3.Connection, decided: str
+) -> None:
+    """The folder a chat turns up in after a human decided on it is a way in nobody approved:
+    finding it there again, under the same identity or another spelling, leaves no parent."""
+    sid = _session(rdb)
+    folder = research_db.add_candidate(rdb, sid, "addlist/F", "addlist", 1, addlist_slug="F")
+    chat = research_db.add_candidate(
+        rdb, sid, "peer:-1000000000042", "peer", 2, peer_id=-1000000000042
+    )
+    assert folder is not None and chat is not None
+    if decided == "granted":
+        _grant(rdb, sid, chat.id, ["join"])
+    else:
+        research_db.update_candidate(rdb, chat.id, status=decided)
+    for identity in ("peer:-1000000000042", "@renamed"):
+        again = research_db.add_candidate(
+            rdb, sid, identity, "peer", 2, peer_id=-1000000000042, parent_id=folder.id
+        )
+        assert again is not None and again.id == chat.id and again.parent_id is None
+
+
+def test_an_undecided_candidate_takes_the_folder_it_is_found_in(rdb: sqlite3.Connection) -> None:
+    sid = _session(rdb)
+    folder = research_db.add_candidate(rdb, sid, "addlist/F", "addlist", 1, addlist_slug="F")
+    chat = research_db.add_candidate(
+        rdb, sid, "peer:-1000000000042", "peer", 2, peer_id=-1000000000042
+    )
+    assert folder is not None and chat is not None and chat.parent_id is None
+    again = research_db.add_candidate(
+        rdb, sid, "peer:-1000000000042", "peer", 2, peer_id=-1000000000042, parent_id=folder.id
+    )
+    assert again is not None and again.parent_id == folder.id
 
 
 def test_step_two_names_v1_chats_by_scope_and_peer(rdb: sqlite3.Connection) -> None:

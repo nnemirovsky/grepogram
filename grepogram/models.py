@@ -729,6 +729,10 @@ class Grant:
     """The searches a ``global_search`` grant covers, as its summary named them."""
     stars_max: int | None = None
     """The most a ``paid_search`` grant may pay, as its summary named it."""
+    join_route: str | None = None
+    """How a ``join`` or ``request`` grant gets the account in, as its summary named it:
+    ``invite``, ``username``, ``id`` or ``folder:<candidate id>``
+    (:func:`grepogram.research_db.check_join_route`)."""
 
     @property
     def live(self) -> bool:

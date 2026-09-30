@@ -547,7 +547,9 @@ grepogram research stop 1            # explores no further; the sources it added
   `request`.
 - **run** re-checks pending admission requests — one no admin answered within
   `admission_timeout_days` is given up as `failed`, and approving `request` again sends a new one
-  — and joins or requests exactly the approved chats.
+  — and joins or requests exactly the approved chats, each the way its approval said (its invite
+  link, its username, its id or the shared folder named); a way in that is gone by then fails
+  the chat for a new approval rather than taking another one.
   It adds each as a source of the session's account, with history back to the session's horizon
   (`since_days` before the session started) and comments for a channel. It joins and adds the
   very chat the probe saw: every source it adds names the chat by its id — a public chat read

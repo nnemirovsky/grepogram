@@ -29,6 +29,9 @@ The tables:
     one human approval each: the concrete actions on one candidate, or session-wide search
     actions, by one account, **through one channel** — ``elicitation`` or ``cli``, enforced by
     a ``CHECK`` and by :func:`add_grant`, the only writer, which takes it as a required argument.
+    A session-wide grant keeps the terms its summary named (step 3: ``search_kinds``,
+    ``stars_max``), and a ``join`` or ``request`` the way in it named (step 4: ``join_route``),
+    the only one a run takes.
 ``exclusions``
     identities research never proposes again, in any session; global and persistent.
 ``searches``
@@ -246,7 +249,14 @@ _V3: tuple[str, ...] = (
     "ALTER TABLE grants ADD COLUMN stars_max INTEGER",
 )
 
-MIGRATIONS: dict[int, tuple[str, ...]] = {1: _V1, 2: _V2, 3: _V3}
+_V4: tuple[str, ...] = (
+    # how a join or an admission request gets the account in, as the approval's summary named
+    # it: "invite", "username", "id" or "folder:<candidate id>". A run takes that route and no
+    # other — a shared folder that lists the chat after the approval adds nothing to it
+    "ALTER TABLE grants ADD COLUMN join_route TEXT",
+)
+
+MIGRATIONS: dict[int, tuple[str, ...]] = {1: _V1, 2: _V2, 3: _V3, 4: _V4}
 """Schema version → the step that brings the file to it, from 1 without a gap (the test suite
 checks that); append-only."""
 SCHEMA_VERSION = max(MIGRATIONS)
@@ -569,7 +579,9 @@ def add_candidate(
     together, and ``peer_id`` / ``username`` name that chat here (:func:`candidate_for`). A
     candidate's peer id is fixed once known: an identity whose row a probe tied to *another*
     peer (a username that moved since) cannot name ``peer_id``'s chat, which is recorded as
-    ``peer:<peer_id>`` instead. An
+    ``peer:<peer_id>`` instead. A candidate that carries a decision — a grant, ever, or any
+    status but ``proposed`` — is never given a parent: the folder it is found in afterwards is
+    a way in no approval of it named. An
     excluded chat, under any spelling it is known by (:func:`excluded_by`), gets no row at all
     and answers ``None`` — exclusions are global, so no session proposes one again.
     """
@@ -601,7 +613,9 @@ def add_candidate(
                        username = COALESCE(username, ?),
                        invite_hash = COALESCE(invite_hash, ?),
                        addlist_slug = COALESCE(addlist_slug, ?),
-                       parent_id = COALESCE(parent_id, ?)
+                       parent_id = CASE WHEN status = 'proposed' AND NOT EXISTS (
+                           SELECT 1 FROM grants WHERE grants.candidate_id = candidates.id)
+                           THEN COALESCE(parent_id, ?) ELSE parent_id END
                    WHERE id = ? RETURNING *""",
                 (depth, peer_id, username, invite_hash, addlist_slug, parent_id, known.id),
             ).fetchone()
@@ -616,7 +630,9 @@ def add_candidate(
                    username = COALESCE(username, excluded.username),
                    invite_hash = COALESCE(invite_hash, excluded.invite_hash),
                    addlist_slug = COALESCE(addlist_slug, excluded.addlist_slug),
-                   parent_id = COALESCE(parent_id, excluded.parent_id)
+                   parent_id = CASE WHEN status = 'proposed' AND NOT EXISTS (
+                       SELECT 1 FROM grants WHERE grants.candidate_id = candidates.id)
+                       THEN COALESCE(parent_id, excluded.parent_id) ELSE parent_id END
                RETURNING *""",
             (
                 session_id,
@@ -968,6 +984,7 @@ def _grant(row: sqlite3.Row) -> Grant:
         voided_at=row["voided_at"],
         search_kinds=tuple(json.loads(row["search_kinds"] or "[]")),
         stars_max=row["stars_max"],
+        join_route=row["join_route"],
     )
 
 
@@ -982,6 +999,7 @@ def add_grant(
     summary: str,
     search_kinds: Sequence[SearchKind] = (),
     stars_max: int | None = None,
+    join_route: str | None = None,
     now: int | None = None,
 ) -> Grant:
     """Record one human approval — the only way a grant comes to exist.
@@ -997,7 +1015,8 @@ def add_grant(
     A session-wide grant carries the terms its summary named, and only those count when it is
     used: ``search_kinds`` — the searches a ``global_search`` covers, at least one — and
     ``stars_max``, the most a ``paid_search`` may pay. Neither goes on a grant without the
-    action it bounds.
+    action it bounds. So does a ``join`` or ``request``: ``join_route`` is the way in its
+    summary named (:func:`check_join_route`), and the only one a run may take.
     """
     _check(via, _CHANNELS, "grant channel")
     if not summary.strip():
@@ -1018,6 +1037,10 @@ def add_grant(
         raise ValueError("a paid_search grant names the most it may pay, and only it does")
     if stars_max is not None and stars_max <= 0:
         raise ValueError(f"a paid_search grant pays at least one star, not {stars_max}")
+    if bool({"join", "request"} & set(wanted)) != (join_route is not None):
+        raise ValueError("a join or request grant names the route it takes, and only it does")
+    if join_route is not None:
+        check_join_route(join_route)
     with db.transaction(conn):
         session = get_session(conn, session_id)
         if session is None:
@@ -1035,8 +1058,8 @@ def add_grant(
                 raise KeyError(f"no candidate {candidate_id} in research session {session_id}")
         row = conn.execute(
             """INSERT INTO grants(session_id, candidate_id, account, actions, via, summary,
-                   granted_at, search_kinds, stars_max)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING *""",
+                   granted_at, search_kinds, stars_max, join_route)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING *""",
             (
                 session_id,
                 candidate_id,
@@ -1047,9 +1070,25 @@ def add_grant(
                 clock(now),
                 json.dumps(kinds) if kinds else None,
                 stars_max,
+                join_route,
             ),
         ).fetchone()
     return _grant(row)
+
+
+JOIN_ROUTES: frozenset[str] = frozenset({"invite", "username", "id"})
+"""The ways into a chat a grant can name besides a shared folder, ``folder:<candidate id>``."""
+FOLDER_ROUTE = "folder:"
+
+
+def check_join_route(route: str) -> None:
+    """Refuse a ``join_route`` that is none of :data:`JOIN_ROUTES` or ``folder:<id>``."""
+    if route in JOIN_ROUTES:
+        return
+    folder = route.removeprefix(FOLDER_ROUTE)
+    if folder != route and folder.isascii() and folder.isdigit() and _row_id(int(folder)):
+        return
+    raise ValueError(f"unknown join route {route!r}")
 
 
 def list_grants(

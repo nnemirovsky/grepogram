@@ -585,11 +585,19 @@ never change the git identity.
 - Research state lives in `research.db` (`paths.research_db_file`, next to `index.db`) and never
   in the index: the index is derived and may be deleted and rebuilt, while approvals, exclusions
   and session history are the user's decisions and nothing rebuilds them. It has its own version
-  (`research_db.SCHEMA_VERSION`, now 3) and its own append-only `research_db.MIGRATIONS`: step 2
+  (`research_db.SCHEMA_VERSION`, now 4) and its own append-only `research_db.MIGRATIONS`: step 2
   moved seeds, scan cursors and evidence from index row ids to `(scope, peer_id)` and walks a
   development build's version 1 up rather than refusing it — a file of decisions is migrated,
   never re-derived. Step 3 adds `grants.search_kinds` / `grants.stars_max`, the terms a
-  session-wide grant was given on; a grant from before it names none and authorizes no search. Its `SchemaError` subclasses `db.SchemaError`, so the existing handlers
+  session-wide grant was given on; a grant from before it names none and authorizes no search.
+  Step 4 adds `grants.join_route` — `invite`, `username`, `id` or `folder:<candidate id>`
+  (`research_db.check_join_route`), the way in a `join` / `request` grant's summary named
+  (`research._way_in_route`, required by `add_grant` for those two actions and only them).
+  **A run takes that route and no other** (`research._granted_route` → `_join_all`): one it can
+  no longer take, or a grant from before step 4 that names none, fails the candidate for a new
+  approval — never a swap to another way in. `add_candidate` never gives a parent to a
+  candidate with a grant (ever) or any status but `proposed`, so a shared folder found after a
+  decision changes neither the summary nor the join. Its `SchemaError` subclasses `db.SchemaError`, so the existing handlers
   catch it, and never advises deleting the file. Whether a candidate is *cached* is
   asked of the index every time and never stored there, and global-search results are
   candidates and evidence in `research.db`, never `messages` rows, so no sync cursor moves. Every

@@ -365,7 +365,7 @@ CREATE TABLE peer_cache(account TEXT NOT NULL, peer_id INTEGER NOT NULL, usernam
 
 A v0.2.0 index (schema 6) walks steps 7, 8 and 9 in place on first open.
 
-### research.db (own schema, `research_db.SCHEMA_VERSION = 1`; v3 as built)
+### research.db (own schema, `research_db.SCHEMA_VERSION = 1`; v4 as built)
 
 `sessions(id, question, account, seeds JSON, limits JSON, state, created_at, stopped_at)`,
 `candidates(id, session_id, identity UNIQUE per session, kind, peer_id, username, invite_hash,
@@ -385,6 +385,11 @@ development builds wrote one) is migrated, never refused.
 Version 3 adds `grants.search_kinds` and `grants.stars_max`: the searches a `global_search`
 approval covers and the most a `paid_search` one pays, as the summary named them, so raising
 either in the config later widens no live grant.
+
+Version 4 adds `grants.join_route` (`invite`, `username`, `id`, `folder:<candidate id>`): the
+way in a `join` or `request` approval's summary named. A run takes exactly that route, and a
+candidate whose recorded route is gone (or a grant from before version 4) is failed for a new
+approval; a candidate carrying a decision is never given a parent folder afterwards.
 
 ### Consent flow
 

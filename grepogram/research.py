@@ -2145,21 +2145,55 @@ def _live_actions(
     }
 
 
-def _join_route(candidate: Candidate, parent: Candidate | None) -> str | None:
-    """How a run would get ``candidate``'s account in, in words; ``None`` when it has no way."""
+def _way_in_route(rdb: sqlite3.Connection, candidate: Candidate, action: str) -> str | None:
+    """How a run would take ``action`` — ``join`` or ``request`` — into ``candidate`` as things
+    stand, as a grant records it (:func:`grepogram.research_db.check_join_route`): its invite
+    link, its public username, the shared folder it was found in (a join only), or its id and
+    the access hash its probe stored; ``None`` when there is no way in. What an approval
+    records is what the run takes (:func:`_granted_route`), whatever the candidate learns later.
+    """
     if candidate.kind == "invite" and candidate.invite_hash:
-        return f"through the invite link t.me/+{shown(candidate.invite_hash)}"
+        return "invite"
     if candidate.username:
-        return f"through its public username @{shown(candidate.username)}"
-    if parent is not None and parent.kind == "addlist" and parent.addlist_slug:
-        folder = f"{_quoted(parent.title)} " if parent.title else ""
-        return (
-            f"through the shared folder {folder}(t.me/addlist/{shown(parent.addlist_slug)}); "
-            "Telegram also adds that folder to the account's chat folders"
-        )
+        return "username"
+    if action == "join" and candidate.parent_id is not None:
+        parent = research_db.get_candidate(rdb, candidate.parent_id)
+        if parent is not None and parent.kind == "addlist" and parent.addlist_slug:
+            return f"{research_db.FOLDER_ROUTE}{parent.id}"
     if candidate.type in ("channel", "supergroup") and candidate.access_hash is not None:
-        return "by its id"
+        return "id"
     return None
+
+
+def _route_folder(rdb: sqlite3.Connection, candidate: Candidate, route: str) -> Candidate | None:
+    """The shared folder a ``folder:<id>`` route names, while it is still one of the candidate's
+    session with a link to join through; ``None`` for any other route."""
+    folder_id = route.removeprefix(research_db.FOLDER_ROUTE)
+    if folder_id == route:
+        return None
+    parent = research_db.get_candidate(rdb, int(folder_id))
+    if parent is None or parent.session_id != candidate.session_id:
+        return None
+    if parent.kind != "addlist" or not parent.addlist_slug:
+        return None
+    return parent
+
+
+def _route_words(rdb: sqlite3.Connection, candidate: Candidate, route: str) -> str:
+    """``route`` in the words an approval summary shows."""
+    if route == "invite":
+        return f"through the invite link t.me/+{shown(candidate.invite_hash or '')}"
+    if route == "username":
+        return f"through its public username @{shown(candidate.username or '')}"
+    if route == "id":
+        return "by its id"
+    parent = _route_folder(rdb, candidate, route)
+    assert parent is not None and parent.addlist_slug is not None  # only built for a live folder
+    folder = f"{_quoted(parent.title)} " if parent.title else ""
+    return (
+        f"through the shared folder {folder}(t.me/addlist/{shown(parent.addlist_slug)}); "
+        "Telegram also adds that folder to the account's chat folders"
+    )
 
 
 def _candidate_entry(
@@ -2209,12 +2243,7 @@ def _candidate_entry(
             refuse("an admission request is already waiting for the chat's admins")
         if candidate.request_needed:
             refuse("joining it needs its admins' approval: approve `request` instead of `join`")
-        parent = (
-            None
-            if candidate.parent_id is None
-            else research_db.get_candidate(rdb, candidate.parent_id)
-        )
-        if _join_route(candidate, parent) is None:
+        if _way_in_route(rdb, candidate, "join") is None:
             refuse("there is no way to join it: no username, invite link or shared folder names it")
     if "request" in new:
         if member:
@@ -2223,6 +2252,8 @@ def _candidate_entry(
             refuse("an admission request is already waiting for the chat's admins")
         if not candidate.request_needed:
             refuse("`request` is only for a chat whose invite asks for its admins' approval")
+        if _way_in_route(rdb, candidate, "request") is None:
+            refuse("there is no way to ask to join it: no username or invite link names it")
     if {"join", "request"} <= effective:
         refuse("`join` and `request` are two ways in; approve one of them")
     if "fetch" in effective and "add_source" not in effective:
@@ -2345,14 +2376,14 @@ def _action_line(
     candidate holds once this approval is granted, the ones already live included."""
     account = session.account
     since = horizon(session)
-    if action == "join":
-        parent = None if c.parent_id is None else research_db.get_candidate(rdb, c.parent_id)
-        route = _join_route(c, parent) or ""
-        return f"join it as {account} {route}; the account becomes a member, visible to its admins"
-    if action == "request":
+    if action in ("join", "request"):
+        route = _way_in_route(rdb, c, action)
+        way = "" if route is None else f" {_route_words(rdb, c, route)}"
+        if action == "join":
+            return f"join it as {account}{way}; the account becomes a member, visible to its admins"
         return (
-            f"send a request to join it as {account}; its admins see the request and decide, "
-            "and the account joins only once they admit it"
+            f"send a request to join it as {account}{way}; its admins see the request and "
+            "decide, and the account joins only once they admit it"
         )
     covering = _covering_source(conn, cfg, session, c)
     if action == "fetch":
@@ -2547,7 +2578,14 @@ def grant(
             groups = [entry.actions] if candidate is not None else [(a,) for a in entry.actions]
             for actions in groups:
                 # a session grant keeps the terms the summary named (_session_line): the kinds
-                # of search and the stars, read from the config at the time the human read them
+                # of search and the stars, read from the config at the time the human read them;
+                # a join or request keeps the way in its line named, the only one a run takes
+                way_in = next((a for a in actions if a in ("join", "request")), None)
+                route = (
+                    None
+                    if candidate is None or way_in is None
+                    else _way_in_route(rdb, candidate, way_in)
+                )
                 granted.append(
                     research_db.add_grant(
                         rdb,
@@ -2561,6 +2599,7 @@ def grant(
                         stars_max=(
                             cfg.research.paid_stars_max if "paid_search" in actions else None
                         ),
+                        join_route=route,
                         now=stamp,
                     )
                 )
@@ -2867,15 +2906,32 @@ def _way_in(rdb: sqlite3.Connection, candidate: Candidate) -> CandidateAction | 
     return None
 
 
-def _folder_parent(rdb: sqlite3.Connection, candidate: Candidate) -> Candidate | None:
-    """The shared folder a candidate joins through: one with no username and no invite of its
-    own that was found in a folder (:func:`_join_route`)."""
-    if candidate.username or candidate.kind == "invite" or candidate.parent_id is None:
-        return None
-    parent = research_db.get_candidate(rdb, candidate.parent_id)
-    if parent is None or parent.kind != "addlist" or not parent.addlist_slug:
-        return None
-    return parent
+def _granted_route(rdb: sqlite3.Connection, candidate: Candidate, action: str) -> str | None:
+    """The way in the live grant approving ``action`` on ``candidate`` recorded — the newest
+    one, should several — or ``None`` when none did (a grant from before routes were
+    recorded)."""
+    for grant in reversed(research_db.live_grants(rdb, candidate.session_id, candidate.id)):
+        if action in grant.actions:
+            return grant.join_route
+    return None
+
+
+def _route_blocked(rdb: sqlite3.Connection, candidate: Candidate, route: str | None) -> str | None:
+    """Why the recorded ``route`` cannot be taken into ``candidate`` now, or ``None`` when it
+    can; a run never swaps it for another way in, since the approval showed this one."""
+    if route is None:
+        return "its approval names no way in"
+    if route == "invite":
+        return None if candidate.kind == "invite" and candidate.invite_hash else "no invite link"
+    if route == "username":
+        known = candidate.username or candidate.access_hash is not None
+        return None if known else "its username is gone"
+    if route == "id":
+        known = candidate.peer_id is not None and candidate.access_hash is not None
+        return None if known else "no access hash addresses it"
+    if _route_folder(rdb, candidate, route) is None:
+        return "the shared folder it was approved through is gone"
+    return None
 
 
 async def _join_all(
@@ -2888,22 +2944,34 @@ async def _join_all(
     budget: sync.SyncBudget,
     stamp: int,
 ) -> bool:
-    """Join, or ask to join, every candidate of ``work`` a live grant says to; ``True`` when a
-    flood wait stopped the run. The chats of one shared folder go in one request naming exactly
-    the approved ones."""
+    """Join, or ask to join, every candidate of ``work`` a live grant says to, **by the route
+    that grant recorded** and no other; ``True`` when a flood wait stopped the run. The chats
+    of one shared folder go in one request naming exactly the approved ones. A candidate whose
+    recorded route cannot be taken any more — or whose grant recorded none — is ``failed`` for
+    a new approval that shows the way in there is now: a chat approved to join by its id is
+    never joined through a folder that listed it afterwards, which would add that folder to the
+    account's chat folders without anyone having read so."""
     folders: dict[int, tuple[Candidate, list[Candidate]]] = {}
     for candidate in work:
-        route = _way_in(rdb, candidate)
-        if route is None:
+        action = _way_in(rdb, candidate)
+        if action is None:
             continue
-        parent = _folder_parent(rdb, candidate) if route == "join" else None
+        current = _fresh(rdb, candidate)
+        route = _granted_route(rdb, current, action)
+        blocked = _route_blocked(rdb, current, route)
+        if blocked is not None:
+            note = f"{blocked}; nothing was sent — approve it again to see how it would go in now"
+            _refuse_candidate(rdb, session, current, "failed", note, report)
+            continue
+        assert route is not None  # _route_blocked refuses a missing one
+        parent = _route_folder(rdb, current, route) if action == "join" else None
         if parent is not None:
-            folders.setdefault(parent.id, (parent, []))[1].append(candidate)
+            folders.setdefault(parent.id, (parent, []))[1].append(current)
             continue
         if budget.expired:
             return False
         try:
-            await _join_one(client, rdb, conn, session, candidate, route, report, stamp)
+            await _join_one(client, rdb, conn, session, current, action, route, report, stamp)
         except errors.FloodError as exc:
             _flood_note(report, exc, "joining more chats")
             return True
@@ -2951,19 +3019,21 @@ async def _join_one(
     session: ResearchSession,
     candidate: Candidate,
     route: CandidateAction,
+    way: str,
     report: RunReport,
     stamp: int,
 ) -> None:
     """Take ``route`` — ``join`` or ``request``, authorized by :func:`_way_in` just before — into
-    one chat.
+    one chat, the ``way`` its grant recorded (:func:`_granted_route`).
 
-    An invite goes through ``messages.importChatInvite``, anything else through
-    ``channels.joinChannel``; for a chat whose admins approve joins either one sends the
-    admission request, which is what a ``request`` grant approved.
+    An ``invite`` way goes through ``messages.importChatInvite``, a ``username`` or ``id`` one
+    through ``channels.joinChannel`` on the probed peer (:func:`_input_channel`); for a chat
+    whose admins approve joins either one sends the admission request, which is what a
+    ``request`` grant approved.
     """
     account = session.account
     try:
-        if candidate.kind == "invite" and candidate.invite_hash:
+        if way == "invite" and candidate.invite_hash:
             request: Any = functions.messages.ImportChatInviteRequest(hash=candidate.invite_hash)
         else:
             request = functions.channels.JoinChannelRequest(
@@ -3047,7 +3117,7 @@ async def _join_folder(
     the folder no longer lists is ``unavailable``; one the account is already in is ``joined``.
     """
     slug = parent.addlist_slug
-    assert slug is not None  # _folder_parent only groups folders with a slug
+    assert slug is not None  # _route_folder only names folders with a slug
     account = session.account
     try:
         answer = await client(functions.chatlists.CheckChatlistInviteRequest(slug=slug))

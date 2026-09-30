@@ -1313,7 +1313,10 @@ def test_the_summary_says_what_the_index_holds_and_how_a_request_works(
         f'Candidate {gated.id}: "Gated" (invite link t.me/+JoinMe), supergroup, 812 members, '
         "its admins approve who joins"
     ) in text
-    assert "send a request to join it as default; its admins see the request and decide" in text
+    assert (
+        "send a request to join it as default through the invite link t.me/+JoinMe; its admins "
+        "see the request and decide"
+    ) in text
     assert "discussion group" not in text.split(f"Candidate {gated.id}")[1]
 
 
@@ -1602,6 +1605,7 @@ def test_a_grant_for_another_account_is_never_written(
             actions=["join"],
             via="cli",
             summary="join as work",
+            join_route="username",
         )
 
     assert not research.authorized(rdb, flats, "join")
@@ -2013,6 +2017,92 @@ async def test_only_the_approved_chats_of_a_shared_folder_are_joined(
     ), "a chat found in the same folder is never acted on without its own approval"
     assert config.load(paths).sources == [], "a join-only approval adds no source"
     assert report.discovery is None
+
+
+def _by_id(rdb: sqlite3.Connection, session: ResearchSession) -> Candidate:
+    """The private folder chat as a candidate known by its id alone, probed with the access
+    hash this account holds for it: no username, no invite, no folder — joinable "by its id"."""
+    marked = _marked(FOLDER_PRIVATE)
+    return _probed(
+        rdb,
+        session,
+        f"peer:{marked}",
+        kind="peer",
+        title="Folder private",
+        type="supergroup",
+        member=False,
+        access_hash=FakeWorld.access_hash("default", marked),
+    )
+
+
+async def test_a_chat_approved_to_join_by_its_id_is_never_joined_through_a_folder_found_later(
+    rdb: sqlite3.Connection, conn: sqlite3.Connection, paths: Paths
+) -> None:
+    """The approval said "by its id"; a shared folder listing the chat that discover probes
+    afterwards gives it no parent, and the run joins by id — never through the folder, which
+    would also add that folder to the account's chat folders without anyone having read so."""
+    client = _run_client(_run_world())
+    session = _start(rdb, conn, (str(SEED),))
+    private = _by_id(rdb, session)
+    summary = research.approval_summary(rdb, conn, CFG, session.id, [_item(private, "join")])
+    assert "join it as default by its id;" in summary
+    (grant,) = _approve(rdb, conn, session, _item(private, "join"))
+    assert grant.join_route == "id"
+    _store(conn, SEED, 1, "see t.me/addlist/Tbilisi1", links=(("link", "addlist/Tbilisi1"),))
+
+    await research.discover(rdb, conn, CFG, session.id, client, now=6)
+
+    folder = research_db.candidate_by_identity(rdb, session.id, "addlist/Tbilisi1")
+    assert folder is not None and folder.probed_at is not None
+    assert _status(rdb, private).parent_id is None, "a decided candidate takes no parent"
+
+    report = await _run(rdb, conn, paths, client, session)
+
+    (join,) = [r for r in client.requests if isinstance(r, functions.channels.JoinChannelRequest)]
+    assert join.channel.channel_id == FOLDER_PRIVATE.id, "the way the approval named"
+    assert report.unavailable == [private.id] and report.joined == [], (
+        "a private chat refuses a join by id — the folder that would have let the account in "
+        "was never shown to anyone"
+    )
+    assert client.chatlist_joins == [] and "Tbilisi1" not in client.chatlists_joined
+    assert _marked(FOLDER_PRIVATE) not in client.members
+
+
+async def test_a_run_takes_the_folder_route_its_approval_recorded(
+    rdb: sqlite3.Connection, conn: sqlite3.Connection, paths: Paths
+) -> None:
+    client = _run_client(_run_world())
+    session, found = await _discovered(rdb, conn, client, "https://t.me/addlist/Tbilisi1")
+    folder = found["addlist/Tbilisi1"]
+    private = found[f"peer:{_marked(FOLDER_PRIVATE)}"]
+    (grant,) = _approve(rdb, conn, session, _item(private, "join"))
+    assert grant.join_route == f"folder:{folder.id}"
+
+    report = await _run(rdb, conn, paths, client, session)
+
+    assert report.joined == [private.id] and client.chatlist_joins == [[_marked(FOLDER_PRIVATE)]]
+    assert not [r for r in client.requests if isinstance(r, functions.channels.JoinChannelRequest)]
+
+
+async def test_a_grant_that_recorded_no_way_in_is_failed_for_a_new_approval(
+    rdb: sqlite3.Connection, conn: sqlite3.Connection, paths: Paths
+) -> None:
+    """A join grant from before routes were recorded names no way in, so the run does not pick
+    one for it: the candidate is ``failed`` and takes a new approval that shows the way."""
+    client = _run_client(_run_world())
+    session = _start(rdb, conn, (str(SEED),))
+    private = _by_id(rdb, session)
+    (grant,) = _approve(rdb, conn, session, _item(private, "join"))
+    rdb.execute("UPDATE grants SET join_route = NULL WHERE id = ?", (grant.id,))
+
+    report = await _run(rdb, conn, paths, client, session)
+
+    assert report.failed == [private.id] and report.joined == []
+    stored = _status(rdb, private)
+    assert stored.status == "failed" and "names no way in" in (stored.note or "")
+    assert _live(rdb, private) == [] and client.requests == []
+    again = research.approval_summary(rdb, conn, CFG, session.id, [_item(private, "join")])
+    assert "by its id" in again
 
 
 async def test_an_imported_folder_takes_its_missing_chat_through_an_update(
