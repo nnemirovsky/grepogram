@@ -1490,6 +1490,10 @@ async def _joined_to_thread[T](job: Callable[[], T], abort: Callable[[], None] |
     only when the process is killed outright, and then the ``messages.indexed`` flags its
     transaction never cleared make the next run rebuild and repair what it left
     (:func:`index_pending`, :func:`grepogram.index.repair_unit_index`).
+
+    ``abort`` is for a cancellation and nothing else: a job that *raised* has already stopped,
+    and the budget ``abort`` expires is the whole run's, shared by every account's queue — one
+    chat's failed re-cut would otherwise end every other account's fetch at its next batch.
     """
     finished = threading.Event()
 
@@ -1503,6 +1507,8 @@ async def _joined_to_thread[T](job: Callable[[], T], abort: Callable[[], None] |
     try:
         return await asyncio.shield(future)
     except BaseException:
+        if finished.is_set():
+            raise
         if abort is not None:
             abort()
         while not finished.wait(JOIN_LOG_EVERY):

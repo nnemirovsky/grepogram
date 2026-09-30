@@ -4373,6 +4373,19 @@ async def test_joined_to_thread_returns_the_result_and_propagates_failures() -> 
         await sync._joined_to_thread(explode)
 
 
+async def test_a_job_that_fails_on_its_own_does_not_abort_the_run() -> None:
+    """``abort`` expires the budget every account's queue shares; a job that raised has stopped
+    already, so only a cancellation may call it — one chat's failure must not end the others."""
+    budget = SyncBudget()
+
+    def explode() -> int:
+        raise sqlite3.IntegrityError("gone")
+
+    with pytest.raises(sqlite3.IntegrityError):
+        await sync._joined_to_thread(explode, budget.cancel)
+    assert not budget.expired and not budget.cancelled
+
+
 async def test_edit_refetch_re_queues_a_photo_replaced_by_a_document(
     conn: sqlite3.Connection,
 ) -> None:
