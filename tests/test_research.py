@@ -27,6 +27,7 @@ from grepogram.models import (
     ChatRow,
     Config,
     DiscoverReport,
+    GlobalSearchReport,
     Grant,
     LimitOverrides,
     LinkKind,
@@ -35,6 +36,7 @@ from grepogram.models import (
     ResearchLimits,
     ResearchSession,
     RunReport,
+    SearchKind,
     Source,
     SyncReport,
 )
@@ -993,24 +995,53 @@ def _posts_world(**kwargs: Any) -> FakeWorld:
     return _world(messages=by_chat, **kwargs)
 
 
-async def test_global_search_needs_the_switch_and_a_grant(
+async def _search(
+    client: FakeClient,
+    rdb: sqlite3.Connection,
+    conn: sqlite3.Connection,
+    cfg: Config,
+    session_id: int,
+    *,
+    kinds: list[SearchKind] | None = None,
+    now: int | None = None,
+) -> list[GlobalSearchReport]:
+    """The global searches :func:`research.discover` runs, without the rest of it: the
+    session's question, for ``kinds`` or every search the config switches on and the session's
+    grant covers — what discover decides before it hands them to ``search_telegram``."""
+    session = research.active_session(rdb, session_id)
+    granted = research.granted_kinds(rdb, session.id)
+    wanted = kinds or [kind for kind in research.search_kinds(cfg) if kind in granted]
+    question = " ".join(session.question.split())
+    return await research.search_telegram(client, rdb, conn, cfg, session, question, wanted, now)
+
+
+def _searched(client: FakeClient) -> list[tuple[str, str]]:
+    """Every global search ``client`` sent, as ``(kind, query)``."""
+    sent: list[tuple[str, str]] = []
+    for request in client.requests:
+        if isinstance(request, functions.contacts.SearchRequest):
+            sent.append(("chat_search", request.q))
+        elif isinstance(request, functions.channels.SearchPostsRequest):
+            sent.append(("post_search", request.query or ""))
+    return sent
+
+
+async def test_discover_searches_only_what_the_switches_turn_on(
     rdb: sqlite3.Connection, conn: sqlite3.Connection
 ) -> None:
+    """A grant covering both searches runs neither while ``[research]`` switches them off, and
+    only the switched-on one once a switch is."""
     session = _asking(rdb, conn, "tbilisi")
-    client = _world().client("default")
-    with pytest.raises(research.ResearchError) as off:
-        await research.global_search(client, rdb, conn, CFG, session.id, "tbilisi")
-    assert "chat_search = true" in (off.value.hint or "")
-    with pytest.raises(research.ResearchError) as ungranted:
-        await research.global_search(client, rdb, conn, SEARCH_CFG, session.id, "tbilisi")
-    assert "approve" in (ungranted.value.hint or "")
-    only_chats = Config(research=ResearchCfg(enabled=True, chat_search=True))
     _grant(rdb, session, "global_search")
-    with pytest.raises(research.ResearchError):
-        await research.global_search(
-            client, rdb, conn, only_chats, session.id, "tbilisi", kinds=["post_search"]
-        )
-    assert client.requests == [] and research_db.list_searches(rdb, session.id) == []
+    client = _world().client("default")
+
+    off = await research.discover(rdb, conn, CFG, session.id, client, now=2)
+    assert off.searches == () and _searched(client) == []
+    only_chats = Config(research=ResearchCfg(enabled=True, chat_search=True))
+    on = await research.discover(rdb, conn, only_chats, session.id, client, now=3)
+
+    assert [search.kind for search in on.searches] == ["chat_search"]
+    assert _searched(client) == [("chat_search", "tbilisi")]
 
 
 async def test_chat_search_proposes_public_chats_as_evidence_only(
@@ -1021,8 +1052,8 @@ async def test_chat_search_proposes_public_chats_as_evidence_only(
     client = _world().client("default")
     before = _counts(conn)
 
-    (report,) = await research.global_search(
-        client, rdb, conn, SEARCH_CFG, session.id, "tbilisi", kinds=["chat_search"], now=6
+    (report,) = await _search(
+        client, rdb, conn, SEARCH_CFG, session.id, kinds=["chat_search"], now=6
     )
 
     assert _counts(conn) == before, "search results never become index rows"
@@ -1047,9 +1078,7 @@ async def test_post_search_asks_the_quota_first_and_records_posts_as_evidence(
     client = _posts_world().client("default")
     before = _counts(conn)
 
-    (report,) = await research.global_search(
-        client, rdb, conn, SEARCH_CFG, session.id, "apartment", kinds=["post_search"]
-    )
+    (report,) = await _search(client, rdb, conn, SEARCH_CFG, session.id, kinds=["post_search"])
 
     assert _counts(conn) == before
     check, search = client.requests
@@ -1075,9 +1104,7 @@ async def test_a_spent_quota_is_never_paid_for_by_default(
     spent = types.SearchPostsFlood(total_daily=10, remains=0, stars_amount=50, wait_till=99)
     client = _posts_world().client("default", search_flood=spent)
 
-    (report,) = await research.global_search(
-        client, rdb, conn, SEARCH_CFG, session.id, "apartment", kinds=["post_search"]
-    )
+    (report,) = await _search(client, rdb, conn, SEARCH_CFG, session.id, kinds=["post_search"])
 
     assert not report.ran and report.wait_till == 99
     assert "paid_stars_max = 0" in report.warnings[0]
@@ -1097,21 +1124,21 @@ async def test_paying_needs_the_ceiling_and_a_separate_paid_grant_used_once(
     cheap = Config(research=ResearchCfg(enabled=True, post_search=True, paid_stars_max=20))
     client = _posts_world().client("default", search_flood=spent)
 
-    (no_grant,) = await research.global_search(client, rdb, conn, paying, session.id, "apartment")
+    (no_grant,) = await _search(client, rdb, conn, paying, session.id)
     assert not no_grant.ran and "paid_search approval" in no_grant.warnings[0]
     _grant(rdb, session, "paid_search")
-    (too_dear,) = await research.global_search(client, rdb, conn, cheap, session.id, "apartment")
+    (too_dear,) = await _search(client, rdb, conn, cheap, session.id)
     assert not too_dear.ran and "above paid_stars_max = 20" in too_dear.warnings[0]
     assert not any(isinstance(r, functions.channels.SearchPostsRequest) for r in client.requests)
 
-    (paid,) = await research.global_search(client, rdb, conn, paying, session.id, "apartment")
+    (paid,) = await _search(client, rdb, conn, paying, session.id)
 
     assert paid.ran and paid.paid_stars == 50 and len(paid.new_candidates) == 2
     (search,) = [r for r in client.requests if isinstance(r, functions.channels.SearchPostsRequest)]
     assert search.allow_paid_stars == 50
     assert not research.search_granted(rdb, session.id, "paid_search"), "a paid grant pays once"
     assert research.search_granted(rdb, session.id, "global_search")
-    (again,) = await research.global_search(client, rdb, conn, paying, session.id, "apartment")
+    (again,) = await _search(client, rdb, conn, paying, session.id)
     assert not again.ran and "paid_search approval" in again.warnings[0]
 
 
@@ -1123,7 +1150,7 @@ async def test_a_flood_wait_on_search_is_recorded_and_stops_the_searches(
     flood = errors.FloodWaitError(request=None, capture=60)
     client = _world().client("default", responses={functions.contacts.SearchRequest: flood})
 
-    reports = await research.global_search(client, rdb, conn, SEARCH_CFG, session.id, "tbilisi")
+    reports = await _search(client, rdb, conn, SEARCH_CFG, session.id)
 
     (report,) = reports
     assert report.kind == "chat_search" and report.flood_wait_s == 60 and not report.ran
@@ -1139,14 +1166,8 @@ async def test_an_excluded_search_result_is_never_proposed(
     _grant(rdb, session, "global_search")
     research_db.add_exclusion(rdb, "@tb_flats")
 
-    (report,) = await research.global_search(
-        _world().client("default"),
-        rdb,
-        conn,
-        SEARCH_CFG,
-        session.id,
-        "flats",
-        kinds=["chat_search"],
+    (report,) = await _search(
+        _world().client("default"), rdb, conn, SEARCH_CFG, session.id, kinds=["chat_search"]
     )
 
     assert report.excluded == 1 and research_db.list_candidates(rdb, session.id) == []
@@ -2878,8 +2899,8 @@ async def test_a_search_result_under_a_moved_username_never_repoints_the_approva
     _hand_over_username(client)
     _grant(rdb, session, "global_search")
 
-    (report,) = await research.global_search(
-        client, rdb, conn, SEARCH_CFG, session.id, "impostor", kinds=["chat_search"], now=6
+    (report,) = await _search(
+        client, rdb, conn, SEARCH_CFG, session.id, kinds=["chat_search"], now=6
     )
 
     _set_aside(rdb, flats, "failed")
@@ -3182,21 +3203,19 @@ def test_validation_and_the_grant_are_one_transaction(
     assert validated_inside == [True], "a skip landing in between cannot be overwritten"
 
 
-async def test_global_search_sends_only_the_session_s_question(
+async def test_discover_sends_only_the_session_s_question(
     rdb: sqlite3.Connection, conn: sqlite3.Connection
 ) -> None:
-    session = _asking(rdb, conn, "tbilisi")
+    """The one query a ``global_search`` grant's summary names is the question, so it is the
+    only text any search sends — collapsed to single spaces, as the summary shows it."""
+    session = _asking(rdb, conn, "  tbilisi   flats ")
     _grant(rdb, session, "global_search")
-    client = _world().client("default")
+    client = _posts_world().client("default")
 
-    with pytest.raises(research.ResearchError, match="only the session's question"):
-        await research.global_search(client, rdb, conn, SEARCH_CFG, session.id, "passwords")
-    assert client.requests == [] and research_db.list_searches(rdb, session.id) == []
+    report = await research.discover(rdb, conn, SEARCH_CFG, session.id, client)
 
-    (report,) = await research.global_search(
-        client, rdb, conn, SEARCH_CFG, session.id, "  tbilisi ", kinds=["chat_search"]
-    )
-    assert report.ran and report.query == "tbilisi"
+    assert [search.query for search in report.searches] == ["tbilisi flats"] * 2
+    assert _searched(client) == [("chat_search", "tbilisi flats"), ("post_search", "tbilisi flats")]
 
 
 async def test_approving_both_searches_leaves_global_search_after_one_paid_search(
@@ -3207,7 +3226,7 @@ async def test_approving_both_searches_leaves_global_search_after_one_paid_searc
     assert [g.actions for g in granted] == [("global_search",), ("paid_search",)]
     client = _posts_world().client("default", search_flood=SPENT)
 
-    (paid,) = await research.global_search(client, rdb, conn, PAYING, session.id, "apartment")
+    (paid,) = await _search(client, rdb, conn, PAYING, session.id)
 
     assert paid.ran and paid.paid_stars == 50
     assert research.search_granted(rdb, session.id, "global_search"), "reused, not burned"
@@ -3227,10 +3246,6 @@ async def test_a_search_switched_on_after_the_approval_is_not_covered_by_it(
 
     assert [search.kind for search in report.searches] == ["chat_search"]
     assert not any(isinstance(r, functions.channels.SearchPostsRequest) for r in client.requests)
-    with pytest.raises(research.ResearchError, match="does not cover post_search"):
-        await research.global_search(
-            client, rdb, conn, SEARCH_CFG, session.id, "apartment", kinds=["post_search"]
-        )
     # approving again names both searches, and only then does the post search run
     text = research.approval_summary(
         rdb, conn, SEARCH_CFG, session.id, [_item(None, "global_search")]
@@ -3250,7 +3265,7 @@ async def test_paid_stars_max_raised_after_the_approval_pays_no_more_than_it_nam
     assert [g.stars_max for g in granted] == [None, 40]
     client = _posts_world().client("default", search_flood=SPENT)  # 50 stars a search
 
-    (report,) = await research.global_search(client, rdb, conn, PAYING, session.id, "apartment")
+    (report,) = await _search(client, rdb, conn, PAYING, session.id)
 
     assert not report.ran and report.paid_stars == 0
     assert "above the 40 the paid_search approval allows" in report.warnings[0]
@@ -3260,7 +3275,7 @@ async def test_paid_stars_max_raised_after_the_approval_pays_no_more_than_it_nam
     text = research.approval_summary(rdb, conn, PAYING, session.id, [_item(None, "paid_search")])
     assert "pay up to 100 Telegram Stars" in text
     _approve(rdb, conn, session, _item(None, "paid_search"), cfg=PAYING)
-    (paid,) = await research.global_search(client, rdb, conn, PAYING, session.id, "apartment")
+    (paid,) = await _search(client, rdb, conn, PAYING, session.id)
     assert paid.ran and paid.paid_stars == 50
 
 
@@ -3282,7 +3297,7 @@ async def test_a_paid_approval_another_search_used_meanwhile_pays_nothing(
 
     monkeypatch.setattr(research, "_paid_refusal", racing)
 
-    (report,) = await research.global_search(client, rdb, conn, PAYING, session.id, "apartment")
+    (report,) = await _search(client, rdb, conn, PAYING, session.id)
 
     assert not report.ran and report.paid_stars == 0
     assert "used by another search meanwhile; nothing was paid" in report.warnings[0]
@@ -3297,10 +3312,7 @@ async def test_concurrent_searches_pay_once_for_one_approval(
     client = _posts_world().client("default", search_flood=SPENT)
 
     reports = await asyncio.gather(
-        *(
-            research.global_search(client, rdb, conn, PAYING, session.id, "apartment")
-            for _ in range(3)
-        )
+        *(_search(client, rdb, conn, PAYING, session.id) for _ in range(3))
     )
 
     paid = [r for r in client.requests if isinstance(r, functions.channels.SearchPostsRequest)]
@@ -3318,7 +3330,7 @@ async def test_a_paid_search_telegram_refuses_says_its_approval_is_spent(
         "default", search_flood=SPENT, responses={functions.channels.SearchPostsRequest: refused}
     )
 
-    (report,) = await research.global_search(client, rdb, conn, PAYING, session.id, "apartment")
+    (report,) = await _search(client, rdb, conn, PAYING, session.id)
 
     assert not report.ran
     assert "the paid search failed and its paid_search approval is spent" in report.warnings[0]

@@ -63,11 +63,11 @@ warning and leaves the rest for the next call. A shared folder's chats become ca
 their own (``via = shared_folder``, ``parent_id`` the folder), and approving the folder grants
 nothing for them.
 
-**Global search** (:func:`global_search`) runs only while ``[research]`` switches it on *and*
-the session holds a live ``global_search`` grant. Its results are candidates and evidence in
-``research.db`` — never ``messages`` rows, so no sync cursor moves. A post search pays only
-when ``paid_stars_max`` allows the price *and* a separate ``paid_search`` grant exists, which
-the paid search then consumes.
+**Global search** (:func:`search_telegram`, from :func:`discover`) runs only while
+``[research]`` switches it on *and* the session holds a live ``global_search`` grant. Its
+results are candidates and evidence in ``research.db`` — never ``messages`` rows, so no sync
+cursor moves. A post search pays only when ``paid_stars_max`` allows the price *and* a separate
+``paid_search`` grant exists, which the paid search then consumes.
 
 **A run** (:func:`run`) carries out what a human approved and nothing else: each join,
 admission request, shared-folder join, source added and fetch is preceded by :func:`authorized`
@@ -1483,19 +1483,11 @@ async def probe_candidates(
     session's ``probe_limit`` of them.
 
     A flood wait stops the pass: the report carries a warning and ``flood_wait_s``, and the
-    candidates not reached wait for the next call.
+    candidates not reached wait for the next call. The probing half of :func:`discover`, which
+    has put the client to :func:`grepogram.sync.check_account` first.
     """
     require_enabled(cfg)
-    return await _probe_pass(client, rdb, conn, active_session(rdb, session_id), now)
-
-
-async def _probe_pass(
-    client: Any,
-    rdb: sqlite3.Connection,
-    conn: sqlite3.Connection,
-    session: ResearchSession,
-    now: int | None,
-) -> ProbeReport:
+    session = active_session(rdb, session_id)
     report = ProbeReport(session_id=session.id)
     pending = [
         view.candidate
@@ -1539,10 +1531,6 @@ async def _probe_pass(
 # --- global search ---------------------------------------------------------------------------
 
 SEARCH_OFF_HINT = "set `chat_search = true` or `post_search = true` under [research]"
-SEARCH_GRANT_HINT = (
-    "global search sends the question to Telegram and needs a human's approval for this "
-    "session first: grepogram research approve"
-)
 _SEARCH_KINDS: tuple[SearchKind, ...] = ("chat_search", "post_search")
 
 
@@ -1582,68 +1570,7 @@ def _paid_ceiling(rdb: sqlite3.Connection, session_id: int) -> int:
     )
 
 
-async def global_search(
-    client: Any,
-    rdb: sqlite3.Connection,
-    conn: sqlite3.Connection,
-    cfg: Config,
-    session_id: int,
-    query: str,
-    *,
-    kinds: Sequence[SearchKind] | None = None,
-    now: int | None = None,
-) -> list[GlobalSearchReport]:
-    """Search Telegram itself for ``query``: public chats by name (``contacts.search``) and
-    public channel posts (``channels.searchPosts``), each only while ``[research]`` switches it
-    on, and both only while the session holds a live ``global_search`` grant. ``query`` must be
-    the session's question — the one query that grant's summary names — or nothing is sent.
-
-    Every chat found becomes a candidate one hop from the question (depth 1) with its result as
-    evidence — a post keeps the origin key ``post:<peer>/<msg>`` discovery gives an indexed
-    copy of it. Nothing is written to ``index.db``. A post search asks
-    ``channels.checkSearchPostsFlood`` first and sends ``allow_paid_stars`` only when the free
-    quota is spent, ``paid_stars_max`` covers the price and a ``paid_search`` grant is live —
-    consumed atomically before the request goes out, so one approval never pays twice, not even
-    for two discover calls running at once; a request Telegram refuses after that leaves the
-    approval spent and says so. Each search is recorded in ``research.db``, run or not.
-    """
-    require_enabled(cfg)
-    session = active_session(rdb, session_id)
-    enabled = search_kinds(cfg)
-    granted = granted_kinds(rdb, session.id)
-    wanted: list[SearchKind] = (
-        list(dict.fromkeys(kinds))
-        if kinds is not None
-        else [kind for kind in enabled if kind in granted]
-    )
-    off = [kind for kind in wanted if kind not in enabled]
-    if not enabled or off:
-        raise ResearchError(
-            f"global search is off: {', '.join(off or _SEARCH_KINDS)}", SEARCH_OFF_HINT
-        )
-    if not granted:
-        raise ResearchError("global search is not approved for this session", SEARCH_GRANT_HINT)
-    uncovered = [kind for kind in wanted if kind not in granted]
-    if uncovered or not wanted:
-        raise ResearchError(
-            f"this session's global_search approval does not cover "
-            f"{', '.join(uncovered or enabled)}: it names {', '.join(granted)}",
-            SEARCH_GRANT_HINT,
-        )
-    text = " ".join(query.split())
-    if not text:
-        raise ResearchError("a global search needs a query")
-    if text != " ".join(session.question.split()):
-        raise ResearchError(
-            "a global search sends only the session's question: that is the query its approval "
-            "named",
-            "start a session with this question to search for it",
-        )
-    await sync.check_account(conn, session.account, client)
-    return await _search_telegram(client, rdb, conn, cfg, session, text, wanted, now)
-
-
-async def _search_telegram(
+async def search_telegram(
     client: Any,
     rdb: sqlite3.Connection,
     conn: sqlite3.Connection,
@@ -1653,8 +1580,21 @@ async def _search_telegram(
     wanted: Sequence[SearchKind],
     now: int | None,
 ) -> list[GlobalSearchReport]:
-    """Run the searches ``wanted`` for ``text`` — whose switches, grant and query the caller
-    checked — one report each; a flood wait ends the rest."""
+    """Search Telegram itself for ``text``, one report per search ``wanted``: public chats by
+    name (``contacts.search``) and public channel posts (``channels.searchPosts``); a flood wait
+    ends the rest. The global-search half of :func:`discover`, which decides what may run — the
+    session's question alone, the one query its ``global_search`` grant's summary names, for the
+    searches ``[research]`` switches on *and* that grant covers — and puts the client to
+    :func:`grepogram.sync.check_account` first.
+
+    Every chat found becomes a candidate one hop from the question (depth 1) with its result as
+    evidence — a post keeps the origin key ``post:<peer>/<msg>`` discovery gives an indexed
+    copy of it. Nothing is written to ``index.db``. A post search asks
+    ``channels.checkSearchPostsFlood`` first and sends ``allow_paid_stars`` only when the free
+    quota is spent, ``paid_stars_max`` covers the price and a ``paid_search`` grant is live —
+    consumed atomically before the request goes out, so one approval never pays twice, not even
+    for two discover calls running at once; a request Telegram refuses after that leaves the
+    approval spent and says so. Each search is recorded in ``research.db``, run or not."""
     stamp = research_db.clock(now)
     reports: list[GlobalSearchReport] = []
     for kind in wanted:
@@ -2035,9 +1975,11 @@ async def discover(
             kind for kind in search_kinds(cfg) if kind in granted and (kind, question) not in done
         ]
         if kinds:
-            searches = await _search_telegram(client, rdb, conn, cfg, session, question, kinds, now)
+            searches = await search_telegram(client, rdb, conn, cfg, session, question, kinds, now)
     flooded = any(search.flood_wait_s is not None for search in searches)
-    probed = None if flooded else await _probe_pass(client, rdb, conn, session, now)
+    probed = (
+        None if flooded else await probe_candidates(client, rdb, conn, cfg, session.id, now=now)
+    )
     return dataclasses.replace(report, pins=pins, probe=probed, searches=tuple(searches))
 
 

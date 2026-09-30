@@ -118,7 +118,7 @@ never change the git identity.
   goes on without the account, with the one wording of why — `sync.ask_account`: a sync
   (`always=True`, then `sync._record_account` records a first sign-in), `StoredPass.start`
   (`prune-deleted`, `extract`, `recapture-links`) and the folder read of `sources prune`
-  (both through `sync.checked_accounts`, which leaves the account out with a warning), and `research.run` / `discover` / `global_search` and `grepogram leave`
+  (both through `sync.checked_accounts`, which leaves the account out with a warning), and `research.run` / `discover` (its pins, global searches and probes) and `grepogram leave`
   (before it resolves or asks; its question names the Telegram user), which refuse. A session
   swapped by hand never deletes, joins or asks as a user nobody chose. Every other client works on an in-memory
   copy (`tg.make_client` → `tg.load_session`; `tg.make_clients` for every account, reporting a
@@ -732,8 +732,9 @@ never change the git identity.
   candidate with no peer id gets no source.
   `research.grant` validates and writes in one `research.db` transaction; each session action is
   its own grant row, and a paid search pays only after `consume_grant` (one conditional
-  `UPDATE`) succeeded, so one approval never pays twice. `global_search` sends the session's
-  question and refuses any other query.
+  `UPDATE`) succeeded, so one approval never pays twice. A global search sends the session's
+  question and nothing else: `research.discover` is its only caller and picks the searches the
+  switches turn on *and* the grant covers, and `research.search_telegram` trusts it to.
 - A candidate is a chat, not a spelling. `research_db.candidate_for` finds the session's row by
   identity, peer id, username or invite hash, `add_candidate` returns that row rather than a
   second one, and a probe that ties two rows to one chat folds the undecided one into the other

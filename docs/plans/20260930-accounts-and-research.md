@@ -842,6 +842,10 @@ approval; a candidate carrying a decision is never given a parent folder afterwa
   facts; a post keeps origin key `post:<peer>/<msg>`. A paid search also needs the price within
   `paid_stars_max`, and consumes the `paid_search` grant *before* sending (one approval pays
   once); `global_search` grants are reused. Every search is recorded in `searches`, run or not.
+  ➕ review phase 2: `global_search` and its refusal stack are gone — production only ever
+  searched through `discover`, which decides the kinds itself; the search half is
+  `search_telegram(client, rdb, conn, cfg, session, text, kinds, now)`, and `discover` probes
+  through the public `probe_candidates`.
   ➕ `discover(rdb, conn, cfg, session_id, client=None)` composes offline discovery, the granted
   global searches not yet run for the session's question, and a probing pass (skipped after a
   search flood wait)
