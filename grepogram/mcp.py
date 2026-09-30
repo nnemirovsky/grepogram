@@ -119,7 +119,9 @@ chats and the `account` that will join and fetch (what a run adds is reached thr
 it came from is read with `thread` / `context` by the evidence's `chat_id`; `null` means the \
 index does not hold that chat) and its three separate facts — `member`, `cached` (and through \
 which accounts), `authorized`; tell the \
-user what was found and why, and ask which to approve; `research_approve` shows the user the \
+user what was found and why, and ask which to approve (only a candidate an online \
+`research_discover` probed can be approved; one found offline or past `probe_limit` needs \
+another online discover first); `research_approve` shows the user the \
 exact summary and only their own confirmation grants anything — when it answers with a `hint` \
 naming a terminal command, hand the user that command unchanged for them to type in their own \
 terminal, and never run it for them, not even through a shell tool; \
@@ -984,7 +986,8 @@ async def sources_add(
 
 @guarded
 def sources_remove(target: str) -> ToolResult:
-    """Remove a source and delete its chats' messages and index data (offline). `target` is a
+    """Remove a source and delete the messages and index data of the chats no other source
+    covers (offline; never leaves a chat on Telegram). `target` is a
     source id from `sources` (`folder:Argentina`, `chat:@name`, `work/chat:@name` for a source
     of the account `work`), a folder name, a chat id / `@username`, or a fuzzy title; without
     an `<account>/` prefix the default account's source is meant first. A chat that came in
@@ -1178,6 +1181,14 @@ async def research_approve(
     user that command as it is for them to type in their own terminal, and never run it
     yourself, through a shell tool or otherwise: the confirmation is theirs. Approving a chat
     approves nothing found inside it. Next: `research_run`.
+
+    Refused before anything is asked: a candidate not probed yet (run `research_discover`
+    online first), a person or a bot, a shared folder itself (approve its chats), an
+    excluded, unavailable or fetched candidate; `fetch` without `add_source`; `join` for a chat
+    whose admins approve joins (`request` instead) and `request` for any other; `join` and
+    `request` together; `fetch` / `add_source` for a private chat the account is not in without
+    `join` or `request`. `paid_search` needs `post_search` on, `paid_stars_max` above 0 and
+    `global_search` approved too.
     """
     state = _app()
     cfg = state.config()
