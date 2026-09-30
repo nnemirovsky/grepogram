@@ -1488,6 +1488,70 @@ def test_accounts_rm_refuses_while_a_sync_runs(
     assert paths.session_file_for(WORK).exists()
 
 
+def test_accounts_rm_stops_that_accounts_research_and_voids_its_grants(
+    tmp_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An approval must not outlive the account it was given to: a later sign-in under the same
+    name may be somebody else. The other account's session is left alone."""
+    paths = _synced_two_accounts(tmp_home, monkeypatch)
+    rdb = research_db.open_store(paths)
+    limits = config.load(paths).research.limits()
+    mine = research_db.create_session(rdb, question="q", account=WORK, seeds=[], limits=limits)
+    theirs = research_db.create_session(
+        rdb, question="q", account=DEFAULT_ACCOUNT, seeds=[], limits=limits
+    )
+    for session in (mine, theirs):
+        research_db.add_grant(
+            rdb,
+            session_id=session.id,
+            candidate_id=None,
+            account=session.account,
+            actions=["global_search"],
+            via="cli",
+            summary="s",
+        )
+    rdb.close()
+    _answer(monkeypatch, YES)
+    result = runner.invoke(cli.app, ["accounts", "rm", WORK])
+    assert result.exit_code == 0, result.output
+    assert "stop its research sessions and void their unused approvals" in result.stdout
+    assert "1 research sessions stopped" in result.stdout
+    rdb = research_db.open_store(paths)
+    try:
+        stopped = research_db.get_session(rdb, mine.id)
+        kept = research_db.get_session(rdb, theirs.id)
+        assert stopped is not None and stopped.state == "stopped"
+        assert kept is not None and kept.state == "active"
+        assert research_db.live_grants(rdb, mine.id, None) == []
+        assert len(research_db.live_grants(rdb, theirs.id, None)) == 1
+    finally:
+        rdb.close()
+
+
+def test_accounts_rm_is_all_or_nothing(tmp_home: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A failure after the first source was removed — here the config save itself — rolls
+    every deletion back: a chat never goes while the source that fetched it stays configured."""
+    paths = _synced_two_accounts(tmp_home, monkeypatch)
+    before = paths.config_file.read_text()
+    indexed = _chats(paths)
+
+    def refuse(*_: object) -> None:
+        raise OSError("disk full")
+
+    monkeypatch.setattr(config, "save", refuse)
+    _answer(monkeypatch, YES)
+    with pytest.raises(OSError, match="disk full"):
+        runner.invoke(cli.app, ["accounts", "rm", WORK], catch_exceptions=False)
+    assert paths.config_file.read_text() == before
+    assert _chats(paths) == indexed
+    conn = db.connect(paths)
+    try:
+        assert db.chat_accounts(conn, NEWS_PEER) == [DEFAULT_ACCOUNT, WORK]
+    finally:
+        conn.close()
+    assert paths.session_file_for(WORK).exists()
+
+
 def _leaves(client: FakeClient) -> list[Any]:
     """The requests of ``client`` that change membership, apart from the reads a resolve makes."""
     kinds = (functions.channels.LeaveChannelRequest, functions.messages.DeleteChatUserRequest)

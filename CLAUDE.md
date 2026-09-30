@@ -155,8 +155,10 @@ never change the git identity.
   covering source in config order — for a link-only discussion group to its channel's
   (`discussion_source_id`), which is why channels are decided before groups — and never onto an
   `import:` tag, and `Removed.kept_chat_ids` names what stayed. `accounts rm` removes an
-  account's sources one by one through the same rule (`sources.remove_source_id`), then
-  `db.forget_account` drops its `chat_access` rows. **Removing a source or an account never
+  account's sources through the same rule (`sources.remove_source_id`), `db.forget_account`
+  drops its `chat_access` rows and the config is saved, all inside one `db.transaction`, so a
+  failure deletes nothing; it first stops the account's active research sessions, voiding their
+  unused grants. **Removing a source or an account never
   leaves a chat on Telegram**; `grepogram leave` is the one command that does, CLI-only. An
   account's reach (`db.chat_reach`, `Hit.accounts`, the `account:` spec and the `accounts` search
   scope) is its `chat_access` rows plus the discussion groups of the channels it reaches, and an

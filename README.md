@@ -208,7 +208,7 @@ diagnostics and logs to stderr and the log file.
 | `grepogram config path` | print the resolved config, session, index, lock and log paths |
 | `grepogram auth [--account NAME] [--label L]` | sign in (phone, code, optional 2FA password) and store the session; `--account` signs in another account, which is added to `[[accounts]]` once the sign-in succeeds |
 | `grepogram accounts ls` | every account with its label, session state (`missing`, `present`, `authorized`), the Telegram user it signed in as, its sources and the chats it reaches; offline |
-| `grepogram accounts rm <name>` | remove an account: its sources, the chats only they cover, what it was recorded as reaching, and its session file; asks on the terminal first. Nothing changes on Telegram |
+| `grepogram accounts rm <name>` | remove an account: its sources, the chats only they cover, what it was recorded as reaching, its research sessions' unused approvals, and its session file; asks on the terminal first. Nothing changes on Telegram |
 | `grepogram dialogs <query> [-n N] [--account NAME]` | find chats and folders of the account whose title, `@username` or folder name matches; prints kind, id, type, title, username, folders, score |
 | `grepogram sources add <target> [--since YYYY-MM-DD] [--comments] [--account NAME]` | add a source and save the config; `target` is a chat id, `@username`, `t.me` link, `folder:<name>` or a fuzzy chat / folder title, and an `<account>/` prefix on it names the account as `--account` does |
 | `grepogram sources ls` | every source the index holds chats under, with the account that fetches it — the configured ones first, then any others still in the database: an `import:<slug>` from `grepogram import`, and a source removed from the config whose chats are still stored — each with its chats, message counts and last sync |
@@ -415,9 +415,9 @@ one account, `default` unless `--account` names another.
 **Removing.** A chat that two sources cover (a channel two accounts configured, or a chat that a
 folder and a `chat` entry both list) is deleted only when the last of them goes. Until then,
 `sources rm` hands it to a remaining source and says which chats it kept. `accounts rm <name>`
-removes that account's sources under the same rule. It also forgets which chats the account
-reached and deletes its session file, after asking on the terminal. The only account left cannot
-be removed. **Neither command leaves anything on Telegram.** `grepogram leave <target> --account
+removes that account's sources under the same rule, all of it or nothing. It also forgets which
+chats the account reached, stops its research sessions so no approval outlives it, and deletes its
+session file, after asking on the terminal. The only account left cannot be removed. **Neither command leaves anything on Telegram.** `grepogram leave <target> --account
 <name>` is the one command that does. It asks on the terminal first, refuses private chats, bots
 and folders, and touches neither the config nor the index.
 

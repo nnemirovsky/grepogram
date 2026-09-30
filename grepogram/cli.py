@@ -1264,7 +1264,8 @@ def accounts_rm(
 
     Asks on the terminal first and refuses without one. A chat another account's source still
     covers stays indexed (a channel both accounts configured); the account only stops being
-    recorded as reaching it. Nothing is changed on Telegram — `leave` is its own command.
+    recorded as reaching it. Its research sessions are stopped, so no approval given to it
+    outlives it. Nothing is changed on Telegram — `leave` is its own command.
     """
     paths, cfg, conn = _load()
     try:
@@ -1281,6 +1282,7 @@ def accounts_rm(
         typer.echo(f"  remove {len(owned)} sources{': ' + ', '.join(owned) if owned else ''}")
         typer.echo("  delete the chats no other source covers, with everything indexed from them")
         typer.echo("  forget which chats this account reaches")
+        typer.echo("  stop its research sessions and void their unused approvals")
         typer.echo(f"  delete its session file {session}")
         with _terminal("accounts rm") as tty:
             confirmed = _ask(tty, f"remove account {name}?")
@@ -1291,34 +1293,62 @@ def accounts_rm(
         # that starts once they are free reads a config without these sources and cannot
         # re-create their chats, and an MCP edit saved in between is not overwritten
         with sync.SyncLock(paths), config.ConfigLock(paths):
+            stopped = _stop_research_of(paths, name)
             deleted, kept = _drop_account(config.load(paths), conn, paths, name)
         session.unlink(missing_ok=True)
     except NoTerminal as exc:
         fail(str(exc), hint=exc.hint)
     except (sources.SourceError, sync.SyncInProgress, ConfigError) as exc:
         fail(str(exc), hint=getattr(exc, "hint", None))
+    except (db.SchemaError, sqlite3.Error) as exc:
+        fail(f"cannot stop the research sessions of account {name}: {exc}; nothing was removed")
     finally:
         conn.close()
     kept_note = f", {len(kept)} kept under another source" if kept else ""
-    typer.echo(f"removed account {name} ({len(deleted)} chats deleted{kept_note})")
+    stopped_note = f", {len(stopped)} research sessions stopped" if stopped else ""
+    typer.echo(f"removed account {name} ({len(deleted)} chats deleted{kept_note}{stopped_note})")
+
+
+def _stop_research_of(paths: Paths, name: str) -> list[int]:
+    """Stop every active research session of account ``name``, voiding the grants it has not
+    used; returns their ids. Whether ``[research]`` is enabled does not matter — an approval must
+    not outlive the account it was given to, and a later sign-in under the same name may be
+    someone else. A ``research.db`` that does not exist holds nothing to stop."""
+    if not paths.research_db_file.exists():
+        return []
+    rdb = research_db.open_store(paths)
+    try:
+        active = [s.id for s in research_db.list_sessions(rdb, "active") if s.account == name]
+        for session_id in active:
+            research_db.stop_session(rdb, session_id)
+    finally:
+        rdb.close()
+    return active
 
 
 def _drop_account(
     current: Config, conn: sqlite3.Connection, paths: Paths, name: str
 ) -> tuple[list[int], list[int]]:
     """Remove every source of ``name`` from ``current`` through the ordinary source-removal
-    rules, drop its ``[[accounts]]`` entry and save; then forget its access. Returns the chats
-    deleted and those kept under another source. The caller holds both locks."""
+    rules, forget its access, drop its ``[[accounts]]`` entry and save the config. Returns the
+    chats deleted and those kept under another source. The caller holds both locks.
+
+    One transaction: every removal joins it (:func:`grepogram.db.transaction`), and the config
+    is saved inside it, last. A failure anywhere — the save included — rolls every deletion
+    back with the config untouched, so no chat is ever deleted while the source that fetched it
+    stays configured and a sync fetches it all over again.
+    """
     deleted: list[int] = []
     kept: list[int] = []
-    for source in [s for s in current.sources if s.account == name]:
-        removed = sources.remove_source_id(current, conn, source.id)
-        current = removed.config
-        deleted += removed.chat_ids
-        kept += removed.kept_chat_ids
-    accounts = [entry for entry in current.accounts if entry.name != name]
-    config.save(dataclasses.replace(current, accounts=accounts), paths)
-    db.forget_account(conn, name)
+    with db.transaction(conn):
+        for source in [s for s in current.sources if s.account == name]:
+            removed = sources.remove_source_id(current, conn, source.id)
+            current = removed.config
+            deleted += removed.chat_ids
+            kept += removed.kept_chat_ids
+        db.forget_account(conn, name)
+        accounts = [entry for entry in current.accounts if entry.name != name]
+        config.save(dataclasses.replace(current, accounts=accounts), paths)
     gone = set(deleted)
     return sorted(gone), sorted({chat_id for chat_id in kept if chat_id not in gone})
 
