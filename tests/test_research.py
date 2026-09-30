@@ -9,7 +9,7 @@ import pytest
 from telethon import errors, utils
 from telethon.tl import functions, types
 
-from grepogram import db, leads, research, research_db, sync, tg
+from grepogram import config, db, leads, research, research_db, sync, tg
 from grepogram.filters import UnknownChat
 from grepogram.models import (
     ApprovalItem,
@@ -23,7 +23,10 @@ from grepogram.models import (
     ResearchCfg,
     ResearchLimits,
     ResearchSession,
+    RunReport,
+    Source,
 )
+from grepogram.paths import Paths
 from tests.fakes import (
     FakeChatlist,
     FakeClient,
@@ -1577,3 +1580,387 @@ def test_approval_refuses_while_research_is_disabled(
         with pytest.raises(research.ResearchDisabled):
             call()
     assert research_db.list_grants(rdb, session.id) == []
+
+
+# --- the run ---------------------------------------------------------------------------------
+
+DEEP = make_channel(3010, "Deep rentals", username="deep_chan")
+OPEN = make_channel(3011, "Open door", megagroup=True)
+
+
+def _run_world(flats_posts: int = 3, **kwargs: Any) -> FakeWorld:
+    """The probing world, with histories: ``@tb_flats`` ends with a post hiding a link to
+    ``@deep_chan``, the gated group and the invite-only group hold a message each."""
+    flats = [
+        tl.message(_marked(FLATS), i, f"flat {i} in Vake", date=tl.at(i))
+        for i in range(1, flats_posts)
+    ]
+    flats.append(
+        tl.hyperlink_message(
+            _marked(FLATS),
+            flats_posts,
+            "more rentals here",
+            anchor="here",
+            url="https://t.me/deep_chan",
+            date=tl.at(flats_posts),
+        )
+    )
+    world = _world(
+        messages={
+            _marked(FLATS): flats,
+            _marked(GATED): [tl.message(_marked(GATED), 1, "welcome", date=tl.at(1))],
+            _marked(OPEN): [tl.message(_marked(OPEN), 1, "hello", date=tl.at(1))],
+            _marked(DEEP): [tl.message(_marked(DEEP), 1, "deep", date=tl.at(1))],
+        },
+        **kwargs,
+    )
+    world.entities[_marked(DEEP)] = DEEP
+    world.entities[_marked(OPEN)] = OPEN
+    world.invites["OpenDoor"] = FakeInvite(OPEN)
+    return world
+
+
+def _no_discussion(request: Any) -> Any:
+    """``channels.getFullChannel`` of a channel with no discussion group."""
+    return types.messages.ChatFull(
+        full_chat=types.ChannelFull(
+            id=0,
+            about="",
+            read_inbox_max_id=0,
+            read_outbox_max_id=0,
+            unread_count=0,
+            chat_photo=types.PhotoEmpty(id=0),
+            notify_settings=types.PeerNotifySettings(),
+            bot_info=[],
+            pts=0,
+        ),
+        chats=[],
+        users=[],
+    )
+
+
+def _run_client(world: FakeWorld, **kwargs: Any) -> FakeClient:
+    responses = {functions.channels.GetFullChannelRequest: _no_discussion}
+    responses.update(kwargs.pop("responses", {}))
+    return world.client("default", me=make_user(9, "Me"), responses=responses, **kwargs)
+
+
+@pytest.fixture
+def paths(tmp_path: Any) -> Paths:
+    home = Paths.under(tmp_path / "home")
+    home.ensure_dirs()
+    config.save(CFG, home)
+    return home
+
+
+async def _discovered(
+    rdb: sqlite3.Connection,
+    conn: sqlite3.Connection,
+    client: FakeClient,
+    *targets: str,
+    **limits: int,
+) -> tuple[ResearchSession, dict[str, Candidate]]:
+    """A session whose seed links to ``targets``, discovered and probed through ``client``."""
+    _links(conn, *targets)
+    session = _start(rdb, conn, (str(SEED),), **limits)
+    await research.discover(rdb, conn, CFG, session.id, client, now=3)
+    found = {c.identity: c for c in research_db.list_candidates(rdb, session.id)}
+    return session, found
+
+
+async def _run(
+    rdb: sqlite3.Connection,
+    conn: sqlite3.Connection,
+    paths: Paths,
+    client: FakeClient,
+    session: ResearchSession,
+    budget: sync.SyncBudget | None = None,
+) -> RunReport:
+    return await research.run(
+        rdb, conn, CFG, paths, {"default": client}, session.id, budget, now=20
+    )
+
+
+def _status(rdb: sqlite3.Connection, candidate: Candidate) -> Candidate:
+    current = research_db.get_candidate(rdb, candidate.id)
+    assert current is not None
+    return current
+
+
+def _live(rdb: sqlite3.Connection, candidate: Candidate) -> list[Grant]:
+    return research_db.live_grants(rdb, candidate.session_id, candidate.id)
+
+
+def _stored(conn: sqlite3.Connection, peer: int) -> list[int]:
+    return [
+        int(row[0])
+        for row in conn.execute(
+            "SELECT msg_id FROM messages WHERE chat_id = ? ORDER BY msg_id", (peer,)
+        )
+    ]
+
+
+async def test_a_run_joins_fetches_and_only_proposes_what_it_finds(
+    rdb: sqlite3.Connection, conn: sqlite3.Connection, paths: Paths
+) -> None:
+    client = _run_client(_run_world())
+    session, found = await _discovered(rdb, conn, client, "@tb_flats")
+    flats = found["@tb_flats"]
+    _approve(rdb, conn, session, _item(flats, "join", "fetch", "add_source"))
+
+    report = await _run(rdb, conn, paths, client, session)
+
+    assert (report.joined, report.sources_added, report.fetched) == ([flats.id],) * 3
+    assert report.messages == 3 and report.stopped_by is None
+    assert _stored(conn, _marked(FLATS)) == [1, 2, 3]
+    (source,) = config.load(paths).sources
+    assert source == Source(
+        chat="@tb_flats", since=research.horizon(session), comments=True, account="default"
+    )
+    done = _status(rdb, flats)
+    assert (done.status, done.member, done.source_id) == ("fetched", True, "chat:@tb_flats")
+    assert _live(rdb, flats) == [], "every approved action was carried out: the grant is used"
+    # the hidden link in the fetched chat is followed one hop further — and only proposed
+    assert report.discovery is not None
+    (deep_id,) = report.discovery.new_candidates
+    deep = research_db.get_candidate(rdb, deep_id)
+    assert deep is not None and (deep.identity, deep.depth, deep.status) == (
+        "@deep_chan",
+        2,
+        "proposed",
+    )
+    assert _live(rdb, deep) == [] and not research.authorized(rdb, deep, "fetch")
+    assert _marked(DEEP) not in {c["chat_id"] for _, c in client.calls if "chat_id" in c}
+    progress = research_db.get_session(rdb, session.id)
+    assert progress is not None and progress.progress["runs"] == 1
+    assert progress.progress["last_run"]["fetched"] == [flats.id]  # type: ignore[index]
+
+
+async def test_a_pending_admission_is_asked_about_again_and_fetched_once_admitted(
+    rdb: sqlite3.Connection, conn: sqlite3.Connection, paths: Paths
+) -> None:
+    client = _run_client(_run_world())
+    session, found = await _discovered(rdb, conn, client, "https://t.me/+JoinMe")
+    gated = found["+JoinMe"]
+    _approve(rdb, conn, session, _item(gated, "request", "fetch", "add_source"))
+
+    first = await _run(rdb, conn, paths, client, session)
+    assert first.pending_admission == [gated.id] and first.fetched == []
+    waiting = _status(rdb, gated)
+    assert (waiting.status, waiting.member) == ("pending_admission", False)
+    assert _marked(GATED) in client.requested
+    assert config.load(paths).sources == [], "no source for a chat the account cannot read"
+    assert _live(rdb, gated), "the fetch waits for the admins; nobody is asked again"
+
+    still = await _run(rdb, conn, paths, client, session)
+    assert still.admitted == [] and _status(rdb, gated).status == "pending_admission"
+    assert _status(rdb, gated).note == research.PENDING_NOTE
+
+    client.join(GATED)  # the chat's admins admit the account
+    second = await _run(rdb, conn, paths, client, session)
+    assert second.admitted == [gated.id]
+    assert second.sources_added == second.fetched == [gated.id]
+    (source,) = config.load(paths).sources
+    assert source.chat == _marked(GATED) and not source.comments
+    assert _stored(conn, _marked(GATED)) == [1]
+    assert _status(rdb, gated).status == "fetched" and _live(rdb, gated) == []
+
+
+async def test_a_message_cap_stops_the_run_and_the_next_one_resumes(
+    rdb: sqlite3.Connection, conn: sqlite3.Connection, paths: Paths
+) -> None:
+    client = _run_client(_run_world(flats_posts=5))
+    session, found = await _discovered(rdb, conn, client, "@tb_flats", max_messages_per_run=2)
+    flats = found["@tb_flats"]
+    _approve(rdb, conn, session, _item(flats, "fetch", "add_source"))
+
+    first = await _run(rdb, conn, paths, client, session)
+    assert first.partial == [flats.id] and first.messages == 2
+    assert first.stopped_by == "messages" and first.joined == []
+    assert _stored(conn, _marked(FLATS)) == [1, 2]
+    chat = db.get_chat(conn, _marked(FLATS))
+    assert chat is not None and chat.last_msg_id == 2 and chat.last_sync_at is None
+    assert _status(rdb, flats).note == research.PARTIAL_NOTE and _live(rdb, flats)
+    assert first.discovery is not None and first.discovery.new_candidates == []
+
+    second = await _run(rdb, conn, paths, client, session)
+    assert second.partial == [flats.id] and second.sources_added == []
+    third = await _run(rdb, conn, paths, client, session)
+    assert third.fetched == [flats.id] and third.stopped_by is None
+    assert _stored(conn, _marked(FLATS)) == [1, 2, 3, 4, 5]
+    assert len(config.load(paths).sources) == 1, "the source is added once"
+    assert third.discovery is not None and len(third.discovery.new_candidates) == 1
+    progress = research_db.get_session(rdb, session.id)
+    assert progress is not None and progress.progress["messages"] == 5
+
+
+async def test_a_spent_clock_leaves_every_granted_step_for_the_next_run(
+    rdb: sqlite3.Connection, conn: sqlite3.Connection, paths: Paths
+) -> None:
+    client = _run_client(_run_world())
+    session, found = await _discovered(rdb, conn, client, "@tb_flats")
+    flats = found["@tb_flats"]
+    _approve(rdb, conn, session, _item(flats, "join", "fetch", "add_source"))
+
+    report = await _run(rdb, conn, paths, client, session, sync.SyncBudget(0))
+
+    assert report.stopped_by == "time" and report.joined == report.fetched == []
+    assert _status(rdb, flats).status == "approved" and _live(rdb, flats)
+    assert not any(isinstance(r, functions.channels.JoinChannelRequest) for r in client.requests)
+    assert config.load(paths).sources == [] and _history_calls(client) == []
+
+
+async def test_sources_a_run_added_survive_stop_and_a_stopped_session_refuses_to_run(
+    rdb: sqlite3.Connection, conn: sqlite3.Connection, paths: Paths
+) -> None:
+    client = _run_client(_run_world())
+    session, found = await _discovered(rdb, conn, client, "@tb_flats")
+    _approve(rdb, conn, session, _item(found["@tb_flats"], "fetch", "add_source"))
+    await _run(rdb, conn, paths, client, session)
+
+    research.stop(rdb, CFG, session.id)
+
+    assert [s.id for s in config.load(paths).sources] == ["chat:@tb_flats"]
+    assert _stored(conn, _marked(FLATS)) == [1, 2, 3]
+    with pytest.raises(research.SessionStopped):
+        await _run(rdb, conn, paths, client, session)
+    with pytest.raises(research.ResearchDisabled):
+        await research.run(rdb, conn, Config(), paths, {"default": client}, session.id)
+
+
+async def test_a_run_needs_the_session_s_own_account(
+    rdb: sqlite3.Connection, conn: sqlite3.Connection, paths: Paths
+) -> None:
+    session = _start(rdb, conn)
+    with pytest.raises(research.ResearchError, match="not signed in") as refused:
+        await research.run(rdb, conn, CFG, paths, {"work": _run_client(_run_world())}, session.id)
+    assert refused.value.hint == tg.auth_hint("default")
+
+
+async def test_only_the_approved_chats_of_a_shared_folder_are_joined(
+    rdb: sqlite3.Connection, conn: sqlite3.Connection, paths: Paths
+) -> None:
+    client = _run_client(_run_world())
+    session, found = await _discovered(rdb, conn, client, "https://t.me/addlist/Tbilisi1")
+    folder = found["addlist/Tbilisi1"]
+    children = {c.identity: c for c in research_db.list_candidates(rdb, session.id)}
+    private = children[f"peer:{_marked(FOLDER_PRIVATE)}"]
+    sibling = children["@folder_chan"]
+    assert private.parent_id == sibling.parent_id == folder.id
+    _approve(rdb, conn, session, _item(private, "join"))
+
+    report = await _run(rdb, conn, paths, client, session)
+
+    assert report.joined == [private.id]
+    assert client.chatlist_joins == [[_marked(FOLDER_PRIVATE)]]
+    assert "Tbilisi1" in client.chatlists_joined
+    assert _status(rdb, private).status == "joined" and _live(rdb, private) == []
+    assert _status(rdb, sibling).status == "proposed" and _marked(FOLDER_CHAN) not in (
+        client.members
+    ), "a chat found in the same folder is never acted on without its own approval"
+    assert config.load(paths).sources == [], "a join-only approval adds no source"
+    assert report.discovery is None
+
+
+async def test_refusals_are_recorded_for_what_they_are(
+    rdb: sqlite3.Connection, conn: sqlite3.Connection, paths: Paths
+) -> None:
+    world = _run_world()
+    client = _run_client(
+        world, responses={functions.channels.JoinChannelRequest: errors.ChannelsTooMuchError(None)}
+    )
+    session, found = await _discovered(
+        rdb, conn, client, "@tb_flats", "https://t.me/+OpenDoor", "https://t.me/+PeekIn"
+    )
+    flats, door, peek = found["@tb_flats"], found["+OpenDoor"], found["+PeekIn"]
+    _approve(
+        rdb,
+        conn,
+        session,
+        _item(flats, "join"),
+        _item(door, "join", "fetch", "add_source"),
+        _item(peek, "join"),
+    )
+    client.join(OPEN)  # the account got in some other way since the approval
+    world.invites["PeekIn"] = errors.InviteHashExpiredError(request=None)
+
+    report = await _run(rdb, conn, paths, client, session)
+
+    too_many = _status(rdb, flats)
+    assert report.failed == [flats.id] and too_many.status == "failed"
+    assert too_many.note is not None and "as many channels and groups" in too_many.note
+    assert _live(rdb, flats) == [], "a failed step waits for a fresh approval"
+    expired = _status(rdb, peek)
+    assert report.unavailable == [peek.id] and expired.status == "unavailable"
+    assert expired.note is not None and "refused the join" in expired.note
+    member = _status(rdb, door)
+    assert door.id in report.joined and member.peer_id == _marked(OPEN)
+    assert report.fetched == [door.id] and _stored(conn, _marked(OPEN)) == [1]
+
+
+async def test_a_flood_wait_on_a_join_stops_the_run_and_keeps_the_grants(
+    rdb: sqlite3.Connection, conn: sqlite3.Connection, paths: Paths
+) -> None:
+    flood = errors.FloodWaitError(request=None, capture=30)
+    client = _run_client(_run_world(), responses={functions.channels.JoinChannelRequest: flood})
+    session, found = await _discovered(rdb, conn, client, "@tb_flats")
+    flats = found["@tb_flats"]
+    _approve(rdb, conn, session, _item(flats, "join", "fetch", "add_source"))
+
+    report = await _run(rdb, conn, paths, client, session)
+
+    assert report.stopped_by == "flood" and "30s" in report.warnings[0]
+    assert _status(rdb, flats).status == "approved" and _live(rdb, flats)
+    assert config.load(paths).sources == []
+
+
+async def test_a_source_removed_since_is_never_added_back(
+    rdb: sqlite3.Connection, conn: sqlite3.Connection, paths: Paths
+) -> None:
+    client = _run_client(_run_world(flats_posts=5))
+    session, found = await _discovered(rdb, conn, client, "@tb_flats", max_messages_per_run=2)
+    flats = found["@tb_flats"]
+    _approve(rdb, conn, session, _item(flats, "fetch", "add_source"))
+    await _run(rdb, conn, paths, client, session)
+    config.update(paths, lambda cfg: dataclasses.replace(cfg, sources=[]))
+
+    report = await _run(rdb, conn, paths, client, session)
+
+    assert config.load(paths).sources == [] and report.partial == report.fetched == []
+    assert "was removed from the config" in report.warnings[0]
+    assert _live(rdb, flats) == [] and _stored(conn, _marked(FLATS)) == [1, 2]
+
+
+async def test_an_imported_chat_is_never_taken_over_by_a_run(
+    rdb: sqlite3.Connection, conn: sqlite3.Connection, paths: Paths
+) -> None:
+    client = _run_client(_run_world())
+    session, found = await _discovered(rdb, conn, client, "@tb_flats")
+    flats = found["@tb_flats"]
+    db.upsert_chat(
+        conn,
+        ChatRow(id=_marked(FLATS), type="channel", title="Flats", source_id="import:flats"),
+    )
+    _approve(rdb, conn, session, _item(flats, "fetch", "add_source"))
+
+    report = await _run(rdb, conn, paths, client, session)
+
+    assert report.failed == [flats.id] and config.load(paths).sources == []
+    note = _status(rdb, flats).note
+    assert note is not None and "import:flats" in note
+    stored = db.get_chat(conn, _marked(FLATS))
+    assert stored is not None and stored.source_id == "import:flats"
+
+
+async def test_a_run_with_nothing_granted_touches_nothing(
+    rdb: sqlite3.Connection, conn: sqlite3.Connection, paths: Paths
+) -> None:
+    client = _run_client(_run_world())
+    session, _ = await _discovered(rdb, conn, client, "@tb_flats", "https://t.me/+OpenDoor")
+    sent = len(client.requests)
+
+    report = await _run(rdb, conn, paths, client, session)
+
+    assert report == RunReport(session_id=session.id)
+    assert len(client.requests) == sent and _history_calls(client) == []
+    assert config.load(paths).sources == []

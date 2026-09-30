@@ -797,19 +797,53 @@ voided_at)`, `exclusions(identity PRIMARY KEY, reason, created_at)`,
 ### Task 16: Research run
 
 **Files:**
-- Modify: `grepogram/research.py`, `grepogram/sync.py` (message cap on `SyncBudget`), `tests/test_research.py`
+- Modify: `grepogram/research.py`, `grepogram/sync.py` (message cap on `SyncBudget`), `grepogram/models.py` (`RunReport`, `RunStop`), `tests/fakes.py`, `tests/test_research.py`, `tests/test_sync.py`
 
-- [ ] `run(rdb, conn, cfg, paths, clients, session, budget)`: re-check pending admissions; join /
+- [x] `run(rdb, conn, cfg, paths, clients, session, budget)`: re-check pending admissions; join /
   request / chatlist-join exactly the granted targets (`UserAlreadyParticipantError` = member,
   `InviteRequestSentError` = `pending_admission`, `ChannelsTooMuchError` / `ChannelPrivateError`
   = recorded honestly); add sources via `config.update` with account, `since`, `comments`;
   `sync_all(…, only=added)`; discovery over the new messages at depth + 1
-- [ ] `SyncBudget` gains an optional message allowance checked in `_fetch_new` next to
+  ➕ signature `run(rdb, conn, cfg, paths, clients, session_id, budget=None, *, embedder=None,
+  now=None)` → `models.RunReport`; `budget` defaults to the session's `run_budget_s` and
+  `max_messages_per_run`. Pending admissions are re-checked with a read-only `probe` (admitted →
+  `joined`, the rest of the grant runs on in the same run). Every outward step asks
+  `authorized()` for that candidate and action first. A folder not imported yet is joined with
+  `chatlists.joinChatlistInvite`, one already imported gets its missing chats through
+  `chatlists.joinChatlistUpdates` (core.telegram.org "Shared folders"), both naming exactly the
+  approved children in one request per folder. `ChannelsTooMuchError` → `failed`, a chat /
+  invite refusal (`ChannelPrivate`, `InviteHashExpired`, …, an unresolvable username) →
+  `unavailable`, both voiding the candidate's grants (a failed one takes a fresh approval);
+  a flood wait stops the run's Telegram work with the grants kept. Sources are added in one
+  `config.update` under `SyncLock` → `ConfigLock` (no Telegram request under either), reusing
+  a chat source of the account that already names the chat, refusing an `import:` chat
+  (`sources.imported_tag`), never re-adding a source removed since (grants voided with a note);
+  a pending chat gets no source until admitted. The sync is `sync_all(clients, conn,
+  config loader, paths, budget, embedder, recut=False, only=…)`, a `SyncInProgress` is a
+  warning (`stopped_by = "sync_busy"`). Every chat the sync attempted — and a channel's
+  discussion group — gets a scan cursor at the candidate's depth, so `discover_offline` reads it
+  at depth + 1 and only proposes. Grants whose actions are all done are consumed; the rest stay
+  live for the next run
+- [x] `SyncBudget` gains an optional message allowance checked in `_fetch_new` next to
   `budget.expired`
-- [ ] progress and status recorded in `research.db`; a stopped session refuses to run
-- [ ] tests: full loop with fakes (discover → approve → run → new candidates proposed, not
+  ➕ `SyncBudget(seconds, *, messages=None)`, `spend()` (fed by `_Run.store` with the newly
+  stored rows, comments included), `messages_left`, `exhausted`, and `halted` (clock or cap),
+  which the fetch loops check (`_fetch_new`, the comment loop in `_store_batch`, `_run_lane`,
+  the fallback loop); `expired` stays the clock alone so indexing and embedding are not cut by
+  the cap. `_batch_size` shrinks the last batch to what the allowance has left
+- [x] progress and status recorded in `research.db`; a stopped session refuses to run
+  ➕ `sessions.progress`: `runs`, cumulative `messages`, `last_run_at` and `last_run` (the
+  report's candidate lists, `stopped_by`, warnings); candidate statuses and notes say what
+  happened (`PENDING_NOTE`, `PARTIAL_NOTE`)
+- [x] tests: full loop with fakes (discover → approve → run → new candidates proposed, not
   fetched), pending admission later accepted, budgets stop and resume, sources survive stop
-- [ ] run checks — must pass before task 17
+  ➕ plus: time budget, folder joins only the approved child, refusals (channel limit, expired
+  invite, already a member), flood wait, removed source not re-added, import not taken over,
+  nothing granted touches nothing, account without a client; `FakeClient` answers
+  `joinChannel` (`join_requests`), `importChatInvite`, `joinChatlistInvite` /
+  `joinChatlistUpdates` (`chatlist_joins`) and `join()` admits an account; sync tests for the
+  message allowance
+- [x] run checks — must pass before task 17
 
 ### Task 17: CLI `research`
 

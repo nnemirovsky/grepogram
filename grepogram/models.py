@@ -826,3 +826,37 @@ class GlobalSearchReport:
     wait_till: int | None = None
     flood_wait_s: int | None = None
     warnings: list[str] = field(default_factory=list)
+
+
+RunStop = Literal["time", "messages", "flood", "sync_busy"]
+"""Why a research run stopped before its granted work was done: the clock, the message cap, a
+flood wait on a join, or another sync holding the lock when the run came to add its sources."""
+
+
+@dataclass(slots=True, kw_only=True)
+class RunReport:
+    """One research run (:func:`grepogram.research.run`): what it did to which candidates.
+
+    ``admitted`` are pending admission requests the chat's admins accepted since the last run;
+    ``joined`` the candidates the run joined (or found the account already in);
+    ``pending_admission`` those whose join became an admission request; ``sources_added`` the
+    candidates an ongoing source was added for; ``fetched`` those whose history the run fetched
+    to the end, ``partial`` those it fetched part of and resumes next run; ``unavailable`` and
+    ``failed`` those Telegram refused, with the reason in the candidate's note. ``messages``
+    counts the messages stored; ``discovery`` is the follow-up discovery over them, whose new
+    candidates are only ever ``proposed``. ``stopped_by`` names what cut the run short.
+    """
+
+    session_id: int
+    admitted: list[int] = field(default_factory=list)
+    joined: list[int] = field(default_factory=list)
+    pending_admission: list[int] = field(default_factory=list)
+    sources_added: list[int] = field(default_factory=list)
+    fetched: list[int] = field(default_factory=list)
+    partial: list[int] = field(default_factory=list)
+    unavailable: list[int] = field(default_factory=list)
+    failed: list[int] = field(default_factory=list)
+    messages: int = 0
+    discovery: DiscoverReport | None = None
+    stopped_by: RunStop | None = None
+    warnings: list[str] = field(default_factory=list)

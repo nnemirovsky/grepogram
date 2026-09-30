@@ -316,6 +316,13 @@ class FakeClient:
     only for a group it is in, ``contacts.search`` over public chats and its own, and
     ``channels.searchPosts`` over public channels' posts, metered by ``search_flood``. Their
     ``chats`` and ``users`` — and a ``chat`` field — teach the session the peers they carry.
+
+    The joins a research run sends change this account's view of the world (:meth:`join`):
+    ``channels.joinChannel`` for a public chat (one listed in ``join_requests`` answers with an
+    admission request instead), ``messages.importChatInvite`` from the world's invites, and
+    ``chatlists.joinChatlistInvite`` / ``joinChatlistUpdates`` for exactly the peers named
+    (each call's ids recorded in ``chatlist_joins``). An admission request sent is kept in
+    ``requested`` until a test admits the account with :meth:`join`.
     """
 
     def __init__(
@@ -338,9 +345,13 @@ class FakeClient:
         world: FakeWorld | None = None,
         chatlists_joined: Iterable[str] = (),
         search_flood: types.SearchPostsFlood = FREE_SEARCH,
+        join_requests: Iterable[Any] = (),
     ) -> None:
         self.account = account
         self.chatlists_joined = set(chatlists_joined)
+        self.join_requests = {int(utils.get_peer_id(e)) for e in join_requests}
+        self.requested: set[int] = set()
+        self.chatlist_joins: list[list[int]] = []
         self.search_flood = search_flood
         self.world = world
         self.dialogs = list(dialogs)
@@ -640,7 +651,88 @@ class FakeClient:
             return self.search_flood
         if isinstance(request, functions.channels.SearchPostsRequest):
             return self._search_posts(request)
+        if isinstance(request, functions.channels.JoinChannelRequest):
+            return self._join_channel(request)
+        if isinstance(request, functions.messages.ImportChatInviteRequest):
+            return self._import_invite(request)
+        if isinstance(request, functions.chatlists.JoinChatlistInviteRequest):
+            return self._join_chatlist(request.slug, request.peers)
+        if isinstance(request, functions.chatlists.JoinChatlistUpdatesRequest):
+            return self._join_chatlist(None, request.peers)
         return None
+
+    # --- joining ---------------------------------------------------------------------------
+
+    def join(self, entity: Any) -> Any:
+        """Make this account a member of ``entity``: a dialog, the member's view of the entity
+        (``left`` cleared) and its history readable — what a join, or an admin admitting an
+        admission request, does. Answers the entity as the account now sees it."""
+        marked = int(utils.get_peer_id(entity))
+        if self.world is not None:
+            seen = self.world.seen_by(self.account, self.world.entities.get(marked, entity))
+        else:
+            seen = entity
+        self.entities[marked] = seen
+        if marked not in self.members:
+            self.members.add(marked)
+            self.dialogs.append(make_dialog(seen))
+        self.requested.discard(marked)
+        self._learn([seen])
+        return seen
+
+    def _joined(self, *entities: Any) -> types.Updates:
+        joined = [self.join(entity) for entity in entities]
+        return types.Updates(updates=[], users=[], chats=joined, date=None, seq=0)
+
+    def _join_channel(self, request: Any) -> Any:
+        """``channels.joinChannel``: a public chat anyone joins, one whose admins approve joins
+        (``join_requests``) answers with the request sent, and a private one refuses — a join
+        by id reaches only what is public. The access hash must be this account's."""
+        wanted = request.channel
+        marked = int(utils.get_peer_id(types.PeerChannel(wanted.channel_id)))
+        entity = self.entities.get(marked)
+        if entity is None or getattr(entity, "access_hash", None) != wanted.access_hash:
+            raise errors.ChannelInvalidError(request=request)
+        if marked in self.members:
+            return self._joined(entity)
+        if not getattr(entity, "username", None):
+            raise errors.ChannelPrivateError(request=request)
+        if marked in self.join_requests:
+            self.requested.add(marked)
+            raise errors.InviteRequestSentError(request=request)
+        return self._joined(entity)
+
+    def _import_invite(self, request: Any) -> Any:
+        """``messages.importChatInvite``: joins the invite's chat, or sends an admission request
+        when the invite asks for one; a member already in is ``USER_ALREADY_PARTICIPANT``."""
+        invites = self.world.invites if self.world is not None else {}
+        found = invites.get(request.hash)
+        if found is None:
+            raise errors.InviteHashInvalidError(request=request)
+        if isinstance(found, BaseException):
+            raise found
+        marked = int(utils.get_peer_id(found.entity))
+        if marked in self.members:
+            raise errors.UserAlreadyParticipantError(request=request)
+        if found.request_needed:
+            self.requested.add(marked)
+            raise errors.InviteRequestSentError(request=request)
+        return self._joined(found.entity)
+
+    def _join_chatlist(self, slug: str | None, peers: Iterable[Any]) -> Any:
+        """``chatlists.joinChatlistInvite`` (a folder not imported yet, by slug) or
+        ``chatlists.joinChatlistUpdates`` (its missing chats): joins exactly ``peers``, which
+        must carry this account's access hashes, and imports the folder."""
+        wanted = [int(utils.get_peer_id(peer)) for peer in peers]
+        for peer, marked in zip(peers, wanted, strict=True):
+            entity = self.entities.get(marked)
+            known = getattr(entity, "access_hash", None)
+            if entity is None or getattr(peer, "access_hash", known) != known:
+                raise errors.ChannelInvalidError(request=None)
+        if slug is not None:
+            self.chatlists_joined.add(slug)
+        self.chatlist_joins.append(wanted)
+        return self._joined(*(self.entities[marked] for marked in wanted))
 
     def _check_invite(self, request: Any) -> Any:
         invites = self.world.invites if self.world is not None else {}

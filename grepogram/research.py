@@ -48,6 +48,15 @@ the session holds a live ``global_search`` grant. Its results are candidates and
 when ``paid_stars_max`` allows the price *and* a separate ``paid_search`` grant exists, which
 the paid search then consumes.
 
+**A run** (:func:`run`) carries out what a human approved and nothing else: each join,
+admission request, shared-folder join, source added and fetch is preceded by :func:`authorized`
+for that very candidate and action, the chats it fetches are synced through the ordinary
+:func:`grepogram.sync.sync_all` narrowed with ``only``, and the chats it stored into are read by
+discovery one hop deeper, which only ever proposes. A shared folder the account already imported
+takes its missing chats through ``chatlists.joinChatlistUpdates`` (core.telegram.org, "Shared
+folders": ``missing_peers`` of ``chatlistInviteAlready`` are passed to that method), one not
+imported yet through ``chatlists.joinChatlistInvite``, each naming exactly the approved peers.
+
 What this relies on of Telegram's API (core.telegram.org, reverified 2026-09-30, and the TL
 classes of Telethon 1.44 / layer 227 for the exact fields):
 
@@ -82,6 +91,7 @@ Message text never reaches the log above DEBUG; counts do.
 """
 
 import dataclasses
+import functools
 import logging
 import sqlite3
 import time
@@ -93,7 +103,8 @@ from typing import Any, NoReturn
 from telethon import errors, utils
 from telethon.tl import functions, types
 
-from grepogram import db, dialogs, leads, research_db, stem, tg
+from grepogram import config, db, dialogs, leads, research_db, sources, stem, sync, tg
+from grepogram.embed import Embedder
 from grepogram.filters import resolve_chats
 from grepogram.leads import LeadTarget
 from grepogram.models import (
@@ -119,9 +130,14 @@ from grepogram.models import (
     ProbeResult,
     ResearchLimits,
     ResearchSession,
+    RunReport,
     SearchKind,
     SessionAction,
+    Source,
+    SyncReport,
+    chat_scope,
 )
+from grepogram.paths import Paths
 
 log = logging.getLogger(__name__)
 
@@ -1895,3 +1911,690 @@ def stop(rdb: sqlite3.Connection, cfg: Config, session_id: int) -> int:
     voided = research_db.stop_session(rdb, session_id)
     log.info("research session %d stopped, %d grant(s) voided", session_id, voided)
     return voided
+
+
+# --- the run ---------------------------------------------------------------------------------
+
+_ACTIONABLE: tuple[CandidateStatus, ...] = ("approved", "joined", "pending_admission")
+"""Statuses a run acts on: approved and not acted on yet, joined but not fetched, or waiting
+for an admission. The rest are decided (skipped, excluded), done (fetched) or refused."""
+_JOIN_REFUSED: tuple[type[Exception], ...] = (
+    errors.ChannelPrivateError,
+    errors.ChannelInvalidError,
+    errors.ChatForbiddenError,
+    errors.InviteHashExpiredError,
+    errors.InviteHashInvalidError,
+    errors.InviteHashEmptyError,
+)
+"""A join Telegram refuses because of the chat: it went private, the link died, the account is
+banned from it. The candidate is ``unavailable``; no later run would do better."""
+_JOIN_UNREACHABLE: tuple[type[Exception], ...] = (*_JOIN_REFUSED, ValueError)
+"""Those, and a chat this account cannot address at all (a username no longer held)."""
+PENDING_NOTE = "an admission request is waiting for the chat's admins"
+PARTIAL_NOTE = "part of its history is fetched; the next run goes on from there"
+
+
+def _granted(rdb: sqlite3.Connection, candidate: Candidate) -> bool:
+    return any(authorized(rdb, candidate, action) for action in _CANDIDATE_ORDER)
+
+
+def _fresh(rdb: sqlite3.Connection, candidate: Candidate) -> Candidate:
+    current = research_db.get_candidate(rdb, candidate.id)
+    assert current is not None  # candidates are never deleted while their session exists
+    return current
+
+
+def _is_member(candidate: Candidate) -> bool:
+    return candidate.member is True or candidate.status in ("joined", "fetched")
+
+
+def _flood_note(report: RunReport, exc: errors.FloodError, what: str) -> None:
+    seconds = _flood_seconds(exc)
+    wait = f"{seconds}s" if seconds is not None else "a while"
+    report.warnings.append(f"Telegram asks to wait {wait} before {what}; the run stopped there")
+    report.stopped_by = "flood"
+
+
+def _refuse_candidate(
+    rdb: sqlite3.Connection,
+    session: ResearchSession,
+    candidate: Candidate,
+    status: CandidateStatus,
+    note: str,
+    report: RunReport,
+) -> None:
+    """Record a refusal honestly and void the candidate's grants: a ``failed`` one takes a new
+    approval once the cause is gone, an ``unavailable`` one none at all."""
+    with db.transaction(rdb):
+        research_db.update_candidate(rdb, candidate.id, status=status, note=note)
+        research_db.void_grants(rdb, session.id, candidate_ids=[candidate.id])
+    (report.unavailable if status == "unavailable" else report.failed).append(candidate.id)
+    log.info("research candidate %d is %s: %s", candidate.id, status, note)
+
+
+def _mark_joined(
+    rdb: sqlite3.Connection,
+    candidate: Candidate,
+    entity: Any,
+    report: RunReport,
+    note: str | None = None,
+) -> Candidate:
+    facts = entity_facts(entity) if entity is not None else {}
+    facts["member"] = True
+    joined = research_db.update_candidate(rdb, candidate.id, status="joined", note=note, **facts)
+    report.joined.append(candidate.id)
+    return joined
+
+
+def _joined_entity(answer: Any, candidate: Candidate) -> Any:
+    """The chat a join answered with: the candidate's own when its peer id is known, else the
+    first group or channel of the answer."""
+    chats = [
+        chat
+        for chat in getattr(answer, "chats", None) or ()
+        if isinstance(chat, types.Channel | types.Chat)
+    ]
+    for chat in chats:
+        if candidate.peer_id is not None and dialogs.peer_id(chat) == candidate.peer_id:
+            return chat
+    return chats[0] if chats else None
+
+
+async def _recheck_admissions(
+    client: Any,
+    rdb: sqlite3.Connection,
+    conn: sqlite3.Connection,
+    session: ResearchSession,
+    report: RunReport,
+    stamp: int,
+) -> bool:
+    """Ask again about every candidate waiting for an admission; ``True`` when a flood wait
+    stopped the run. A probe reads metadata only — whether the account is in now — so it needs
+    no grant; an admitted candidate is ``joined`` and the rest of its grant runs on."""
+    for candidate in research_db.list_candidates(rdb, session.id, ["pending_admission"]):
+        try:
+            outcome = await probe(client, rdb, conn, candidate, now=stamp)
+        except errors.FloodError as exc:
+            _flood_note(report, exc, "checking admission requests")
+            return True
+        current = outcome.candidate
+        if current.member:
+            research_db.update_candidate(
+                rdb, current.id, status="joined", note="admitted by the chat's admins"
+            )
+            report.admitted.append(current.id)
+        elif outcome.result == "probed":
+            research_db.update_candidate(rdb, current.id, note=PENDING_NOTE)
+    return False
+
+
+def _way_in(rdb: sqlite3.Connection, candidate: Candidate) -> CandidateAction | None:
+    """The approved way into ``candidate`` this run still has to take, if any."""
+    if candidate.status == "pending_admission" or _is_member(candidate):
+        return None
+    if authorized(rdb, candidate, "join"):
+        return "join"
+    if authorized(rdb, candidate, "request"):
+        return "request"
+    return None
+
+
+def _folder_parent(rdb: sqlite3.Connection, candidate: Candidate) -> Candidate | None:
+    """The shared folder a candidate joins through: one with no username and no invite of its
+    own that was found in a folder (:func:`_join_route`)."""
+    if candidate.username or candidate.kind == "invite" or candidate.parent_id is None:
+        return None
+    parent = research_db.get_candidate(rdb, candidate.parent_id)
+    if parent is None or parent.kind != "addlist" or not parent.addlist_slug:
+        return None
+    return parent
+
+
+async def _join_all(
+    client: Any,
+    rdb: sqlite3.Connection,
+    conn: sqlite3.Connection,
+    session: ResearchSession,
+    work: Sequence[Candidate],
+    report: RunReport,
+    budget: sync.SyncBudget,
+    stamp: int,
+) -> bool:
+    """Join, or ask to join, every candidate of ``work`` a live grant says to; ``True`` when a
+    flood wait stopped the run. The chats of one shared folder go in one request naming exactly
+    the approved ones."""
+    folders: dict[int, tuple[Candidate, list[Candidate]]] = {}
+    for candidate in work:
+        route = _way_in(rdb, candidate)
+        if route is None:
+            continue
+        parent = _folder_parent(rdb, candidate) if route == "join" else None
+        if parent is not None:
+            folders.setdefault(parent.id, (parent, []))[1].append(candidate)
+            continue
+        if budget.expired:
+            return False
+        try:
+            await _join_one(client, rdb, conn, session, candidate, route, report, stamp)
+        except errors.FloodError as exc:
+            _flood_note(report, exc, "joining more chats")
+            return True
+    for parent, children in folders.values():
+        if budget.expired:
+            return False
+        try:
+            await _join_folder(client, rdb, session, parent, children, report)
+        except errors.FloodError as exc:
+            _flood_note(report, exc, "joining more chats")
+            return True
+    return False
+
+
+async def _input_channel(client: Any, candidate: Candidate) -> Any:
+    if candidate.username:
+        entity = await client.get_entity(f"@{candidate.username}")
+        return utils.get_input_channel(entity)
+    if candidate.peer_id is None or candidate.access_hash is None:
+        raise ValueError("nothing addresses this chat: no username and no access hash")
+    return types.InputChannel(utils.resolve_id(candidate.peer_id)[0], candidate.access_hash)
+
+
+async def _join_one(
+    client: Any,
+    rdb: sqlite3.Connection,
+    conn: sqlite3.Connection,
+    session: ResearchSession,
+    candidate: Candidate,
+    route: CandidateAction,
+    report: RunReport,
+    stamp: int,
+) -> None:
+    """Take ``route`` — ``join`` or ``request``, both authorized just before — into one chat.
+
+    An invite goes through ``messages.importChatInvite``, anything else through
+    ``channels.joinChannel``; for a chat whose admins approve joins either one sends the
+    admission request, which is what a ``request`` grant approved.
+    """
+    if not authorized(rdb, candidate, route):  # pragma: no cover - _way_in just asked
+        return
+    account = session.account
+    try:
+        if candidate.kind == "invite" and candidate.invite_hash:
+            request: Any = functions.messages.ImportChatInviteRequest(hash=candidate.invite_hash)
+        else:
+            request = functions.channels.JoinChannelRequest(
+                channel=await _input_channel(client, candidate)
+            )
+        answer = await client(request)
+    except errors.FloodError:
+        raise
+    except errors.UnauthorizedError as exc:
+        _raise_auth(exc, account)
+    except errors.UserAlreadyParticipantError:
+        joined = _mark_joined(rdb, candidate, None, report, "the account was already a member")
+        if joined.peer_id is None:
+            await probe(client, rdb, conn, joined, now=stamp)
+        return
+    except errors.InviteRequestSentError:
+        note = PENDING_NOTE
+        if route == "join":
+            note += "; Telegram turned the approved join into an admission request"
+        research_db.update_candidate(
+            rdb, candidate.id, status="pending_admission", member=False, note=note
+        )
+        report.pending_admission.append(candidate.id)
+        return
+    except errors.ChannelsTooMuchError:
+        note = (
+            f"account {account} is in as many channels and groups as Telegram allows; leave "
+            "some and approve this one again"
+        )
+        _refuse_candidate(rdb, session, candidate, "failed", note, report)
+        return
+    except _JOIN_UNREACHABLE as exc:
+        note = f"Telegram refused the join: {exc}"
+        _refuse_candidate(rdb, session, candidate, "unavailable", note, report)
+        return
+    except errors.RPCError as exc:
+        _refuse_candidate(rdb, session, candidate, "failed", f"the join failed: {exc}", report)
+        return
+    _mark_joined(rdb, candidate, _joined_entity(answer, candidate), report)
+    log.info("research session %d: joined candidate %d as %s", session.id, candidate.id, account)
+
+
+async def _join_folder(
+    client: Any,
+    rdb: sqlite3.Connection,
+    session: ResearchSession,
+    parent: Candidate,
+    children: Sequence[Candidate],
+    report: RunReport,
+) -> None:
+    """Join exactly ``children`` — each approved for ``join`` on its own — through their shared
+    folder's link.
+
+    The folder is checked again first, so the peers go out with the access hashes this account
+    holds now: a folder not imported yet is joined with ``chatlists.joinChatlistInvite``, one
+    already imported gets its missing chats through ``chatlists.joinChatlistUpdates``. A chat
+    the folder no longer lists is ``unavailable``; one the account is already in is ``joined``.
+    """
+    slug = parent.addlist_slug
+    assert slug is not None  # _folder_parent only groups folders with a slug
+    account = session.account
+    try:
+        answer = await client(functions.chatlists.CheckChatlistInviteRequest(slug=slug))
+    except errors.FloodError:
+        raise
+    except errors.UnauthorizedError as exc:
+        _raise_auth(exc, account)
+    except errors.RPCError as exc:
+        for child in children:
+            note = f"its shared folder t.me/addlist/{slug} is refused: {exc}"
+            _refuse_candidate(rdb, session, child, "unavailable", note, report)
+        return
+    entities = {dialogs.peer_id(e): e for e in (*answer.chats, *answer.users)}
+    filter_id: int | None = None
+    already: set[int] = set()
+    if isinstance(answer, types.chatlists.ChatlistInviteAlready):
+        filter_id = answer.filter_id
+        already = {int(utils.get_peer_id(p)) for p in answer.already_peers}
+        offered = already | {int(utils.get_peer_id(p)) for p in answer.missing_peers}
+    else:
+        offered = {int(utils.get_peer_id(p)) for p in answer.peers}
+    to_join: list[tuple[Candidate, Any]] = []
+    for child in children:
+        if not authorized(rdb, child, "join"):  # pragma: no cover - _way_in just asked
+            continue
+        entity = None if child.peer_id is None else entities.get(child.peer_id)
+        if child.peer_id in already:
+            _mark_joined(rdb, child, entity, report, "the account was already a member")
+        elif child.peer_id not in offered or entity is None:
+            note = f"the shared folder t.me/addlist/{slug} no longer lists it"
+            _refuse_candidate(rdb, session, child, "unavailable", note, report)
+        else:
+            to_join.append((child, entity))
+    if not to_join:
+        return
+    peers = [utils.get_input_peer(entity) for _, entity in to_join]
+    request: Any = (
+        functions.chatlists.JoinChatlistInviteRequest(slug=slug, peers=peers)
+        if filter_id is None
+        else functions.chatlists.JoinChatlistUpdatesRequest(
+            chatlist=types.InputChatlistDialogFilter(filter_id=filter_id), peers=peers
+        )
+    )
+    try:
+        result = await client(request)
+    except errors.FloodError:
+        raise
+    except errors.UnauthorizedError as exc:
+        _raise_auth(exc, account)
+    except errors.ChannelsTooMuchError:
+        for child, _ in to_join:
+            note = (
+                f"account {account} is in as many channels and groups as Telegram allows; "
+                "leave some and approve this one again"
+            )
+            _refuse_candidate(rdb, session, child, "failed", note, report)
+        return
+    except errors.RPCError as exc:
+        for child, _ in to_join:
+            note = f"joining through t.me/addlist/{slug} failed: {exc}"
+            _refuse_candidate(rdb, session, child, "failed", note, report)
+        return
+    for child, entity in to_join:
+        _mark_joined(rdb, child, _joined_entity(result, child) or entity, report)
+    log.info(
+        "research session %d: joined %d chat(s) of a shared folder as %s",
+        session.id,
+        len(to_join),
+        account,
+    )
+
+
+def _configured(cfg: Config, account: str, candidate: Candidate) -> Source | None:
+    """The chat source of ``account`` that already names ``candidate``'s chat, by id or name."""
+    wanted: list[sources.Target] = []
+    if candidate.peer_id is not None:
+        wanted.append(sources.Target(kind="id", value=candidate.peer_id))
+    if candidate.username:
+        wanted.append(sources.Target(kind="username", value=candidate.username))
+    for source in cfg.sources:
+        if source.account != account or source.chat is None:
+            continue
+        try:
+            target = sources.parse_target(str(source.chat))
+        except sources.InvalidTarget:
+            continue
+        if any(sources.same_target(target, other) for other in wanted):
+            return source
+    return None
+
+
+def _planned_source(
+    rdb: sqlite3.Connection,
+    conn: sqlite3.Connection,
+    session: ResearchSession,
+    candidate: Candidate,
+    report: RunReport,
+) -> Source | None:
+    """The source a run adds for ``candidate``, or ``None`` when it adds none this time.
+
+    Only with a live ``add_source`` grant, once the account can read the chat — a member, or a
+    public chat anyone reads — and never over a chat the index holds as a Telegram Desktop
+    import (:func:`grepogram.sources.imported_tag`), whose history a live source would take over.
+    """
+    if candidate.source_id is not None or not authorized(rdb, candidate, "add_source"):
+        return None
+    if candidate.status == "pending_admission":
+        return None
+    if not (_is_member(candidate) or candidate.username):
+        return None
+    if candidate.peer_id is None and not candidate.username:
+        note = "nothing names the chat well enough to add it as a source"
+        _refuse_candidate(rdb, session, candidate, "failed", note, report)
+        return None
+    kind: ChatType = candidate.type or "channel"
+    if candidate.peer_id is not None:
+        held = sources.imported_tag(
+            conn, candidate.peer_id, scope=chat_scope(kind, session.account)
+        )
+        if held is not None:
+            note = (
+                f"the index holds this chat as {held}, a Telegram Desktop import; a live source "
+                f"would take it over, so none was added — `grepogram sources rm {held}` first"
+            )
+            _refuse_candidate(rdb, session, candidate, "failed", note, report)
+            return None
+    return Source(
+        chat=f"@{candidate.username}" if candidate.username else candidate.peer_id,
+        since=horizon(session),
+        comments=kind == "channel",
+        account=session.account,
+    )
+
+
+def _add_sources(
+    rdb: sqlite3.Connection,
+    conn: sqlite3.Connection,
+    paths: Paths,
+    session: ResearchSession,
+    work: Sequence[Candidate],
+    report: RunReport,
+) -> None:
+    """Add the approved sources in one config write, under the :class:`~grepogram.sync.SyncLock`
+    and then the :class:`~grepogram.config.ConfigLock` (:func:`grepogram.config.update`), and
+    record on each candidate the source it is fetched through — a chat source of the account
+    that already names it is reused rather than doubled. No Telegram request runs under either
+    lock. :class:`~grepogram.sync.SyncInProgress` propagates."""
+    planned: list[tuple[Candidate, Source]] = []
+    for candidate in work:
+        source = _planned_source(rdb, conn, session, _fresh(rdb, candidate), report)
+        if source is not None:
+            planned.append((candidate, source))
+    if not planned:
+        return
+    chosen: dict[int, tuple[str, bool]] = {}
+
+    def change(current: Config) -> Config:
+        chosen.clear()
+        for candidate, source in planned:
+            existing = _configured(current, source.account, candidate)
+            if existing is not None:
+                chosen[candidate.id] = (existing.id, False)
+                continue
+            current = sources.with_source(current, source, None)
+            chosen[candidate.id] = (source.id, True)
+        return current
+
+    with sync.SyncLock(paths):
+        config.update(paths, change)
+    with db.transaction(rdb):
+        for candidate, _ in planned:
+            source_id, added = chosen[candidate.id]
+            research_db.update_candidate(rdb, candidate.id, source_id=source_id)
+            if added:
+                report.sources_added.append(candidate.id)
+    log.info("research session %d: %d source(s) added", session.id, len(report.sources_added))
+
+
+def _to_fetch(
+    rdb: sqlite3.Connection,
+    session: ResearchSession,
+    cfg: Config,
+    work: Sequence[Candidate],
+    report: RunReport,
+) -> list[Candidate]:
+    """The candidates this run fetches: a live ``fetch`` grant and a source that is still
+    configured. A source someone removed since is never added back — removing it was a
+    decision — and the candidate's grants are voided with a note saying so."""
+    configured = {source.id for source in cfg.sources}
+    fetching: list[Candidate] = []
+    for candidate in work:
+        current = _fresh(rdb, candidate)
+        if current.source_id is None or current.status not in _ACTIONABLE:
+            continue
+        if current.status == "pending_admission" or not authorized(rdb, current, "fetch"):
+            continue
+        if current.source_id not in configured:
+            note = f"its source {current.source_id} was removed from the config; not fetched"
+            with db.transaction(rdb):
+                research_db.update_candidate(rdb, current.id, note=note)
+                research_db.void_grants(rdb, session.id, candidate_ids=[current.id])
+            report.warnings.append(f"candidate {current.id}: {note}")
+            continue
+        fetching.append(current)
+    return fetching
+
+
+def _fetched_chat(conn: sqlite3.Connection, candidate: Candidate) -> ChatRow | None:
+    """The index row of the chat ``candidate``'s source covers."""
+    assert candidate.source_id is not None
+    rows = [db.get_chat(conn, chat_id) for chat_id in db.source_chat_ids(conn, candidate.source_id)]
+    stored = [row for row in rows if row is not None]
+    for row in stored:
+        if candidate.peer_id is not None and row.peer_id == candidate.peer_id:
+            return row
+        if candidate.username and (row.username or "").lower() == candidate.username.lower():
+            return row
+    return stored[0] if len(stored) == 1 else None
+
+
+def _settle_fetches(
+    rdb: sqlite3.Connection,
+    conn: sqlite3.Connection,
+    session: ResearchSession,
+    fetching: Sequence[Candidate],
+    synced: SyncReport,
+    report: RunReport,
+    stamp: int,
+) -> int:
+    """Record what the sync did for each fetched candidate and register every chat it stored
+    into for discovery one hop deeper — the chat and a channel's discussion group, at the
+    candidate's depth (:func:`scan_targets`). Returns how many chats were registered."""
+    registered = 0
+    for candidate in fetching:
+        chat = _fetched_chat(conn, candidate)
+        if chat is None:
+            note = "its source did not resolve to the chat this run"
+            research_db.update_candidate(rdb, candidate.id, note=note)
+            report.warnings.append(f"candidate {candidate.id}: {note}")
+            continue
+        if chat.id in synced.unavailable:
+            note = "Telegram refused its history to the account"
+            _refuse_candidate(rdb, session, candidate, "unavailable", note, report)
+            continue
+        attempted = chat.id in synced.chats_done or chat.id in synced.chats_remaining
+        if attempted:
+            chats = [chat]
+            discussion = db.get_discussion_chat(conn, chat.id)
+            if discussion is not None:
+                chats.append(discussion)
+            for row in chats:
+                research_db.set_scan_cursor(
+                    rdb, session.id, row.id, depth=candidate.depth, msg_id=0, now=stamp
+                )
+                registered += 1
+        if chat.id in synced.chats_done:
+            research_db.update_candidate(rdb, candidate.id, status="fetched", note=None)
+            report.fetched.append(candidate.id)
+        elif attempted:
+            research_db.update_candidate(rdb, candidate.id, note=PARTIAL_NOTE)
+            report.partial.append(candidate.id)
+    return registered
+
+
+def _done(candidate: Candidate, action: str) -> bool:
+    if action == "join":
+        return _is_member(candidate)
+    if action == "request":
+        return _is_member(candidate) or candidate.status == "pending_admission"
+    if action == "add_source":
+        return candidate.source_id is not None
+    return candidate.status == "fetched"
+
+
+def _consume_done(
+    rdb: sqlite3.Connection, session: ResearchSession, work: Sequence[Candidate], stamp: int
+) -> int:
+    """Consume every live grant whose actions are all carried out; the rest stay live for the
+    next run, which nobody has to approve again. Returns how many candidates still hold one."""
+    waiting = 0
+    for candidate in work:
+        current = _fresh(rdb, candidate)
+        live = research_db.live_grants(rdb, session.id, current.id)
+        for grant in live:
+            if all(_done(current, action) for action in grant.actions):
+                research_db.consume_grant(rdb, grant.id, now=stamp)
+        if research_db.live_grants(rdb, session.id, current.id):
+            waiting += 1
+    return waiting
+
+
+def _record_progress(
+    rdb: sqlite3.Connection, session: ResearchSession, report: RunReport, stamp: int
+) -> None:
+    progress = dict(research_db.get_session(rdb, session.id).progress)  # type: ignore[union-attr]
+    runs = progress.get("runs", 0)
+    total = progress.get("messages", 0)
+    progress.update(
+        runs=(runs if isinstance(runs, int) else 0) + 1,
+        messages=(total if isinstance(total, int) else 0) + report.messages,
+        last_run_at=stamp,
+        last_run={
+            "admitted": report.admitted,
+            "joined": report.joined,
+            "pending_admission": report.pending_admission,
+            "sources_added": report.sources_added,
+            "fetched": report.fetched,
+            "partial": report.partial,
+            "unavailable": report.unavailable,
+            "failed": report.failed,
+            "messages": report.messages,
+            "new_candidates": [] if report.discovery is None else report.discovery.new_candidates,
+            "stopped_by": report.stopped_by,
+            "warnings": report.warnings,
+        },
+    )
+    research_db.set_session_progress(rdb, session.id, progress)
+
+
+async def run(
+    rdb: sqlite3.Connection,
+    conn: sqlite3.Connection,
+    cfg: Config,
+    paths: Paths,
+    clients: Mapping[str, Any],
+    session_id: int,
+    budget: sync.SyncBudget | None = None,
+    *,
+    embedder: Embedder | None = None,
+    now: int | None = None,
+) -> RunReport:
+    """Carry out what a human approved for a session, within its budgets, and look one hop
+    further from what it fetched.
+
+    In order: the admission requests still waiting are asked about again (an admitted chat is
+    ``joined``); every candidate with a live grant is joined or asked to join exactly as
+    approved — the chats of one shared folder in one request naming only them — each outward
+    step behind :func:`authorized` for that very candidate and action; the approved sources are
+    added to the config (account, ``since`` = :func:`horizon`, comments for a channel) in one
+    locked write; those chats — and nothing else — are synced through
+    :func:`grepogram.sync.sync_all` with ``only``, under ``budget`` (the session's
+    ``run_budget_s`` and ``max_messages_per_run`` by default); and every chat the sync stored
+    into is registered for discovery, which runs over it at depth + 1 and only ever *proposes*
+    what it finds. Nothing discovered inside an approved chat is acted on.
+
+    Telegram's answers are recorded as they are: already a member is ``joined``, an admission
+    request is ``pending_admission`` (asked about again next run), a chat that refuses the
+    account is ``unavailable``, and an account at its channel limit is ``failed`` until
+    approved again. A flood wait ends the run's Telegram work; a clock or message cap that runs
+    out leaves the fetch resumable. Grants whose actions are all done are consumed and the rest
+    stay for the next run, which is resumable from ``research.db`` alone; progress is recorded
+    on the session. A stopped session refuses to run (:class:`SessionStopped`), and every source
+    a run added stays when the session stops.
+    """
+    require_enabled(cfg)
+    session = active_session(rdb, session_id)
+    client = clients.get(session.account)
+    if client is None:
+        raise ResearchError(
+            f"account {session.account} is not signed in for this run",
+            tg.auth_hint(session.account),
+        )
+    limits = session.limits
+    if budget is None:
+        budget = sync.SyncBudget(limits.run_budget_s, messages=limits.max_messages_per_run)
+    stamp = _stamp(now)
+    spent_before = budget.spent
+    report = RunReport(session_id=session.id)
+    flooded = await _recheck_admissions(client, rdb, conn, session, report, stamp)
+    work = [
+        view.candidate
+        for view in candidate_views(rdb, conn, session, _ACTIONABLE)
+        if _granted(rdb, view.candidate)
+    ]
+    if not flooded:
+        flooded = await _join_all(client, rdb, conn, session, work, report, budget, stamp)
+    registered = 0
+    if not flooded and not budget.expired:
+        try:
+            _add_sources(rdb, conn, paths, session, work, report)
+            current = config.load(paths)
+            fetching = _to_fetch(rdb, session, current, work, report)
+            if fetching and not budget.halted:
+                synced = await sync.sync_all(
+                    clients,
+                    conn,
+                    functools.partial(config.load, paths),
+                    paths,
+                    budget,
+                    embedder,
+                    recut=False,
+                    only=sorted({c.source_id for c in fetching if c.source_id is not None}),
+                )
+                report.warnings.extend(synced.warnings)
+                registered = _settle_fetches(rdb, conn, session, fetching, synced, report, stamp)
+        except sync.SyncInProgress as exc:
+            report.warnings.append(f"{exc}; the approved sources wait for the next run")
+            report.stopped_by = "sync_busy"
+    report.messages = budget.spent - spent_before
+    waiting = _consume_done(rdb, session, work, stamp)
+    if report.stopped_by is None and waiting and budget.halted:
+        report.stopped_by = "messages" if budget.exhausted else "time"
+    if registered:
+        report.discovery = discover_offline(rdb, conn, cfg, session.id, now=stamp)
+    _record_progress(rdb, session, report, stamp)
+    log.info(
+        "research session %d run: %d joined, %d waiting for admission, %d source(s) added, "
+        "%d fetched, %d partly, %d message(s)%s",
+        session.id,
+        len(report.joined),
+        len(report.pending_admission),
+        len(report.sources_added),
+        len(report.fetched),
+        len(report.partial),
+        report.messages,
+        "" if report.stopped_by is None else f", stopped by {report.stopped_by}",
+    )
+    return report
