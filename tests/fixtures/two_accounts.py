@@ -16,6 +16,7 @@ from dataclasses import dataclass
 
 from grepogram import db, index, units
 from grepogram.models import AccountCfg, ChatRow, Config, MessageRow, Source
+from tests.fakes import FakeWorld
 
 HALL = -1001000000900
 HALL_CHAT = -1001000000901
@@ -79,10 +80,16 @@ def load(conn: sqlite3.Connection, synced_at: int | None = SYNCED_AT) -> TwoAcco
         ChatRow(id=BOB, type="user", title="Bob", scope="work", source_id=f"work/chat:{BOB}"),
         "work",
     )
-    db.set_chat_access(conn, HALL, "default", access_hash=111)
-    db.set_chat_access(conn, HALL, "work", access_hash=222)
-    db.set_chat_access(conn, default_bob.id, "default", access_hash=333)
-    db.set_chat_access(conn, work_bob.id, "work", access_hash=444)
+    # each account's own hash for a peer, as a FakeWorld hands it to that account's client
+    for chat, account in (
+        (hall, "default"),
+        (hall, "work"),
+        (default_bob, "default"),
+        (work_bob, "work"),
+    ):
+        db.set_chat_access(
+            conn, chat.id, account, access_hash=FakeWorld.access_hash(account, chat.peer_id)
+        )
     histories = {
         hall.id: [_msg(HALL, 1, "Brubank opens a new branch downtown", from_name="Hall")],
         hall_chat.id: [_msg(HALL_CHAT, 3, "The Brubank queue is long today", 5)],
