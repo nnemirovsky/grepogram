@@ -217,8 +217,11 @@ never change the git identity.
   A chat goes to the first account of its route in the run and not stopped, so a chat whose own
   account is absent is fetched through another that reaches it; one nobody in the run reaches
   is counted in one warning per account (`_SyncPass.unfetched`), not listed as remaining. A
-  fallback fetch's own warnings carry the fetching account's label. A flood wait stops only
-  that account's queue; a scoped chat never falls back. `prune-deleted` removes a message only
+  fallback fetch's own warnings carry the fetching account's label. Every fetch — a lane's own
+  and a fallback another lane makes — holds that account's `_Lane.turn` lock, warm-up included,
+  so one client never runs two fetches at once, and a fallback that finds its account
+  flood-stopped once its turn comes passes over it (`accounts.AccountStopped`) without sending
+  anything. A flood wait stops only that account's queue; a scoped chat never falls back. `prune-deleted` removes a message only
   when **every** account `recorded_reach` names answers it empty (`sync._confirmed_gone`): an
   account that joined late may see history as empty that another still reads, so one of them
   absent or flood-stopped leaves the chat untouched, and only an account Telegram refused the

@@ -314,6 +314,16 @@ class Attempt[T]:
     failure: Failed | None = None
 
 
+class AccountStopped(Exception):
+    """An attempt found its account stopped once its turn came — a flood wait another pass
+    through the same account hit while this one waited for it. :func:`through_accounts` passes
+    over the account without counting a refusal or a second flood wait."""
+
+    def __init__(self, account: str) -> None:
+        super().__init__(f"account {account} was stopped while this attempt waited for it")
+        self.account = account
+
+
 def _never(_: object) -> bool:
     return False
 
@@ -356,7 +366,8 @@ async def through_accounts[T](
     (:func:`warm_peer_cache`). Then:
 
     * a flood wait stops that account — added to ``stopped`` for the rest of the pass — and the
-      next account is tried;
+      next account is tried, and so is the next one when ``act`` raises
+      :class:`AccountStopped` (it found the account stopped once its turn came);
     * a rejected session is raised naming its account (:func:`~grepogram.tg.reraise_unauthorized`);
     * a shared chat refused to the account (:data:`REROUTE_ERRORS`), or answered with a result
       ``refused`` says is a refusal, is tried through the next account;
@@ -383,6 +394,8 @@ async def through_accounts[T](
             result = await act(account, client)
         except ConfigError:
             raise
+        except AccountStopped:
+            continue
         except errors.FloodWaitError as exc:
             log.warning(
                 "flood wait of %ss on chat %s through account %s; stopping it for this run",

@@ -4116,6 +4116,88 @@ async def test_a_flood_wait_on_the_fallback_account_stops_that_account(
     ]
 
 
+def _held(
+    monkeypatch: pytest.MonkeyPatch, client: FakeClient, peak: list[int], pause: float = 0.01
+) -> None:
+    """Make ``client``'s fetches yield between messages and record in ``peak[0]`` the most of
+    them that were ever running at once."""
+    inner = client.iter_messages
+    running = 0
+
+    async def iter_messages(*args: Any, **kwargs: Any) -> AsyncIterator[Any]:
+        nonlocal running
+        running += 1
+        peak[0] = max(peak[0], running)
+        try:
+            await asyncio.sleep(pause)
+            async for message in inner(*args, **kwargs):
+                await asyncio.sleep(pause)
+                yield message
+        finally:
+            running -= 1
+
+    monkeypatch.setattr(client, "iter_messages", iter_messages)
+
+
+def _delayed(
+    monkeypatch: pytest.MonkeyPatch, client: FakeClient, chat_id: int, pause: float
+) -> None:
+    """Make ``client``'s fetch of ``chat_id`` wait ``pause`` seconds before it asks anything."""
+    inner = client.iter_messages
+
+    async def iter_messages(entity: Any, *args: Any, **kwargs: Any) -> AsyncIterator[Any]:
+        if client._peer_id(entity) == chat_id:
+            await asyncio.sleep(pause)
+        async for message in inner(entity, *args, **kwargs):
+            yield message
+
+    monkeypatch.setattr(client, "iter_messages", iter_messages)
+
+
+async def test_a_fallback_through_another_account_waits_for_that_account_s_own_fetch(
+    conn: sqlite3.Connection, paths: Paths, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The default account is refused the shared group and the work account stands in while its
+    own queue fetches its private chat: one client never runs two fetches at once."""
+    world = _world()
+    cfg = _cfg(
+        Source(chat=PRIV_ID), Source(chat=PRIV_ID, account=WORK), Source(chat=BOB_ID, account=WORK)
+    )
+    home = _home(world, failures={PRIV_ID: errors.ChannelPrivateError(request=None)})
+    work = _work(world)
+    peak = [0]
+    _held(monkeypatch, work, peak)
+
+    report = await _run_accounts({DEFAULT_ACCOUNT: home, WORK: work}, conn, paths, cfg)
+
+    assert peak == [1], "the fallback took its turn after the work account's own fetch"
+    assert len(_history_fetches(work, PRIV_ID)) == 1 and report.unavailable == []
+    assert _texts(conn, PRIV_ID) == {1: "club 1", 2: "club 2", 3: "club 3"}
+    assert _texts(conn, BOB_ID) == {1: "bob here"}
+
+
+async def test_a_fallback_never_asks_through_an_account_flood_stopped_while_it_waited(
+    conn: sqlite3.Connection, paths: Paths, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The work account's own fetch is running when the default account is refused the shared
+    group; that fetch then hits a flood wait. The fallback, waiting for the work account's turn,
+    finds it stopped and sends nothing through it."""
+    world = _world()
+    cfg = _cfg(
+        Source(chat=PRIV_ID), Source(chat=PRIV_ID, account=WORK), Source(chat=BOB_ID, account=WORK)
+    )
+    home = _home(world, failures={PRIV_ID: errors.ChannelPrivateError(request=None)})
+    work = _work(world, failures={BOB_ID: errors.FloodWaitError(request=None, capture=60)})
+    _delayed(monkeypatch, home, PRIV_ID, 0.02)
+    _delayed(monkeypatch, work, BOB_ID, 0.05)
+
+    report = await _run_accounts({DEFAULT_ACCOUNT: home, WORK: work}, conn, paths, cfg)
+
+    assert _fetch_calls(work, PRIV_ID) == [], "not one request through a stopped account"
+    assert report.unavailable == [PRIV_ID]
+    assert any("wait 60s" in warning for warning in report.warnings)
+
+
 def _slow(monkeypatch: pytest.MonkeyPatch, client: FakeClient, pause: float = 0.01) -> None:
     """Make ``client`` yield to the event loop between messages, as a network fetch does."""
     inner = client.iter_messages

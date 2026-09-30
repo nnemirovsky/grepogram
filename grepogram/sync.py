@@ -61,6 +61,7 @@ from telethon.tl import functions, types
 from grepogram import db, dialogs, index, leads, tg, units
 from grepogram.accounts import (
     UNAVAILABLE_ERRORS,
+    AccountStopped,
     Refusal,
     StoredPass,
     account_warning,
@@ -71,6 +72,7 @@ from grepogram.accounts import (
     reaching_accounts,
     recorded_reach,
     through_accounts,
+    warm_peer_cache,
 )
 from grepogram.config import ConfigError
 from grepogram.dialogs import entity_username
@@ -2015,6 +2017,10 @@ class _Lane:
     queue: deque[tuple[ChatRow, Source]] = field(default_factory=deque)
     """The chats to fetch, each with the source it is fetched for — checked once, when the chat
     was queued (:func:`_enqueue`)."""
+    turn: asyncio.Lock = field(default_factory=asyncio.Lock)
+    """Held for every fetch through this account, its own queue's and every fallback another
+    queue makes through it (:func:`_fetch_chat`): one account never runs two fetches at once,
+    and one that waited for its turn sees a flood wait the other hit before it asks anything."""
 
 
 @dataclass(slots=True, eq=False)
@@ -2348,27 +2354,42 @@ async def _fetch_chat(run: _SyncPass, lane: _Lane, chat: ChatRow, source: Source
     the other accounts of this run that reach it are tried in :func:`reaching_accounts`' order
     (:func:`through_accounts`, the one retry rule every pass shares). Each is warmed first from what
     the index stores for it (:func:`~grepogram.accounts.warm_peer_cache`): its client may never have
-    read a dialog this run. The first that fetches it clears the ``unavailable`` flag the refusal
-    set, the report says which account stood in, and the chat's own warnings are labelled with the
-    account that fetched it. A flood wait on any account stops *that* account's queue. When every
-    account is refused, the chat is reported as the first refusal left it. The primary source never
-    moves: it says how the chat is fetched (``since``, ``comments``), not through whom.
+    read a dialog this run. **Every fetch holds its account's turn** (:attr:`_Lane.turn`), the
+    lane's own and a fallback alike, warm-up included: that account's own queue runs beside this
+    one, and two fetches through one client at once would share its flood limit, and one could
+    go on asking after the other was flood-stopped. An account found stopped once its turn comes
+    is passed over (:class:`~grepogram.accounts.AccountStopped`). The first that fetches it
+    clears the ``unavailable`` flag the refusal set, the report says which account stood in, and
+    the chat's own warnings are labelled with the account that fetched it. A flood wait on any
+    account stops *that* account's queue. When every account is refused, the chat is reported as
+    the first refusal left it. The primary source never moves: it says how the chat is fetched
+    (``since``, ``comments``), not through whom.
     """
     route = _route(run, chat, lane.account) if chat.is_shared else [lane.account]
     current = chat
+    # the primary's client learned the chat resolving its source, or from the stored access
+    # hashes seeded before it; any other account is warmed for it first
+    warmed = lane.account if lane.account == source.account else None
 
     async def fetch(account: str, client: Any) -> SyncedChat:
         nonlocal current
-        synced = await sync_chat(
-            client,
-            run.conn,
-            current,
-            source,
-            run.budget,
-            cfg=run.cfg,
-            me=run.lanes[account].me,
-            account=account,
-        )
+        async with run.lanes[account].turn:
+            # waiting for the account's turn may have outlasted a flood wait that stopped it
+            if account in run.stopped:
+                raise AccountStopped(account)
+            cap_flood_sleep(client, run.cfg.sync, run.budget)
+            if account != warmed:
+                await warm_peer_cache(client, [chat], run.conn, account)
+            synced = await sync_chat(
+                client,
+                run.conn,
+                current,
+                source,
+                run.budget,
+                cfg=run.cfg,
+                me=run.lanes[account].me,
+                account=account,
+            )
         current = synced.chat
         return synced
 
@@ -2383,9 +2404,8 @@ async def _fetch_chat(run: _SyncPass, lane: _Lane, chat: ChatRow, source: Source
         fetch,
         refused=lambda synced: synced.unavailable,
         halted=lambda: run.budget.halted,
-        # the primary's client learned the chat resolving its source, or from the stored
-        # access hashes seeded before it; any other account is warmed for it first
-        warmed={lane.account} if lane.account == source.account else (),
+        # fetch warms under the account's turn, so the warm-up is serialised with the fetch
+        warmed=run.lanes.keys(),
     )
     for flood in outcome.flooded:
         log.warning(
