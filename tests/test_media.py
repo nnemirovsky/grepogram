@@ -27,7 +27,7 @@ from grepogram.models import (
 )
 from grepogram.paths import Paths
 from grepogram.sync import SyncBudget
-from tests.fakes import FakeClient, make_channel, make_dialog
+from tests.fakes import FakeClient, make_channel, make_dialog, make_user
 from tests.fixtures import tl
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
@@ -419,6 +419,34 @@ async def test_a_pdf_is_downloaded_extracted_and_stored(
     assert _indexed(conn) == {1: 1}, "the pass rebuilt the row it flagged, in the same transaction"
     assert _fetches(client) == [{"chat_id": CHAT_ID, "limit": None, "ids": [1]}]
     assert [name for name, _ in client.calls if name == "download_media"]
+
+
+async def test_a_dm_under_a_synthetic_id_is_re_fetched_by_its_peer_id(
+    conn: sqlite3.Connection, scratch: Path
+) -> None:
+    """A second account's private chat with a person the default account also talks to is stored
+    under a synthetic id: the re-fetch and the download name the peer, the text lands on the
+    row under that synthetic id, and the default account's conversation is not touched."""
+    alice = make_user(1, "Alice")
+    db.upsert_chat(conn, ChatRow(id=1, type="user", title="Alice", source_id="chat:@alice"))
+    chat = db.upsert_chat(
+        conn,
+        ChatRow(id=1, type="user", title="Alice", source_id="work/chat:@alice", scope="work"),
+        "work",
+    )
+    assert chat.id == db.SYNTHETIC_BASE and chat.peer_id == 1
+    sync.on_chat_synced(conn, chat, _cfg(), db.upsert_messages(conn, [_pdf_row(chat.id, 1)]))
+    client = _client(
+        dialogs=[make_dialog(alice)],
+        messages={1: [tl.document_message(1, 1, "note.pdf")]},
+        downloads={(1, 1): SAMPLE_PDF.read_bytes()},
+    )
+    report = await media.run(conn, client, _cfg(), SyncBudget())
+    assert report.extracted == 1 and report.warnings == []
+    assert _fetches(client) == [{"chat_id": 1, "limit": None, "ids": [1]}]
+    [stored] = db.get_messages(conn, chat.id)
+    assert stored.extracted_text and "sample pdf" in stored.extracted_text.lower()
+    assert db.get_messages(conn, 1) == []
 
 
 async def test_the_temp_file_is_removed_after_a_success(

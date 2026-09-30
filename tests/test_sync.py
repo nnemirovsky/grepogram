@@ -21,6 +21,7 @@ from typer.testing import CliRunner
 from grepogram import cli, db, index, search, sources, sync, tg, units
 from grepogram.config import ConfigError
 from grepogram.models import (
+    DEFAULT_ACCOUNT,
     ChatRow,
     Config,
     Filters,
@@ -1654,7 +1655,7 @@ async def test_a_group_two_channels_pointed_at_belongs_to_the_last_one(
     other = db.upsert_chat(
         conn, ChatRow(id=OTHER_ID, type="channel", title="Other", source_id="chat:@other_news")
     )
-    linked = await sync.link_discussion_chat(client, conn, other)
+    linked = await sync.link_discussion_chat(client, conn, other, DEFAULT_ACCOUNT)
     assert linked is not None and linked.id == DISC_ID
     assert db.get_discussion_chat(conn, OTHER_ID) == linked
     assert db.get_discussion_chat(conn, NEWS_ID) is None
@@ -1695,7 +1696,7 @@ async def test_a_handed_over_group_gives_the_new_channel_none_of_the_old_comment
     db.upsert_messages(
         conn, [MessageRow(chat_id=OTHER_ID, msg_id=1, date=1_700_000_000, text="other post 1")]
     )
-    assert await sync.link_discussion_chat(client, conn, other) is not None
+    assert await sync.link_discussion_chat(client, conn, other, DEFAULT_ACCOUNT) is not None
     moved = _cfg(NEWS_SOURCE, other_source)
     await sync.index_pending(conn, moved, other)
     assert _thread_texts(conn, OTHER_ID) == {}
@@ -1775,7 +1776,7 @@ async def test_an_unlink_leaves_the_forum_topics_of_the_group_alone(
     news = db.get_chat(conn, NEWS_ID)
     assert news is not None
     client.responses[functions.channels.GetFullChannelRequest] = _full_channel(None)
-    assert await sync.link_discussion_chat(client, conn, news) is None
+    assert await sync.link_discussion_chat(client, conn, news, DEFAULT_ACCOUNT) is None
     assert db.get_discussion_chat(conn, NEWS_ID) is None
     assert _forum_state(conn) == before
     assert db.stored_comment_post_ids(conn, FORUM_DISC_ID, NEWS_ID) == []
@@ -1815,7 +1816,7 @@ async def test_a_handover_leaves_the_forum_topics_of_the_group_alone(
     db.upsert_messages(
         conn, [MessageRow(chat_id=OTHER_ID, msg_id=3, date=1_700_000_000, text="other post 3")]
     )
-    linked = await sync.link_discussion_chat(client, conn, other)
+    linked = await sync.link_discussion_chat(client, conn, other, DEFAULT_ACCOUNT)
     assert linked is not None and linked.id == FORUM_DISC_ID
     assert _forum_state(conn) == before
     assert db.stored_comment_post_ids(conn, FORUM_DISC_ID, NEWS_ID) == []
@@ -1880,7 +1881,7 @@ async def test_a_group_deleted_after_an_unlink_leaves_no_thread_quoting_it(
     assert _thread_texts(conn, NEWS_ID) != {}
     _fake_vectors(conn, NEWS_ID)
     client.responses[functions.channels.GetFullChannelRequest] = _full_channel(None)
-    assert await sync.link_discussion_chat(client, conn, news) is None
+    assert await sync.link_discussion_chat(client, conn, news, DEFAULT_ACCOUNT) is None
     assert _thread_texts(conn, NEWS_ID) == {}
     db.delete_chat(conn, DISC_ID)
     assert _thread_texts(conn, NEWS_ID) == {}
@@ -1901,7 +1902,7 @@ async def test_a_group_deleted_after_a_handover_leaves_the_old_channel_clean(
     other = db.upsert_chat(
         conn, ChatRow(id=OTHER_ID, type="channel", title="Other", source_id="chat:@other_news")
     )
-    assert await sync.link_discussion_chat(client, conn, other) is not None
+    assert await sync.link_discussion_chat(client, conn, other, DEFAULT_ACCOUNT) is not None
     assert _thread_texts(conn, NEWS_ID) == {}
     db.delete_chat(conn, DISC_ID)
     assert _thread_texts(conn, NEWS_ID) == {}
@@ -1973,7 +1974,7 @@ async def test_a_handed_over_group_belongs_to_the_source_that_holds_it_now(
     other = db.upsert_chat(
         conn, ChatRow(id=OTHER_ID, type="channel", title="Other", source_id="chat:@other_news")
     )
-    handed = await sync.link_discussion_chat(client, conn, other)
+    handed = await sync.link_discussion_chat(client, conn, other, DEFAULT_ACCOUNT)
     assert handed is not None and handed.id == DISC_ID
     assert handed.source_id == "chat:@other_news"
     moved = _cfg(NEWS_SOURCE, Source(chat="@other_news", comments=True))
@@ -2031,7 +2032,7 @@ async def test_a_discussion_group_held_as_an_import_is_never_linked(
         conn, ChatRow(id=NEWS_ID, type="channel", title="News", source_id=NEWS_SOURCE.id)
     )
     with pytest.raises(sync.DiscussionUnavailable) as excinfo:
-        await sync.link_discussion_chat(client, conn, news)
+        await sync.link_discussion_chat(client, conn, news, DEFAULT_ACCOUNT)
     assert "grepogram sources rm import:news-chat" in str(excinfo.value)
     group = db.get_chat(conn, DISC_ID)
     assert group is not None and group.source_id == "import:news-chat"
@@ -2076,7 +2077,7 @@ async def test_an_imported_group_a_channel_links_is_never_offered_for_pruning(
         ChatRow(id=NEWS_ID, type="channel", title="News", username="news", source_id="folder:News"),
     )
     with pytest.raises(sync.DiscussionUnavailable):
-        await sync.link_discussion_chat(client, conn, news)
+        await sync.link_discussion_chat(client, conn, news, DEFAULT_ACCOUNT)
     scan = sources.prunable(
         _cfg(Source(folder="News", comments=True)),
         conn,
@@ -2110,7 +2111,7 @@ async def test_a_directly_configured_group_keeps_its_source_whatever_the_spellin
     news = db.upsert_chat(
         conn, ChatRow(id=NEWS_ID, type="channel", title="News", source_id=NEWS_SOURCE.id)
     )
-    linked = await sync.link_discussion_chat(client, conn, news)
+    linked = await sync.link_discussion_chat(client, conn, news, DEFAULT_ACCOUNT)
     assert linked is not None and linked.source_id == own.id
     cfg = _cfg(NEWS_SOURCE, own)
     by_source = {s.source_id: [c.id for c in s.chats] for s in sources.sources_status(cfg, conn)}
@@ -2207,13 +2208,13 @@ async def test_the_unlink_and_the_flags_of_the_posts_it_invalidates_are_one_comm
     monkeypatch.setattr(db, "mark_unindexed", killed)
     client.responses[functions.channels.GetFullChannelRequest] = _full_channel(None)
     with pytest.raises(RuntimeError):
-        await sync.link_discussion_chat(client, conn, news)
+        await sync.link_discussion_chat(client, conn, news, DEFAULT_ACCOUNT)
     monkeypatch.undo()
     linked = db.get_discussion_chat(conn, NEWS_ID)
     assert linked is not None and linked.id == DISC_ID
     assert db.unindexed_message_ids(conn, NEWS_ID) == []
     assert not conn.in_transaction
-    assert await sync.link_discussion_chat(client, conn, news) is None
+    assert await sync.link_discussion_chat(client, conn, news, DEFAULT_ACCOUNT) is None
     assert db.get_discussion_chat(conn, NEWS_ID) is None
     flagged = db.get_messages_by_ids(conn, db.unindexed_message_ids(conn, NEWS_ID))
     assert [post.msg_id for post in flagged] == [1, 3]
@@ -3062,6 +3063,142 @@ async def test_migration_check_survives_unresolvable_entities(
     messages = [record.getMessage() for record in caplog.records]
     assert any("cannot check for migration" in m for m in messages)
     assert any("cannot be resolved" in m for m in messages)
+
+
+# --- peer ids --------------------------------------------------------------------------------
+
+
+WORK = "work"
+WORK_ALICE_SOURCE = Source(chat="@alice", account=WORK)
+
+
+def _work_dm(conn: sqlite3.Connection) -> ChatRow:
+    """Alice's private chat as a second account stores it, after the default account's.
+
+    The default account's row already holds id 1, so the work account's row of the same peer is
+    filed under a synthetic id — the one shape in which a row id and a Telegram id differ.
+    """
+    db.upsert_chat(
+        conn,
+        ChatRow(id=ALICE_ID, type="user", title="Alice", username="alice", source_id="chat:@alice"),
+    )
+    chat = db.upsert_chat(
+        conn,
+        ChatRow(
+            id=ALICE_ID,
+            type="user",
+            title="Alice",
+            username="alice",
+            source_id=WORK_ALICE_SOURCE.id,
+            scope=WORK,
+        ),
+        WORK,
+    )
+    assert (chat.id, chat.peer_id, chat.scope) == (db.SYNTHETIC_BASE, ALICE_ID, WORK)
+    return chat
+
+
+async def test_a_dm_under_a_synthetic_id_syncs_through_its_peer_id(
+    conn: sqlite3.Connection,
+) -> None:
+    """Telegram is asked for peer 1; the rows land under the work account's own row, and the
+    default account's conversation with the same person is left exactly as it was."""
+    chat = _work_dm(conn)
+    client = _client(
+        messages={
+            ALICE_ID: [
+                tl.message(ALICE_ID, 1, "hello from work"),
+                tl.message(ALICE_ID, 2, "answer", reply_to=tl.reply_header(1, reply_to_peer=1)),
+            ]
+        }
+    )
+    synced = await sync.sync_chat(client, conn, chat, WORK_ALICE_SOURCE, SyncBudget())
+    assert synced.new == 2
+    assert [kw["chat_id"] for kw in _fetch_calls(client, ALICE_ID)] == [ALICE_ID]
+    assert _fetch_calls(client, chat.id) == []
+    assert _texts(conn, chat.id) == {1: "hello from work", 2: "answer"}
+    assert _texts(conn, ALICE_ID) == {}
+    first, second = db.get_messages(conn, chat.id)
+    assert first.from_id == ALICE_ID, "an incoming private message comes from the peer"
+    assert second.reply_to_msg_id == 1, "a reply header naming the peer is an in-chat reply"
+    stored = db.get_chat(conn, chat.id)
+    assert stored is not None and stored.last_msg_id == 2
+
+
+async def test_a_dm_under_a_synthetic_id_is_swept_by_its_peer_id(
+    conn: sqlite3.Connection, paths: Paths
+) -> None:
+    chat = _work_dm(conn)
+    client = _client(messages={ALICE_ID: _talk(101, 102, 103)})
+    await sync.sync_chat(client, conn, chat, WORK_ALICE_SOURCE, SyncBudget())
+    client.messages[ALICE_ID] = [m for m in client.messages[ALICE_ID] if m.id != 102]
+    report = await _prune(client, conn, paths, _cfg(), chat_id=chat.id)
+    assert (report.removed, report.checked) == (1, 3)
+    assert _swept(client) == [ALICE_ID]
+    assert _texts(conn, chat.id) == {101: "m101", 103: "m103"}
+
+
+async def test_a_source_of_another_account_cannot_fetch_a_scoped_chat(
+    conn: sqlite3.Connection,
+) -> None:
+    """A private chat is its account's own: a source of the default account asking for the work
+    account's row would read the default account's history into it."""
+    chat = _work_dm(conn)
+    client = _client(messages={ALICE_ID: [tl.message(ALICE_ID, 1, "not yours")]})
+    with pytest.raises(ValueError, match="work's own user"):
+        await sync.sync_chat(client, conn, chat, ALICE_SOURCE, SyncBudget())
+    assert client.calls == []
+    assert _texts(conn, chat.id) == {}
+
+
+async def test_a_sync_run_skips_a_scoped_chat_another_accounts_source_names(
+    conn: sqlite3.Connection, paths: Paths
+) -> None:
+    """The run does not fall over on it either: the chat is reported and the others go on."""
+    chat = _work_dm(conn)
+    client = _client(messages={ALICE_ID: [tl.message(ALICE_ID, 1, "hi")]})
+    cfg = _cfg(Source(chat="@alice", account=WORK), ARG_SOURCE)
+    client.messages[ARG_ID] = [tl.message(ARG_ID, 1, "still synced", sender=2)]
+    report = await _run(client, conn, paths, cfg)
+    assert any("default's own user" in warning for warning in report.warnings)
+    assert _texts(conn, ARG_ID) == {1: "still synced"}
+    assert _texts(conn, ALICE_ID) == {} and _texts(conn, chat.id) == {}
+
+
+async def test_a_scoped_legacy_group_migrating_to_a_supergroup_still_links(
+    conn: sqlite3.Connection,
+) -> None:
+    """The work account's copy of a legacy group sits under a synthetic id; the migration is
+    still read off its peer id and the supergroup it became is one shared row, id = peer id."""
+    db.upsert_chat(conn, ChatRow(id=OLD_ID, type="group", title="Old group", source_id="chat:-10"))
+    source = Source(chat=OLD_ID, account=WORK)
+    old = db.upsert_chat(
+        conn,
+        ChatRow(id=OLD_ID, type="group", title="Old group", source_id=source.id, scope=WORK),
+        WORK,
+    )
+    assert old.id == db.SYNTHETIC_BASE and old.peer_id == OLD_ID
+    client = _client(messages={OLD_ID: [tl.message(OLD_ID, 1, "old times", sender=1)]})
+    synced = await sync.sync_chat(client, conn, old, source, SyncBudget())
+    assert ("get_entity", {"key": OLD_ID}) in client.calls
+    assert synced.migrated_to is not None
+    assert (synced.migrated_to.id, synced.migrated_to.peer_id) == (GEORGIA_ID, GEORGIA_ID)
+    assert synced.migrated_to.scope == "" and synced.migrated_to.source_id == source.id
+    assert synced.chat.id == old.id and synced.chat.migrated_to == GEORGIA_ID
+    assert _texts(conn, old.id) == {1: "old times"}
+    default_group = db.get_chat(conn, OLD_ID)
+    assert default_group is not None and default_group.migrated_to is None
+
+
+def test_a_chat_built_from_an_entity_carries_the_account_it_came_through() -> None:
+    """Never the default account's scope by omission: a user another account reached is that
+    account's row, while a channel is shared whichever account reached it."""
+    user = sync._chat_row_from_entity(ALICE, None, WORK)
+    assert (user.id, user.peer_id, user.scope) == (ALICE_ID, ALICE_ID, WORK)
+    group = sync._chat_row_from_entity(OLD_GROUP, None, WORK)
+    assert group.scope == WORK
+    channel = sync._chat_row_from_entity(NEWS, "chat:@news", WORK)
+    assert (channel.peer_id, channel.scope) == (NEWS_ID, "")
 
 
 # --- sync_all --------------------------------------------------------------------------------

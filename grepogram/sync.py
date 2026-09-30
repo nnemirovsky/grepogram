@@ -72,6 +72,7 @@ from grepogram.models import (
     SyncCfg,
     SyncReport,
     UserRow,
+    chat_scope,
 )
 from grepogram.paths import FileLock, Paths
 from grepogram.sources import (
@@ -190,9 +191,11 @@ def map_message(
 
     Service messages (joins, pins, topic edits) and ``MessageEmpty`` are skipped. The row is
     stored under ``chat.id`` whatever the message's own peer is, which is how channel comments
-    land in their discussion chat. Text is the message text or caption; a poll, venue or
-    contact — media that carries its content outside the text — contributes its own text when
-    the message has none.
+    land in their discussion chat; what Telegram says about the chat itself — the peer that sent
+    a channel post, the peer a quoted reply points into — is compared with ``chat.peer_id``, the
+    id Telegram knows, which a scoped row stored under a synthetic id does not share. Text is the
+    message text or caption; a poll, venue or contact — media that carries its content outside
+    the text — contributes its own text when the message has none.
     """
     if isinstance(msg, types.MessageService) or not isinstance(msg, types.Message):
         return None
@@ -200,9 +203,9 @@ def map_message(
         log.debug("skipping message %s in chat %s: no date", msg.id, chat.id)
         return None
     from_id, from_name = sender_of(msg, names, me=me)
-    if from_id == chat.id and from_id not in names and chat.title:
+    if from_id == chat.peer_id and from_id not in names and chat.title:
         from_name = chat.title
-    reply_to_msg_id, topic_id = reply_of(msg.reply_to, chat.id)
+    reply_to_msg_id, topic_id = reply_of(msg.reply_to, chat.peer_id)
     media_kind, media_filename = media_of(msg.media)
     return MessageRow(
         chat_id=chat.id,
@@ -228,14 +231,15 @@ def epoch(when: dt.datetime) -> int:
     return int(when.timestamp())
 
 
-def reply_of(reply_to: Any, chat_id: int) -> tuple[int | None, int | None]:
+def reply_of(reply_to: Any, peer_id: int) -> tuple[int | None, int | None]:
     """``(reply_to_msg_id, topic_id)`` from a message's ``reply_to`` header.
 
     In a forum the header always points at the topic: a message that merely sits in a topic has
     ``forum_topic`` set and ``reply_to_msg_id`` = the topic root with no ``reply_to_top_id`` and
     is not a reply; a real reply inside a topic carries its parent in ``reply_to_msg_id`` and the
     topic root in ``reply_to_top_id``. Story replies and quotes of a message from another chat
-    (``reply_to_peer_id`` set to a different peer) are not in-chat replies.
+    (``reply_to_peer_id`` set to a different peer than ``peer_id``, the chat's Telegram id)
+    are not in-chat replies.
     """
     if not isinstance(reply_to, types.MessageReplyHeader):
         return None, None
@@ -246,7 +250,7 @@ def reply_of(reply_to: Any, chat_id: int) -> tuple[int | None, int | None]:
         if not reply_to.reply_to_top_id:
             parent = None
     other = reply_to.reply_to_peer_id
-    if other is not None and int(utils.get_peer_id(other)) != chat_id:
+    if other is not None and int(utils.get_peer_id(other)) != peer_id:
         parent = None
     return parent, topic
 
@@ -602,6 +606,22 @@ class _Run:
         self.discussion = None
 
 
+def foreign_scope(chat: ChatRow, source: Source) -> str | None:
+    """Why ``source`` may not fetch ``chat``, or ``None`` when it may.
+
+    A private chat or legacy group is stored under the account whose history it is
+    (``chats.scope``), and only that account's client may read into it: another account's
+    conversation with the same peer has message ids of its own. A channel or supergroup is
+    shared and any account's source may fetch it.
+    """
+    if not chat.scope or chat.scope == source.account:
+        return None
+    return (
+        f"chat {chat.id} ({chat.title}) is {chat.scope}'s own {chat.type}, so source {source.id} "
+        f"of account {source.account} cannot fetch it"
+    )
+
+
 def _track(seen: dict[int, None], ids: Iterable[int]) -> None:
     for row_id in ids:
         seen.setdefault(row_id, None)
@@ -653,7 +673,17 @@ async def sync_chat(
     result keeps pointing at the supergroup so :func:`sync_all` syncs that one.
     :class:`~telethon.errors.FloodWaitError` beyond the client's sleep threshold and
     authorization errors propagate after the current batch is committed.
+
+    ``client`` is ``source.account``'s, and every chat stored on the way (a migration's
+    supergroup, a channel's discussion group) is filed under that account
+    (:func:`grepogram.db.upsert_chat`). Telegram is addressed by ``chat.peer_id`` throughout and
+    the rows by ``chat.id``. A private chat or legacy group is the account's own, so a source of
+    another account asking for one is a ``ValueError`` rather than a fetch through the wrong
+    session.
     """
+    foreign = foreign_scope(chat, source)
+    if foreign is not None:
+        raise ValueError(foreign)
     if chat.migrated_to is not None:
         log.debug("chat %s migrated to %s; its history is frozen", chat.id, chat.migrated_to)
         return SyncedChat(chat=chat, migrated_to=db.get_chat(conn, chat.migrated_to))
@@ -667,10 +697,14 @@ async def sync_chat(
         me=me,
     )
     try:
-        migrated = await _check_migration(client, conn, chat) if chat.type == "group" else None
+        migrated = (
+            await _check_migration(client, conn, chat, source.account)
+            if chat.type == "group"
+            else None
+        )
         if source.comments and chat.type == "channel":
             try:
-                run.discussion = await link_discussion_chat(client, conn, chat)
+                run.discussion = await link_discussion_chat(client, conn, chat, source.account)
             except DiscussionUnavailable as exc:
                 run.drop_comments(exc)
         fetched = await _fetch_new(run)
@@ -741,7 +775,7 @@ async def _fetch_new(run: _Run) -> _Fetched:
     seen_up_to = progress
     offset_date = since_of(run.source) if progress == 0 else None
     iterator = run.client.iter_messages(
-        chat.id, min_id=progress, reverse=True, offset_date=offset_date
+        chat.peer_id, min_id=progress, reverse=True, offset_date=offset_date
     )
     async for msg in iterator:
         seen_up_to = max(seen_up_to, int(msg.id))
@@ -832,7 +866,7 @@ async def _fetch_comments(run: _Run, post_id: int) -> list[int]:
     rows: list[MessageRow] = []
     stored: list[int] = []
     try:
-        async for msg in run.client.iter_messages(run.chat.id, reply_to=post_id):
+        async for msg in run.client.iter_messages(run.chat.peer_id, reply_to=post_id):
             row = run.map(msg, run.discussion)
             if row is not None:
                 rows.append(
@@ -878,7 +912,7 @@ async def _refetch_edits(run: _Run, cfg: Config) -> list[int]:
     fresh: list[MessageRow] = []
     replies: dict[int, int] = {}
     seen: set[int] = set()
-    async for msg in run.client.iter_messages(chat.id, limit=cfg.sync.edit_refetch):
+    async for msg in run.client.iter_messages(chat.peer_id, limit=cfg.sync.edit_refetch):
         seen.add(int(msg.id))
         row = run.map(msg, chat)
         if row is not None:
@@ -1058,10 +1092,17 @@ def _refresh_comment_reactions(run: _Run, row_ids: Sequence[int]) -> None:
     db.refresh_unit_reactions(run.conn, run.discussion.id, [row.msg_id for row in rows])
 
 
-async def _check_migration(client: Any, conn: sqlite3.Connection, chat: ChatRow) -> ChatRow | None:
-    """Detect a legacy group upgraded to a supergroup; upsert and return the new chat row."""
+async def _check_migration(
+    client: Any, conn: sqlite3.Connection, chat: ChatRow, account: str
+) -> ChatRow | None:
+    """Detect a legacy group upgraded to a supergroup; upsert and return the new chat row.
+
+    The group is asked about by its peer id, which a group stored under a synthetic row id does
+    not share; the supergroup is a shared chat, found by its Telegram identity and stored through
+    ``account``, whose client is the one asking.
+    """
     try:
-        entity = await client.get_entity(chat.id)
+        entity = await client.get_entity(chat.peer_id)
     except ValueError as exc:
         log.warning("chat %s (%s): cannot check for migration: %s", chat.id, chat.title, exc)
         return None
@@ -1069,7 +1110,7 @@ async def _check_migration(client: Any, conn: sqlite3.Connection, chat: ChatRow)
     if target is None:
         return None
     new_id = dialogs.peer_id(types.PeerChannel(int(target.channel_id)))
-    new_chat = db.get_chat(conn, new_id)
+    new_chat = db.get_chat_by_peer(conn, new_id, chat_scope("supergroup", account))
     if new_chat is None:
         try:
             entity = await client.get_entity(new_id)
@@ -1082,16 +1123,21 @@ async def _check_migration(client: Any, conn: sqlite3.Connection, chat: ChatRow)
                 exc,
             )
             return None
-        new_chat = db.upsert_chat(conn, _chat_row_from_entity(entity, chat.source_id))
-    db.set_chat_migrated(conn, chat.id, new_id)
-    log.info("chat %s (%s) migrated to supergroup %s", chat.id, chat.title, new_id)
+        new_chat = db.upsert_chat(
+            conn, _chat_row_from_entity(entity, chat.source_id, account), account
+        )
+    db.set_chat_migrated(conn, chat.id, new_chat.id)
+    log.info("chat %s (%s) migrated to supergroup %s", chat.id, chat.title, new_chat.id)
     return new_chat
 
 
 async def link_discussion_chat(
-    client: Any, conn: sqlite3.Connection, channel: ChatRow
+    client: Any, conn: sqlite3.Connection, channel: ChatRow, account: str
 ) -> ChatRow | None:
     """Upsert the channel's linked discussion group as its own ``chats`` row.
+
+    ``client`` is ``account``'s, and the group is stored through that account
+    (:func:`grepogram.db.upsert_chat`); the channel is asked about by its peer id.
 
     The row carries ``discussion_of = channel.id`` and the ``source_id``
     :func:`~grepogram.sources.discussion_source_id` decides: a group a source covers on its own
@@ -1122,7 +1168,7 @@ async def link_discussion_chat(
     is useful: a group the account was kicked from still comes back inside ``full.chats``, so
     nothing else here would ever fail on it.
     """
-    full = await client(functions.channels.GetFullChannelRequest(channel.id))
+    full = await client(functions.channels.GetFullChannelRequest(channel.peer_id))
     linked = getattr(full.full_chat, "linked_chat_id", None)
     if not linked:
         _relink_discussion(conn, channel, None)
@@ -1149,7 +1195,7 @@ async def link_discussion_chat(
             ) from exc
     with db.transaction(conn):
         source_id = discussion_source_id(db.get_chat(conn, linked_id), channel)
-        stored = db.upsert_chat(conn, _chat_row_from_entity(entity, source_id))
+        stored = db.upsert_chat(conn, _chat_row_from_entity(entity, source_id, account), account)
         _relink_discussion(conn, channel, stored.id)
     return _refresh(conn, stored)
 
@@ -1227,10 +1273,18 @@ def _drop_comment_units(conn: sqlite3.Connection, channel_id: int | None, group_
     )
 
 
-def _chat_row_from_entity(entity: Any, source_id: str | None) -> ChatRow:
+def _chat_row_from_entity(entity: Any, source_id: str | None, account: str) -> ChatRow:
+    """The row of a Telegram entity reached through ``account``, for :func:`db.upsert_chat`.
+
+    The scope is spelled out rather than left to :class:`ChatRow`'s default, which is the
+    default account's: a user, bot or legacy group some other account reached must never be
+    filed under ``default``. ``id`` is the peer id only as a proposal — the upsert allocates.
+    """
     info = dialogs.dialog_info(entity)
     return ChatRow(
         id=info.id,
+        peer_id=info.id,
+        scope=chat_scope(info.type, account),
         type=info.type,
         title=info.title,
         username=info.username,
@@ -1664,6 +1718,11 @@ async def _sync_chats(
         if source is None:
             log.debug("chat %s has no configured source; skipped", chat.id)
             continue
+        foreign = foreign_scope(chat, source)
+        if foreign is not None:
+            log.warning("%s; skipped", foreign)
+            tally.warnings.append(foreign)
+            continue
         if budget.expired:
             tally.remaining.append(chat.id)
             deferred.append(chat)
@@ -1885,7 +1944,7 @@ async def warm_peer_cache(client: Any, chats: Sequence[ChatRow]) -> None:
     file and nothing else, so **the entity cache of every client grepogram builds starts empty**
     — the docstring there states the rule and every Telegram-facing pass has to honour it. A
     request that names a chat by its stored id and nothing else, which is what
-    ``client.get_messages(chat.id, ids=[…])`` is, has no access hash to build an ``InputPeer``
+    ``client.get_messages(chat.peer_id, ids=[…])`` is, has no access hash to build an ``InputPeer``
     from: Telethon 1.44 asks the session, gets nothing, and its network fallback
     (``channels.getChannels`` / ``users.getUsers`` with ``access_hash = 0``) is documented to
     answer only for a bot's private chats or a contact. For a user session on a private
@@ -1946,7 +2005,7 @@ async def warm_peer_cache(client: Any, chats: Sequence[ChatRow]) -> None:
     log.debug("warmed the entity cache with %d dialogs", len(listed))
     resolved = set(listed)
     for chat in chats:
-        if chat.id in resolved or not chat.username:
+        if chat.peer_id in resolved or not chat.username:
             continue
         try:
             entity = await client.get_entity(chat.username)
@@ -1964,7 +2023,7 @@ async def warm_peer_cache(client: Any, chats: Sequence[ChatRow]) -> None:
             continue
         resolved.add(int(utils.get_peer_id(entity)))
     for chat in chats:
-        if chat.id in resolved or chat.discussion_of is None:
+        if chat.peer_id in resolved or chat.discussion_of is None:
             continue
         try:
             await client(functions.channels.GetFullChannelRequest(chat.discussion_of))
@@ -2007,7 +2066,7 @@ async def _sweep_chat(
         if not page:
             db.clear_prune_cursor(conn, chat.id)
             return True
-        gone = _empty_slots(page, await client.get_messages(chat.id, ids=page))
+        gone = _empty_slots(page, await client.get_messages(chat.peer_id, ids=page))
         if gone is None:
             log.warning(
                 "chat %s (%s): Telegram's answer did not line up with the %d ids asked about; "

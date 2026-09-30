@@ -397,17 +397,26 @@ voided_at)`, `exclusions(identity PRIMARY KEY, reason, created_at)`,
 ### Task 4: Address Telegram and links by peer id
 
 **Files:**
-- Modify: `grepogram/sync.py`, `grepogram/media.py`, `grepogram/links.py`, `grepogram/search.py`
+- Modify: `grepogram/sync.py`, `grepogram/media.py`, `grepogram/links.py`
 - Modify: `tests/test_sync.py`, `tests/test_sync_map.py`, `tests/test_media.py`, `tests/test_links.py`
+- `grepogram/search.py` needed no change: it hands the stored `ChatRow` to `links.message_url`,
+  which is where the peer id is read
 
-- [ ] every call in Context's list uses `chat.peer_id`; `map_message` compares `from_id` with
-  `chat.peer_id` and passes `chat.peer_id` to `reply_of`, while the row keeps `chat_id=chat.id`
-- [ ] `links.message_url` builds `tg://openmessage?user_id=` / `chat_id=` from `peer_id`
-- [ ] `_chat_row_from_entity`, `_check_migration`, `link_discussion_chat` go through the
-  scope-aware `upsert_chat`
-- [ ] tests: a DM row with a synthetic id syncs, extracts media, prunes and links by its peer id;
+- [x] every call in Context's list uses `chat.peer_id`; `map_message` compares `from_id` with
+  `chat.peer_id` and passes `chat.peer_id` to `reply_of`, while the row keeps `chat_id=chat.id`.
+  `media._extract_chat` / `_extract_batch` take the `ChatRow` (not an id) so the re-fetch can
+  name the peer; the re-cut still reads the row as stored now
+- [x] `links.message_url` builds `tg://openmessage?user_id=` / `chat_id=` from `peer_id`
+- [x] `_chat_row_from_entity`, `_check_migration`, `link_discussion_chat` go through the
+  scope-aware `upsert_chat`. The account is explicit, never defaulted: `sync_chat` passes
+  `source.account` to both, `_chat_row_from_entity(entity, source_id, account)` spells the scope
+  out with `chat_scope`, and `upsert_chat` gets the same account. `sync.foreign_scope(chat,
+  source)` refuses a scoped chat to another account's source — `sync_chat` raises `ValueError`,
+  and `_sync_chats` skips the chat with a warning so one misfiled source cannot end the run
+  (until tasks 5/6 resolve and fetch per account, a non-default source naming a DM hits this)
+- [x] tests: a DM row with a synthetic id syncs, extracts media, prunes and links by its peer id;
   a legacy group migrating to a supergroup still links
-- [ ] run checks — must pass before task 5
+- [x] run checks — must pass before task 5
 
 ### Task 5: Sources per account, shared coverage and removal
 

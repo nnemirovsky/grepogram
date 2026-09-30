@@ -4,7 +4,7 @@ import logging
 import pytest
 from telethon.tl import types
 
-from grepogram import sync
+from grepogram import db, sync
 from grepogram.models import ChatRow, MessageRow, UserRow
 from tests.fakes import make_channel, make_group, make_message, make_user
 from tests.fixtures import tl
@@ -235,6 +235,21 @@ def test_chat_title_names_the_chat_itself_when_absent_from_names() -> None:
     untitled = ChatRow(id=ARG.id, type="supergroup")
     row = _map(tl.message(ARG.id, 1, "x", sender=ARG_ENTITY), untitled, {})
     assert row.from_name == f"id{ARG.id}"
+
+
+def test_a_row_under_a_synthetic_id_is_read_against_its_peer_id() -> None:
+    """A second account's private chat with Alice is stored under a synthetic id, and Telegram
+    still names the chat by peer 1: the sender check and the quoted-reply check compare with the
+    peer id, while the row keeps the row id."""
+    work_dm = ChatRow(
+        id=db.SYNTHETIC_BASE, peer_id=1, type="user", title="Alice at work", scope="work"
+    )
+    row = _map(tl.message(1, 1, "hi"), work_dm, {})
+    assert (row.chat_id, row.from_id, row.from_name) == (db.SYNTHETIC_BASE, 1, "Alice at work")
+    reply = _map(tl.message(1, 2, "yes", reply_to=tl.reply_header(1, reply_to_peer=1)), work_dm)
+    assert reply.reply_to_msg_id == 1
+    elsewhere = tl.reply_header(1, reply_to_peer=db.SYNTHETIC_BASE)
+    assert _map(tl.message(1, 3, "no", reply_to=elsewhere), work_dm).reply_to_msg_id is None
 
 
 def test_row_is_stored_under_the_given_chat() -> None:

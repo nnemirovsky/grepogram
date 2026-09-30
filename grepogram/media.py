@@ -2,11 +2,11 @@
 
 ``grepogram extract`` runs this. It is a **network** pass, not the offline analogue of
 ``grepogram embed``: Telethon downloads from a ``Message`` object, never from a stored row, so
-every pending message is re-fetched by id (``client.get_messages(chat_id, ids=[…])``) before its
-file is downloaded — which is also where the size comes from, there being no size column. It
-runs after a sync rather than inside one because a 400-page PDF or a slow OCR must never eat a
-sync's budget, and it is resumable by construction: ``messages.media_state`` is the whole of its
-memory.
+every pending message is re-fetched by id (``client.get_messages(chat.peer_id, ids=[…])``)
+before its file is downloaded — which is also where the size comes from, there being no size
+column. It runs after a sync rather than inside one because a 400-page PDF or a slow OCR must
+never eat a sync's budget, and it is resumable by construction: ``messages.media_state`` is the
+whole of its memory.
 
 The offline half comes first and touches no network at all. Which kinds have an extractor here
 and which are switched off in ``[media]`` follows from the stored ``media_kind`` alone, and which
@@ -181,14 +181,14 @@ async def run(
         if not budget.expired:
             sync._cap_flood_sleep(client, cfg.sync, budget)
             await sync.warm_peer_cache(client, chats)
-        for chat_id in [chat.id for chat in chats]:
+        for chat in chats:
             if budget.expired:
                 break
             sync._cap_flood_sleep(client, cfg.sync, budget)
             try:
-                await _extract_chat(conn, client, chat_id, extractors, cfg, scratch, budget, tally)
+                await _extract_chat(conn, client, chat, extractors, cfg, scratch, budget, tally)
             except errors.FloodWaitError as exc:
-                log.warning("flood wait of %ss on chat %s; stopping this run", exc.seconds, chat_id)
+                log.warning("flood wait of %ss on chat %s; stopping this run", exc.seconds, chat.id)
                 warnings.append(
                     f"flood wait: Telegram asks to wait {exc.seconds}s before more media "
                     "requests; run `grepogram extract` again later"
@@ -197,8 +197,8 @@ async def run(
             except errors.UnauthorizedError:
                 raise
             except (errors.RPCError, ValueError) as exc:
-                log.warning("chat %s: %s; its media was skipped this run", chat_id, exc)
-                warnings.append(f"chat {chat_id}: {exc}")
+                log.warning("chat %s: %s; its media was skipped this run", chat.id, exc)
+                warnings.append(f"chat {chat.id}: {exc}")
     remaining, unreachable = _queue_left(conn)
     return MediaReport(
         extracted=tally[db.MEDIA_EXTRACTED],
@@ -268,22 +268,26 @@ def _scratch() -> Iterator[Path]:
 async def _extract_chat(
     conn: sqlite3.Connection,
     client: Any,
-    chat_id: int,
+    chat: ChatRow,
     extractors: dict[MediaKind, Extractor],
     cfg: Config,
     scratch: Path,
     budget: sync.SyncBudget,
     tally: dict[int, int],
 ) -> None:
-    """One chat's queue, batch by batch, each batch committed on its own."""
-    chat = db.get_chat(conn, chat_id)
+    """One chat's queue, batch by batch, each batch committed on its own.
+
+    ``chat`` is what Telegram is asked by (its peer id); the re-cut reads the row as it is stored
+    now, which a chat deleted since the queue was listed no longer has.
+    """
+    stored = db.get_chat(conn, chat.id)
     while not budget.expired:
-        rows = db.messages_pending_media(conn, BATCH, chat_id)
+        rows = db.messages_pending_media(conn, BATCH, chat.id)
         if not rows:
             return
-        outcomes = await _extract_batch(client, chat_id, rows, extractors, cfg, scratch, budget)
+        outcomes = await _extract_batch(client, chat, rows, extractors, cfg, scratch, budget)
         await sync._joined_to_thread(
-            functools.partial(_store, conn, chat, cfg, outcomes), budget.cancel
+            functools.partial(_store, conn, stored, cfg, outcomes), budget.cancel
         )
         for outcome in outcomes:
             tally[outcome.state] += 1
@@ -293,7 +297,7 @@ async def _extract_chat(
 
 async def _extract_batch(
     client: Any,
-    chat_id: int,
+    chat: ChatRow,
     rows: Sequence[MessageRow],
     extractors: dict[MediaKind, Extractor],
     cfg: Config,
@@ -305,9 +309,10 @@ async def _extract_batch(
     The re-fetch is the whole reason this pass needs a client: a download needs the ``Message``
     Telegram just returned, and so does the size — no column carries it. The answer is matched
     back by id rather than by position, so a short or reordered reply cannot shift a row's
-    outcome onto its neighbour.
+    outcome onto its neighbour. Telegram is asked by the chat's peer id and the rows are keyed by
+    its row id, which a private chat stored under a synthetic id does not share.
     """
-    fetched = await client.get_messages(chat_id, ids=[row.msg_id for row in rows])
+    fetched = await client.get_messages(chat.peer_id, ids=[row.msg_id for row in rows])
     by_id = {int(msg.id): msg for msg in fetched or () if msg is not None}
     cap = cfg.media.max_download_mb * 1024 * 1024
     outcomes: list[_Outcome] = []
