@@ -30,6 +30,7 @@ from grepogram.sources import (
     Target,
     parse_target,
     same_target,
+    split_source_id,
 )
 
 WHEN_GRAMMAR = (
@@ -144,9 +145,10 @@ def resolve_chats(conn: sqlite3.Connection, cfg: Config, specs: Sequence[str]) -
     source that has never been synced is called out as such.
     """
     chats = db.list_chats(conn)
+    coverage = db.chat_sources_map(conn)
     selected: set[int] = set()
     for spec in specs:
-        selected |= _resolve_spec(spec, chats, cfg)
+        selected |= _resolve_spec(spec, chats, coverage, cfg)
     return selected
 
 
@@ -164,19 +166,28 @@ def resolve_chat(conn: sqlite3.Connection, cfg: Config, spec: str) -> int:
     raise AmbiguousChat(spec, [_label(c) for c in _by_title(db.list_chats(conn)) if c.id in found])
 
 
-def _resolve_spec(spec: str, chats: list[ChatRow], cfg: Config) -> set[int]:
+def _resolve_spec(
+    spec: str, chats: list[ChatRow], coverage: dict[int, list[str]], cfg: Config
+) -> set[int]:
     try:
         target = parse_target(spec)
     except InvalidTarget as exc:
-        raise UnknownChat(spec, _describe(chats), hint=str(exc)) from exc
-    found = _select(target, chats)
+        raise UnknownChat(spec, _describe(chats, coverage), hint=str(exc)) from exc
+    found = _select(target, chats, coverage)
     if found:
         return found
-    raise UnknownChat(spec, _describe(chats), hint=_unsynced_hint(target, cfg, chats))
+    raise UnknownChat(
+        spec, _describe(chats, coverage), hint=_unsynced_hint(target, cfg, chats, coverage)
+    )
 
 
-def _select(target: Target, chats: list[ChatRow]) -> set[int]:
+def _select(target: Target, chats: list[ChatRow], coverage: dict[int, list[str]]) -> set[int]:
     """The chats ``target`` selects; empty when it names none.
+
+    An id is Telegram's marked id or the row id a result carries (they differ only for a scoped
+    chat under a synthetic id). A ``folder:`` spec selects every chat that folder source covers,
+    as primary or not (``coverage``); one with an ``<account>/`` prefix only that account's
+    folder, and every other spec it restricts to the chats that account's sources could reach.
 
     ``import:<slug>`` is read here and not by :func:`~grepogram.sources.parse_target`, which
     leaves it a fuzzy target: the score would be taken over the *whole typed string*, seven
@@ -187,18 +198,20 @@ def _select(target: Target, chats: list[ChatRow]) -> set[int]:
     agree: an ``import:`` id is what ``sources ls``, the MCP ``sources`` tool and every refusal
     message print, so it must scope a search and a reader exactly as ``folder:`` does.
     """
+    if target.account is not None:
+        chats = [c for c in chats if c.is_shared or c.scope == target.account]
     if target.kind == "id":
-        return {chat.id for chat in chats if chat.id == target.value}
+        return {chat.id for chat in chats if target.value in (chat.id, chat.peer_id)}
     if target.kind == "username":
         wanted = target.text.casefold()
         return {chat.id for chat in chats if (chat.username or "").casefold() == wanted}
-    folders = _tagged(chats, FOLDER_PREFIX)
+    folders = _tagged(chats, coverage, FOLDER_PREFIX, target.account)
     query = dialogs.normalize(target.text)
     if target.kind == "folder":
         return _by_name(query, folders)
     if target.text.casefold().startswith(IMPORT_PREFIX):
         slug = dialogs.normalize(target.text[len(IMPORT_PREFIX) :])
-        return _by_name(slug, _tagged(chats, IMPORT_PREFIX))
+        return _by_name(slug, _tagged(chats, coverage, IMPORT_PREFIX))
     scored = [(dialogs.score(query, name), ids) for name, ids in folders.items()]
     for chat in chats:
         value = dialogs.score(query, chat.title or "")
@@ -225,18 +238,43 @@ def _best_tier(scored: list[tuple[float, set[int]]]) -> set[int]:
     return set().union(*tier)
 
 
-def _tagged(chats: list[ChatRow], prefix: str) -> dict[str, set[int]]:
-    """Source name (the id past ``prefix``) → ids of the chats indexed through that source."""
+def _tagged(
+    chats: list[ChatRow],
+    coverage: dict[int, list[str]],
+    prefix: str,
+    account: str | None = None,
+) -> dict[str, set[int]]:
+    """Source name (the id past ``prefix`` and past any ``<account>/``) → ids of the chats that
+    source covers, over every account's sources or only ``account``'s.
+
+    Two accounts' folders of one name land under the one name, so an unprefixed ``folder:``
+    spec selects both — it is a search scope, and the wider one is what was asked for.
+    """
     tagged: dict[str, set[int]] = {}
-    for chat in chats:
-        if chat.source_id and chat.source_id.startswith(prefix):
-            tagged.setdefault(chat.source_id[len(prefix) :], set()).add(chat.id)
+    for source_id, chat_id in _covering(chats, coverage):
+        owner, bare = split_source_id(source_id)
+        if bare.startswith(prefix) and (account is None or owner == account):
+            tagged.setdefault(bare[len(prefix) :], set()).add(chat_id)
     return tagged
 
 
-def _describe(chats: list[ChatRow]) -> list[str]:
-    folders = _tagged(chats, FOLDER_PREFIX)
-    listing = [f"{FOLDER_PREFIX}{name} ({len(ids)} chats)" for name, ids in sorted(folders.items())]
+def _covering(chats: list[ChatRow], coverage: dict[int, list[str]]) -> list[tuple[str, int]]:
+    """Every ``(source id, chat id)`` pair: each chat's primary source and the others covering
+    it (``chat_sources``)."""
+    pairs: dict[tuple[str, int], None] = {}
+    for chat in chats:
+        for source_id in [chat.source_id, *coverage.get(chat.id, [])]:
+            if source_id:
+                pairs[(source_id, chat.id)] = None
+    return list(pairs)
+
+
+def _describe(chats: list[ChatRow], coverage: dict[int, list[str]]) -> list[str]:
+    folders: dict[str, set[int]] = {}
+    for source_id, chat_id in _covering(chats, coverage):
+        if split_source_id(source_id)[1].startswith(FOLDER_PREFIX):
+            folders.setdefault(source_id, set()).add(chat_id)
+    listing = [f"{source_id} ({len(ids)} chats)" for source_id, ids in sorted(folders.items())]
     listing += [_label(chat) for chat in _by_title(chats)]
     return listing
 
@@ -250,9 +288,11 @@ def _label(chat: ChatRow) -> str:
     return f"{chat.title!r} (id {chat.id}{handle})"
 
 
-def _unsynced_hint(target: Target, cfg: Config, chats: list[ChatRow]) -> str | None:
+def _unsynced_hint(
+    target: Target, cfg: Config, chats: list[ChatRow], coverage: dict[int, list[str]]
+) -> str | None:
     """Point at a configured source the spec names when nothing has been indexed through it."""
-    indexed = {chat.source_id for chat in chats if chat.source_id}
+    indexed = {source_id for source_id, _ in _covering(chats, coverage)}
     for source in cfg.sources:
         if source.id not in indexed and _names_source(target, source):
             return f"source {source.id} is configured but has no indexed chats yet, run a sync"
@@ -264,8 +304,11 @@ def _names_source(target: Target, source: Source) -> bool:
 
     A chat entry is matched by the identity its ``chat =`` value resolves to
     (:func:`grepogram.sources.same_target`), so the id, the ``@username`` and both ``t.me`` link
-    forms of one chat all point at it; free text still scores against the value as written.
+    forms of one chat all point at it; free text still scores against the value as written. A
+    target with an ``<account>/`` prefix names only that account's entries.
     """
+    if target.account is not None and target.account != source.account:
+        return False
     if source.folder is not None:
         if target.kind == "folder":
             return dialogs.normalize(target.text) == dialogs.normalize(source.folder)

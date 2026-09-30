@@ -422,21 +422,39 @@ voided_at)`, `exclusions(identity PRIMARY KEY, reason, created_at)`,
 
 **Files:**
 - Modify: `grepogram/sources.py`, `grepogram/filters.py`, `tests/test_sources.py`, `tests/test_filters.py`
+- Modify: `grepogram/dialogs.py` (`DialogCatalog.access_hash`, entities `entity()` resolved join
+  the memo), `grepogram/db.py` (`set_source_chats`, `source_chat_ids`, `chat_sources_map`,
+  `set_primary_source`), `grepogram/models.py` (`SourceStatus.account`)
+- Modify: `grepogram/sync.py` — `_sync_chats` resolves with `{DEFAULT_ACCOUNT: client}` until
+  task 6 hands it every account's client, so another account's source is skipped (logged)
+  instead of being read through the default session; `tests/test_sync.py` covers that and keeps
+  the `foreign_scope` guard tested by feeding the run a misfiled chat
+- Modify: `grepogram/cli.py`, `grepogram/mcp.py`, `tests/test_mcp.py` — `sources rm` reports the
+  chats kept under another source, `sources_remove` returns `kept_chat_ids`
 
-- [ ] `parse_target` / `find_source` accept the `<account>/` prefix on source ids; `_names_chat`
-  and `_same_target` compare against `peer_id`
-- [ ] `resolve_sources(cfg, clients, conn)` resolves each account's sources with that account's
+- [x] `parse_target` / `find_source` accept the `<account>/` prefix on source ids; `_names_chat`
+  and `_same_target` compare against `peer_id`. `Target.account` is set only by an explicit
+  prefix (`sources.split_source_id` / `source_account` read it off an id); an unprefixed target
+  means the default account's source when it has a match and any account's otherwise, with two
+  other accounts' matches an `AmbiguousTarget` (`sources._in_account`). In `filters`, an
+  unprefixed `folder:` spec selects every account's folder of that name (a search scope), a
+  prefixed one that account's only, and an id matches `peer_id` or the row id
+- [x] `resolve_sources(cfg, clients, conn)` resolves each account's sources with that account's
   `DialogCatalog`; writes `chat_sources`, `chat_access` (with the entity's `access_hash`); a chat
-  covered by several sources keeps the first as primary (`imported_tag` still guards)
-- [ ] `add_source(..., account)` and `with_source` reject a duplicate per account
-- [ ] `remove_source` deletes a chat only when no other configured source covers it
+  covered by several sources keeps the first as primary (`imported_tag` still guards, looked up
+  by `(scope, peer_id)`). A source whose account has no client is skipped with a warning and
+  keeps its coverage; a resolved source's coverage is replaced by what it lists now
+  (`db.set_source_chats`), keeping the peers a folder names but could not resolve
+- [x] `add_source(..., account)` and `with_source` reject a duplicate per account
+- [x] `remove_source` deletes a chat only when no other configured source covers it
   (`chat_sources` minus the removed one ∩ configured ids); otherwise moves the primary
   `source_id` to a remaining source (through `discussion_source_id` for discussion groups) and
   drops the `chat_sources` row; `sources_status` lists chats under every covering source with
-  the account
-- [ ] tests: same channel via two accounts' sources → removing one keeps rows and re-points the
+  the account. `Removed.kept_chat_ids` names the chats that stayed; channels are decided before
+  discussion groups so a linked-only group follows its channel's new primary
+- [x] tests: same channel via two accounts' sources → removing one keeps rows and re-points the
   primary; removing the last deletes; scoped DMs of two accounts are independent; imports untouched
-- [ ] run checks — must pass before task 6
+- [x] run checks — must pass before task 6
 
 ### Task 6: Multi-account sync
 

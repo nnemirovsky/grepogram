@@ -504,3 +504,55 @@ def test_resolve_filters_propagates_errors(conn: sqlite3.Connection) -> None:
         filters.resolve_filters(conn, CFG, ["@nobody"], None, None, NOW)
     with pytest.raises(InvalidDate):
         filters.resolve_filters(conn, CFG, ["@alice"], "soon", None, NOW)
+
+
+# --- accounts --------------------------------------------------------------------------------
+
+WORK_NEWS = -1000000000600
+
+
+def _work_chats(conn: sqlite3.Connection) -> ChatRow:
+    """The work account's copy of Alice's private chat (a synthetic row of peer 777), a channel
+    only the work account's folder lists, and the Argentina chat that folder covers as well."""
+    work_alice = db.upsert_chat(
+        conn,
+        ChatRow(
+            id=ALICE,
+            type="user",
+            title="Alice Liddell",
+            username="alice",
+            source_id="work/chat:777",
+            scope="work",
+        ),
+        "work",
+    )
+    db.upsert_chat(
+        conn,
+        ChatRow(id=WORK_NEWS, type="channel", title="Work news", source_id="work/folder:Argentina"),
+    )
+    db.set_source_chats(conn, "work/folder:Argentina", [WORK_NEWS, ARG_CHAT])
+    return work_alice
+
+
+def test_a_folder_spec_selects_every_chat_its_source_covers(conn: sqlite3.Connection) -> None:
+    """A chat the work account's folder covers as a second source is selected by it, and an
+    unprefixed folder spec reaches both accounts' folders of that name."""
+    _work_chats(conn)
+    assert filters.resolve_chats(conn, CFG, ["work/folder:Argentina"]) == {WORK_NEWS, ARG_CHAT}
+    assert filters.resolve_chats(conn, CFG, ["folder:Argentina"]) == ARGENTINA | {WORK_NEWS}
+
+
+def test_an_id_spec_names_a_chat_by_its_peer_or_its_row_id(conn: sqlite3.Connection) -> None:
+    work_alice = _work_chats(conn)
+    assert work_alice.id >= db.SYNTHETIC_BASE
+    assert filters.resolve_chats(conn, CFG, [str(ALICE)]) == {ALICE, work_alice.id}
+    assert filters.resolve_chats(conn, CFG, [str(work_alice.id)]) == {work_alice.id}
+    assert filters.resolve_chats(conn, CFG, [f"work/chat:{ALICE}"]) == {work_alice.id}
+    assert filters.resolve_chats(conn, CFG, ["work/chat:@arg_chat"]) == {ARG_CHAT}
+
+
+def test_a_prefixed_spec_hints_only_at_its_own_accounts_source(conn: sqlite3.Connection) -> None:
+    cfg = Config(sources=[*CFG.sources, Source(chat="@ghost_channel", account="work")])
+    with pytest.raises(UnknownChat) as excinfo:
+        filters.resolve_chats(conn, cfg, ["work/chat:@ghost_channel"])
+    assert excinfo.value.hint is not None and "work/chat:@ghost_channel" in excinfo.value.hint
