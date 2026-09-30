@@ -11,11 +11,14 @@ import datetime as dt
 import inspect
 import zlib
 from collections.abc import AsyncIterator, Iterable, Mapping
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 from telethon import errors, utils
 from telethon.tl import custom, functions, types
+from telethon.tl.types import chatlists as tl_chatlists
+from telethon.tl.types import contacts as tl_contacts
 from telethon.tl.types import messages as tl_messages
 
 from grepogram.models import DEFAULT_ACCOUNT
@@ -182,6 +185,30 @@ def make_message(
     return tl.message(chat_id, msg_id, text, date=date)
 
 
+@dataclass(frozen=True, slots=True)
+class FakeInvite:
+    """An invite link of a :class:`FakeWorld`: the chat it opens, whether joining it sends an
+    admission request, whether a non-member may preview the chat (``ChatInvitePeek``), and the
+    member count the preview shows (the entity's own when ``None``)."""
+
+    entity: Any
+    request_needed: bool = False
+    peek: bool = False
+    participants: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class FakeChatlist:
+    """A shared folder (``t.me/addlist/<slug>``) of a :class:`FakeWorld`: its title and chats."""
+
+    title: str
+    entities: list[Any] = field(default_factory=list)
+
+
+FREE_SEARCH = types.SearchPostsFlood(total_daily=10, remains=10, stars_amount=0)
+"""The ``channels.checkSearchPostsFlood`` answer of an account with free post searches left."""
+
+
 class FakeWorld:
     """Telegram as several accounts see it: one set of chats, a view of it per account.
 
@@ -190,6 +217,11 @@ class FakeWorld:
     whatever account reads them. A private chat's history is the account's own — the same
     conversation has other message ids for the other side — so it is not held here but handed
     to :meth:`client` as that account's ``messages``.
+
+    ``invites`` maps an invite hash to the :class:`FakeInvite` it opens (or to the exception
+    ``messages.checkChatInvite`` raises for it) and ``chatlists`` a folder slug to its
+    :class:`FakeChatlist` (or an exception); a hash or a slug the world does not hold is
+    refused the way Telegram refuses it.
 
     :meth:`client` builds the account's :class:`FakeClient`: ``members`` are the chats it has a
     dialog with, every entity it sees carries the access hash *that account* addresses it by
@@ -204,25 +236,35 @@ class FakeWorld:
         entities: Iterable[Any] = (),
         messages: Mapping[int, Iterable[types.Message]] | None = None,
         comments: Mapping[tuple[int, int], Iterable[types.Message]] | None = None,
+        invites: Mapping[str, FakeInvite | BaseException] | None = None,
+        chatlists: Mapping[str, FakeChatlist | BaseException] | None = None,
     ) -> None:
         self.entities: dict[int, Any] = {utils.get_peer_id(e): e for e in entities}
         self.messages = {chat_id: list(items) for chat_id, items in (messages or {}).items()}
         self.comments = {key: list(items) for key, items in (comments or {}).items()}
+        self.invites = dict(invites or {})
+        self.chatlists = dict(chatlists or {})
 
     @staticmethod
     def access_hash(account: str, marked_id: int) -> int:
         """The access hash ``account`` addresses ``marked_id`` by — stable, and its own."""
         return zlib.crc32(f"{account}:{marked_id}".encode())
 
-    def seen_by(self, account: str, entity: Any) -> Any:
-        """``entity`` as ``account`` receives it: a copy carrying that account's access hash.
+    def seen_by(self, account: str, entity: Any, *, member: bool = True) -> Any:
+        """``entity`` as ``account`` receives it: a copy carrying that account's access hash,
+        and for a channel or group it is not in (``member=False``) the ``left`` flag Telegram
+        sets on it.
 
         A legacy group has no access hash at all and is handed over as it is.
         """
-        if getattr(entity, "access_hash", None) is None:
+        left = not member and isinstance(entity, types.Channel | types.Chat)
+        if getattr(entity, "access_hash", None) is None and not left:
             return entity
         seen = copy.copy(entity)
-        seen.access_hash = self.access_hash(account, utils.get_peer_id(entity))
+        if getattr(entity, "access_hash", None) is not None:
+            seen.access_hash = self.access_hash(account, utils.get_peer_id(entity))
+        if left:
+            seen.left = True
         return seen
 
     def client(
@@ -266,6 +308,14 @@ class FakeClient:
     channel it has no dialog with refuses its history. ``session`` stands in for Telethon's
     in-memory session: ``session.process_entities`` with ``InputPeer*`` objects seeds the cache
     with stored access hashes, which address the peer only when the hash is this account's.
+
+    Besides ``responses``, the raw requests research sends are answered from the world itself
+    (:meth:`_research_answer`): ``messages.checkChatInvite`` and ``chatlists.checkChatlistInvite``
+    from its invites and folders (``chatlists_joined`` names the folders this account imported),
+    ``channels.getChannels`` only with *this account's* access hash and ``messages.getChats``
+    only for a group it is in, ``contacts.search`` over public chats and its own, and
+    ``channels.searchPosts`` over public channels' posts, metered by ``search_flood``. Their
+    ``chats`` and ``users`` — and a ``chat`` field — teach the session the peers they carry.
     """
 
     def __init__(
@@ -286,8 +336,12 @@ class FakeClient:
         strict_entities: bool = True,
         account: str = DEFAULT_ACCOUNT,
         world: FakeWorld | None = None,
+        chatlists_joined: Iterable[str] = (),
+        search_flood: types.SearchPostsFlood = FREE_SEARCH,
     ) -> None:
         self.account = account
+        self.chatlists_joined = set(chatlists_joined)
+        self.search_flood = search_flood
         self.world = world
         self.dialogs = list(dialogs)
         self.members = {int(dialog.id) for dialog in self.dialogs}
@@ -300,7 +354,8 @@ class FakeClient:
         threads: dict[tuple[int, int], Iterable[types.Message]] = {}
         if world is not None:
             for marked, entity in world.entities.items():
-                self.entities.setdefault(marked, world.seen_by(account, entity))
+                seen = world.seen_by(account, entity, member=marked in self.members)
+                self.entities.setdefault(marked, seen)
             histories.update(world.messages)
             threads.update(world.comments)
         histories.update(messages or {})
@@ -547,14 +602,183 @@ class FakeClient:
                 if isinstance(response, BaseException):
                     raise response
                 answer = response(request) if callable(response) else response
-                self._learn(
-                    [
-                        *(getattr(answer, "chats", None) or ()),
-                        *(getattr(answer, "users", None) or ()),
-                    ]
-                )
+                self._learn_answer(answer)
                 return answer
-        raise NotImplementedError(f"FakeClient has no response for {type(request).__name__}")
+        answer = self._research_answer(request)
+        if answer is None:
+            raise NotImplementedError(f"FakeClient has no response for {type(request).__name__}")
+        self._learn_answer(answer)
+        return answer
+
+    def _learn_answer(self, answer: Any) -> None:
+        """Learn what Telethon's ``_entities_to_rows`` reads off an answer: ``user``, ``chat``,
+        ``chats`` and ``users``."""
+        single = [getattr(answer, name, None) for name in ("user", "chat")]
+        self._learn(
+            [
+                *(entity for entity in single if entity is not None),
+                *(getattr(answer, "chats", None) or ()),
+                *(getattr(answer, "users", None) or ()),
+            ]
+        )
+
+    # --- raw requests research sends --------------------------------------------------------
+
+    def _research_answer(self, request: Any) -> Any:
+        """The world's answer to a request research sends, or ``None`` for any other."""
+        if isinstance(request, functions.messages.CheckChatInviteRequest):
+            return self._check_invite(request)
+        if isinstance(request, functions.chatlists.CheckChatlistInviteRequest):
+            return self._check_chatlist(request)
+        if isinstance(request, functions.channels.GetChannelsRequest):
+            return self._get_channels(request)
+        if isinstance(request, functions.messages.GetChatsRequest):
+            return self._get_chats(request)
+        if isinstance(request, functions.contacts.SearchRequest):
+            return self._search_chats(request)
+        if isinstance(request, functions.channels.CheckSearchPostsFloodRequest):
+            return self.search_flood
+        if isinstance(request, functions.channels.SearchPostsRequest):
+            return self._search_posts(request)
+        return None
+
+    def _check_invite(self, request: Any) -> Any:
+        invites = self.world.invites if self.world is not None else {}
+        found = invites.get(request.hash)
+        if found is None:
+            raise errors.InviteHashInvalidError(request=request)
+        if isinstance(found, BaseException):
+            raise found
+        marked = int(utils.get_peer_id(found.entity))
+        entity = self.entities.get(marked, found.entity)
+        if marked in self.members:
+            return types.ChatInviteAlready(chat=entity)
+        if found.peek:
+            return types.ChatInvitePeek(chat=entity, expires=FAR_FUTURE)
+        channel = isinstance(entity, types.Channel)
+        count = found.participants
+        if count is None:
+            count = getattr(entity, "participants_count", None) or 0
+        return types.ChatInvite(
+            title=entity.title,
+            photo=types.PhotoEmpty(id=0),
+            participants_count=count,
+            color=0,
+            channel=channel or None,
+            broadcast=(channel and not entity.megagroup) or None,
+            megagroup=(channel and bool(entity.megagroup)) or None,
+            public=bool(getattr(entity, "username", None)) or None,
+            request_needed=found.request_needed or None,
+        )
+
+    def _check_chatlist(self, request: Any) -> Any:
+        folders = self.world.chatlists if self.world is not None else {}
+        found = folders.get(request.slug)
+        if found is None:
+            raise errors.BadRequestError(request, "INVITE_SLUG_EXPIRED", 400)
+        if isinstance(found, BaseException):
+            raise found
+        entities = [self.entities.get(utils.get_peer_id(e), e) for e in found.entities]
+        chats = [e for e in entities if not isinstance(e, types.User)]
+        users = [e for e in entities if isinstance(e, types.User)]
+        if request.slug in self.chatlists_joined:
+            return tl_chatlists.ChatlistInviteAlready(
+                filter_id=2,
+                missing_peers=[
+                    utils.get_peer(e) for e in entities if utils.get_peer_id(e) not in self.members
+                ],
+                already_peers=[
+                    utils.get_peer(e) for e in entities if utils.get_peer_id(e) in self.members
+                ],
+                chats=chats,
+                users=users,
+            )
+        return tl_chatlists.ChatlistInvite(
+            title=types.TextWithEntities(found.title, []),
+            peers=[utils.get_peer(e) for e in entities],
+            chats=chats,
+            users=users,
+        )
+
+    def _get_channels(self, request: Any) -> Any:
+        chats = []
+        for wanted in request.id:
+            marked = int(utils.get_peer_id(types.PeerChannel(wanted.channel_id)))
+            entity = self.entities.get(marked)
+            if entity is None or getattr(entity, "access_hash", None) != wanted.access_hash:
+                raise errors.ChannelInvalidError(request=request)
+            chats.append(entity)
+        return tl_messages.Chats(chats=chats)
+
+    def _get_chats(self, request: Any) -> Any:
+        chats = []
+        for bare in request.id:
+            marked = int(utils.get_peer_id(types.PeerChat(bare)))
+            if marked not in self.members or marked not in self.entities:
+                raise errors.ChatIdInvalidError(request=request)
+            chats.append(self.entities[marked])
+        return tl_messages.Chats(chats=chats)
+
+    def _search_chats(self, request: Any) -> Any:
+        """``contacts.search``: chats and users whose name or username holds ``q`` — the
+        account's own (``my_results``) and public ones (``results``)."""
+        needle = request.q.lower()
+        mine: list[Any] = []
+        public: list[Any] = []
+        for marked, entity in self.entities.items():
+            name = utils.get_display_name(entity).lower()
+            username = (getattr(entity, "username", None) or "").lower()
+            if needle not in name and needle not in username:
+                continue
+            if marked in self.members:
+                mine.append(entity)
+            elif username:
+                public.append(entity)
+        found = [*mine, *public][: request.limit]
+        return tl_contacts.Found(
+            my_results=[utils.get_peer(e) for e in found if e in mine],
+            results=[utils.get_peer(e) for e in found if e not in mine],
+            chats=[e for e in found if not isinstance(e, types.User)],
+            users=[e for e in found if isinstance(e, types.User)],
+        )
+
+    def _search_posts(self, request: Any) -> Any:
+        """``channels.searchPosts``: posts of public broadcast channels holding the query,
+        newest first. A free search spends one of ``search_flood.remains``; with none left the
+        request must carry ``allow_paid_stars``, which this refuses otherwise (the error name is
+        this fake's stand-in, grepogram never sends such a request)."""
+        flood = self.search_flood
+        if not (flood.query_is_free or flood.remains > 0):
+            if not request.allow_paid_stars:
+                raise errors.BadRequestError(request, "ALLOW_PAYMENT_REQUIRED", 400)
+        elif not flood.query_is_free:
+            self.search_flood = types.SearchPostsFlood(
+                total_daily=flood.total_daily,
+                remains=flood.remains - 1,
+                stars_amount=flood.stars_amount,
+                wait_till=flood.wait_till,
+            )
+        needle = (request.query or "").lower()
+        posts: list[types.Message] = []
+        chats: dict[int, Any] = {}
+        for chat_id, history in self.messages.items():
+            entity = self.entities.get(chat_id)
+            if not isinstance(entity, types.Channel) or entity.megagroup or not entity.username:
+                continue
+            for message in history:
+                if needle and needle in (message.message or "").lower():
+                    posts.append(message)
+                    chats[chat_id] = entity
+        posts.sort(key=lambda m: m.date, reverse=True)
+        posts = posts[: request.limit]
+        return tl_messages.MessagesSlice(
+            count=len(posts),
+            messages=posts,
+            topics=[],
+            chats=[chats[int(utils.get_peer_id(m.peer_id))] for m in posts],
+            users=[],
+            search_flood=self.search_flood,
+        )
 
     # --- the session's entity cache ---------------------------------------------------------
 
