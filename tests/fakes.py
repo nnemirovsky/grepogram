@@ -6,8 +6,10 @@ objects (``types.User``, ``types.Channel``, ``custom.Dialog``) without a client 
 """
 
 import asyncio
+import copy
 import datetime as dt
 import inspect
+import zlib
 from collections.abc import AsyncIterator, Iterable, Mapping
 from pathlib import Path
 from typing import Any
@@ -16,6 +18,7 @@ from telethon import errors, utils
 from telethon.tl import custom, functions, types
 from telethon.tl.types import messages as tl_messages
 
+from grepogram.models import DEFAULT_ACCOUNT
 from tests.fixtures import tl
 
 FAR_FUTURE = dt.datetime(2100, 1, 1, tzinfo=dt.UTC)
@@ -179,6 +182,62 @@ def make_message(
     return tl.message(chat_id, msg_id, text, date=date)
 
 
+class FakeWorld:
+    """Telegram as several accounts see it: one set of chats, a view of it per account.
+
+    ``entities`` are the peers Telegram knows; ``messages`` and ``comments`` are the histories of
+    the **shared** chats (channels and supergroups), which carry one global set of message ids
+    whatever account reads them. A private chat's history is the account's own — the same
+    conversation has other message ids for the other side — so it is not held here but handed
+    to :meth:`client` as that account's ``messages``.
+
+    :meth:`client` builds the account's :class:`FakeClient`: ``members`` are the chats it has a
+    dialog with, every entity it sees carries the access hash *that account* addresses it by
+    (:meth:`access_hash`, different per account as in Telegram), and a private channel it is no
+    member of refuses its history with ``ChannelPrivateError``. A public chat — one with a
+    username — is readable without joining.
+    """
+
+    def __init__(
+        self,
+        *,
+        entities: Iterable[Any] = (),
+        messages: Mapping[int, Iterable[types.Message]] | None = None,
+        comments: Mapping[tuple[int, int], Iterable[types.Message]] | None = None,
+    ) -> None:
+        self.entities: dict[int, Any] = {utils.get_peer_id(e): e for e in entities}
+        self.messages = {chat_id: list(items) for chat_id, items in (messages or {}).items()}
+        self.comments = {key: list(items) for key, items in (comments or {}).items()}
+
+    @staticmethod
+    def access_hash(account: str, marked_id: int) -> int:
+        """The access hash ``account`` addresses ``marked_id`` by — stable, and its own."""
+        return zlib.crc32(f"{account}:{marked_id}".encode())
+
+    def seen_by(self, account: str, entity: Any) -> Any:
+        """``entity`` as ``account`` receives it: a copy carrying that account's access hash.
+
+        A legacy group has no access hash at all and is handed over as it is.
+        """
+        if getattr(entity, "access_hash", None) is None:
+            return entity
+        seen = copy.copy(entity)
+        seen.access_hash = self.access_hash(account, utils.get_peer_id(entity))
+        return seen
+
+    def client(
+        self,
+        account: str = DEFAULT_ACCOUNT,
+        *,
+        members: Iterable[Any] = (),
+        **kwargs: Any,
+    ) -> "FakeClient":
+        """The client of ``account``, with a dialog for each of ``members`` and no folders."""
+        dialogs = [make_dialog(self.seen_by(account, entity)) for entity in members]
+        kwargs.setdefault("folders", [])
+        return FakeClient(account=account, world=self, dialogs=dialogs, **kwargs)
+
+
 class FakeClient:
     """In-memory replacement for ``TelegramClient``.
 
@@ -201,6 +260,12 @@ class FakeClient:
     the plain ``ValueError`` Telethon raises for it — see :meth:`_require_resolved`. Pass
     ``strict_entities=False`` only for a test whose subject is not peer resolution and that has
     no realistic route to warm the cache.
+
+    ``account`` and ``world`` make it one account's view of a :class:`FakeWorld`: the world's
+    entities (with this account's access hashes) and shared histories join its own, and a private
+    channel it has no dialog with refuses its history. ``session`` stands in for Telethon's
+    in-memory session: ``session.process_entities`` with ``InputPeer*`` objects seeds the cache
+    with stored access hashes, which address the peer only when the hash is this account's.
     """
 
     def __init__(
@@ -219,15 +284,29 @@ class FakeClient:
         me: types.User | None = None,
         two_factor: bool = False,
         strict_entities: bool = True,
+        account: str = DEFAULT_ACCOUNT,
+        world: FakeWorld | None = None,
     ) -> None:
+        self.account = account
+        self.world = world
         self.dialogs = list(dialogs)
+        self.members = {int(dialog.id) for dialog in self.dialogs}
         self.entities: dict[int, Any] = {}
         for entity in entities:
             self.entities[utils.get_peer_id(entity)] = entity
         for dialog in self.dialogs:
             self.entities.setdefault(dialog.id, dialog.entity)
-        self.messages = {chat_id: _by_id(items) for chat_id, items in (messages or {}).items()}
-        self.comments = {key: _by_id(items) for key, items in (comments or {}).items()}
+        histories: dict[int, Iterable[types.Message]] = {}
+        threads: dict[tuple[int, int], Iterable[types.Message]] = {}
+        if world is not None:
+            for marked, entity in world.entities.items():
+                self.entities.setdefault(marked, world.seen_by(account, entity))
+            histories.update(world.messages)
+            threads.update(world.comments)
+        histories.update(messages or {})
+        threads.update(comments or {})
+        self.messages = {chat_id: _by_id(items) for chat_id, items in histories.items()}
+        self.comments = {key: _by_id(items) for key, items in threads.items()}
         self.responses = dict(responses or {})
         if folders is not None:
             self.responses.setdefault(
@@ -242,6 +321,8 @@ class FakeClient:
         self.two_factor = two_factor
         self.strict_entities = strict_entities
         self.resolved: set[int] = set()
+        self.seeded: dict[int, int] = {}
+        self.session = FakeSession(self)
         self.connected = False
         self.flood_sleep_threshold = 120
         self.calls: list[tuple[str, dict[str, Any]]] = []
@@ -353,6 +434,8 @@ class FakeClient:
                 },
             )
         )
+        if not self._may_read(chat_id):
+            raise errors.ChannelPrivateError(request=None)
         failure = self.failures.get(chat_id)
         if reply_to is not None and (chat_id, reply_to) in self.failures:
             failure = self.failures[(chat_id, reply_to)]
@@ -485,6 +568,7 @@ class FakeClient:
         measures a cache the second pass would never have.
         """
         self.resolved.clear()
+        self.seeded.clear()
 
     def _learn(self, entities: Iterable[Any]) -> None:
         """Cache the peers of an answer, as Telethon's ``session.process_entities`` does.
@@ -521,9 +605,29 @@ class FakeClient:
         """
         if not self.strict_entities or marked_id in self.resolved:
             return
-        if utils.resolve_id(marked_id)[1] is types.PeerChat:
+        kind = utils.resolve_id(marked_id)[1]
+        if kind is types.PeerChat:
             return
+        if marked_id in self.seeded:
+            known = getattr(self.entities.get(marked_id), "access_hash", None)
+            if known is not None and known == self.seeded[marked_id]:
+                self.resolved.add(marked_id)
+                return
+            # a hash that is not this account's: Telegram refuses the request it went out in
+            if kind is types.PeerChannel:
+                raise errors.ChannelInvalidError(request=None)
+            raise errors.PeerIdInvalidError(request=None)
         raise ValueError(f"Could not find the input entity for {marked_id!r}")
+
+    def _may_read(self, marked_id: int) -> bool:
+        """Whether this account may read a world chat's history: always, but for a private
+        channel or supergroup (no username) it has no dialog with."""
+        if self.world is None:
+            return True
+        entity = self.world.entities.get(marked_id)
+        if not isinstance(entity, types.Channel) or entity.username:
+            return True
+        return marked_id in self.members
 
     # --- helpers ---------------------------------------------------------------------------
 
@@ -553,6 +657,25 @@ class FakeClient:
                     return entity
             return None
         return self.entities.get(utils.get_peer_id(key))
+
+
+class FakeSession:
+    """The part of Telethon's ``MemorySession`` grepogram writes to: ``process_entities``.
+
+    Telethon turns each ``InputPeerUser`` / ``InputPeerChannel`` it is given into a cache row, so
+    a later request naming that peer by bare id goes out with the stored access hash; this
+    records the hash in :attr:`FakeClient.seeded`, where :meth:`FakeClient._require_resolved`
+    checks it against the account's own.
+    """
+
+    def __init__(self, client: FakeClient) -> None:
+        self._client = client
+
+    def process_entities(self, tlo: Any) -> None:
+        entities = tlo if isinstance(tlo, list | tuple) else [tlo]
+        for entity in entities:
+            if isinstance(entity, types.InputPeerUser | types.InputPeerChannel):
+                self._client.seeded[int(utils.get_peer_id(entity))] = int(entity.access_hash)
 
 
 def _by_id(messages: Iterable[types.Message]) -> list[types.Message]:
