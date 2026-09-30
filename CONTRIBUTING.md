@@ -71,6 +71,9 @@ account, no API keys and no models downloaded.
   `torch` / `sentence_transformers` through `sys.modules`.
 - The `tmp_home` fixture points `GREPOGRAM_HOME` at a `tmp_path` subdirectory, so no test touches
   `~/.config/grepogram`.
+- The autouse `no_terminal` fixture points the CLI's confirmation terminal at a path nothing
+  opens, so no test reads from or writes to the real `/dev/tty`; a test that answers a question
+  installs a terminal of its own.
 - CI sets `HF_HUB_OFFLINE=1` for the whole run.
 
 Every code change carries tests: new functions and modified ones, the success path and the failure
@@ -98,9 +101,16 @@ The scope is required. One logical change per commit. No `Co-Authored-By` or oth
 - A version string anywhere but `grepogram/__init__.py`, which hatch and `grepogram --version`
   both read.
 - A schema change that edits `_V5`. The base schema is frozen now that v0.1.0 is tagged; append a
-  migration step above `db.BASE_VERSION` instead.
+  migration step above `db.BASE_VERSION` instead. A step may fill the columns and tables it adds
+  from values already stored; it never rewrites a stored value, because an imported history
+  cannot be fetched again.
 - `async with client` on a Telethon client — it calls `start()` and prompts on stdin. Use
-  `tg.connected(client)`.
+  `tg.connected(client, account)`.
+- Addressing Telegram or building a link with `chat.id`. That is the index row, which a private
+  chat of a second account holds under a synthetic id; Telegram's id is `chat.peer_id`.
+- A way around a human's consent: a tool parameter shaped like one (`approve`, `confirm`,
+  `yes`), a `--yes` option, or a confirmation read from stdin instead of the controlling
+  terminal. Research approvals, `accounts rm` and `leave` are the user's to answer.
 - A writer in `db.py` outside `db.transaction(conn)`.
 - A file that ends with a trailing blank line, or without a newline.
 
@@ -108,4 +118,4 @@ The scope is required. One logical change per commit. No `Co-Authored-By` or oth
 
 Open an issue with the bug report template and fill in the version, the macOS version and which
 optional extras are installed — most reports turn on one of those three. `grepogram config path`
-prints where the config, session, index and log live; the log is the useful attachment.
+prints where the config, sessions, index, research store and log live; the log is the useful attachment.
