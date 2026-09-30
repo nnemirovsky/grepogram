@@ -1229,10 +1229,9 @@ async def research_approve(
         **asked,
         "approved": True,
         "answer": answer.action,
-        "grants": [
-            {"id": g.id, "candidate_id": g.candidate_id, "account": g.account, "actions": g.actions}
-            for g in granted
-        ],
+        "grants": research.grant_documents(
+            granted, {c.id: c for c in research_db.list_candidates(rdb, session_id)}
+        ),
         "hint": RUN_NEXT_HINT,
     }
 

@@ -3922,21 +3922,7 @@ def status_document(
         return {"sessions": listed, "exclusions": exclusions}
     session = known_session(rdb, session_id)
     candidates = {c.id: c for c in research_db.list_candidates(rdb, session.id)}
-    grants = []
-    for live in research_db.list_grants(rdb, session.id, live_only=True):
-        target = None if live.candidate_id is None else candidates.get(live.candidate_id)
-        grants.append(
-            {
-                "id": live.id,
-                "candidate_id": live.candidate_id,
-                "identity": None if target is None else target.identity,
-                "title": None if target is None else target.title,
-                "account": live.account,
-                "actions": list(live.actions),
-                "via": live.via,
-                "granted_at": live.granted_at,
-            }
-        )
+    grants = grant_documents(research_db.list_grants(rdb, session.id, live_only=True), candidates)
     waiting = [
         {"id": c.id, "identity": c.identity, "title": c.title}
         for c in candidates.values()
@@ -3948,6 +3934,30 @@ def status_document(
         "pending_grants": grants,
         "pending_admission": waiting,
     }
+
+
+def grant_documents(
+    grants: Iterable[Grant], candidates: Mapping[int, Candidate]
+) -> list[dict[str, Any]]:
+    """Grants as ``research_status`` and ``research_approve`` both show one: the candidate it
+    names by identity and title as well as by id (``None`` for a session-wide grant), and who
+    gave it, how and when. ``candidates`` are the session's, by id."""
+    documents: list[dict[str, Any]] = []
+    for grant in grants:
+        target = None if grant.candidate_id is None else candidates.get(grant.candidate_id)
+        documents.append(
+            {
+                "id": grant.id,
+                "candidate_id": grant.candidate_id,
+                "identity": None if target is None else target.identity,
+                "title": None if target is None else target.title,
+                "account": grant.account,
+                "actions": list(grant.actions),
+                "via": grant.via,
+                "granted_at": grant.granted_at,
+            }
+        )
+    return documents
 
 
 def _status_counts(rdb: sqlite3.Connection, session_id: int) -> dict[str, int]:

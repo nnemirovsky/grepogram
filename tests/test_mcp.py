@@ -1880,19 +1880,24 @@ async def test_research_loop_through_the_tools(
     assert ctx.asked == [(summary, tools.Confirm)], "the user is asked with exactly the summary"
     assert approved["approved"] is True and approved["summary"] == summary
     assert approved["items"] == ["1:join,fetch,add_source"], "a bare id joins, public or not"
+    (grant,) = _grants(paths)
+    assert (grant.via, grant.summary) == ("elicitation", summary)
     assert approved["grants"] == [
         {
             "id": 1,
             "candidate_id": 1,
+            "identity": approved["grants"][0]["identity"],
+            "title": approved["grants"][0]["title"],
             "account": "default",
-            "actions": ("join", "fetch", "add_source"),
+            "actions": ["join", "fetch", "add_source"],
+            "via": "elicitation",
+            "granted_at": grant.granted_at,
         }
     ]
-    (grant,) = _grants(paths)
-    assert (grant.via, grant.summary) == ("elicitation", summary)
+    assert approved["grants"][0]["identity"] is not None
 
     status = tools.research_status(1)
-    assert [g["actions"] for g in status["pending_grants"]] == [["join", "fetch", "add_source"]]
+    assert status["pending_grants"] == approved["grants"], "one shape of a grant, both tools"
     assert tools.research_status()["sessions"][0]["state"] == "active"
 
     ran = await tools.research_run(1)
