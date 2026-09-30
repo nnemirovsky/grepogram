@@ -144,11 +144,17 @@ Decisions taken with the user before planning:
   again" is not an acceptable upgrade path. CLAUDE.md is amended to say so: steps may *fill new
   columns deterministically from existing ones*, never rewrite existing values.
 - **Sync across accounts.** `sync_all` takes an account→client mapping. Each resolved chat is
-  fetched once, by the account of its primary source, falling back to another account in
-  `chat_access` when that one is refused. Account queues run concurrently (`asyncio.gather`) under
-  the one `SyncLock` and one `SyncBudget` (the DB connection already serialises statements); a
-  flood wait stops only that account's queue. `index_pending`, `index_stranded`, re-cut and
-  embedding stay once per run. Each account signs its own "me".
+  fetched once, by the first account of its route (`sync.reaching_accounts`: the primary
+  source's account, then the others `chat_access` records) that is in the run and not stopped;
+  `sync.through_accounts` is the one retry walk down that route, shared by sync, `extract`,
+  `prune-deleted` and `recapture-links`. A source that does not resolve keeps being the primary
+  of its chats, which are still fetched through another account, so primaries never flip for a
+  run. Account queues run concurrently (an `asyncio.TaskGroup`) under the one `SyncLock` and one
+  `SyncBudget`, whose message allowance is held per batch (`SyncBudget.hold`) so concurrent
+  queues cannot overshoot a cap; a flood wait stops only that account's queue. `prune-deleted`
+  removes a message only when every account that reaches the chat answers it gone.
+  `index_pending`, `index_stranded`, re-cut and embedding stay once per run. Each account signs
+  its own "me".
 - **Queries.** One index, one search. `account:<name>` chat specs and an `accounts` search
   parameter scope a query to chats that account reaches; this is a **scope, not isolation** —
   every account belongs to the same local user, and opt-in sources already bound what is indexed.
@@ -165,11 +171,28 @@ Decisions taken with the user before planning:
   (`msg.entities`, `msg.reply_markup`, `msg.fwd_from`, `msg.media.webpage`) — added to the
   CLAUDE.md list. Rows stored before step 8 have none; discovery falls back to a regex over their
   stored text (visible URLs and mentions only) and says so.
+- **As built, step 9 refines that.** Whether a row falls back is the per-row
+  `messages.links_read` (filled from step 8's mark; an import's rows are unread unless the
+  export spelled their links), not an id threshold. Discovery reads each chat from a cursor on
+  the index's lead clock (`messages.lead_seq`, ticked on every insert, on every re-store that
+  read the links again, and on a recapture), so a late comment, an edit that gained a link and a
+  recaptured row are all read. `peer_cache(account, peer_id, username, access_hash)` keeps what a
+  sync was handed with a forward, so a forward's origin channel can be probed.
+  `grepogram recapture-links` (CLI-only, `sync.recapture_links`) re-reads the unread rows by id
+  and writes only their links, forward origin, `links_read` and a clock tick; an import is never
+  re-read. The first sync after the upgrade re-stores the linked or forwarded rows of each
+  `edit_refetch` window once.
 - **Research state lives in `research.db`**, a separate 0600 SQLite file next to `index.db`
   with its own version. The index is derived and may be deleted and rebuilt; approvals,
-  exclusions and session history are the user's decisions and must survive that.
-- **Sessions**: question, seed chats, acting account, limits (depth, candidates, `since`
-  horizon, messages per run, run seconds), state (`active` / `stopped`), progress.
+  exclusions and session history are the user's decisions and must survive that. As built
+  (`research_db` v2), it never names a chat by an index row id: seeds, scan cursors and evidence
+  carry `(scope, peer_id)` and are resolved to the row the index holds at use, and a cursor
+  counts only on the index `meta['index_id']` names.
+- **Sessions**: question (one line of plain text, at most 500 characters), seed chats, acting
+  account, limits (depth, candidates per call and per session, probes, `since` horizon,
+  messages per run, run seconds, admission timeout), state (`active` / `stopped`), progress.
+  `max_session_candidates` (500) is a ceiling over every discover call and run of a session;
+  what it cuts moves the cursor on and is reported as `session_full`.
 - **Candidates**: one per `(session, target identity)`: username, peer, invite hash, `addlist`
   slug or post; depth; status (`proposed`, `approved`, `skipped`, `excluded`, `joined`,
   `pending_admission`, `fetched`, `unavailable`, `failed`); and three separate facts that are
@@ -179,11 +202,22 @@ Decisions taken with the user before planning:
   `button`, `pinned`, `forward`, `directory`, `shared_folder`, `chat_search`, `post_search`),
   the source chat/message, a snippet, and an **origin key**: forwards of one post share the
   origin `(fwd_peer_id, fwd_msg_id)` and count once, so a post forwarded into ten chats is one
-  piece of corroboration, not ten.
+  piece of corroboration, not ten. As built the key is `post:<peer>/<msg>`, which the indexed
+  original in its channel and a global post-search result share too; `directory` evidence
+  reuses its lead's key.
+- **Pinned posts and directories (as built).** Discovery reads the pinned posts of the chats a
+  session reads — its seeds, which are the user's own sources, and chats a run fetched under a
+  grant — once per chat per session and whatever their age, for leads only: they become
+  `pinned` evidence and never `messages` rows. A chat whose links name at least
+  `DIRECTORY_MIN_CHATS` (10) distinct chats is a directory, and each chat found in it gets
+  `directory` evidence; approving the directory approves none of them.
 - **Probing** (read-only metadata, no history): resolve username, `messages.checkChatInvite`,
   `chatlists.checkChatlistInvite`, bounded per discover call and flood-aware. Probing tells the
   approval what it is approving (title, type, size, public/private, member or not, request
-  needed). Fetching any history — pinned posts included — needs a grant.
+  needed). Fetching any history needs a grant; the pinned posts above are the one read
+  outside it, and only of chats the user already indexes or approved. A forward's origin is
+  probed with the access hash `peer_cache` holds, or by its cached username only when that
+  still resolves to the same peer.
 - **Global discovery** (`contacts.search`, `channels.searchPosts`) is off unless `[research]`
   enables it *and* the session holds a `global_search` grant whose approval text disclosed that
   queries reach Telegram and may return snippets from unknown channels. `searchPosts` is preceded
@@ -194,7 +228,12 @@ Decisions taken with the user before planning:
   account, the concrete actions (`fetch`, `join`, `request`, `add_source`), the channel that
   produced them (`elicitation` | `cli`) and the time. Approving a directory or a chat grants
   nothing for what is discovered inside it. A grant is reused by later runs until consumed or
-  the session stops; nothing asks twice for approved work. Skips and exclusions need no consent
+  the session stops; nothing asks twice for approved work. As built: a grant is consumed only
+  when every action it names is done; `failed` and `unavailable` void it, and only a `failed`
+  candidate takes a new approval; a bare candidate id means `join,fetch,add_source` (`request`
+  where the admins approve joins, just `fetch,add_source` for a member), public chats included,
+  and reading a public chat without joining is an explicit `ID:fetch,add_source`; only a probed
+  candidate can be approved. Skips and exclusions need no consent
   (they only narrow); exclusions are global and persistent.
 - **Run**: for each granted candidate, in order — join (`channels.joinChannel`,
   `messages.importChatInvite`, `chatlists.joinChatlistInvite` with exactly the approved peers) or
@@ -202,8 +241,12 @@ Decisions taken with the user before planning:
   `config.update` (account, `since` = horizon, `comments` for channels); sync exactly those
   chats through `sync_all(only=…)` under the `SyncLock`, the research time budget and a message
   cap; then discover over the newly stored messages at depth + 1 (proposed, never auto-approved).
-  Pending admissions are re-checked at the start of every run. The run is resumable from
-  `research.db` alone.
+  Pending admissions are re-checked at the start of every run, and one no admin answered within
+  `admission_timeout_days` (30) is `failed` with a note. A run acts on the peer the probe saw: a
+  join goes by the stored id and access hash, a joined chat's source names it by peer id, and a
+  public chat read without joining is re-resolved before it is added. If another sync holds the
+  lock the run adds and fetches nothing and reports `stopped_by: sync_busy`. The run is
+  resumable from `research.db` alone.
 - **Stop** marks the session stopped, voids its unconsumed grants and leaves every source it
   added. **Removing a source never leaves a chat**; leaving is its own CLI-only command.
 
@@ -218,10 +261,12 @@ CLI and MCP share `grepogram/research.py` and `research.db`.
 | `research candidates` | `research_candidates` | candidates with evidence and the three access facts |
 | `research approve` (TTY only) | `research_approve` (elicitation) | grant named targets × concrete actions |
 | `research skip` / `exclude` | `research_skip` / `research_exclude` | narrow, no consent needed |
+| `research unexclude` | — (CLI-only) | lift an exclusion the user made |
 | `research run` | `research_run` | execute granted work within budgets |
-| `research status` | `research_status` | progress, pending grants, pending admissions |
+| `research status` | `research_status` | progress, pending grants, pending admissions; every exclusion with its reason |
 | `research stop` | `research_stop` | stop exploring; sources stay |
 | `accounts ls` / `accounts rm`, `auth --account`, `leave` | `accounts` (read-only) | account management |
+| `recapture-links` | — (CLI-only) | re-read the links of rows stored before capture |
 
 Research tools refuse with a hint while `[research] enabled = false` (the default); ordinary
 `search` never expands scope.
@@ -246,11 +291,17 @@ post_search = false            # channels.searchPosts (public posts)
 paid_stars_max = 0             # 0 = never pay for post search
 max_depth = 2
 max_candidates = 50            # per discover call
+max_session_candidates = 500   # per session (added in review)
 probe_limit = 20               # username / invite / addlist probes per discover call
 since_days = 365               # horizon given to sources a research run adds
 max_messages_per_run = 5000
 run_budget_s = 300
+admission_timeout_days = 30    # an unanswered admission request is given up (added in review)
 ```
+
+Every research limit is a whole number from 1 to `models.RESEARCH_LIMIT_MAX`'s ceiling.
+`research start` / `research_start` override the per-call and per-run limits; the two added in
+review always come from the config.
 
 ### Schema step 7 (accounts)
 
@@ -293,7 +344,26 @@ CREATE INDEX message_links_target ON message_links(target);
 `upsert_messages` replaces a message's links with what the fresh row carries. `RECIPE_VERSION`
 does not move: unit text is unchanged.
 
-### research.db (own schema, `research_db.SCHEMA_VERSION = 1`)
+As built, step 7 still creates `chat_access.via` / `checked_at` and `accounts.added_at`, but
+nothing writes them any more.
+
+### Schema step 9 (discovery completeness, added in review)
+
+```sql
+ALTER TABLE messages ADD COLUMN links_read INTEGER NOT NULL DEFAULT 0;
+UPDATE messages SET links_read = 1 WHERE fwd_peer_id IS NOT NULL
+    OR id IN (SELECT message_id FROM message_links)
+    OR (id >= <meta links_captured_from> AND chat_id NOT IN (<imported chats>));
+ALTER TABLE messages ADD COLUMN lead_seq INTEGER NOT NULL DEFAULT 1;
+CREATE INDEX messages_lead_seq ON messages(chat_id, lead_seq);
+CREATE TABLE peer_cache(account TEXT NOT NULL, peer_id INTEGER NOT NULL, username TEXT,
+    access_hash INTEGER, seen_at INTEGER, PRIMARY KEY (account, peer_id));
+-- meta: lead_clock = 1, index_id = random hex, synthetic_next = the synthetic high-water mark
+```
+
+A v0.2.0 index (schema 6) walks steps 7, 8 and 9 in place on first open.
+
+### research.db (own schema, `research_db.SCHEMA_VERSION = 1`; v2 as built)
 
 `sessions(id, question, account, seeds JSON, limits JSON, state, created_at, stopped_at)`,
 `candidates(id, session_id, identity UNIQUE per session, kind, peer_id, username, invite_hash,
@@ -302,6 +372,13 @@ addlist_slug, title, type, depth, status, member, access_hash, request_needed, p
 `grants(id, session_id, candidate_id NULL, account, actions JSON, via, granted_at, consumed_at,
 voided_at)`, `exclusions(identity PRIMARY KEY, reason, created_at)`,
 `searches(id, session_id, kind, query, ran_at, results)`. Opened with `paths.PRIVATE_FILE_MODE`.
+
+Version 2, added in review, replaces every index row id with Telegram's identity:
+`session_seeds(session_id, position, scope, peer_id)` instead of `sessions.seeds`,
+`chat_scans(session_id, scope, peer_id, depth, index_id, lead_seq, pins_read_at, directory,
+scanned_at)` instead of the `msg_id` cursors in `scans`, `evidence.chat_id` → `scope` +
+`peer_id`, and `candidates.requested_at` for the admission timeout. A version-1 file (only
+development builds wrote one) is migrated, never refused.
 
 ### Consent flow
 
@@ -315,8 +392,16 @@ voided_at)`, `exclusions(identity PRIMARY KEY, reason, created_at)`,
    `ctx.elicit(message=summary, schema=Confirm)` where `Confirm` has one boolean `approve`.
    `accept` + `approve=True` → grants written with `via='elicitation'`; decline / cancel → nothing.
 3. Otherwise → error result with `hint`: `run in a terminal: grepogram research approve <sid>
-   <ids…>` (the exact items). The CLI prints the same summary and reads the confirmation from
-   `/dev/tty`; with no TTY it refuses. There is no `--yes`.
+   <ids…>` (the exact items), worded as a command the user types in their own terminal. The CLI
+   prints the same summary and reads the confirmation from `/dev/tty`; with no TTY it refuses.
+   There is no `--yes`.
+4. As built, the terminal confirmation is a random five-character code the question shows and
+   the human types back (`cli._ask`), not `y`: a pipe or a blind `yes` cannot answer it. It
+   does not stop an agent that has a shell, which can give the command a pty of its own and read
+   the code, so every text that names the command says the user runs it themselves. Every
+   interpolated title, username and the question go through `research.shown` (control and
+   invisible formatting characters as U+FFFD, one line), and the summary names a configured
+   source that already covers a chat.
 
 ## What Goes Where
 
