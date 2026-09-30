@@ -1461,10 +1461,12 @@ def sources_status(cfg: Config, conn: sqlite3.Connection) -> list[SourceStatus]:
 
     A chat is listed under every source that covers it — its primary ``source_id`` and each one
     ``chat_sources`` records — so a channel two accounts configured shows under both. Each entry
-    names the account its source belongs to; an ``import:`` names none.
+    names the account its source belongs to; an ``import:`` names none. Each chat lists the
+    accounts ``chat_access`` records as reaching it — none for an import.
     """
     counts = db.message_counts(conn)
     coverage = db.chat_sources_map(conn)
+    reaching = db.chat_accounts_map(conn)
     by_source: dict[str, list[ChatRow]] = {}
     for chat in db.list_chats(conn):
         owners = dict.fromkeys([chat.source_id] if chat.source_id else [])
@@ -1486,6 +1488,7 @@ def sources_status(cfg: Config, conn: sqlite3.Connection) -> list[SourceStatus]:
                     message_count=counts.get(chat.id, 0),
                     last_sync_at=chat.last_sync_at,
                     unavailable=chat.unavailable,
+                    accounts=reaching.get(chat.id, []),
                 )
                 for chat in by_source.get(source_id, [])
             ],

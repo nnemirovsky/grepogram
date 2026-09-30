@@ -565,15 +565,26 @@ voided_at)`, `exclusions(identity PRIMARY KEY, reason, created_at)`,
 
 **Files:**
 - Modify: `grepogram/mcp.py`, `tests/test_mcp.py`
+- Modify: `grepogram/models.py` (`ChatStatus.accounts`), `grepogram/sources.py`
+  (`sources_status` fills it), `grepogram/db.py` (`chat_accounts_map`), `README.md` (MCP tool
+  table)
 
-- [ ] `AppState.telegram(account)` and `AppState.telegrams()` (all signed-in accounts, each its
-  own fresh client); `ClientFactory` takes the account
-- [ ] `sync` and `_auto_sync` pass every account; `dialogs(query, account)`,
+- [x] `AppState.telegram(account)` and `AppState.telegrams()` (all signed-in accounts, each its
+  own fresh client); `ClientFactory` takes the account. `telegrams()` follows the CLI's rules:
+  a missing / unreadable session is reported only for an account that owns a source, a
+  refused one always (`tg.connected_all`), and only no account at all raises (a source
+  owner's reason first); it yields `Accounts(clients, skipped)`. An unknown account is
+  `UnknownAccount` (a `ConfigError` whose hint is the `auth --account` sign-in)
+- [x] `sync` and `_auto_sync` pass every account; `dialogs(query, account)`,
   `sources_add(target, since, comments, account)`, `sources_remove` accept prefixed ids;
-  `sources` result carries accounts; new read-only `accounts` tool
-- [ ] tests: two fake accounts through the tools, auth error of one account reported with its
+  `sources` result carries accounts; new read-only `accounts` tool.
+  ➕ `sync` returns `accounts_skipped` (`account`, `error`, `hint`) plus one warning per skipped
+  account; a `dialogs` match's `target` carries the `<account>/` prefix for a non-default
+  account; every chat in `sources` lists the accounts that reach it (`ChatStatus.accounts`);
+  an auth failure of a non-default account names it in `error` and its sign-in in `hint`
+- [x] tests: two fake accounts through the tools, auth error of one account reported with its
   hint while the other syncs, stdout stays empty
-- [ ] run checks — must pass before task 10
+- [x] run checks — must pass before task 10
 
 ### Task 10: Account scopes and provenance in queries
 

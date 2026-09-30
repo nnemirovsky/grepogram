@@ -1,6 +1,6 @@
 """The MCP server: the search engine as tools for Claude Code, spoken over stdio.
 
-:func:`build_server` registers the eight tools of the contract on a
+:func:`build_server` registers the nine tools of the contract on a
 :class:`~mcp.server.fastmcp.FastMCP` named ``grepogram`` whose ``instructions`` carry the agent
 playbook (:data:`INSTRUCTIONS`); :func:`main` is the ``grepogram-mcp`` entry point. Every tool is
 a thin wrapper over the library — :mod:`grepogram.search`, :mod:`grepogram.sync`,
@@ -17,12 +17,16 @@ every tool body (:func:`guarded` / :func:`guarded_async`), so a stray ``print`` 
 cannot corrupt a JSON-RPC frame.
 
 The tools that talk to Telegram (``sync``, ``dialogs``, ``sources_add``) and ``search``, which may
-refresh a stale index first, are coroutines; the offline readers are plain functions. Retrieval
+refresh a stale index first, are coroutines; the offline readers are plain functions. Several
+Telegram accounts may be signed in at once: ``sync`` and the refresh inside ``search`` connect
+every one of them (:meth:`AppState.telegrams`) and go on without an account whose session is
+missing or signed out, reporting it with the command that signs it in; ``dialogs`` and
+``sources_add`` act as the one account they are given (:meth:`AppState.telegram`). Retrieval
 and embedding run in worker threads so the event loop keeps answering while they work — the SQLite
 connection serialises its statements across threads (:class:`grepogram.db.Connection`) and the
 models serialise their own calls. Tool calls arrive concurrently, so nothing that one call could
-close under another is shared: every Telegram-using block builds and disconnects its own client on
-a private in-memory copy of the session (:func:`grepogram.tg.make_client`), syncs queue on
+close under another is shared: every Telegram-using block builds and disconnects its own clients on
+private in-memory copies of the sessions (:func:`grepogram.tg.make_client`), syncs queue on
 ``AppState.sync_lock`` instead of failing each other with ``SyncInProgress``, and config changes
 go through ``AppState.editing_config`` — the process-wide lock plus the cross-process
 :class:`grepogram.config.ConfigLock` — so neither two ``sources_add`` calls nor a CLI command in
@@ -42,10 +46,10 @@ import threading
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable, Coroutine, Iterator, Sequence
 from contextlib import asynccontextmanager, contextmanager
-from dataclasses import asdict
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from types import TracebackType
-from typing import Any, TextIO
+from typing import Any, TextIO, TypedDict
 
 from mcp.server.fastmcp import FastMCP
 from telethon import errors as tg_errors
@@ -67,7 +71,7 @@ from grepogram.rerank import Reranker
 from grepogram.search import UnknownMessage
 from grepogram.sources import AmbiguousTarget, SourceError
 from grepogram.sync import SyncBudget, SyncInProgress, SyncLock
-from grepogram.tg import AuthRequired, SessionError
+from grepogram.tg import AuthRequired, SessionError, SessionMissing
 
 log = logging.getLogger(__name__)
 
@@ -90,12 +94,17 @@ post's comments come from the discussion group, and both chats number their mess
 filters or chats.
 - When the user names a chat that is not indexed yet, call `sources` to see what is indexed and \
 `dialogs` to find the chat or folder, then `sources_add` and `sync`.
+- Several Telegram accounts may be signed in: `accounts` lists them. `dialogs` and `sources_add` \
+act as one account (`account`, the default one when omitted), and a match's `target` already \
+names it; `sync` fetches through every signed-in account and names any account it had to skip, \
+with the command that signs it in.
 - A result with `error` explains what went wrong and `hint` what to do next; `warnings` are \
 advisory and the hits alongside them are valid.
 """
 
 ToolResult = dict[str, Any]
-ClientFactory = Callable[[Config, Paths], Any]
+ClientFactory = Callable[[Config, Paths, str], Any]
+"""Builds the (unconnected) client of an account: ``(config, paths, account)``."""
 
 AUTH_HINT = "sign in from a terminal with `grepogram auth`, then retry"
 SETUP_HINT = (
@@ -125,6 +134,7 @@ CONFIG_HINT = (
     "section documents"
 )
 NO_SOURCES_HINT = "find chats with dialogs, add them with sources_add, then sync"
+ACCOUNTS_HINT = "`accounts` lists the accounts; a new one is signed in from a terminal"
 SYNC_NEXT_HINT = "call sync to fetch and index its history"
 
 TOOL_ERRORS: tuple[type[Exception], ...] = (
@@ -168,6 +178,73 @@ class NotConfigured(ConfigError):
     def __init__(self, path: Path) -> None:
         self.path = path
         super().__init__(f"[telegram] api_id and api_hash are not set in {path}")
+
+
+class UnknownAccount(ConfigError):
+    """A tool was asked to act as an account the config does not know."""
+
+    def __init__(self, name: str, known: Sequence[str]) -> None:
+        self.name = name
+        super().__init__(f"unknown account {name!r}; known: {', '.join(known)}", auth_hint(name))
+
+
+def auth_hint(account: str = DEFAULT_ACCOUNT) -> str:
+    """What to do about ``account``'s missing or rejected session: :data:`AUTH_HINT` itself for
+    the default account, the ``--account`` sign-in for any other."""
+    if account == DEFAULT_ACCOUNT:
+        return AUTH_HINT
+    return f"sign in from a terminal with `grepogram auth --account {account}`, then retry"
+
+
+def session_hint(account: str = DEFAULT_ACCOUNT) -> str:
+    """:data:`SESSION_HINT` for ``account``: its own sign-in command when it is not the default."""
+    if account == DEFAULT_ACCOUNT:
+        return SESSION_HINT
+    return SESSION_HINT.replace("`grepogram auth`", f"`grepogram auth --account {account}`")
+
+
+class SkippedAccount(TypedDict):
+    """An account a multi-account block went on without: why, and what to do about it."""
+
+    account: str
+    error: str
+    hint: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class Accounts:
+    """What :meth:`AppState.telegrams` connected: a client per signed-in account, and the
+    reason each account that could not take part was left out — a missing or unreadable
+    session file of an account that owns a source, or a session Telegram does not accept."""
+
+    clients: dict[str, Any] = field(default_factory=dict)
+    skipped: dict[str, Exception] = field(default_factory=dict)
+
+    def skipped_list(self) -> list[SkippedAccount]:
+        """Each left-out account with its error and the hint that names its sign-in."""
+        return [
+            {"account": name, "error": _reason(exc), "hint": _account_hint(name, exc)}
+            for name, exc in self.skipped.items()
+        ]
+
+    def warnings(self) -> list[str]:
+        """One warning per left-out account: its name, why, and how to sign it in."""
+        return [
+            f"account {item['account']} skipped: {item['error']}"
+            + (f"; {item['hint']}" if item["hint"] else "")
+            for item in self.skipped_list()
+        ]
+
+
+def _reason(exc: Exception) -> str:
+    """Why an account was left out, without the account name the caller already gives."""
+    return exc.reason if isinstance(exc, AuthRequired) else describe(exc)
+
+
+def _account_hint(account: str, exc: Exception) -> str | None:
+    if isinstance(exc, SessionError):
+        return session_hint(account)
+    return hint_for(exc)
 
 
 # --- stdout hygiene --------------------------------------------------------------------------
@@ -222,8 +299,9 @@ class AppState:
     hand) while the server runs is picked up by the next tool call. A model that fails to load
     is not retried: the reason is kept in ``embed_error`` / ``rerank_error`` and repeated in
     every result's ``warnings`` until the server restarts. Telegram clients are not kept:
-    :meth:`telegram` builds one per block through ``client_factory``
-    (:func:`grepogram.tg.make_client` unless a test injects a fake). ``sync_lock`` lets one sync
+    :meth:`telegram` builds one per block for one account, :meth:`telegrams` one per signed-in
+    account, both through ``client_factory`` (:func:`grepogram.tg.make_client` unless a test
+    injects a fake). ``sync_lock`` lets one sync
     run at a time in this process — the explicit ``sync`` tool and the refresh inside ``search``
     queue behind each other rather than tripping over the cross-process
     :class:`~grepogram.sync.SyncLock` — and :meth:`editing_config` serialises config changes.
@@ -286,27 +364,74 @@ class AppState:
         with self._config_lock, config.ConfigLock(self.paths):
             yield self.config()
 
+    def account(self, cfg: Config, name: str | None) -> str:
+        """``name`` (the default account when ``None``) if ``cfg`` knows it, else
+        :class:`UnknownAccount` naming the known ones and how to sign the new one in."""
+        chosen = name or DEFAULT_ACCOUNT
+        known = cfg.account_names()
+        if chosen not in known:
+            raise UnknownAccount(chosen, known)
+        return chosen
+
+    def _require_keys(self, cfg: Config) -> None:
+        if cfg.telegram.api_id == 0 or not cfg.telegram.api_hash:
+            raise NotConfigured(self.paths.config_file)
+
     @asynccontextmanager
-    async def telegram(self) -> AsyncIterator[Any]:
-        """A connected, authorized client for the block, built for it and disconnected on exit.
+    async def telegram(self, account: str = DEFAULT_ACCOUNT) -> AsyncIterator[Any]:
+        """A connected, authorized client of ``account`` for the block, built for it and
+        disconnected on exit.
 
         A fresh ``TelegramClient`` per block reads the session file as it is now — so a session
         created with ``grepogram auth`` after a failed call works without a restart, and a
         client that once found itself unauthorized (Telethon remembers that per instance) is
         never asked again — on a private in-memory copy, so concurrent blocks (and a CLI sync
         in another process) share neither a connection nor a session database. Raises
+        :class:`UnknownAccount` for an account the config does not know,
         :class:`NotConfigured` without API keys, :class:`~grepogram.tg.SessionMissing` before
         any client is built when there is no session file, :class:`~grepogram.tg.SessionError`
         when the file cannot be read, and :class:`~grepogram.tg.AuthRequired` for a session
-        Telegram rejects.
+        Telegram rejects — each naming ``account``.
         """
         cfg = self.config()
-        if cfg.telegram.api_id == 0 or not cfg.telegram.api_hash:
-            raise NotConfigured(self.paths.config_file)
-        tg.ensure_session_mode(self.paths)
-        client = self.client_factory(cfg, self.paths)
-        async with tg.connected(client) as connected:
+        self.account(cfg, account)
+        self._require_keys(cfg)
+        tg.ensure_session_mode(self.paths, account)
+        client = self.client_factory(cfg, self.paths, account)
+        async with tg.connected(client, account) as connected:
             yield connected
+
+    @asynccontextmanager
+    async def telegrams(self) -> AsyncIterator[Accounts]:
+        """A connected client of every signed-in account for the block — each built for it, on
+        its own copy of its session, and all disconnected on exit — as :meth:`telegram` builds
+        one; the same rules as ``grepogram sync``.
+
+        An account whose session file is missing or unreadable is left out, and reported in
+        :attr:`Accounts.skipped` when it owns a configured source (an install that signed in
+        only named accounts never had a default session to miss); an account Telegram refuses
+        is left out and reported (:func:`grepogram.tg.connected_all`). One account's failure
+        never stops the others. Only when no account can connect at all is a reason raised —
+        a source owner's first, so a single-account install reads what it always did.
+        """
+        cfg = self.config()
+        self._require_keys(cfg)
+        owners = {source.account for source in cfg.sources}
+        clients: dict[str, Any] = {}
+        unavailable: dict[str, Exception] = {}
+        for name in cfg.account_names():
+            try:
+                tg.ensure_session_mode(self.paths, name)
+                clients[name] = self.client_factory(cfg, self.paths, name)
+            except (SessionMissing, SessionError) as exc:
+                unavailable[name] = exc
+        if not clients:
+            first = next(iter(unavailable.values()))
+            raise next((exc for name, exc in unavailable.items() if name in owners), first)
+        skipped = {name: exc for name, exc in unavailable.items() if name in owners}
+        async with tg.connected_all(clients) as live:
+            skipped.update(live.refused)
+            yield Accounts(live.clients, skipped)
 
     def load_embedder(self, cfg: Config) -> Embedder:
         """The embedding model, loaded once and kept (a :data:`grepogram.search.EmbedderLoader`).
@@ -372,8 +497,11 @@ def _app() -> AppState:
 
 
 def describe(exc: BaseException) -> str:
-    """The ``error`` text for an expected failure."""
+    """The ``error`` text for an expected failure; a session failure of an account other than
+    the default one names the account."""
     if isinstance(exc, AuthRequired):
+        if exc.account != DEFAULT_ACCOUNT:
+            return f"account {exc.account}: {exc.reason}"
         return exc.reason
     if isinstance(exc, tg_errors.RPCError):
         return f"telegram error: {exc}"
@@ -385,7 +513,7 @@ def describe(exc: BaseException) -> str:
 def hint_for(exc: BaseException) -> str | None:
     """What to do about an expected failure, when there is something to do."""
     if isinstance(exc, AuthRequired):
-        return AUTH_HINT
+        return auth_hint(exc.account)
     if isinstance(exc, NotConfigured):
         return SETUP_HINT
     if isinstance(exc, ConfigError):
@@ -509,7 +637,9 @@ async def _auto_sync(state: AppState, cfg: Config) -> tuple[bool, list[str]]:
     """Refresh a stale index within ``auto_sync_budget_s``; ``(synced, warnings)``.
 
     Every expected failure — no session, a sync already running in another process, a flood
-    wait, a network error — is a warning and the search goes on over the index as it is. A sync
+    wait, a network error — is a warning and the search goes on over the index as it is. Every
+    signed-in account takes part; one whose session is missing or refused is a warning naming
+    it, and the others refresh. A sync
     already running in this process is waited for instead, but no longer than the budget: a
     short refresh leaves the index fresh and nothing is fetched again, while a long explicit
     ``sync`` is reported as a warning and the search runs on the index as it is. The sources
@@ -531,9 +661,9 @@ async def _auto_sync(state: AppState, cfg: Config) -> tuple[bool, list[str]]:
             log.debug("auto-sync: the index was refreshed while this call waited")
             return False, []
         embedder = await asyncio.to_thread(state.embedder)
-        async with state.telegram() as client:
+        async with state.telegrams() as accounts:
             report = await syncing.sync_all(
-                {DEFAULT_ACCOUNT: client},
+                accounts.clients,
                 state.conn,
                 state.config,
                 state.paths,
@@ -546,7 +676,7 @@ async def _auto_sync(state: AppState, cfg: Config) -> tuple[bool, list[str]]:
         return False, [f"auto-sync skipped: {describe(exc)}"]
     finally:
         state.sync_lock.release()
-    warnings = [f"auto-sync: {warning}" for warning in report.warnings]
+    warnings = [f"auto-sync: {warning}" for warning in [*accounts.warnings(), *report.warnings]]
     if report.chats_remaining:
         warnings.append(
             f"auto-sync stopped after {budget_s}s with {len(report.chats_remaining)} chats "
@@ -634,11 +764,14 @@ def _messages_result(chat_id: int, msg_id: int, views: Sequence[MessageView]) ->
 
 @guarded_async
 async def sync(budget_s: int = 45) -> ToolResult:
-    """Fetch new messages from every configured source into the index (needs a signed-in
-    session). Runs for at most `budget_s` seconds and stops cleanly: `chats_remaining` lists
+    """Fetch new messages from every configured source of every signed-in account into the
+    index. Runs for at most `budget_s` seconds and stops cleanly: `chats_remaining` lists
     what is still behind — call again to continue. Returns `new` (messages stored),
-    `chats_done`, `chats_remaining`, `unavailable` (chats Telegram refused), `warnings` and
-    `index_age_min`. New units are embedded when the model is available.
+    `chats_done`, `chats_remaining`, `unavailable` (chats Telegram refused), `warnings`,
+    `accounts_skipped` and `index_age_min`. An account whose session is missing or signed out
+    does not stop the others: it is listed in `accounts_skipped` with its `error` and the
+    `hint` that signs it in, and its sources wait for the next sync. New units are embedded
+    when the model is available.
 
     This call is also what lets a pending one-time unit re-cut make progress: it is a deliberate
     act, like `grepogram sync` in a terminal, so it re-cuts a few chats a run (bounded and
@@ -652,21 +785,22 @@ async def sync(budget_s: int = 45) -> ToolResult:
     if not cfg.sources:
         return {"error": "no sources are configured", "hint": NO_SOURCES_HINT}
     embedder = await asyncio.to_thread(state.embedder)
-    async with state.sync_lock, state.telegram() as client:
+    async with state.sync_lock, state.telegrams() as accounts:
         report = await syncing.sync_all(
-            {DEFAULT_ACCOUNT: client},
+            accounts.clients,
             state.conn,
             state.config,
             state.paths,
             SyncBudget(budget_s),
             embedder,
         )
-    warnings = list(report.warnings)
+    warnings = [*accounts.warnings(), *report.warnings]
     if embedder is None:
         warnings.append(f"dense index not updated: {state.embed_error}")
     return {
         **asdict(report),
         "warnings": warnings,
+        "accounts_skipped": accounts.skipped_list(),
         "index_age_min": retrieval.index_age_min(state.conn),
     }
 
@@ -675,9 +809,10 @@ async def sync(budget_s: int = 45) -> ToolResult:
 def sources() -> ToolResult:
     """List every source the index holds chats under, with the `account` it belongs to and the
     chats indexed through each: `id`, `title`, `type`, `username`, `message_count`,
-    `last_sync_at` (unix seconds, null before the first sync) and `unavailable`. A chat several
-    sources cover is listed under each. A source with no chats has not been synced yet.
-    `index_age_min` is minutes since the last completed sync (null before the first).
+    `last_sync_at` (unix seconds, null before the first sync), `unavailable` and `accounts` (the
+    accounts that reach the chat). A chat several sources cover is listed under each. A source
+    with no chats has not been synced yet. `index_age_min` is minutes since the last completed
+    sync (null before the first).
 
     The configured sources come first, then any other `source_id` still in the database. An
     `import:<slug>` is a Telegram Desktop export the user indexed from a file: those chats are
@@ -692,21 +827,29 @@ def sources() -> ToolResult:
 
 
 @guarded_async
-async def dialogs(query: str) -> ToolResult:
-    """Find chats and folders of the signed-in Telegram account whose title, `@username` or
-    folder name matches `query` (substring first, then fuzzy). Each match has `kind` (`dialog`
-    or `folder`), `id`, `title`, `type` (user, bot, group, supergroup, channel or folder),
-    `username`, `folders` (the folders a chat is in), `score` and `target`, the value to pass to
-    `sources_add`. Use it when the user names a chat that is not indexed yet.
+async def dialogs(query: str, account: str | None = None) -> ToolResult:
+    """Find chats and folders of a signed-in Telegram account whose title, `@username` or
+    folder name matches `query` (substring first, then fuzzy). `account` names the account to
+    look in (`accounts` lists them); omitted, it is the default one. Each match has `kind`
+    (`dialog` or `folder`), `id`, `title`, `type` (user, bot, group, supergroup, channel or
+    folder), `username`, `folders` (the folders a chat is in), `score` and `target`, the value
+    to pass to `sources_add` — for an account other than the default one it carries the
+    `<account>/` prefix, so the source is added for the account that found it. Use it when the
+    user names a chat that is not indexed yet.
     """
     state = _app()
-    async with state.telegram() as client:
+    name = state.account(state.config(), account)
+    async with state.telegram(name) as client:
         catalog = DialogCatalog(client)
         found = match_dialogs(query, await catalog.list_dialogs(), await catalog.list_folders())
-    return {"query": query, "matches": [_match_dict(found_match) for found_match in found]}
+    return {
+        "query": query,
+        "account": name,
+        "matches": [_match_dict(found_match, name) for found_match in found],
+    }
 
 
-def _match_dict(found: Match) -> ToolResult:
+def _match_dict(found: Match, account: str = DEFAULT_ACCOUNT) -> ToolResult:
     if found.folder is not None:
         return {
             "kind": "folder",
@@ -716,10 +859,11 @@ def _match_dict(found: Match) -> ToolResult:
             "username": None,
             "folders": [],
             "score": round(found.score, 3),
-            "target": f"{sourcing.FOLDER_PREFIX}{found.title}",
+            "target": _target(account, f"{sourcing.FOLDER_PREFIX}{found.title}"),
         }
     dialog = found.dialog
     assert dialog is not None
+    chat = f"@{dialog.username}" if dialog.username else str(dialog.id)
     return {
         "kind": "dialog",
         "id": dialog.id,
@@ -728,16 +872,27 @@ def _match_dict(found: Match) -> ToolResult:
         "username": dialog.username,
         "folders": list(dialog.folders),
         "score": round(found.score, 3),
-        "target": f"@{dialog.username}" if dialog.username else str(dialog.id),
+        "target": chat if account == DEFAULT_ACCOUNT else _target(account, f"chat:{chat}"),
     }
 
 
+def _target(account: str, target: str) -> str:
+    """``target`` as ``sources_add`` reads it for ``account``: an ``<account>/`` prefix for any
+    account but the default one (:func:`grepogram.sources.parse_target`)."""
+    return target if account == DEFAULT_ACCOUNT else f"{account}/{target}"
+
+
 @guarded_async
-async def sources_add(target: str, since: str | None = None, comments: bool = False) -> ToolResult:
-    """Add a Telegram folder or chat to the indexed sources and save the config (needs a
-    signed-in session). `target` is a chat id or `@username` (as `dialogs` reports them), a
-    t.me link, `folder:<name>`, or a chat / folder title (fuzzy; an ambiguous one comes back as
-    `error` with `candidates`). `since` (YYYY-MM-DD) skips older history on the first sync;
+async def sources_add(
+    target: str, since: str | None = None, comments: bool = False, account: str | None = None
+) -> ToolResult:
+    """Add a Telegram folder or chat of an account to the indexed sources and save the config
+    (needs that account's signed-in session). `target` is a chat id or `@username` (as
+    `dialogs` reports them), a t.me link, `folder:<name>`, or a chat / folder title (fuzzy; an
+    ambiguous one comes back as `error` with `candidates`). `account` names the account the
+    source belongs to; omitted, it is the one an `<account>/` prefix on `target` names (a
+    `dialogs` target carries it), else the default one. `since` (YYYY-MM-DD) skips older
+    history on the first sync;
     `comments=true` (channels only) also indexes the linked discussion threads. Returns the
     stored `source` and the `chats` it covers; call `sync` afterwards. A chat already in the
     index as a Telegram Desktop import comes back as `error`: a live source would take it over
@@ -745,14 +900,15 @@ async def sources_add(target: str, since: str | None = None, comments: bool = Fa
     """
     state = _app()
     parsed = sourcing.parse_target(target)
-    async with state.telegram() as client:
+    name = state.account(state.config(), account or parsed.account)
+    async with state.telegram(name) as client:
         catalog = DialogCatalog(client)
         added = await sourcing.add_source(
-            state.config(), parsed, catalog, since=since, comments=comments
+            state.config(), parsed, catalog, since=since, comments=comments, account=name
         )
     # `db.upsert_chat` overwrites `source_id`, so a live source over an imported chat would drop
     # the `import:` tag every protection of that history keys on; the CLI refuses the same way
-    sourcing.refuse_imported(state.conn, added.dialogs)
+    sourcing.refuse_imported(state.conn, added.dialogs, name)
     dialog = None if added.folder is not None else added.dialogs[0]
     with state.editing_config() as current:
         state.save_config(sourcing.with_source(current, added.source, dialog))
@@ -769,10 +925,12 @@ async def sources_add(target: str, since: str | None = None, comments: bool = Fa
 @guarded
 def sources_remove(target: str) -> ToolResult:
     """Remove a source and delete its chats' messages and index data (offline). `target` is a
-    source id from `sources` (`folder:Argentina`, `chat:@name`), a folder name, a chat id /
-    `@username`, or a fuzzy title. A chat that came in through a folder cannot be removed on
-    its own (remove the folder source or take the chat out of the folder in Telegram), nor can
-    a channel's discussion group indexed through the channel's source. A chat another source
+    source id from `sources` (`folder:Argentina`, `chat:@name`, `work/chat:@name` for a source
+    of the account `work`), a folder name, a chat id / `@username`, or a fuzzy title; without
+    an `<account>/` prefix the default account's source is meant first. A chat that came in
+    through a folder cannot be removed on its own (remove the folder source or take the chat
+    out of the folder in Telegram), nor can a channel's discussion group indexed through the
+    channel's source. A chat another source
     still covers (a channel a second account also configured) is kept and listed in
     `kept_chat_ids`; `removed_chat_ids` are the chats deleted. Refused with `error` while a
     sync is running.
@@ -792,6 +950,40 @@ def sources_remove(target: str) -> ToolResult:
     }
 
 
+@guarded
+def accounts() -> ToolResult:
+    """List the Telegram accounts grepogram knows (offline, read-only): `name`, `label`,
+    `session` (`missing` with no session file, `authorized` when the account was signed in the
+    last time grepogram used it, `present` for a file no run has confirmed yet), `user_id` and
+    `display_name` (null until confirmed), `sources` (the ids of its configured sources),
+    `chats` (how many indexed chats it reaches) and `hint` (how to sign it in, when its session
+    is missing). Accounts are added, removed and signed in from a terminal only.
+    """
+    state = _app()
+    cfg = state.config()
+    recorded = {row.name: row for row in db.list_accounts(state.conn)}
+    reached = db.account_chat_counts(state.conn)
+    labels = {entry.name: entry.label for entry in cfg.accounts}
+    listed: list[ToolResult] = []
+    for name in cfg.account_names():
+        who = recorded.get(name)
+        present = state.paths.session_file_for(name).exists()
+        session = "missing" if not present else "present" if who is None else "authorized"
+        listed.append(
+            {
+                "name": name,
+                "label": labels.get(name),
+                "session": session,
+                "user_id": None if who is None else who.user_id,
+                "display_name": None if who is None else who.display_name,
+                "sources": [source.id for source in cfg.sources if source.account == name],
+                "chats": reached.get(name, 0),
+                "hint": None if present else auth_hint(name),
+            }
+        )
+    return {"accounts": listed, "hint": ACCOUNTS_HINT}
+
+
 TOOLS: tuple[Callable[..., Any], ...] = (
     search,
     thread,
@@ -801,6 +993,7 @@ TOOLS: tuple[Callable[..., Any], ...] = (
     dialogs,
     sources_add,
     sources_remove,
+    accounts,
 )
 
 
@@ -808,7 +1001,7 @@ TOOLS: tuple[Callable[..., Any], ...] = (
 
 
 def build_server() -> FastMCP[Any]:
-    """A ``grepogram`` FastMCP server with the eight tools; docstrings are the descriptions."""
+    """A ``grepogram`` FastMCP server with the nine tools; docstrings are the descriptions."""
     server: FastMCP[Any] = FastMCP(SERVER_NAME, instructions=INSTRUCTIONS)
     for tool in TOOLS:
         server.add_tool(tool, description=inspect.cleandoc(tool.__doc__ or ""))

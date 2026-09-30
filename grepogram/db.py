@@ -1020,6 +1020,18 @@ def chat_sources_map(conn: sqlite3.Connection) -> dict[int, list[str]]:
     return covering
 
 
+def chat_accounts_map(conn: sqlite3.Connection) -> dict[int, list[str]]:
+    """Chat id → every account ``chat_access`` records as reaching it, in
+    :func:`chat_accounts` order, for the readers that walk all chats."""
+    reaching: dict[int, list[str]] = {}
+    for row in conn.execute(
+        "SELECT chat_id, account FROM chat_access ORDER BY chat_id, account != ?, account",
+        (DEFAULT_ACCOUNT,),
+    ):
+        reaching.setdefault(int(row["chat_id"]), []).append(str(row["account"]))
+    return reaching
+
+
 def set_primary_source(conn: sqlite3.Connection, chat_id: int, source_id: str) -> None:
     """Move chat ``chat_id``'s primary owner (``chats.source_id``) to ``source_id``.
 

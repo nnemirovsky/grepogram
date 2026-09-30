@@ -31,6 +31,7 @@ from grepogram.embed import FakeEmbedder, ModelUnavailable
 from grepogram.filters import InvalidDate, UnknownChat
 from grepogram.models import (
     DEFAULT_ACCOUNT,
+    AccountCfg,
     ChatRow,
     Config,
     MessageRow,
@@ -44,7 +45,7 @@ from grepogram.search import UnknownMessage
 from grepogram.sources import AmbiguousTarget
 from grepogram.sync import SyncInProgress, SyncLock
 from grepogram.tg import AuthRequired, SessionError, SessionMissing
-from tests.fakes import FakeClient, make_channel, make_dialog, make_folder, make_user
+from tests.fakes import FakeClient, FakeWorld, make_channel, make_dialog, make_folder, make_user
 from tests.fixtures import chat_ru, tl
 
 ARG = chat_ru.ARG_ID
@@ -93,7 +94,7 @@ def bind(
 
     def make(cfg: Config = CFG, client: FakeClient | None = None) -> tools.AppState:
         chosen = fake if client is None else client
-        state = tools.AppState(paths, cfg, conn, client_factory=lambda cfg, paths: chosen)
+        state = tools.AppState(paths, cfg, conn, client_factory=lambda cfg, paths, account: chosen)
         tools.bind(state)
         return state
 
@@ -346,7 +347,9 @@ async def test_auto_sync_without_a_session_is_a_warning(
     ]
     built: list[Config] = []
     tools.bind(
-        tools.AppState(paths, CFG, stale.conn, client_factory=lambda cfg, p: built.append(cfg))
+        tools.AppState(
+            paths, CFG, stale.conn, client_factory=lambda cfg, p, account: built.append(cfg)
+        )
     )
     paths.session_file.unlink()
     result = await tools.search("DNI", mode="lexical")
@@ -388,7 +391,7 @@ async def test_each_telegram_call_builds_a_fresh_client(
     clients = [_client(authorized=False), _client()]
     built: list[FakeClient] = []
 
-    def factory(cfg: Config, p: Paths) -> FakeClient:
+    def factory(cfg: Config, p: Paths, account: str) -> FakeClient:
         built.append(clients[len(built)])
         return built[-1]
 
@@ -461,7 +464,7 @@ async def test_auto_sync_waits_no_longer_than_its_budget_for_a_running_sync(
 async def test_an_unreadable_session_file_is_an_error_with_a_hint(
     stale: tools.AppState, paths: Paths, conn: sqlite3.Connection
 ) -> None:
-    def locked(cfg: Config, p: Paths) -> FakeClient:
+    def locked(cfg: Config, p: Paths, account: str) -> FakeClient:
         raise SessionError(p.session_file, sqlite3.OperationalError("database is locked"))
 
     tools.bind(tools.AppState(paths, CFG, conn, client_factory=locked))
@@ -1154,6 +1157,282 @@ def test_stdout_guard_holds_until_the_last_block_exits(
     assert sys.stdout is before
 
 
+# --- accounts --------------------------------------------------------------------------------
+
+WORK = "work"
+BOB = make_user(2, "Bob")
+WORK_ME = make_user(43, "Worker")
+TWO_ACCOUNTS = Config(
+    telegram=KEYS,
+    search=CFG.search,
+    units=CFG.units,
+    accounts=[AccountCfg(name=WORK, label="work phone")],
+    sources=[
+        Source(chat="@news"),
+        Source(chat="@news", account=WORK),
+        Source(chat=2, account=WORK),
+    ],
+)
+
+
+class Accounts:
+    """The default account and ``work`` over one world: both see the public channel ``@news``,
+    ``work`` alone has a private chat with Bob. Every block gets fresh clients, as the server's
+    factory builds them; ``built`` records each one per account."""
+
+    def __init__(self, paths: Paths) -> None:
+        self.paths = paths
+        self.world = FakeWorld(
+            entities=[NEWS, BOB],
+            messages={NEWS_ID: [tl.channel_post(NEWS_ID, i, f"news {i}") for i in (1, 2)]},
+        )
+        self.options: dict[str, dict[str, Any]] = {DEFAULT_ACCOUNT: {}, WORK: {}}
+        self.built: dict[str, list[FakeClient]] = {DEFAULT_ACCOUNT: [], WORK: []}
+        paths.session_file_for(WORK).parent.mkdir(parents=True, exist_ok=True)
+        paths.session_file_for(WORK).touch()
+
+    def factory(self, cfg: Config, paths: Paths, account: str) -> FakeClient:
+        if account == WORK:
+            client = self.world.client(
+                WORK,
+                members=[NEWS, BOB],
+                me=WORK_ME,
+                messages={2: [tl.message(2, 5, "bob at work", sender=2)]},
+                **self.options[WORK],
+            )
+        else:
+            client = self.world.client(members=[NEWS], me=ME, **self.options[DEFAULT_ACCOUNT])
+        self.built[account].append(client)
+        return client
+
+
+@pytest.fixture
+def accounts(paths: Paths, conn: sqlite3.Connection) -> Iterator[Accounts]:
+    two = Accounts(paths)
+    tools.bind(tools.AppState(paths, TWO_ACCOUNTS, conn, client_factory=two.factory))
+    yield two
+    tools.unbind()
+
+
+def _skipped(account: str, error: str) -> dict[str, object]:
+    return {"account": account, "error": error, "hint": tools.auth_hint(account)}
+
+
+async def test_sync_fetches_through_every_signed_in_account(
+    accounts: Accounts, conn: sqlite3.Connection
+) -> None:
+    report = await tools.sync(budget_s=10)
+    assert "error" not in report, report
+    assert report["new"] == 3 and report["accounts_skipped"] == [] and report["warnings"] == []
+    bob = db.get_chat_by_peer(conn, 2, WORK)
+    assert bob is not None
+    assert db.message_counts(conn) == {NEWS_ID: 2, bob.id: 1}
+    assert db.chat_accounts(conn, NEWS_ID) == [DEFAULT_ACCOUNT, WORK]
+    assert {name: len(built) for name, built in accounts.built.items()} == {
+        DEFAULT_ACCOUNT: 1,
+        WORK: 1,
+    }
+    assert all(not c.is_connected() for built in accounts.built.values() for c in built)
+    again = await tools.sync(budget_s=10)
+    assert again["new"] == 0
+    assert {name: len(built) for name, built in accounts.built.items()} == {
+        DEFAULT_ACCOUNT: 2,
+        WORK: 2,
+    }
+
+
+async def test_sync_goes_on_without_a_signed_out_account_and_names_its_sign_in(
+    accounts: Accounts, conn: sqlite3.Connection, capfd: pytest.CaptureFixture[str]
+) -> None:
+    accounts.options[WORK] = {"authorized": False}
+    report = await tools.sync(budget_s=10)
+    assert "error" not in report, report
+    assert report["new"] == 2 and db.message_counts(conn) == {NEWS_ID: 2}
+    assert report["accounts_skipped"] == [_skipped(WORK, "Telegram session is not authorized")]
+    assert tools.auth_hint(WORK) == (
+        "sign in from a terminal with `grepogram auth --account work`, then retry"
+    )
+    assert report["warnings"] == [
+        f"account work skipped: Telegram session is not authorized; {tools.auth_hint(WORK)}"
+    ]
+    assert db.chat_accounts(conn, NEWS_ID) == [DEFAULT_ACCOUNT]
+
+    accounts.options[WORK] = {}
+    accounts.paths.session_file_for(WORK).unlink()
+    missing = await tools.sync(budget_s=10)
+    work_session = accounts.paths.session_file_for(WORK)
+    assert missing["accounts_skipped"] == [_skipped(WORK, f"no Telegram session at {work_session}")]
+    assert len(accounts.built[WORK]) == 1  # no client is built for a missing session
+    assert capfd.readouterr().out == ""
+
+
+async def test_sync_with_no_account_signed_in_is_an_error_naming_the_source_owner(
+    accounts: Accounts, paths: Paths
+) -> None:
+    paths.session_file.unlink()
+    accounts.options[WORK] = {"authorized": False}
+    refused = await tools.sync(budget_s=10)
+    assert refused["error"] == "account work: Telegram session is not authorized"
+    assert refused["hint"] == tools.auth_hint(WORK)
+    paths.session_file_for(WORK).unlink()
+    missing = await tools.sync(budget_s=10)
+    assert missing["error"] == f"no Telegram session at {paths.session_file}"
+    assert missing["hint"] == tools.AUTH_HINT  # the default account owns a source too
+
+
+async def test_a_session_file_only_named_accounts_need_is_not_missed(
+    paths: Paths, conn: sqlite3.Connection
+) -> None:
+    """An install whose sources all belong to ``work`` never had a default session to miss."""
+    two = Accounts(paths)
+    paths.session_file.unlink()
+    cfg = dataclasses.replace(TWO_ACCOUNTS, sources=[Source(chat=2, account=WORK)])
+    tools.bind(tools.AppState(paths, cfg, conn, client_factory=two.factory))
+    try:
+        report = await tools.sync(budget_s=10)
+    finally:
+        tools.unbind()
+    assert "error" not in report, report
+    assert report["new"] == 1 and report["accounts_skipped"] == [] and report["warnings"] == []
+
+
+async def test_auto_sync_refreshes_every_account_and_warns_about_a_refused_one(
+    accounts: Accounts, conn: sqlite3.Connection
+) -> None:
+    await tools.sync(budget_s=10)
+    conn.execute("UPDATE chats SET last_sync_at = 1")
+    conn.execute("DELETE FROM meta WHERE key LIKE 'last_sync%'")
+    assert tools._stale(tools._app(), TWO_ACCOUNTS)
+    accounts.world.messages[NEWS_ID].append(tl.channel_post(NEWS_ID, 3, "news 3 Brubank"))
+    accounts.options[WORK] = {"authorized": False}
+    result = await tools.search("Brubank", mode="lexical")
+    assert result["synced"] is True and _has(result, NEWS_ID, 3)
+    assert result["warnings"] == [
+        "auto-sync: account work skipped: Telegram session is not authorized; "
+        f"{tools.auth_hint(WORK)}"
+    ]
+
+
+async def test_dialogs_reads_the_account_it_is_given(accounts: Accounts) -> None:
+    home = await tools.dialogs("news")
+    assert home["account"] == DEFAULT_ACCOUNT
+    assert [m["target"] for m in home["matches"]] == ["@news"]
+    work = await tools.dialogs("bob", account=WORK)
+    assert "error" not in work, work
+    assert work["account"] == WORK
+    assert [(m["id"], m["target"]) for m in work["matches"]] == [(2, "work/chat:2")]
+    assert [m["target"] for m in (await tools.dialogs("news", WORK))["matches"]] == [
+        "work/chat:@news"
+    ]
+    assert len(accounts.built[DEFAULT_ACCOUNT]) == 1 and len(accounts.built[WORK]) == 2
+    assert not any(c.is_connected() for built in accounts.built.values() for c in built)
+    unknown = await tools.dialogs("bob", account="nobody")
+    assert unknown["error"] == f"unknown account 'nobody'; known: {DEFAULT_ACCOUNT}, {WORK}"
+    assert unknown["hint"] == tools.auth_hint("nobody")
+    accounts.options[WORK] = {"authorized": False}
+    refused = await tools.dialogs("bob", account=WORK)
+    assert refused == {
+        "error": "account work: Telegram session is not authorized",
+        "hint": tools.auth_hint(WORK),
+    }
+
+
+async def test_sources_add_for_another_account(paths: Paths, conn: sqlite3.Connection) -> None:
+    two = Accounts(paths)
+    cfg = dataclasses.replace(TWO_ACCOUNTS, sources=[])
+    state = tools.AppState(paths, cfg, conn, client_factory=two.factory)
+    tools.bind(state)
+    try:
+        prefixed = await tools.sources_add("work/chat:2")
+        named = await tools.sources_add("@news", account=WORK)
+        home = await tools.sources_add("@news")
+        clash = await tools.sources_add("work/chat:@news", account=DEFAULT_ACCOUNT)
+        unknown = await tools.sources_add("@news", account="nobody")
+    finally:
+        tools.unbind()
+    assert prefixed["source"]["id"] == "work/chat:2" and prefixed["source"]["account"] == WORK
+    assert named["source"]["id"] == "work/chat:@news"
+    assert home["source"]["id"] == "chat:@news" and home["source"]["account"] == DEFAULT_ACCOUNT
+    assert "account default" in clash["error"]
+    assert unknown["hint"] == tools.auth_hint("nobody")
+    assert [s.id for s in state.config().sources] == [
+        "work/chat:2",
+        "work/chat:@news",
+        "chat:@news",
+    ]
+    assert len(two.built[WORK]) == 2 and len(two.built[DEFAULT_ACCOUNT]) == 2
+
+
+async def test_sources_carry_accounts_and_remove_keeps_a_shared_chat(
+    accounts: Accounts, conn: sqlite3.Connection
+) -> None:
+    await tools.sync(budget_s=10)
+    bob = db.get_chat_by_peer(conn, 2, WORK)
+    assert bob is not None
+    listed = {s["source_id"]: s for s in tools.sources()["sources"]}
+    assert [(s, listed[s]["account"]) for s in listed] == [
+        ("chat:@news", DEFAULT_ACCOUNT),
+        ("work/chat:@news", WORK),
+        ("work/chat:2", WORK),
+    ]
+    assert listed["chat:@news"]["chats"][0]["accounts"] == [DEFAULT_ACCOUNT, WORK]
+    assert listed["work/chat:2"]["chats"][0]["accounts"] == [WORK]
+    removed = tools.sources_remove("chat:@news")
+    assert removed["source_id"] == "chat:@news"
+    assert removed["removed_chat_ids"] == [] and removed["kept_chat_ids"] == [NEWS_ID]
+    dm = tools.sources_remove("work/chat:2")
+    assert dm["source_id"] == "work/chat:2" and dm["removed_chat_ids"] == [bob.id]
+    assert [s.id for s in tools._app().config().sources] == ["work/chat:@news"]
+    assert db.message_counts(conn) == {NEWS_ID: 2}
+    (left,) = tools.sources()["sources"]
+    assert left["source_id"] == "work/chat:@news" and left["chats"][0]["id"] == NEWS_ID
+
+
+async def test_accounts_lists_every_account_offline(
+    accounts: Accounts, conn: sqlite3.Connection, paths: Paths
+) -> None:
+    before = tools.accounts()
+    assert [(a["name"], a["label"], a["session"]) for a in before["accounts"]] == [
+        (DEFAULT_ACCOUNT, None, "present"),
+        (WORK, "work phone", "present"),
+    ]
+    assert before["hint"] == tools.ACCOUNTS_HINT
+    await tools.sync(budget_s=10)
+    paths.session_file.unlink()
+    home, work = tools.accounts()["accounts"]
+    assert home == {
+        "name": DEFAULT_ACCOUNT,
+        "label": None,
+        "session": "missing",
+        "user_id": 42,
+        "display_name": "Me Myself",
+        "sources": ["chat:@news"],
+        "chats": 1,
+        "hint": tools.AUTH_HINT,
+    }
+    assert work == {
+        "name": WORK,
+        "label": "work phone",
+        "session": "authorized",
+        "user_id": 43,
+        "display_name": "Worker",
+        "sources": ["work/chat:@news", "work/chat:2"],
+        "chats": 2,
+        "hint": None,
+    }
+    assert all(not c.is_connected() for built in accounts.built.values() for c in built)
+
+
+def test_session_hints_name_the_account() -> None:
+    assert tools.session_hint() == tools.SESSION_HINT
+    assert "`grepogram auth --account work`" in tools.session_hint(WORK)
+    work = AuthRequired(account=WORK)
+    assert tools.failure(work) == {
+        "error": "account work: Telegram session is not authorized",
+        "hint": tools.auth_hint(WORK),
+    }
+
+
 # --- server ----------------------------------------------------------------------------------
 
 
@@ -1165,15 +1444,16 @@ def test_instructions_carry_the_playbook() -> None:
     assert "`url`" in text
     assert "say so rather than guess" in text
     assert "`sources`" in text and "`dialogs`" in text and "`sources_add`" in text
+    assert "`accounts`" in text and "signs it in" in text
 
 
-async def test_server_lists_the_eight_tools_over_a_session(state: tools.AppState) -> None:
+async def test_server_lists_the_nine_tools_over_a_session(state: tools.AppState) -> None:
     server = tools.build_server()
     assert server.name == "grepogram" and server.instructions == tools.INSTRUCTIONS
     async with create_connected_server_and_client_session(server) as session:
         listed = await session.list_tools()
         by_name = {tool.name: tool for tool in listed.tools}
-        assert len(by_name) == 8
+        assert len(by_name) == 9
         assert sorted(by_name) == sorted(tool.__name__ for tool in tools.TOOLS)
         search_tool = by_name["search"]
         assert search_tool.description is not None
@@ -1186,6 +1466,10 @@ async def test_server_lists_the_eight_tools_over_a_session(state: tools.AppState
         assert by_name["sync"].inputSchema["properties"]["budget_s"]["default"] == 45
         assert by_name["context"].inputSchema["properties"]["before"]["default"] == 15
         assert by_name["sources"].inputSchema["properties"] == {}
+        assert by_name["accounts"].inputSchema["properties"] == {}
+        assert by_name["dialogs"].inputSchema["required"] == ["query"]
+        assert "account" in by_name["dialogs"].inputSchema["properties"]
+        assert "account" in by_name["sources_add"].inputSchema["properties"]
         for tool in listed.tools:
             assert tool.description
         result = await session.call_tool("search", {"query": "DNI", "mode": "lexical", "k": 2})
