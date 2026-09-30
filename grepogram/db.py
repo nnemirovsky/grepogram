@@ -1475,6 +1475,52 @@ def links_captured_from(conn: sqlite3.Connection) -> int:
     return int(value) if value else 1
 
 
+_TEXT_MAY_LINK = (
+    "(text LIKE '%@%' OR text LIKE '%t.me%' OR text LIKE '%telegram.me%' "
+    "OR text LIKE '%telegram.dog%' OR text LIKE '%tg:%')"
+)
+"""What the text of a row stored before link capture must hold for
+:func:`grepogram.leads.text_leads` to find anything in it; ``LIKE`` ignores ASCII case."""
+
+
+def lead_messages(
+    conn: sqlite3.Connection, chat_id: int, after_msg_id: int, captured_from: int
+) -> list[MessageRow]:
+    """The messages of ``chat_id`` above Telegram ``msg_id`` ``after_msg_id`` that may name
+    another chat, ascending by ``msg_id`` — research's offline discovery reads these.
+
+    A row carries a lead when it has stored links or a forward origin; a row stored before
+    ``captured_from`` (:func:`links_captured_from`) with neither may still show one in its text,
+    and is included when that text could hold a URL or a mention at all.
+    """
+    rows = conn.execute(
+        f"""SELECT * FROM messages AS m WHERE chat_id = ? AND msg_id > ?
+            AND (fwd_peer_id IS NOT NULL
+                 OR EXISTS (SELECT 1 FROM message_links WHERE message_id = m.id)
+                 OR (id < ? AND {_TEXT_MAY_LINK}))
+            ORDER BY msg_id""",
+        (chat_id, after_msg_id, captured_from),
+    )
+    return [_message_row(row) for row in rows]
+
+
+def newest_msg_id(conn: sqlite3.Connection, chat_id: int) -> int:
+    """The highest Telegram ``msg_id`` stored for ``chat_id``; ``0`` for a chat holding none."""
+    row = conn.execute(
+        "SELECT MAX(msg_id) AS newest FROM messages WHERE chat_id = ?", (chat_id,)
+    ).fetchone()
+    return int(row["newest"] or 0)
+
+
+def chats_for_username(conn: sqlite3.Connection, username: str) -> list[ChatRow]:
+    """Every stored chat whose ``@username`` is ``username``, ignoring case, ordered by id."""
+    rows = conn.execute(
+        "SELECT * FROM chats WHERE lower(username) = ? ORDER BY id",
+        (username.lstrip("@").lower(),),
+    )
+    return [_chat_row(row) for row in rows]
+
+
 def attachment_replaced(stored: MessageRow, fresh: MessageRow) -> bool:
     """Whether storing ``fresh`` over ``stored`` would trip :data:`_ATTACHMENT_REPLACED`.
 

@@ -697,3 +697,51 @@ class ScanCursor:
     depth: int
     msg_id: int
     scanned_at: int
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class CandidateView:
+    """A candidate as research presents it: its evidence, how many independent origins that
+    evidence has (``corroboration``), how many of the question's terms its snippets share
+    (``overlap``), and whether the index already holds the chat — ``cached_chats`` are those
+    rows, ``cached_accounts`` the accounts they came through. Membership stays
+    ``candidate.member``; neither of the two says anything about the other."""
+
+    candidate: Candidate
+    corroboration: int = 0
+    overlap: int = 0
+    cached_chats: tuple[int, ...] = ()
+    cached_accounts: tuple[str, ...] = ()
+    evidence: tuple[Evidence, ...] = ()
+
+    @property
+    def cached(self) -> bool:
+        return bool(self.cached_chats)
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class DiscoverReport:
+    """What one offline discovery pass did — :func:`grepogram.research.discover_offline`'s answer.
+
+    ``leads`` counts the paths to a chat outside the session that were read; ``in_session`` those
+    to a chat the session already reads, ``people`` those naming a person, and neither counts as
+    a lead. ``text_fallback`` is how many messages, stored before links were captured, were read
+    by their visible text alone — their hidden hyperlinks and buttons were never seen.
+    ``beyond_depth``, ``excluded`` and ``over_cap`` count the new identities left out, and
+    ``truncated`` says the cap held some back: their chats keep their cursor, so the next call
+    reads them again.
+    """
+
+    session_id: int
+    chats_scanned: int = 0
+    messages_scanned: int = 0
+    text_fallback: int = 0
+    leads: int = 0
+    in_session: int = 0
+    people: int = 0
+    new_candidates: list[int] = field(default_factory=list)
+    updated_candidates: list[int] = field(default_factory=list)
+    beyond_depth: int = 0
+    excluded: int = 0
+    over_cap: int = 0
+    truncated: bool = False

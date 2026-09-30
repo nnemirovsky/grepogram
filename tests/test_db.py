@@ -2046,6 +2046,41 @@ def test_message_links_are_deleted_with_their_message_and_chat(conn: sqlite3.Con
     assert [row["target"] for row in targets] == ["@c_chat"]
 
 
+def test_lead_messages_are_the_rows_that_may_name_another_chat(conn: sqlite3.Connection) -> None:
+    db.upsert_chat(conn, _chat(1))
+    db.upsert_messages(
+        conn,
+        [
+            _message(1, 1, text="old t.me/a_chat"),
+            _message(1, 2, text="old plain"),
+            _message(1, 3, text="old @mention"),
+        ],
+    )
+    db.set_meta(conn, db.META_LINKS_CAPTURED_FROM, "4")
+    db.upsert_messages(
+        conn,
+        [
+            _message(1, 4, text="captured t.me/b_chat", links=()),
+            _message(1, 5, links=(("text_url", "@c_chat"),)),
+            _message(1, 6, fwd_peer_id=-1001, fwd_msg_id=2),
+            _message(1, 7, text="plain"),
+        ],
+    )
+    captured = db.links_captured_from(conn)
+    assert [m.msg_id for m in db.lead_messages(conn, 1, 0, captured)] == [1, 3, 5, 6]
+    assert [m.msg_id for m in db.lead_messages(conn, 1, 3, captured)] == [5, 6]
+    assert db.newest_msg_id(conn, 1) == 7
+    assert db.newest_msg_id(conn, 2) == 0
+
+
+def test_chats_for_username_ignores_case_and_the_at_sign(conn: sqlite3.Connection) -> None:
+    db.upsert_chat(conn, ChatRow(id=-1001, type="channel", username="Rent_Chan"))
+    db.upsert_chat(conn, ChatRow(id=-1002, type="channel", username="other"))
+    assert [c.id for c in db.chats_for_username(conn, "@rent_chan")] == [-1001]
+    assert [c.id for c in db.chats_for_username(conn, "RENT_CHAN")] == [-1001]
+    assert db.chats_for_username(conn, "nobody") == []
+
+
 def test_upsert_messages_rewrites_every_column_on_conflict(conn: sqlite3.Connection) -> None:
     db.upsert_chat(conn, _chat(1))
     first = MessageRow(chat_id=1, msg_id=5, date=100, from_id=1, from_name="Ann", text="a")

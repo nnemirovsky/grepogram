@@ -675,17 +675,36 @@ voided_at)`, `exclusions(identity PRIMARY KEY, reason, created_at)`,
 
 **Files:**
 - Create: `grepogram/research.py`, `tests/test_research.py`
+- Modify: `grepogram/db.py` (`lead_messages`, `newest_msg_id`, `chats_for_username`),
+  `grepogram/models.py` (`CandidateView`, `DiscoverReport`), `tests/test_db.py`
 
-- [ ] `start_session(rdb, conn, cfg, question, seeds, account, limits)` (seeds resolved through
+- [x] `start_session(rdb, conn, cfg, question, seeds, account, limits)` (seeds resolved through
   `filters.resolve_chats`, refusing while `research.enabled` is false)
-- [ ] `collect_leads(conn, chat_ids, since_msg_ids)` from `message_links`, `fwd_peer_id`, and
+  ➕ `research.ResearchError(hint)` and its `ResearchDisabled` / `UnknownSession` /
+  `SessionStopped`; an empty question, no seeds or an account the config does not know are
+  refused; `limits` default to `cfg.research.limits()`; `discover_offline` refuses a stopped
+  session
+- [x] `collect_leads(conn, chat_ids, since_msg_ids)` from `message_links`, `fwd_peer_id`, and
   `leads.text_leads` for rows stored before step 8; evidence with origin keys
-- [ ] candidate building: exclusions skipped, depth tracked, `cached` from `index.db`
+  ➕ origin key: `post:<peer>/<msg>` for a forwarded post *and* for that post where it is indexed
+  in a channel/supergroup (so a link inside ten forwarded copies counts once with the original),
+  `fwd:<author>@<date>` for an author-only forward, `msg:<chat row>/<msg>` otherwise. A candidate
+  is chat-level (`@name/123` → `@name`, `c/<id>/<post>` → `peer:<marked>`); a positive peer id (a
+  mention by id, a forward from a person) is a person and not a candidate (`people` in the
+  report); a lead to the session's own chats (seeds and fetched chats) is `in_session`, not a
+  candidate. Scanned chats are the seeds at depth 0 plus `research_db.scans` cursors at their
+  depth (task 16 registers fetched chats there)
+- [x] candidate building: exclusions skipped, depth tracked, `cached` from `index.db`
   (`chats_for_peer`), dedupe by identity, corroboration = distinct origin keys, ranking by
   corroboration and question-term overlap of evidence snippets; `max_candidates` cap
-- [ ] tests: a link, a hidden hyperlink, a button, a forward chain and ten forwards of one post
+  ➕ `cached_in` asks by peer id *and* `@username` (`db.chats_for_username`) and reports the
+  accounts through `db.chat_reach` (an import is cached through none); `candidate_views` returns
+  `CandidateView`s ranked corroboration → overlap → depth → id. The cap limits *new* candidates
+  per call; a chat whose leads the cap cut keeps its cursor so the next call re-reads them, and a
+  deeper path still adds evidence to an existing candidate
+- [x] tests: a link, a hidden hyperlink, a button, a forward chain and ten forwards of one post
   (one corroboration), an excluded target, an already-indexed chat marked cached, depth cap
-- [ ] run checks — must pass before task 14
+- [x] run checks — must pass before task 14
 
 ### Task 14: Probing and global discovery
 
