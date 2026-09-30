@@ -1012,27 +1012,10 @@ def accounts() -> ToolResult:
     is missing). Accounts are added, removed and signed in from a terminal only.
     """
     state = _app()
-    cfg = state.config()
-    recorded = {row.name: row for row in db.list_accounts(state.conn)}
-    reached = db.account_chat_counts(state.conn)
-    labels = {entry.name: entry.label for entry in cfg.accounts}
-    listed: list[ToolResult] = []
-    for name in cfg.account_names():
-        who = recorded.get(name)
-        present = state.paths.session_file_for(name).exists()
-        session = "missing" if not present else "present" if who is None else "authorized"
-        listed.append(
-            {
-                "name": name,
-                "label": labels.get(name),
-                "session": session,
-                "user_id": None if who is None else who.user_id,
-                "display_name": None if who is None else who.display_name,
-                "sources": [source.id for source in cfg.sources if source.account == name],
-                "chats": reached.get(name, 0),
-                "hint": None if present else auth_hint(name),
-            }
-        )
+    listed = [
+        {**asdict(status), "hint": auth_hint(status.name) if status.session == "missing" else None}
+        for status in sourcing.accounts_status(state.config(), state.paths, state.conn)
+    ]
     return {"accounts": listed, "hint": ACCOUNTS_HINT}
 
 

@@ -1286,23 +1286,20 @@ def accounts_ls() -> None:
     """
     paths, cfg, conn = _load()
     try:
-        recorded = {row.name: row for row in db.list_accounts(conn)}
-        reached = db.account_chat_counts(conn)
+        listed = sources.accounts_status(cfg, paths, conn)
     finally:
         conn.close()
-    labels = {entry.name: entry.label for entry in cfg.accounts}
-    rows: list[tuple[str, ...]] = []
-    for name in cfg.account_names():
-        who = recorded.get(name)
-        if not paths.session_file_for(name).exists():
-            state = "missing"
-        else:
-            state = "present" if who is None else "authorized"
-        user = "-" if who is None else f"{who.display_name or '-'} ({who.user_id})"
-        owned = sum(1 for source in cfg.sources if source.account == name)
-        rows.append(
-            (name, labels.get(name) or "-", state, user, str(owned), str(reached.get(name, 0)))
+    rows = [
+        (
+            status.name,
+            status.label or "-",
+            status.session,
+            "-" if status.user_id is None else f"{status.display_name or '-'} ({status.user_id})",
+            str(len(status.sources)),
+            str(status.chats),
         )
+        for status in listed
+    ]
     _print_table(("account", "label", "session", "user", "sources", "chats"), rows)
 
 

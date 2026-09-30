@@ -37,6 +37,7 @@ from grepogram.dialogs import DialogCatalog, DialogInfo, FolderInfo, Match
 from grepogram.models import (
     ACCOUNT_NAME,
     DEFAULT_ACCOUNT,
+    AccountStatus,
     ChatRow,
     ChatStatus,
     Config,
@@ -44,6 +45,7 @@ from grepogram.models import (
     SourceStatus,
     chat_scope,
 )
+from grepogram.paths import Paths
 from grepogram.tdesktop import ImportedChat
 
 log = logging.getLogger(__name__)
@@ -1660,3 +1662,29 @@ def sources_status(cfg: Config, conn: sqlite3.Connection) -> list[SourceStatus]:
         )
         for source_id in order
     ]
+
+
+def accounts_status(cfg: Config, paths: Paths, conn: sqlite3.Connection) -> list[AccountStatus]:
+    """Every account the config knows (:meth:`~grepogram.models.Config.account_names`), offline:
+    ``missing`` with no session file, ``authorized`` when grepogram recorded who it is the last
+    time it used it, ``present`` for a file no run has confirmed yet — with its label, the ids
+    of its configured sources and how many indexed chats it reaches."""
+    recorded = {row.name: row for row in db.list_accounts(conn)}
+    reached = db.account_chat_counts(conn)
+    labels = {entry.name: entry.label for entry in cfg.accounts}
+    listed: list[AccountStatus] = []
+    for name in cfg.account_names():
+        who = recorded.get(name)
+        present = paths.session_file_for(name).exists()
+        listed.append(
+            AccountStatus(
+                name=name,
+                label=labels.get(name),
+                session="missing" if not present else "present" if who is None else "authorized",
+                user_id=None if who is None else who.user_id,
+                display_name=None if who is None else who.display_name,
+                sources=[source.id for source in cfg.sources if source.account == name],
+                chats=reached.get(name, 0),
+            )
+        )
+    return listed

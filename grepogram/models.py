@@ -605,6 +605,26 @@ class SourceStatus:
     chats: list[ChatStatus]
 
 
+SessionState = Literal["missing", "present", "authorized"]
+"""An account's session file: none, one no run has confirmed yet, or one grepogram last used
+signed in (a sync or ``auth`` recorded who the account is)."""
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class AccountStatus:
+    """One account as ``accounts ls`` and the ``accounts`` tool list it (offline): its session
+    file's state, who it is once recorded, the ids of its configured sources and how many
+    indexed chats it reaches."""
+
+    name: str
+    label: str | None = None
+    session: SessionState
+    user_id: int | None = None
+    display_name: str | None = None
+    sources: list[str] = field(default_factory=list)
+    chats: int = 0
+
+
 # --- research.db rows ------------------------------------------------------------------------
 
 

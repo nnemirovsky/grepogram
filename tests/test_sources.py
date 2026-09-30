@@ -14,7 +14,15 @@ from typer.testing import CliRunner
 
 from grepogram import cli, config, db, sources, sync, tg
 from grepogram.dialogs import DialogCatalog, DialogInfo, dialog_info
-from grepogram.models import ChatRow, Config, MessageRow, Source
+from grepogram.models import (
+    AccountCfg,
+    AccountRow,
+    AccountStatus,
+    ChatRow,
+    Config,
+    MessageRow,
+    Source,
+)
 from grepogram.paths import Paths
 from grepogram.sources import (
     AmbiguousTarget,
@@ -2171,3 +2179,33 @@ def test_prunable_does_not_let_one_accounts_folder_cover_anothers_private_chat(
         sources.FolderMembership(listed={"folder:People": set(), "work/folder:People": {1}}),
     )
     assert [candidate.chat.id for candidate in scan.prunable] == [1]
+
+
+def test_accounts_status_is_the_one_listing_both_front_ends_print(
+    tmp_home: Path, conn: sqlite3.Connection
+) -> None:
+    """``accounts ls`` and the ``accounts`` tool print this list; the session state comes from
+    the file and from what a run recorded, never from Telegram."""
+    paths = Paths.from_env()
+    cfg = Config(
+        accounts=[AccountCfg(name="work", label="work phone"), AccountCfg(name="spare")],
+        sources=[Source(chat="@news"), Source(chat="@news", account="work")],
+    )
+    tg.prepare_session(paths)
+    tg.prepare_session(paths, "work")
+    db.upsert_account(conn, AccountRow(name="work", user_id=43, display_name="Worker"))
+    news = db.upsert_chat(conn, ChatRow(id=-1001, type="channel", title="News"))
+    db.set_chat_access(conn, news.id, "work")
+    assert sources.accounts_status(cfg, paths, conn) == [
+        AccountStatus(name="default", session="present", sources=["chat:@news"]),
+        AccountStatus(
+            name="work",
+            label="work phone",
+            session="authorized",
+            user_id=43,
+            display_name="Worker",
+            sources=["work/chat:@news"],
+            chats=1,
+        ),
+        AccountStatus(name="spare", session="missing"),
+    ]
