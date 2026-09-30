@@ -627,15 +627,23 @@ async def test_a_username_probe_reads_metadata_and_no_history(
 async def test_membership_is_the_acting_account_s(
     rdb: sqlite3.Connection, conn: sqlite3.Connection
 ) -> None:
+    """``member`` is what Telegram tells the session's own account: work being in the chat says
+    nothing about default, and the other way round."""
     _links(conn, "@tb_flats")
-    session = _start(rdb, conn)
-    research.discover_offline(rdb, conn, CFG, session.id)
-    client = _world().client("default", members=[FLATS])
+    world = _world()
+    as_default = _start(rdb, conn)
+    as_work = research.start_session(rdb, conn, WORK_CFG, QUESTION, [str(SEED)], "work", now=1)
+    for session, cfg in ((as_default, CFG), (as_work, WORK_CFG)):
+        research.discover_offline(rdb, conn, cfg, session.id)
 
-    await research.probe_candidates(client, rdb, conn, CFG, session.id)
+    await research.probe_candidates(world.client("default"), rdb, conn, CFG, as_default.id)
+    work = world.client("work", members=[FLATS])
+    await research.probe_candidates(work, rdb, conn, WORK_CFG, as_work.id)
 
-    (candidate,) = research_db.list_candidates(rdb, session.id)
-    assert candidate.member is True
+    (for_default,) = research_db.list_candidates(rdb, as_default.id)
+    (for_work,) = research_db.list_candidates(rdb, as_work.id)
+    assert for_default.member is False, "work's membership is not default's"
+    assert for_work.member is True
 
 
 async def test_a_username_nobody_holds_or_a_user_is_recorded_as_such(
@@ -1897,6 +1905,44 @@ async def test_only_the_approved_chats_of_a_shared_folder_are_joined(
     ), "a chat found in the same folder is never acted on without its own approval"
     assert config.load(paths).sources == [], "a join-only approval adds no source"
     assert report.discovery is None
+
+
+async def test_an_imported_folder_takes_its_missing_chat_through_an_update(
+    rdb: sqlite3.Connection, conn: sqlite3.Connection, paths: Paths
+) -> None:
+    """A folder the account imported already gets the approved chat through
+    ``chatlists.joinChatlistUpdates`` naming the filter the folder became, which Telegram
+    accepts only for a folder the account holds and a chat that folder lists."""
+    client = _run_client(_run_world(), members=[FOLDER_CHAN], chatlists_joined={"Tbilisi1"})
+    session, found = await _discovered(rdb, conn, client, "https://t.me/addlist/Tbilisi1")
+    private = found[f"peer:{_marked(FOLDER_PRIVATE)}"]
+    _approve(rdb, conn, session, _item(private, "join"))
+
+    report = await _run(rdb, conn, paths, client, session)
+
+    assert report.joined == [private.id]
+    assert client.chatlist_joins == [[_marked(FOLDER_PRIVATE)]]
+    assert _marked(FOLDER_PRIVATE) in client.members
+
+
+async def test_the_fake_joins_only_a_folder_s_own_chats_of_a_folder_it_holds() -> None:
+    """The fake refuses what Telegram refuses, so a run naming another chat, or updating a
+    folder the account never imported, cannot pass for a join."""
+    client = _run_client(_run_world())
+    outside = utils.get_input_peer(client.entities[_marked(GATED)])  # not in the folder
+    inside = utils.get_input_peer(client.entities[_marked(FOLDER_PRIVATE)])
+    joined = functions.chatlists.JoinChatlistInviteRequest(slug="Tbilisi1", peers=[outside])
+    with pytest.raises(errors.BadRequestError, match="PEER_ID_INVALID"):
+        await client(joined)
+    update = functions.chatlists.JoinChatlistUpdatesRequest(
+        chatlist=types.InputChatlistDialogFilter(filter_id=FakeClient.filter_id("Tbilisi1")),
+        peers=[inside],
+    )
+    with pytest.raises(errors.BadRequestError, match="FILTER_ID_INVALID"):
+        await client(update)
+    assert client.chatlist_joins == []
+    await client(functions.chatlists.JoinChatlistInviteRequest(slug="Tbilisi1", peers=[inside]))
+    assert client.chatlist_joins == [[_marked(FOLDER_PRIVATE)]]
 
 
 async def test_refusals_are_recorded_for_what_they_are(

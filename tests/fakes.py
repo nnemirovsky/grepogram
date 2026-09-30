@@ -339,9 +339,11 @@ class FakeClient:
     The joins a research run sends change this account's view of the world (:meth:`join`):
     ``channels.joinChannel`` for a public chat (one listed in ``join_requests`` answers with an
     admission request instead), ``messages.importChatInvite`` from the world's invites, and
-    ``chatlists.joinChatlistInvite`` / ``joinChatlistUpdates`` for exactly the peers named
-    (each call's ids recorded in ``chatlist_joins``). An admission request sent is kept in
-    ``requested`` until a test admits the account with :meth:`join`.
+    ``chatlists.joinChatlistInvite`` / ``joinChatlistUpdates`` for exactly the peers named,
+    each a chat of that folder, and for ``joinChatlistUpdates`` a folder this account imported,
+    named by its :meth:`filter_id` (each call's ids recorded in ``chatlist_joins``). An
+    admission request sent is kept in ``requested`` until a test admits the account with
+    :meth:`join`.
     """
 
     def __init__(
@@ -702,9 +704,9 @@ class FakeClient:
         if isinstance(request, functions.messages.ImportChatInviteRequest):
             return self._import_invite(request)
         if isinstance(request, functions.chatlists.JoinChatlistInviteRequest):
-            return self._join_chatlist(request.slug, request.peers)
+            return self._join_chatlist(request, request.slug, request.peers)
         if isinstance(request, functions.chatlists.JoinChatlistUpdatesRequest):
-            return self._join_chatlist(None, request.peers)
+            return self._join_chatlist(request, self._imported(request), request.peers)
         return None
 
     # --- joining ---------------------------------------------------------------------------
@@ -766,18 +768,40 @@ class FakeClient:
             raise errors.InviteRequestSentError(request=request)
         return self._joined(found.entity)
 
-    def _join_chatlist(self, slug: str | None, peers: Iterable[Any]) -> Any:
+    @staticmethod
+    def filter_id(slug: str) -> int:
+        """The dialog filter an imported folder became for this account — stable per slug, and
+        above 1, the ids Telegram keeps for its own filters."""
+        return 2 + zlib.crc32(slug.encode()) % 1000
+
+    def _imported(self, request: Any) -> str:
+        """The folder ``chatlists.joinChatlistUpdates`` names by its filter id: one this account
+        imported, or Telegram refuses the request."""
+        wanted = request.chatlist.filter_id
+        for slug in self.chatlists_joined:
+            if self.filter_id(slug) == wanted:
+                return slug
+        raise errors.BadRequestError(request, "FILTER_ID_INVALID", 400)
+
+    def _join_chatlist(self, request: Any, slug: str, peers: Iterable[Any]) -> Any:
         """``chatlists.joinChatlistInvite`` (a folder not imported yet, by slug) or
         ``chatlists.joinChatlistUpdates`` (its missing chats): joins exactly ``peers``, which
-        must carry this account's access hashes, and imports the folder."""
+        must be chats *that folder* lists and carry this account's access hashes, and imports
+        the folder."""
+        folders = self.world.chatlists if self.world is not None else {}
+        folder = folders.get(slug)
+        if folder is None or isinstance(folder, BaseException):
+            raise errors.BadRequestError(request, "INVITE_SLUG_EXPIRED", 400)
+        listed = {int(utils.get_peer_id(e)) for e in folder.entities}
         wanted = [int(utils.get_peer_id(peer)) for peer in peers]
         for peer, marked in zip(peers, wanted, strict=True):
             entity = self.entities.get(marked)
             known = getattr(entity, "access_hash", None)
+            if marked not in listed:
+                raise errors.BadRequestError(request, "PEER_ID_INVALID", 400)
             if entity is None or getattr(peer, "access_hash", known) != known:
-                raise errors.ChannelInvalidError(request=None)
-        if slug is not None:
-            self.chatlists_joined.add(slug)
+                raise errors.ChannelInvalidError(request=request)
+        self.chatlists_joined.add(slug)
         self.chatlist_joins.append(wanted)
         return self._joined(*(self.entities[marked] for marked in wanted))
 
@@ -822,7 +846,7 @@ class FakeClient:
         users = [e for e in entities if isinstance(e, types.User)]
         if request.slug in self.chatlists_joined:
             return tl_chatlists.ChatlistInviteAlready(
-                filter_id=2,
+                filter_id=self.filter_id(request.slug),
                 missing_peers=[
                     utils.get_peer(e) for e in entities if utils.get_peer_id(e) not in self.members
                 ],
