@@ -183,9 +183,19 @@ never change the git identity.
   a dangling id. `sources.remove_source` deletes a chat only when no
   source left in the config covers it — recorded in `chat_sources`, or named outright by a
   `chat:` entry through its id or stored username (`sources._configured_for`), which covers it
-  before its first sync; a folder or fuzzy entry that has recorded nothing yet keeps the chat
-  undecided under it (`sources._undecided_cover`, `Removed.undecided_chat_ids`) instead of
-  deleting on a guess; otherwise the primary moves to the first remaining
+  before its first sync; a source that has recorded nothing yet and could still list the chat
+  keeps it undecided under it (`sources._undecided_cover`, `Removed.undecided_chat_ids`)
+  instead of deleting on a guess — a folder, or a fuzzy `chat =` value the chat's stored title
+  matches under `dialogs.match`, and either only of an account with a session file
+  (`has_session`, `sources.with_session`; the CLI and MCP pass it, the default is "none"). A
+  fuzzy value that does not match, an invite link, or a source of an account with no session
+  decides nothing: a chat parked under a source that can never tell is a chat the user removed
+  that stays searchable for good. The undecided chat's way out is `sources prune`: a folder
+  that syncs without it offers it, and so does a `chat:` source that resolved to another chat
+  and neither records nor names it (`sources._stray_under`) — short of a channel entry with
+  `comments`, whose unlinked group looks the same and keeps that source.
+  `sources rm <such a chat>` deletes it alone (`Removed.stray`) instead of its unrelated
+  source. A chat some remaining source does cover moves its primary to the first remaining
   covering source in config order — for a link-only discussion group to its channel's
   (`discussion_source_id`), which is why channels are decided before groups — and never onto an
   `import:` tag, and `Removed.kept_chat_ids` names what stayed. `accounts rm` removes an

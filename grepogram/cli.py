@@ -1236,13 +1236,24 @@ def sources_rm(
         # overwritten by a snapshot that predates it
         with sync.SyncLock(paths), config.ConfigLock(paths):
             current = config.load(paths)
-            removed = sources.remove_source(current, conn, sources.parse_target(target))
+            removed = sources.remove_source(
+                current,
+                conn,
+                sources.parse_target(target),
+                has_session=sources.with_session(paths),
+            )
             if removed.source is not None:
                 config.save(removed.config, paths)
     except (sources.SourceError, sync.SyncInProgress, ConfigError) as exc:
         fail(str(exc), hint=getattr(exc, "hint", None))
     finally:
         conn.close()
+    if removed.stray:
+        typer.echo(
+            f"removed chat {removed.chat_ids[0]}, held under {removed.source_id} which does not "
+            "cover it; that source stays"
+        )
+        return
     kept = (
         f", {len(removed.kept_chat_ids)} kept under another source" if removed.kept_chat_ids else ""
     )
@@ -1250,8 +1261,8 @@ def sources_rm(
     if removed.undecided_chat_ids:
         typer.echo(
             f"note: {len(removed.undecided_chat_ids)} of them kept because a source not synced "
-            "yet may cover them; after its next sync, `grepogram sources prune` removes what it "
-            "does not",
+            "yet may cover them (a folder, or a title entry matching theirs); once it syncs, "
+            "`grepogram sources prune` offers the ones it does not cover",
             err=True,
         )
 
@@ -1262,7 +1273,8 @@ def sources_prune(
         bool, typer.Option("--dry-run", help="Show what would go and change nothing.")
     ] = False,
 ) -> None:
-    """Delete indexed chats their folder source no longer lists; needs a session.
+    """Delete indexed chats their folder source no longer lists, or held under a chat source
+    that resolved to another chat; needs a session.
 
     What a folder holds right now is only knowable from Telegram, so the folders are read over
     the network first and the sync lock is taken afterwards, for the deletion alone; there is no

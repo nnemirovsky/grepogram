@@ -283,7 +283,8 @@ grepogram context --before 5 --after 5 -- -1001234567890 1284
 ```
 
 Three commands keep an index honest rather than grow it, and none of them is silent.
-`sources prune` deletes the indexed chats a folder source no longer lists. What a folder holds
+`sources prune` deletes the indexed chats a folder source no longer lists (and a chat left under
+a `chat` entry that resolved to another one, see **Removing** below). What a folder holds
 *now* is only knowable from Telegram, so it resolves over the network first and takes the sync
 lock afterwards, for the deletion alone; it prints what would go and what it kept — a channel's
 discussion group is kept, and the message names the channel keeping it — and asks before deleting
@@ -457,9 +458,14 @@ one account, `default` unless `--account` names another.
 **Removing.** A chat that two sources cover (a channel two accounts configured, or a chat that a
 folder and a `chat` entry both list) is deleted only when the last of them goes. Until then,
 `sources rm` hands it to a remaining source and says which chats it kept. A `chat` entry naming
-the chat counts even before its first sync, and a folder (or a title-only `chat` entry) that has
-never synced keeps the chats it might list rather than let them go — `sources rm` says so, and
-`sources prune` after that folder's sync removes what it does not list. `accounts rm <name>`
+the chat counts even before its first sync. A folder that has never synced, or a title-only
+`chat` entry whose title matches the chat's, keeps the chats it might list rather than let them go
+— but only for an account that has a session, since nothing else would ever sync it; `sources rm`
+says so, and once that source syncs, `sources prune` offers the ones it turned out not to cover. A
+title entry that does not match, an invite link, and any source of an account with no session
+keep nothing. A chat left under a `chat` entry that resolved to another chat is offered by
+`sources prune` too, and `sources rm <that chat>` deletes it alone, leaving the entry configured.
+`accounts rm <name>`
 removes that account's sources under the same rule, all of it or nothing. It also forgets which
 chats the account reached and the peers its syncs cached, stops its research sessions so no approval outlives it, and deletes its
 session file, after asking on the terminal. The only account left cannot be removed. `default`
@@ -643,7 +649,7 @@ advisory; the data next to them is valid.
 | `sources` | — | `{sources, index_age_min}`: every source the index holds chats under, with its `account` and its chats (`id`, `title`, `type`, `username`, `message_count`, `last_sync_at`, `unavailable`, `accounts` — the accounts that reach it) — the configured sources first, then any other `source_id` still in the database, including an `import:<slug>` from `grepogram import` |
 | `dialogs` | `query`, `account=null` | `{query, account, matches}`: chats and folders of the account (the default one when omitted) matching the name; each match carries `kind`, `id`, `title`, `type`, `username`, `folders`, `score` and `target`, the string to pass to `sources_add` — `<account>/chat:…` / `<account>/folder:…` for an account other than the default one |
 | `sources_add` | `target`, `since=null`, `comments=false`, `account=null` | `{source, kind, title, chats, hint}` after saving the config; the source belongs to `account`, else to the account an `<account>/` prefix on `target` names, else to the default one |
-| `sources_remove` | `target` | `{source_id, removed_chat_ids, kept_chat_ids, undecided_chat_ids, config_updated}` after deleting the data of the chats no other source covers; `target` is a source id from `sources` (`folder:<name>`, `chat:<value>`, `<account>/chat:<value>`), a folder name, a chat id, `@username` or a fuzzy title; `error` while a sync is running |
+| `sources_remove` | `target` | `{source_id, removed_chat_ids, kept_chat_ids, undecided_chat_ids, config_updated}` after deleting the data of the chats no other source covers; `target` is a source id from `sources` (`folder:<name>`, `chat:<value>`, `<account>/chat:<value>`), a folder name, a chat id, `@username` or a fuzzy title; a target naming a chat held under a `chat:` source that resolved to another chat deletes that chat alone (`config_updated` false, `source_id` the source that stays); `error` while a sync is running |
 | `accounts` | — | `{accounts, hint}`: every account (offline) with `name`, `label`, `session` (`missing` / `present` / `authorized`), `user_id`, `display_name`, `sources`, `chats` and, for a missing session, the `hint` that signs it in; accounts are signed in and removed from a terminal only |
 | `research_start` | `question`, `seeds: list[str]`, `account=null`, `max_depth`, `max_candidates`, `probe_limit`, `since_days`, `max_messages_per_run`, `run_budget_s` (each `null` = the `[research]` default) | the session, as `grepogram research start --json` prints it: `id`, `question`, `account`, `seeds` (each `{scope, peer_id}`, the chat as Telegram names it), `limits`, `state`, `progress`, `horizon` (the date the sources a run adds start from) |
 | `research_discover` | `session_id`, `offline=false` | the discover report: `leads`, `new_candidates`, `updated_candidates`, what was left out (`beyond_depth`, `excluded`, `over_cap`, `session_full`), `directories`, `pins` (the pinned posts of the session's chats, read once each for leads and never indexed), `probe` (read-only metadata of the best candidates, as the session's account) and `searches` (the global searches the user approved); `offline` asks Telegram nothing |

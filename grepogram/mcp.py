@@ -997,14 +997,19 @@ def sources_remove(target: str) -> ToolResult:
     channel's source. A chat another source
     still covers (a channel a second account also configured) is kept and listed in
     `kept_chat_ids`; `removed_chat_ids` are the chats deleted. `undecided_chat_ids` are the
-    kept ones only a source not synced yet (a folder, a fuzzy title) might cover: they wait
-    under it, and `grepogram sources prune` after its sync removes what it does not list.
-    Refused with `error` while a sync is running.
+    kept ones only a source not synced yet might cover — a folder of an account that has a
+    session, or a fuzzy-title entry their stored title matches: they wait under it, and once it
+    syncs, the CLI's `grepogram sources prune` offers the ones it does not cover. A `target`
+    naming one chat held under a `chat:` source that resolved to another chat deletes that
+    chat alone: `removed_chat_ids` holds it, `source_id` is the source it was held under, which
+    stays, and `config_updated` is false. Refused with `error` while a sync is running.
     """
     state = _app()
     parsed = sourcing.parse_target(target)
     with SyncLock(state.paths), state.editing_config() as current:
-        removed = sourcing.remove_source(current, state.conn, parsed)
+        removed = sourcing.remove_source(
+            current, state.conn, parsed, has_session=sourcing.with_session(state.paths)
+        )
         if removed.source is not None:
             state.save_config(removed.config)
     log.info("source %s removed (%d chats)", removed.source_id, len(removed.chat_ids))

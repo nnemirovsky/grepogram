@@ -173,9 +173,14 @@ class Removed:
     first of those as their new primary source (:func:`remove_source`)."""
     undecided_chat_ids: list[int] = dataclasses.field(default_factory=list)
     """Those of :attr:`kept_chat_ids` kept only because a source left in the config has never
-    recorded what it covers — a folder or a fuzzy ``chat =`` entry not synced yet — and might
-    cover them: nothing offline can tell, so they wait under that source for its first sync
-    (:func:`_undecided_cover`)."""
+    recorded what it covers and might cover them (:func:`_undecided_cover`): a folder, or a
+    fuzzy ``chat =`` entry their stored title matches, of an account that has a session and
+    not synced yet. They wait under that source; once it syncs, ``sources prune`` offers the ones
+    the folder does not list and the ones the fuzzy entry resolved past (:func:`prunable`)."""
+    stray: bool = False
+    """The target named one chat held under a source that no longer covers it
+    (:func:`_stray_under`): only that chat was deleted, ``source`` is ``None`` and
+    ``source_id`` is the source it was held under, which stays configured."""
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -594,7 +599,18 @@ def same_target(one: Target, other: Target) -> bool:
     return False
 
 
-def remove_source(cfg: Config, conn: sqlite3.Connection, target: Target) -> Removed:
+def _no_session(account: str) -> bool:
+    """The default of ``has_session``: no account is known to have one."""
+    return False
+
+
+def remove_source(
+    cfg: Config,
+    conn: sqlite3.Connection,
+    target: Target,
+    *,
+    has_session: Callable[[str], bool] = _no_session,
+) -> Removed:
     """Drop the source ``target`` names and delete every chat nothing else covers any more.
 
     The target may be a source id (``folder:Argentina``, ``chat:@arg_chat``,
@@ -611,9 +627,10 @@ def remove_source(cfg: Config, conn: sqlite3.Connection, target: Target) -> Remo
     channel two accounts each configured, a chat both a folder and a ``chat:`` entry list —
     and ``chat_sources`` records which (:func:`resolve_sources`); a ``chat:`` entry naming the
     chat by its id, ``@username`` or link covers it too before its first sync has recorded
-    anything (:func:`_configured_for`), and a folder or fuzzy entry that has recorded nothing
-    yet keeps it undecided rather than let it go (:func:`_undecided_cover`,
-    :attr:`Removed.undecided_chat_ids`). A chat another configured
+    anything (:func:`_configured_for`), and a source that has recorded nothing yet and might
+    list it — a folder, or a fuzzy entry its stored title matches, of an account
+    ``has_session`` says has a session — keeps it undecided rather than let it go
+    (:func:`_undecided_cover`, :attr:`Removed.undecided_chat_ids`). A chat another configured
     source still covers keeps everything indexed from it and only changes its primary owner
     (``chats.source_id``): to the first remaining covering source in config order, or — for a
     channel's discussion group known only through the link — to its channel's source
@@ -624,11 +641,24 @@ def remove_source(cfg: Config, conn: sqlite3.Connection, target: Target) -> Remo
 
     Deleting a discussion group takes the comments it fed to a channel's post threads with it
     (:func:`grepogram.db.delete_chat`), so the index never quotes rows this removed.
+
+    A target naming one chat held under a ``chat:`` source that resolved to another chat and
+    covers it no longer (:func:`_stray_under`) deletes that chat alone and leaves the source
+    and the config as they are (:attr:`Removed.stray`).
     """
-    return remove_source_id(cfg, conn, find_source(cfg, conn, target))
+    stray = _stray_target(cfg, conn, target)
+    if stray is not None:
+        return _remove_stray(cfg, conn, stray)
+    return remove_source_id(cfg, conn, find_source(cfg, conn, target), has_session=has_session)
 
 
-def remove_source_id(cfg: Config, conn: sqlite3.Connection, source_id: str) -> Removed:
+def remove_source_id(
+    cfg: Config,
+    conn: sqlite3.Connection,
+    source_id: str,
+    *,
+    has_session: Callable[[str], bool] = _no_session,
+) -> Removed:
     """:func:`remove_source` for a source id already known exactly — a ``[[sources]]`` entry's
     own :attr:`~grepogram.models.Source.id`, as ``accounts rm`` walks an account's sources —
     with no target to parse or match. The same rules decide what is deleted and what stays."""
@@ -643,7 +673,7 @@ def remove_source_id(cfg: Config, conn: sqlite3.Connection, source_id: str) -> R
         for chat in sorted(owned, key=lambda c: (c.discussion_of is not None, c.id)):
             successor = _successor(conn, chat, source_id, remaining, rank)
             if successor is None:
-                successor = _undecided_cover(conn, chat, remaining)
+                successor = _undecided_cover(conn, chat, remaining, has_session)
                 if successor is not None:
                     undecided.append(chat.id)
             if successor is None:
@@ -656,7 +686,7 @@ def remove_source_id(cfg: Config, conn: sqlite3.Connection, source_id: str) -> R
     if undecided:
         log.warning(
             "removing source %s: %d chat(s) kept because a source not synced yet may cover "
-            "them; `grepogram sources prune` after its sync removes what it does not",
+            "them; once it syncs, `grepogram sources prune` offers the ones it does not cover",
             source_id,
             len(undecided),
         )
@@ -719,25 +749,119 @@ def _recorded(conn: sqlite3.Connection, source_id: str) -> bool:
 
 
 def _undecided_cover(
-    conn: sqlite3.Connection, chat: ChatRow, remaining: Sequence[Source]
+    conn: sqlite3.Connection,
+    chat: ChatRow,
+    remaining: Sequence[Source],
+    has_session: Callable[[str], bool],
 ) -> str | None:
     """The first source of ``remaining`` that might cover ``chat`` although nothing offline can
-    say so, or ``None``: a folder, or a ``chat =`` value naming no identity (a fuzzy title),
-    of an account that may mean this row, that has **recorded no coverage at all** — it has not
-    resolved since it was added, so what it lists is unknown. Such a chat is kept under it,
-    never deleted on a guess; ``sources prune`` offers it once that folder's sync shows it does
-    not list the chat. An imported chat is never kept this way (:func:`_successor`)."""
+    say so, or ``None``. Only two kinds may, both of an account that may mean this row
+    (:func:`_reaches`) and both having **recorded no coverage at all** — not resolved since they
+    were added, so what they list is unknown:
+
+    * a folder: ``sources prune`` reads it once it syncs and offers the chat if it does not
+      list it;
+    * a ``chat =`` value naming no identity (a fuzzy title) that ``chat``'s stored title or
+      username matches under the rule the dialog catalog resolves it by
+      (:func:`grepogram.dialogs.match`): it may well be this chat. A fuzzy value that does not
+      match, and an invite link, name exactly one other chat and decide nothing about this one.
+
+    Either only of an account with a session file (``has_session``): a source of an account
+    that is not signed in can be resolved by nothing, and a chat kept for its first sync would
+    wait for good.
+
+    Such a chat is kept under that source rather than deleted on a guess. If the fuzzy entry
+    later resolves to a different chat, :func:`prunable` offers this one
+    (:func:`_stray_under`) and ``sources rm`` removes it alone. An imported chat is never kept
+    this way (:func:`_successor`)."""
     if (chat.source_id or "").startswith(IMPORT_PREFIX):
         return None
     for source in remaining:
-        if not _reaches(chat, source.account) or _recorded(conn, source.id):
+        if not _reaches(chat, source.account) or not has_session(source.account):
+            continue
+        if _recorded(conn, source.id):
             continue
         if source.folder is not None:
             return source.id
         target = _target_of(str(source.chat))
-        if target is None or target.kind == "fuzzy":
+        if target is not None and target.kind == "fuzzy" and _might_be(target.text, chat):
             return source.id
     return None
+
+
+def _might_be(text: str, chat: ChatRow) -> bool:
+    """Whether the fuzzy ``chat =`` value ``text`` could resolve to ``chat``: its stored title
+    or username matches under :func:`grepogram.dialogs.match`, the rule a sync resolves it by."""
+    dialog = DialogInfo(
+        id=chat.peer_id, title=chat.title or "", type=chat.type, username=chat.username
+    )
+    return bool(dialogs.match(text, [dialog]))
+
+
+def with_session(paths: Paths) -> Callable[[str], bool]:
+    """Whether an account has a session file, as :func:`remove_source` asks it."""
+    return lambda account: paths.session_file_for(account).exists()
+
+
+def _stray_under(cfg: Config, conn: sqlite3.Connection, chat: ChatRow) -> bool:
+    """Whether ``chat`` is held under a ``chat:`` source that has resolved to another chat and
+    covers it no longer — the state a chat :func:`_undecided_cover` kept under a fuzzy entry
+    is left in once that entry resolves elsewhere.
+
+    All of: its primary is a configured ``chat:`` entry that recorded coverage and neither
+    records nor names this chat; no configured source records or names it; it is not a
+    channel's discussion group, nor — under a channel entry with ``comments`` — a group a
+    channel was unlinked from, which keeps that source until it is removed
+    (:func:`discussion_source_id`). Nothing but ``sources rm`` of the unrelated source would
+    otherwise ever delete it, so :func:`prunable` offers it and :func:`remove_source` removes it
+    alone."""
+    source_id = chat.source_id or ""
+    source = next((s for s in cfg.sources if s.id == source_id), None)
+    if source is None or source.chat is None or chat.discussion_of is not None:
+        return False
+    covered = db.source_chat_ids(conn, source_id)
+    if not covered or chat.id in covered:
+        return False
+    configured = {s.id for s in cfg.sources}
+    if configured & set(db.chat_source_ids(conn, chat.id)):
+        return False
+    if any(_configured_for(s, chat) for s in cfg.sources):
+        return False
+    if source.comments and any(
+        (other := db.get_chat(conn, chat_id)) is not None and other.type == "channel"
+        for chat_id in covered
+    ):
+        return False
+    return True
+
+
+def _remove_stray(cfg: Config, conn: sqlite3.Connection, chat: ChatRow) -> Removed:
+    """Delete ``chat`` alone (:func:`_stray_under`); the source it was held under stays."""
+    with db.transaction(conn):
+        db.delete_chat(conn, chat.id)
+    log.info("removed chat %s held under %s, which does not cover it", chat.id, chat.source_id)
+    return Removed(
+        config=cfg, source_id=chat.source_id or "", source=None, chat_ids=[chat.id], stray=True
+    )
+
+
+def _stray_target(cfg: Config, conn: sqlite3.Connection, target: Target) -> ChatRow | None:
+    """The chat ``target`` names when it is one :func:`_stray_under` describes, else ``None``:
+    an id, ``@username`` or link no configured entry names, or a fuzzy title whose best match is
+    that chat's."""
+    if target.kind == "folder":
+        return None
+    chats = db.list_chats(conn)
+    matched: ChatRow | None
+    if target.kind in ("id", "username"):
+        if _named_source(target, [s.id for s in cfg.sources]) is not None:
+            return None
+        matched = _indexed_chat(chats, target)
+    elif target.text.casefold().startswith(IMPORT_PREFIX):
+        return None
+    else:
+        matched = _fuzzy_match(target.text, _known_sources(cfg, conn, chats), chats)[1]
+    return matched if matched is not None and _stray_under(cfg, conn, matched) else None
 
 
 def find_source(cfg: Config, conn: sqlite3.Connection, target: Target) -> str:
@@ -759,10 +883,7 @@ def find_source(cfg: Config, conn: sqlite3.Connection, target: Target) -> str:
     :func:`grepogram.sync.link_discussion_chat` and :func:`resolve_sources`' log line).
     """
     chats = db.list_chats(conn)
-    known = [s.id for s in cfg.sources]
-    stored = {c.source_id for c in chats if c.source_id}
-    stored |= {s for ids in db.chat_sources_map(conn).values() for s in ids}
-    known += sorted(stored - set(known))
+    known = _known_sources(cfg, conn, chats)
     if target.kind == "folder":
         return _folder_source(target, known)
     if target.kind in ("id", "username"):
@@ -773,6 +894,15 @@ def find_source(cfg: Config, conn: sqlite3.Connection, target: Target) -> str:
     if target.text.casefold().startswith(IMPORT_PREFIX):
         return _import_source(target.text, known)
     return _fuzzy_source(target.text, known, chats)
+
+
+def _known_sources(cfg: Config, conn: sqlite3.Connection, chats: Sequence[ChatRow]) -> list[str]:
+    """Every source id a target may name: the configured ones in config order, then those only
+    the index still records."""
+    known = [s.id for s in cfg.sources]
+    stored = {c.source_id for c in chats if c.source_id}
+    stored |= {s for ids in db.chat_sources_map(conn).values() for s in ids}
+    return known + sorted(stored - set(known))
 
 
 def _named_source(target: Target, known: Sequence[str]) -> str | None:
@@ -804,19 +934,27 @@ def _indexed_source(chats: Sequence[ChatRow], target: Target) -> str:
     scoped chat under a synthetic id; a private chat two accounts both hold is two rows of one
     peer, told apart by the account (:func:`_in_account`).
     """
+    return _chat_source(_indexed_chat(chats, target), _label(target))
+
+
+def _label(target: Target) -> str:
+    return f"id {target.value}" if target.kind == "id" else f"@{target.text}"
+
+
+def _indexed_chat(chats: Sequence[ChatRow], target: Target) -> ChatRow | None:
+    """The one indexed chat an id or ``@username`` target names, ``None`` when none does."""
     if target.kind == "id":
-        label = f"id {target.value}"
         matched = [c for c in chats if target.value in (c.peer_id, c.id)]
     else:
-        label = f"@{target.text}"
         wanted = target.text.casefold()
         matched = [c for c in chats if (c.username or "").casefold() == wanted]
     matched = _in_account(matched, _chat_account, target.account)
     if len(matched) > 1:
         raise AmbiguousTarget(
-            label, [f"{c.title!r} (id {c.id}) through {c.source_id or '-'}" for c in matched]
+            _label(target),
+            [f"{c.title!r} (id {c.id}) through {c.source_id or '-'}" for c in matched],
         )
-    return _chat_source(matched[0] if matched else None, label)
+    return matched[0] if matched else None
 
 
 def _chat_account(chat: ChatRow) -> str:
@@ -929,6 +1067,17 @@ def _own_source(chat: ChatRow) -> bool:
 
 
 def _fuzzy_source(text: str, known: list[str], chats: list[ChatRow]) -> str:
+    winner, matched = _fuzzy_match(text, known, chats)
+    if matched is not None:
+        _refuse_indirect(matched, repr(text))
+    return winner
+
+
+def _fuzzy_match(
+    text: str, known: Sequence[str], chats: Sequence[ChatRow]
+) -> tuple[str, ChatRow | None]:
+    """The source a fuzzy ``text`` names best, and the indexed chat it was matched through —
+    ``None`` when the source's own name was the better hit."""
     query = dialogs.normalize(text)
     best: dict[str, tuple[float, bool, ChatRow | None]] = {}
 
@@ -952,10 +1101,7 @@ def _fuzzy_source(text: str, known: list[str], chats: list[ChatRow]) -> str:
         raise UnknownSource(f"no source matches {text!r} (sources: {', '.join(known) or 'none'})")
     ranked = sorted(best, key=lambda s: (-best[s][0], s))
     winner = _pick_unique(text, ranked, lambda s: best[s][0], str)
-    matched = best[winner][2]
-    if matched is not None:
-        _refuse_indirect(matched, repr(text))
-    return winner
+    return winner, best[winner][2]
 
 
 # --- resolution on sync ----------------------------------------------------------------------
@@ -1456,6 +1602,11 @@ def prunable(cfg: Config, conn: sqlite3.Connection, folders: FolderMembership) -
     * one whose source is gone from the config; that is ``sources rm``'s business, and nothing
       here can resolve a source the config does not hold.
 
+    One more kind is offered: a chat held under a ``chat:`` source that resolved to another
+    chat and covers it no longer (:func:`_stray_under`) — what a chat
+    :func:`_undecided_cover` kept under a fuzzy entry becomes when that entry turns out to name
+    something else. Its source *has* answered, which is the evidence.
+
     A configured source that failed to resolve makes the whole scan inconclusive, and
     :attr:`PruneScan.prunable` comes back empty while :attr:`PruneScan.unresolved` is not:
     coverage is a union over every source, so one unchecked source means no chat can be *proved*
@@ -1476,7 +1627,8 @@ def prunable(cfg: Config, conn: sqlite3.Connection, folders: FolderMembership) -
 
     for chat in db.list_chats(conn):
         source_id = chat.source_id or ""
-        if not split_source_id(source_id)[1].startswith(FOLDER_PREFIX):
+        in_folder = split_source_id(source_id)[1].startswith(FOLDER_PREFIX)
+        if not in_folder and not _stray_under(cfg, conn, chat):
             continue  # an import and a chat entry name themselves; neither can leave a folder
         if any(
             chat.peer_id in ids and _reaches(chat, source_account(listed))
@@ -1486,7 +1638,9 @@ def prunable(cfg: Config, conn: sqlite3.Connection, folders: FolderMembership) -
             for account, t in named
         ):
             continue
-        if source_id in folders.failed:
+        if not in_folder:
+            record(offered, chat, f"{source_id} resolved to another chat and does not cover it")
+        elif source_id in folders.failed:
             record(kept, chat, f"{source_id} could not be checked")
         elif source_id not in folders.listed:
             record(kept, chat, f"{source_id} is not a configured source; use sources rm")
@@ -1883,9 +2037,14 @@ def _drop_account(
     """
     deleted: list[int] = []
     kept: list[int] = []
+    session = with_session(paths)
+
+    def others(account: str) -> bool:
+        return account != name and session(account)  # this account's session goes with it
+
     with db.transaction(conn):
         for source in [s for s in current.sources if s.account == name]:
-            removed = remove_source_id(current, conn, source.id)
+            removed = remove_source_id(current, conn, source.id, has_session=others)
             current = removed.config
             deleted += removed.chat_ids
             kept += removed.kept_chat_ids

@@ -1079,13 +1079,13 @@ def test_cli_sources_rm_applies_to_the_config_as_stored_under_the_config_lock(
         return loaded
 
     def remove_under_the_locks(
-        cfg: Config, conn: sqlite3.Connection, target: sources.Target
+        cfg: Config, conn: sqlite3.Connection, target: sources.Target, **kwargs: Any
     ) -> sources.Removed:
         assert [s.id for s in cfg.sources] == ["chat:@alice", "folder:Argentina"]
         assert _config_lock_held(paths)
         with pytest.raises(sync.SyncInProgress), sync.SyncLock(paths):
             pass
-        return real_remove(cfg, conn, target)
+        return real_remove(cfg, conn, target, **kwargs)
 
     monkeypatch.setattr(cli, "_load", load_then_lose_the_race)
     monkeypatch.setattr(sources, "remove_source", remove_under_the_locks)
@@ -2162,8 +2162,12 @@ async def test_a_folder_not_synced_yet_keeps_a_chat_it_might_cover_undecided(
     cfg = _cfg(Source(chat="@news"), Source(chat="@alice"), folder)
 
     with caplog.at_level("WARNING", logger="grepogram.sources"):
-        news = sources.remove_source(cfg, conn, sources.parse_target("chat:@news"))
-        alice = sources.remove_source(news.config, conn, sources.parse_target("chat:@alice"))
+        news = sources.remove_source(
+            cfg, conn, sources.parse_target("chat:@news"), has_session=lambda a: a == WORK
+        )
+        alice = sources.remove_source(
+            news.config, conn, sources.parse_target("chat:@alice"), has_session=lambda a: True
+        )
 
     assert (news.chat_ids, news.kept_chat_ids, news.undecided_chat_ids) == (
         [],
@@ -2174,6 +2178,133 @@ async def test_a_folder_not_synced_yet_keeps_a_chat_it_might_cover_undecided(
     assert kept is not None and kept.source_id == folder.id
     assert "a source not synced yet may cover them" in caplog.text
     assert alice.chat_ids == [1] and alice.undecided_chat_ids == [], "a user is private"
+
+
+async def test_a_folder_of_an_account_with_no_session_decides_nothing(
+    conn: sqlite3.Connection,
+) -> None:
+    """Nothing can ever read the folder of an account that is not signed in, so it cannot keep
+    a chat for a sync that will not come: the chat goes as if the folder were not there."""
+    await _resolve(_cfg(Source(chat="@news")), _clients(), conn)
+    cfg = _cfg(Source(chat="@news"), Source(folder="Argentina", account=WORK))
+
+    removed = sources.remove_source(
+        cfg, conn, sources.parse_target("chat:@news"), has_session=lambda a: a != WORK
+    )
+
+    assert (removed.chat_ids, removed.kept_chat_ids, removed.undecided_chat_ids) == (
+        [NEWS_ID],
+        [],
+        [],
+    )
+    assert db.get_chat(conn, NEWS_ID) is None
+
+
+async def test_prune_removes_an_undecided_chat_once_its_folder_syncs_without_it(
+    conn: sqlite3.Connection,
+) -> None:
+    await _resolve(_cfg(Source(chat="@news")), {"default": _client()}, conn)
+    folder = Source(folder="People")
+    cfg = _cfg(Source(chat="@news"), folder)
+    removed = sources.remove_source(
+        cfg, conn, sources.parse_target("chat:@news"), has_session=lambda a: True
+    )
+    assert removed.undecided_chat_ids == [NEWS_ID]
+
+    await _resolve(removed.config, {"default": _client()}, conn)
+    kept = db.get_chat(conn, NEWS_ID)
+    assert kept is not None and kept.source_id == folder.id, "People does not list the channel"
+    membership = await sources.folder_membership(removed.config, {"default": _catalog()})
+    scan = sources.prunable(removed.config, conn, membership)
+
+    assert [(c.chat.id, c.reason) for c in scan.prunable] == [
+        (NEWS_ID, "folder:People no longer lists it")
+    ]
+    assert sources.prune_chats(conn, scan.prunable) == [NEWS_ID]
+    assert db.get_chat(conn, NEWS_ID) is None
+
+
+@pytest.mark.parametrize("value", ["Argentina chat", "https://t.me/+AbCdEf123"])
+async def test_a_chat_entry_that_cannot_be_the_chat_decides_nothing(
+    conn: sqlite3.Connection, value: str
+) -> None:
+    """A fuzzy title that does not match the chat's, or an invite link, names exactly one other
+    chat: it cannot keep this one, which would otherwise wait under it for good."""
+    await _resolve(_cfg(Source(chat="@news")), {"default": _client()}, conn)
+    cfg = _cfg(Source(chat="@news"), Source(chat=value))
+
+    removed = sources.remove_source(
+        cfg, conn, sources.parse_target("chat:@news"), has_session=lambda a: True
+    )
+
+    assert (removed.chat_ids, removed.undecided_chat_ids) == ([NEWS_ID], [])
+    assert db.get_chat(conn, NEWS_ID) is None
+
+
+async def test_a_fuzzy_entry_matching_the_chats_title_keeps_it_undecided(
+    conn: sqlite3.Connection,
+) -> None:
+    await _resolve(_cfg(Source(chat="@news")), {"default": _client()}, conn)
+    title = Source(chat="news")
+    cfg = _cfg(Source(chat="@news"), title)
+
+    removed = sources.remove_source(
+        cfg, conn, sources.parse_target("chat:@news"), has_session=lambda a: True
+    )
+
+    assert (removed.chat_ids, removed.undecided_chat_ids) == ([], [NEWS_ID])
+    kept = db.get_chat(conn, NEWS_ID)
+    assert kept is not None and kept.source_id == title.id
+
+
+async def test_a_fuzzy_entry_of_an_account_with_no_session_decides_nothing(
+    conn: sqlite3.Connection,
+) -> None:
+    await _resolve(_cfg(Source(chat="@news")), {"default": _client()}, conn)
+    cfg = _cfg(Source(chat="@news"), Source(chat="news"))
+
+    removed = sources.remove_source(cfg, conn, sources.parse_target("chat:@news"))
+
+    assert (removed.chat_ids, removed.undecided_chat_ids) == ([NEWS_ID], [])
+
+
+async def test_a_chat_left_under_a_chat_entry_that_resolved_elsewhere_is_prunable(
+    conn: sqlite3.Connection,
+) -> None:
+    """A title entry kept a chat before its first sync and then resolved to another chat: the
+    chat is covered by nothing, so prune offers it and ``sources rm`` removes it alone."""
+    entry = Source(chat="Argentina chat")
+    cfg = _cfg(entry)
+    _store(conn, _left(entry.id), 2)
+    await _resolve(cfg, {"default": _client()}, conn)
+    assert db.source_chat_ids(conn, entry.id) == [ARG_ID]
+
+    scan = sources.prunable(cfg, conn, _membership())
+    assert [(c.chat.id, c.reason) for c in scan.prunable] == [
+        (LEFT_ID, f"{entry.id} resolved to another chat and does not cover it")
+    ]
+
+    for raw in (str(LEFT_ID), "Left chat"):
+        _store(conn, _left(entry.id), 2)
+        removed = sources.remove_source(cfg, conn, sources.parse_target(raw))
+        assert (removed.stray, removed.source, removed.source_id) == (True, None, entry.id)
+        assert removed.chat_ids == [LEFT_ID] and removed.config == cfg
+        assert db.get_chat(conn, LEFT_ID) is None
+        assert db.get_chat(conn, ARG_ID) is not None, "the unrelated source keeps its chat"
+
+
+async def test_a_group_under_a_channel_entry_with_comments_is_not_offered(
+    conn: sqlite3.Connection,
+) -> None:
+    """A group a channel was unlinked from keeps the channel's source until that source goes;
+    it looks like a stray chat and must not be offered."""
+    entry = Source(chat="@news", comments=True)
+    cfg = _cfg(entry)
+    await _resolve(cfg, {"default": _client()}, conn)
+    _store(conn, _left(entry.id), 2)
+    assert sources.prunable(cfg, conn, _membership()).prunable == []
+    plain = _cfg(Source(chat="@news"))
+    assert [c.chat.id for c in sources.prunable(plain, conn, _membership()).prunable] == [LEFT_ID]
 
 
 async def test_a_linked_discussion_group_follows_its_channel_to_the_remaining_source(
