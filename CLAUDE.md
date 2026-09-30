@@ -717,7 +717,10 @@ never change the git identity.
   the handle, research approved a chat); such a chat has no dialog, so `_address_public` seeds
   the probe's access hash into the run's client (`sources.seed_peers`) — or, probed without
   one, resolves the username, which must still name the probed peer — and `_add_sources` keeps
-  it in `peer_cache` for the session's account before the config write
+  it in `peer_cache` for the session's account before the config write — under `SyncLock` and
+  `ConfigLock`, after the approval and the account are checked again on the config as it is
+  then, and only for the sources actually added, so a session `accounts rm` ended while the run
+  planned adds nothing and leaves no hash for the forgotten account
   (`_remember_read_without_joining`), because a run that adds the source and fetches nothing
   (`ID:add_source` alone, or a fetch deferred and the session stopped) leaves no `chat_access`
   row behind; `sources.resolve_sources` seeds both (`db.stored_peers`, `db.cached_peers`), and a

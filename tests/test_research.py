@@ -2664,6 +2664,50 @@ async def test_a_public_chat_added_as_a_source_alone_syncs_on_every_later_sync(
     assert db.access_hash(conn, _marked(FLATS), "default") == flats.access_hash
 
 
+@pytest.mark.parametrize("removal", ["accounts rm", "session stopped", "account dropped"])
+def test_a_source_planned_before_its_account_went_away_is_never_saved(
+    rdb: sqlite3.Connection,
+    conn: sqlite3.Connection,
+    paths: Paths,
+    monkeypatch: pytest.MonkeyPatch,
+    removal: str,
+) -> None:
+    """``accounts rm work`` gets its locks while the run is planning: the run adds nothing once
+    it holds them, keeps no access hash for the forgotten account, and leaves a config every
+    later command still loads. The two halves of the removal are refused each on its own — a
+    stopped session's approval, and a source of an account the config no longer lists."""
+    cfg = Config(research=ResearchCfg(enabled=True), accounts=[AccountCfg(name="work")])
+    config.save(cfg, paths)
+    session = research.start_session(rdb, conn, cfg, QUESTION, [str(SEED)], "work", now=1)
+    flats = _flats(rdb, session, peer_id=_marked(FLATS), access_hash=77)
+    _approve(rdb, conn, session, _item(flats, "add_source"), cfg=cfg)
+    approved = _status(rdb, flats).status
+    plan = research._planned_source
+
+    def plan_then_remove(*args: Any, **kwargs: Any) -> Source | None:
+        planned = plan(*args, **kwargs)
+        assert planned is not None and planned.account == "work"
+        if removal != "account dropped":
+            research_db.stop_session(rdb, session.id)
+        if removal != "session stopped":
+            db.forget_account(conn, "work")
+            config.update(paths, lambda current: dataclasses.replace(current, accounts=[]))
+        return planned
+
+    monkeypatch.setattr(research, "_planned_source", plan_then_remove)
+    report = RunReport(session_id=session.id)
+
+    research._add_sources(rdb, conn, paths, session, [flats], report)
+
+    assert config.load(paths).sources == [] and report.sources_added == []
+    assert conn.execute("SELECT COUNT(*) FROM peer_cache").fetchone()[0] == 0
+    stored = _status(rdb, flats)
+    assert stored.source_id is None and stored.status == approved
+    assert "its approval ended before its source was saved" in (stored.note or "")
+    assert report.warnings == [f"candidate {flats.id}: {stored.note}"]
+    assert _live(rdb, flats) == []
+
+
 async def test_a_deferred_fetch_of_a_stopped_session_still_syncs_its_public_source_later(
     rdb: sqlite3.Connection, conn: sqlite3.Connection, paths: Paths
 ) -> None:

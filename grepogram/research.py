@@ -3332,10 +3332,16 @@ def _add_sources(
     report: RunReport,
 ) -> None:
     """Add the approved sources in one config write, under the :class:`~grepogram.sync.SyncLock`
-    and then the :class:`~grepogram.config.ConfigLock` (:func:`grepogram.config.update`), and
-    record on each candidate the source it is fetched through — a chat source of the account
-    that already names it is reused rather than doubled. No Telegram request runs under either
-    lock. :class:`~grepogram.sync.SyncInProgress` propagates."""
+    and then the :class:`~grepogram.config.ConfigLock`, and record on each candidate the source
+    it is fetched through — a chat source of the account that already names it is reused rather
+    than doubled. No Telegram request runs under either lock.
+
+    The approval is checked again under both locks, on the config as it is by then: a session
+    ``accounts rm`` (or a stop) ended while the run was planning — the account's
+    ``[[accounts]]`` entry gone with it — adds nothing, writes no access hash for the forgotten
+    account, and its candidates say why (:func:`_lapsed`). Only the sources actually added have
+    their access hash kept (:func:`_remember_read_without_joining`), before the config is saved.
+    :class:`~grepogram.sync.SyncInProgress` propagates."""
     planned: list[tuple[Candidate, Source]] = []
     for candidate in work:
         current = _fresh(rdb, candidate)
@@ -3344,29 +3350,59 @@ def _add_sources(
             planned.append((current, source))
     if not planned:
         return
-    _remember_read_without_joining(conn, session, [candidate for candidate, _ in planned])
     chosen: dict[int, tuple[str, bool]] = {}
-
-    def change(current: Config) -> Config:
-        chosen.clear()
+    lapsed: list[Candidate] = []
+    with sync.SyncLock(paths), config.ConfigLock(paths):
+        cfg = config.load(paths)
+        known = cfg.account_names()
+        adding: list[Candidate] = []
         for candidate, source in planned:
-            existing = _configured(current, source.account, candidate)
+            if source.account not in known or not authorized(rdb, candidate, "add_source"):
+                lapsed.append(candidate)
+                continue
+            existing = _configured(cfg, source.account, candidate)
             if existing is not None:
                 chosen[candidate.id] = (existing.id, False)
                 continue
-            current = sources.with_source(current, source, None)
+            cfg = sources.with_source(cfg, source, None)
             chosen[candidate.id] = (source.id, True)
-        return current
-
-    with sync.SyncLock(paths):
-        config.update(paths, change)
+            adding.append(candidate)
+        if adding:
+            _remember_read_without_joining(conn, session, adding)
+            config.save(cfg, paths)
     with db.transaction(rdb):
-        for candidate, _ in planned:
-            source_id, added = chosen[candidate.id]
-            research_db.update_candidate(rdb, candidate.id, source_id=source_id)
+        for candidate_id, (source_id, added) in chosen.items():
+            research_db.update_candidate(rdb, candidate_id, source_id=source_id)
             if added:
-                report.sources_added.append(candidate.id)
+                report.sources_added.append(candidate_id)
+    _lapsed(rdb, session, lapsed, report)
     log.info("research session %d: %d source(s) added", session.id, len(report.sources_added))
+
+
+def _lapsed(
+    rdb: sqlite3.Connection,
+    session: ResearchSession,
+    candidates: Sequence[Candidate],
+    report: RunReport,
+) -> None:
+    """Note on each of ``candidates`` that its approval ended before its source was written —
+    the session was stopped, its account removed, or the candidate skipped or excluded since
+    the run planned it — and void what is left of its grants. Its status stays what it was:
+    nothing was done to the chat, and a skip or an exclusion keeps its own note."""
+    note = (
+        "its approval ended before its source was saved (session stopped or account removed); "
+        "nothing was added"
+    )
+    noted: list[int] = []
+    with db.transaction(rdb):
+        for candidate in candidates:
+            research_db.void_grants(rdb, session.id, candidate_ids=[candidate.id])
+            current = research_db.get_candidate(rdb, candidate.id)
+            # a skip or an exclusion since is a human's decision and already says why
+            if current is not None and current.status not in ("skipped", "excluded"):
+                research_db.update_candidate(rdb, candidate.id, note=note)
+                noted.append(candidate.id)
+    report.warnings.extend(f"candidate {candidate_id}: {note}" for candidate_id in noted)
 
 
 def _remember_read_without_joining(
@@ -3383,7 +3419,8 @@ def _remember_read_without_joining(
     a flood wait deferred to a session that is then stopped) would leave every later sync
     unable to address the chat at all. :func:`grepogram.sources.resolve_sources` seeds these
     (:func:`grepogram.db.cached_peers`), so the source syncs from then on whatever the run did.
-    Written first, so a failed config write leaves one spare hash rather than a source nothing
+    Written under the locks and before the config, for the sources about to be added only, so
+    a failed config write leaves one spare hash of a live account rather than a source nothing
     can address. The hash is the account's own: the probe ran as it."""
     peers = [
         (candidate.peer_id, candidate.username, candidate.access_hash)

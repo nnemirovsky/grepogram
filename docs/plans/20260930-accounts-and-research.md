@@ -237,8 +237,9 @@ Decisions taken with the user before planning:
   (they only narrow); exclusions are global and persistent.
 - **Run**: for each granted candidate, in order — join (`channels.joinChannel`,
   `messages.importChatInvite`, `chatlists.joinChatlistInvite` with exactly the approved peers) or
-  record `pending_admission` on `InviteRequestSentError`; add the ongoing source through
-  `config.update` (account, `since` = horizon, `comments` for channels); sync exactly those
+  record `pending_admission` on `InviteRequestSentError`; add the ongoing source under the `SyncLock` and the `ConfigLock`, the approval and the account
+  checked again on the config as it is then (account, `since` = horizon, `comments` for
+  channels); sync exactly those
   chats through `sync_all(only=…)` under the `SyncLock`, the research time budget and a message
   cap; then discover over the newly stored messages at depth + 1 (proposed, never auto-approved).
   Pending admissions are re-checked at the start of every run, and one no admin answered within
