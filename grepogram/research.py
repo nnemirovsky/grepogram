@@ -1426,7 +1426,10 @@ async def _probe_addlist(
     targets = scan_targets(rdb, conn, session)
     allowance = room(rdb, session)
     children: list[int] = []
-    left_out: Counter[str] = Counter()
+    left_out: Counter[EntityOutcome] = Counter()
+    found = _AnsweredEvidence(
+        "shared_folder", f"addlist:{slug}", in_itself=False, msg_id=None, snippet=title
+    )
     with db.transaction(rdb):
         for peer in peers:
             marked = int(utils.get_peer_id(peer))
@@ -1439,15 +1442,11 @@ async def _probe_addlist(
                 session,
                 targets.keys(),
                 entity,
+                found,
                 depth=candidate.depth,
                 parent_id=candidate.id,
                 room_left=allowance - len(children),
                 facts={"member": joined[marked]} if marked in joined else {},
-                via="shared_folder",
-                origin_key=f"addlist:{slug}",
-                in_itself=False,
-                msg_id=None,
-                snippet=title,
                 stamp=stamp,
             )
             if recorded.candidate is None:
@@ -1463,10 +1462,7 @@ async def _probe_addlist(
         candidate=stored,
         result="probed",
         children=tuple(children),
-        people=left_out["person"],
-        excluded=left_out["excluded"],
-        in_session=left_out["in_session"],
-        over_cap=left_out["over_cap"],
+        **_left_out_counts(left_out),
     )
 
 
@@ -1509,10 +1505,7 @@ async def probe_candidates(
             "unresolvable": report.unresolvable,
         }[outcome.result].append(outcome.candidate.id)
         report.children.extend(outcome.children)
-        report.people += outcome.people
-        report.excluded += outcome.excluded
-        report.in_session += outcome.in_session
-        report.over_cap += outcome.over_cap
+        _add_left_out(report, {name: getattr(outcome, name) for name in _LEFT_OUT.values()})
     report.remaining = sum(
         1 for c in research_db.list_candidates(rdb, session.id, _PROBED) if c.probed_at is None
     )
@@ -1649,6 +1642,42 @@ a chat the session already reads, one nothing names, one over the candidate cap,
 one — or recorded it as a ``new`` candidate or evidence of a ``known`` one."""
 
 
+_LEFT_OUT: dict[EntityOutcome, str] = {
+    "person": "people",
+    "excluded": "excluded",
+    "in_session": "in_session",
+    "over_cap": "over_cap",
+}
+"""The outcomes of :func:`_record_entity` that leave a chat out, by the count every report of
+chats Telegram answered with keeps of them (:class:`~grepogram.models.ProbeOutcome`,
+:class:`~grepogram.models.ProbeReport`, :class:`~grepogram.models.GlobalSearchReport`)."""
+
+
+def _left_out_counts(outcomes: Mapping[EntityOutcome, int]) -> dict[str, int]:
+    """``outcomes`` as the ``people`` / ``excluded`` / ``in_session`` / ``over_cap`` fields of a
+    report (:data:`_LEFT_OUT`)."""
+    return {name: outcomes.get(outcome, 0) for outcome, name in _LEFT_OUT.items()}
+
+
+def _add_left_out(report: ProbeReport | GlobalSearchReport, counts: Mapping[str, int]) -> None:
+    """Add ``counts`` (:func:`_left_out_counts`) to ``report``'s own."""
+    for name, count in counts.items():
+        setattr(report, name, getattr(report, name) + count)
+
+
+@dataclass(frozen=True, slots=True)
+class _AnsweredEvidence:
+    """How a chat Telegram answered with was found — the evidence :func:`_record_entity` keeps:
+    ``via`` which path, under ``origin_key``, ``in_itself`` when it was found in the chat itself
+    (a search result: then ``msg_id`` is the post), with a ``snippet`` of what was seen."""
+
+    via: EvidenceVia
+    origin_key: str
+    in_itself: bool
+    msg_id: int | None
+    snippet: str | None
+
+
 @dataclass(frozen=True, slots=True)
 class _Recorded:
     outcome: EntityOutcome
@@ -1663,16 +1692,12 @@ def _record_entity(
     session: ResearchSession,
     reads: Collection[int],
     entity: Any,
+    found: _AnsweredEvidence,
     *,
     depth: int,
     parent_id: int | None,
     room_left: int,
     facts: Mapping[str, Any],
-    via: EvidenceVia,
-    origin_key: str,
-    in_itself: bool,
-    msg_id: int | None,
-    snippet: str | None,
     stamp: int,
 ) -> _Recorded:
     """Record one chat Telegram answered with — a chat of a shared folder, a global search's
@@ -1683,8 +1708,9 @@ def _record_entity(
     excluded chat are left out, and so is a new one once ``room_left`` is spent. What Telegram
     said about the chat is stored as probed facts, ``facts`` on top (a folder knows whether the
     account joined it); the candidate is named by its ``@username`` or else its marked id
-    (:func:`entity_target`), ``depth`` hops from the question and inside ``parent_id``. The
-    evidence was found ``in_itself`` — in the chat, for a search result — or nowhere indexed.
+    (:func:`entity_target`), ``depth`` hops from the question and inside ``parent_id``, with
+    ``found`` as its evidence — found in the chat itself, for a search result, or nowhere
+    indexed.
 
     A candidate probed as another peer that goes by this chat's name is a name that moved: it
     is set aside (:func:`_name_moved`) and this chat becomes a candidate of its own, under its
@@ -1726,14 +1752,15 @@ def _record_entity(
     candidate = _reconcile(
         rdb, research_db.update_candidate(rdb, candidate.id, probed_at=stamp, **known)
     )
+    in_chat = ChatKey(chat_scope(known["type"], session.account), marked)
     added = research_db.add_evidence(
         rdb,
         candidate.id,
-        via,
-        origin_key,
-        chat=ChatKey(chat_scope(known["type"], session.account), marked) if in_itself else None,
-        msg_id=msg_id,
-        snippet=snippet,
+        found.via,
+        found.origin_key,
+        chat=in_chat if found.in_itself else None,
+        msg_id=found.msg_id,
+        snippet=found.snippet,
         now=stamp,
     )
     return _Recorded("new" if existing is None else "known", candidate, added)
@@ -1753,32 +1780,25 @@ def _found_chat(
     stamp: int,
 ) -> None:
     """Record one chat a global search answered with (:func:`_record_entity`) in ``report``."""
+    found = _AnsweredEvidence(
+        report.kind, origin_key, in_itself=True, msg_id=msg_id, snippet=snippet_text
+    )
     recorded = _record_entity(
         rdb,
         conn,
         session,
         reads,
         entity,
+        found,
         depth=1,
         parent_id=None,
         room_left=room(rdb, session),
         facts={},
-        via=report.kind,
-        origin_key=origin_key,
-        in_itself=True,
-        msg_id=msg_id,
-        snippet=snippet_text,
         stamp=stamp,
     )
     candidate = recorded.candidate
-    if recorded.outcome == "person":
-        report.people += 1
-    elif recorded.outcome == "in_session":
-        report.in_session += 1
-    elif recorded.outcome == "over_cap":
-        report.over_cap += 1
-    elif recorded.outcome == "excluded":
-        report.excluded += 1
+    if recorded.outcome in _LEFT_OUT:
+        _add_left_out(report, _left_out_counts({recorded.outcome: 1}))
     elif candidate is not None and recorded.outcome == "new":
         report.new_candidates.append(candidate.id)
     elif candidate is not None and recorded.added and candidate.id not in report.updated_candidates:

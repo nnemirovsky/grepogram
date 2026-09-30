@@ -877,7 +877,7 @@ class DiscoverReport:
     probe: "ProbeReport | None" = None
     """What probing found, when :func:`grepogram.research.discover` had a client to probe with."""
     searches: "tuple[GlobalSearchReport, ...]" = ()
-    """The global searches that call ran (:func:`grepogram.research.global_search`)."""
+    """The global searches that call ran (:func:`grepogram.research.search_telegram`)."""
 
 
 @dataclass(slots=True, kw_only=True)
@@ -943,7 +943,7 @@ class ProbeReport:
 
 @dataclass(slots=True, kw_only=True)
 class GlobalSearchReport:
-    """One Telegram-side search (:func:`grepogram.research.global_search`). Its results became
+    """One Telegram-side search (:func:`grepogram.research.search_telegram`). Its results became
     candidates and evidence in ``research.db`` and nothing else.
 
     ``ran`` is false when the search was not sent (quota spent with paying not allowed, a flood
