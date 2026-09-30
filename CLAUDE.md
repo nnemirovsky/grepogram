@@ -688,7 +688,9 @@ never change the git identity.
   `ID:fetch,add_source`. A run acts on the peer the probe saw: a join goes by the stored
   peer id and access hash, a username is resolved only without them and must still name that
   peer (`_OtherChat`), `_mark_joined` never overwrites `peer_id` from a join answer and fails the
-  candidate when Telegram answered with another chat, a member's source names the chat by id,
+  candidate when Telegram answered with another chat, an invite no probe tied to a peer takes
+  only the one chat of the answer that is the probed type (and title, between two alike) and
+  fails otherwise (`_joined_entity` → `None`), never the answer's first chat blindly, a member's source names the chat by id,
   and a public chat read without joining is re-resolved before it is added (`_confirm_public`).
   `research.grant` validates and writes in one `research.db` transaction; each session action is
   its own grant row, and a paid search pays only after `consume_grant` (one conditional

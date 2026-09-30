@@ -2771,18 +2771,33 @@ def _mark_joined(
 
 
 def _joined_entity(answer: Any, candidate: Candidate) -> Any:
-    """The chat a join answered with: the candidate's own when its peer id is known and the
-    answer holds it, else the first group or channel of the answer — which
-    :func:`_mark_joined` refuses to take for a candidate whose peer id it is not."""
+    """The chat a join answered with.
+
+    For a candidate whose peer id a probe learned: that chat when the answer holds it, else the
+    first group or channel of the answer — which :func:`_mark_joined` refuses to take for it.
+    For one whose peer id no probe learned (an invite that only showed a title): the one chat of
+    the answer that is what the probe saw — its type, and its title when two are alike — or
+    ``None`` when the answer does not say which chat the invite led to; the old group a
+    supergroup was migrated from is never it."""
     chats = [
         chat
         for chat in getattr(answer, "chats", None) or ()
         if isinstance(chat, types.Channel | types.Chat)
     ]
-    for chat in chats:
-        if candidate.peer_id is not None and dialogs.peer_id(chat) == candidate.peer_id:
-            return chat
-    return chats[0] if chats else None
+    if candidate.peer_id is not None:
+        for chat in chats:
+            if dialogs.peer_id(chat) == candidate.peer_id:
+                return chat
+        return chats[0] if chats else None
+    alike = [
+        chat
+        for chat in chats
+        if not getattr(chat, "migrated_to", None)
+        and (candidate.type is None or dialogs.chat_type(chat) == candidate.type)
+    ]
+    if len(alike) > 1 and candidate.title:
+        alike = [chat for chat in alike if utils.get_display_name(chat) == candidate.title]
+    return alike[0] if len(alike) == 1 else None
 
 
 async def _recheck_admissions(
@@ -2988,7 +3003,18 @@ async def _join_one(
     except errors.RPCError as exc:
         _refuse_candidate(rdb, session, candidate, "failed", f"the join failed: {exc}", report)
         return
-    if _mark_joined(rdb, session, candidate, _joined_entity(answer, candidate), report):
+    entity = _joined_entity(answer, candidate)
+    if entity is None and candidate.peer_id is None:
+        title = _quoted(candidate.title) if candidate.title else None
+        seen = " ".join(part for part in (candidate.type, title) if part)
+        note = (
+            "Telegram's answer to the join does not say which chat the invite led to — none of "
+            f"the chats it named is the {seen or 'chat'} the probe saw; nothing was fetched or "
+            f"added — check which chats account {account} is in now"
+        )
+        _refuse_candidate(rdb, session, candidate, "failed", note, report)
+        return
+    if _mark_joined(rdb, session, candidate, entity, report):
         log.info(
             "research session %d: joined candidate %d as %s", session.id, candidate.id, account
         )

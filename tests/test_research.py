@@ -2036,6 +2036,58 @@ async def test_refusals_are_recorded_for_what_they_are(
     assert report.fetched == [door.id] and _stored(conn, _marked(OPEN)) == [1]
 
 
+@pytest.mark.parametrize(
+    "answer",
+    [
+        pytest.param(["impostor"], id="another-kind-of-chat"),
+        pytest.param(["gated", "mine"], id="two-alike-none-titled-so"),
+        pytest.param([], id="no-chat"),
+    ],
+)
+async def test_an_invite_join_whose_answer_is_not_the_probed_chat_is_not_taken(
+    rdb: sqlite3.Connection, conn: sqlite3.Connection, paths: Paths, answer: list[str]
+) -> None:
+    """An invite probed only by its title and type has no peer id to check a join against: the
+    answer must name exactly one chat that is what the probe saw, or nothing is taken."""
+    named = {"impostor": IMPOSTOR, "gated": GATED, "mine": MINE}
+    chats = [named[name] for name in answer]
+    world = _run_world()
+    world.entities[_marked(IMPOSTOR)] = IMPOSTOR
+    joined = types.Updates(updates=[], users=[], chats=chats, date=None, seq=0)
+    client = _run_client(world, responses={functions.messages.ImportChatInviteRequest: joined})
+    session, found = await _discovered(rdb, conn, client, "https://t.me/+OpenDoor")
+    door = found["+OpenDoor"]
+    assert door.peer_id is None and door.type == "supergroup" and door.title == "Open door"
+    _approve(rdb, conn, session, _item(door, "join", "fetch", "add_source"))
+
+    report = await _run(rdb, conn, paths, client, session)
+
+    stored = _status(rdb, door)
+    assert report.failed == [door.id] and report.joined == report.fetched == []
+    assert stored.status == "failed" and stored.peer_id is None
+    assert "does not say which chat the invite led to" in (stored.note or "")
+    assert 'supergroup "Open door"' in (stored.note or "")
+    assert _live(rdb, door) == [] and config.load(paths).sources == [] and _read(client) == set()
+
+
+async def test_an_invite_join_answer_naming_the_probed_chat_among_others_is_taken(
+    rdb: sqlite3.Connection, conn: sqlite3.Connection, paths: Paths
+) -> None:
+    other = copy.copy(OPEN)
+    other.id, other.title = 3099, "Somewhere else"
+    world = _run_world()
+    joined = types.Updates(updates=[], users=[], chats=[other, OPEN], date=None, seq=0)
+    client = _run_client(world, responses={functions.messages.ImportChatInviteRequest: joined})
+    session, found = await _discovered(rdb, conn, client, "https://t.me/+OpenDoor")
+    door = found["+OpenDoor"]
+    assert door.peer_id is None
+    _approve(rdb, conn, session, _item(door, "join"))
+
+    report = await _run(rdb, conn, paths, client, session)
+
+    assert report.joined == [door.id] and _status(rdb, door).peer_id == _marked(OPEN)
+
+
 async def test_a_flood_wait_on_a_join_stops_the_run_and_keeps_the_grants(
     rdb: sqlite3.Connection, conn: sqlite3.Connection, paths: Paths
 ) -> None:
