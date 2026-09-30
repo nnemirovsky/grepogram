@@ -41,6 +41,7 @@ import sqlite_vec
 from grepogram.models import (
     DEFAULT_ACCOUNT,
     AccountRow,
+    CachedPeer,
     ChatRow,
     LinkKind,
     MessageRow,
@@ -1738,12 +1739,12 @@ def set_captured_links(
 def remember_peers(
     conn: sqlite3.Connection,
     account: str,
-    peers: Iterable[tuple[int, str | None, int | None]],
+    peers: Iterable[CachedPeer],
     now: int | None = None,
 ) -> None:
-    """Record ``(peer_id, username, access_hash)`` of peers ``account`` was handed while
-    fetching — a forward's origin channel, typically, which no source covers. A value left
-    ``None`` keeps what is stored; a username is stored lowercased."""
+    """Record the peers ``account`` was handed while fetching (:class:`CachedPeer`) — a
+    forward's origin channel, typically, which no source covers. A value left ``None`` keeps
+    what is stored; a username is stored lowercased."""
     with transaction(conn):
         conn.executemany(
             """INSERT INTO peer_cache(account, peer_id, username, access_hash, seen_at)
@@ -1753,8 +1754,8 @@ def remember_peers(
                    access_hash = COALESCE(excluded.access_hash, peer_cache.access_hash),
                    seen_at = COALESCE(excluded.seen_at, peer_cache.seen_at)""",
             [
-                (account, peer_id, username.lower() if username else None, access_hash, now)
-                for peer_id, username, access_hash in peers
+                (account, p.peer_id, p.username.lower() if p.username else None, p.access_hash, now)
+                for p in peers
             ],
         )
 

@@ -660,6 +660,16 @@ class AccountStatus:
 # --- research.db rows ------------------------------------------------------------------------
 
 
+class CachedPeer(NamedTuple):
+    """A peer an account was handed while fetching — a forward's origin channel, typically — as
+    ``peer_cache`` keeps it: its marked id, and its username and this account's access hash when
+    Telegram gave them (:func:`grepogram.db.remember_peers`)."""
+
+    peer_id: int
+    username: str | None
+    access_hash: int | None
+
+
 class ChatKey(NamedTuple):
     """A chat as Telegram names it — ``(scope, peer_id)``, the identity
     :func:`grepogram.db.upsert_chat` finds a row by — rather than by an index row id, which a

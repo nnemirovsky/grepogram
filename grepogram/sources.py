@@ -26,7 +26,7 @@ import re
 import sqlite3
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any, Literal
+from typing import Any, Literal, NamedTuple
 
 from telethon import errors, utils
 from telethon.tl import types
@@ -37,6 +37,7 @@ from grepogram.models import (
     ACCOUNT_NAME,
     DEFAULT_ACCOUNT,
     AccountStatus,
+    ChatKey,
     ChatRow,
     ChatStatus,
     Config,
@@ -899,16 +900,24 @@ class Resolution:
     through whichever account can). ``flooded`` maps an account whose resolve Telegram stopped
     with a flood wait to the seconds asked, and ``failed`` one another Telegram error stopped to
     the error: that account's sources were all skipped, keeping what they covered.
-    ``unresolved`` is ``(account, source id, reason)`` of each source that did not resolve on
-    its own (:class:`SourceError`: its chat or folder no longer names anything this account
-    reaches), so a sync can say so in its report — a source that silently never syncs looks
+    ``unresolved`` names each source that did not resolve on its own (:class:`Unresolved`;
+    :class:`SourceError`: its chat or folder no longer names anything this account reaches),
+    so a sync can say so in its report — a source that silently never syncs looks
     exactly like one with nothing new.
     """
 
     chats: list[ChatRow] = dataclasses.field(default_factory=list)
     flooded: dict[str, int] = dataclasses.field(default_factory=dict)
     failed: dict[str, str] = dataclasses.field(default_factory=dict)
-    unresolved: list[tuple[str, str, str]] = dataclasses.field(default_factory=list)
+    unresolved: list["Unresolved"] = dataclasses.field(default_factory=list)
+
+
+class Unresolved(NamedTuple):
+    """A source that did not resolve on its own, whose account it is, and why."""
+
+    account: str
+    source_id: str
+    reason: str
 
 
 async def resolve_sources(
@@ -966,12 +975,12 @@ async def resolve_sources(
     """
     catalogs: dict[str, DialogCatalog] = {}
     rows: list[ChatRow] = []
-    stored: dict[tuple[str, int], ChatRow] = {}
-    held_back: set[tuple[str, int]] = set()
+    stored: dict[ChatKey, ChatRow] = {}
+    held_back: set[ChatKey] = set()
     coverage: dict[str, set[int]] = {}
     flooded: dict[str, int] = {}
     failed: dict[str, str] = {}
-    unresolved: list[tuple[str, str, str]] = []
+    unresolved: list[Unresolved] = []
 
     def keep(source: Source) -> None:
         _keep_primary(conn, source, stored, rows)
@@ -1003,7 +1012,7 @@ async def resolve_sources(
             infos, named = await _source_listing(source, catalog, conn)
         except SourceError as exc:
             log.warning("skipping source %s: %s", source.id, exc)
-            unresolved.append((source.account, source.id, str(exc)))
+            unresolved.append(Unresolved(source.account, source.id, str(exc)))
             keep(source)
             continue
         except errors.UnauthorizedError as exc:
@@ -1031,12 +1040,12 @@ async def resolve_sources(
         covered = coverage.setdefault(source.id, set())
         covered |= _still_named(conn, source, named)
         for info in infos:
-            key = (chat_scope(info.type, source.account), info.id)
+            key = ChatKey(chat_scope(info.type, source.account), info.id)
             if key in held_back:
                 continue
             chat = stored.get(key)
             if chat is None:
-                held = imported_tag(conn, info.id, scope=key[0])
+                held = imported_tag(conn, info.id, scope=key.scope)
                 if held is not None:
                     held_back.add(key)
                     log.info(
@@ -1076,7 +1085,7 @@ async def resolve_sources(
 def _keep_primary(
     conn: sqlite3.Connection,
     source: Source,
-    stored: dict[tuple[str, int], ChatRow],
+    stored: dict[ChatKey, ChatRow],
     rows: list[ChatRow],
 ) -> None:
     """Hold on to the chats ``source`` — one that did not resolve this run — is the primary
@@ -1086,7 +1095,7 @@ def _keep_primary(
         chat = db.get_chat(conn, chat_id)
         if chat is None or chat.source_id != source.id:
             continue
-        key = (chat.scope, chat.peer_id)
+        key = ChatKey(chat.scope, chat.peer_id)
         if key in stored:
             continue
         stored[key] = chat

@@ -21,6 +21,7 @@ from grepogram.models import (
     AccountCfg,
     AccountRow,
     ApprovalItem,
+    CachedPeer,
     Candidate,
     CandidateView,
     ChatKey,
@@ -3841,7 +3842,9 @@ async def test_a_forward_origin_known_by_its_username_alone_is_probed_by_it(
     """A ``min`` origin brings no usable access hash, only its username: the probe resolves the
     name and takes the answer only when it is that very peer."""
     flats, secret = _marked(FLATS), _marked(SECRET)
-    db.remember_peers(conn, "default", [(flats, "tb_flats", None), (secret, "tb_flats", None)])
+    db.remember_peers(
+        conn, "default", [CachedPeer(flats, "tb_flats", None), CachedPeer(secret, "tb_flats", None)]
+    )
     _store(conn, SEED, 1, "repost", fwd_peer_id=flats, fwd_msg_id=3)
     _store(conn, SEED, 2, "another", fwd_peer_id=secret, fwd_msg_id=4)
     session = _start(rdb, conn)

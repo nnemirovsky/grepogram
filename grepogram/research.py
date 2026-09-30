@@ -141,6 +141,7 @@ from grepogram.models import (
     RESEARCH_LIMIT_MAX,
     SHARED_CHAT_TYPES,
     ApprovalItem,
+    CachedPeer,
     Candidate,
     CandidateAction,
     CandidateKind,
@@ -3430,7 +3431,7 @@ def _remember_read_without_joining(
     a failed config write leaves one spare hash of a live account rather than a source nothing
     can address. The hash is the account's own: the probe ran as it."""
     peers = [
-        (candidate.peer_id, candidate.username, candidate.access_hash)
+        CachedPeer(candidate.peer_id, candidate.username, candidate.access_hash)
         for candidate in planned
         if not _is_member(candidate)
         and candidate.peer_id is not None

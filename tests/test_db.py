@@ -10,7 +10,15 @@ import pytest
 import sqlite_vec
 
 from grepogram import db
-from grepogram.models import AccountRow, ChatRow, MessageRow, UnitRow, UserRow, chat_scope
+from grepogram.models import (
+    AccountRow,
+    CachedPeer,
+    ChatRow,
+    MessageRow,
+    UnitRow,
+    UserRow,
+    chat_scope,
+)
 from grepogram.paths import Paths
 
 TABLES = {
@@ -1064,8 +1072,8 @@ def test_forget_account_drops_its_access_and_its_row_only(conn: sqlite3.Connecti
     db.set_chat_access(conn, -1001, "default", access_hash=1)
     db.upsert_account(conn, AccountRow(name="work", user_id=7))
     db.upsert_account(conn, AccountRow(name="default", user_id=5))
-    db.remember_peers(conn, "work", [(-1003, "origin", 77)])
-    db.remember_peers(conn, "default", [(-1003, "origin", 55)])
+    db.remember_peers(conn, "work", [CachedPeer(-1003, "origin", 77)])
+    db.remember_peers(conn, "default", [CachedPeer(-1003, "origin", 55)])
     assert db.account_chat_counts(conn) == {"default": 1, "work": 2}
     assert db.forget_account(conn, "work") == 2
     # the hashes the work user cached address nothing for whoever signs in under the name next
@@ -2187,9 +2195,9 @@ def test_a_synthetic_id_is_never_handed_out_twice(conn: sqlite3.Connection) -> N
 
 
 def test_forward_origins_are_remembered_per_account(conn: sqlite3.Connection) -> None:
-    db.remember_peers(conn, "default", [(-1007, "Origin_Chan", 111)], now=1)
-    db.remember_peers(conn, "work", [(-1007, None, 222)], now=2)
-    db.remember_peers(conn, "default", [(-1007, None, None)], now=3)
+    db.remember_peers(conn, "default", [CachedPeer(-1007, "Origin_Chan", 111)], now=1)
+    db.remember_peers(conn, "work", [CachedPeer(-1007, None, 222)], now=2)
+    db.remember_peers(conn, "default", [CachedPeer(-1007, None, None)], now=3)
     assert db.cached_peer_hash(conn, -1007, "default") == 111
     assert db.cached_peer_hash(conn, -1007, "work") == 222
     assert db.cached_peer_hash(conn, -1007, "other") is None

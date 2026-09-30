@@ -66,6 +66,7 @@ from grepogram.embed import Embedder
 from grepogram.models import (
     DEFAULT_ACCOUNT,
     AccountRow,
+    CachedPeer,
     ChatRow,
     Config,
     LinkKind,
@@ -608,17 +609,17 @@ class SyncedChat:
     warnings: list[str] = field(default_factory=list)
 
 
-def forward_peers(messages: Iterable[Any]) -> list[tuple[int, str | None, int | None]]:
-    """``(peer_id, username, access_hash)`` of the channels and supergroups ``messages`` were
-    forwarded from, as Telegram handed them along with the messages (``msg.forward.chat``, bound
-    from the answer's ``chats`` at no cost).
+def forward_peers(messages: Iterable[Any]) -> list[CachedPeer]:
+    """The channels and supergroups ``messages`` were forwarded from, as Telegram handed them
+    along with the messages (``msg.forward.chat``, bound from the answer's ``chats`` at no
+    cost).
 
     That is the only moment grepogram learns how to reach a forward's origin: the message
     carries its id alone, and an id is no address — a channel is asked about with this
     account's access hash, or found by its username. A ``min`` entity's access hash addresses
     nothing and is left out; its username is kept. An origin that brings neither is dropped.
     """
-    found: dict[int, tuple[int, str | None, int | None]] = {}
+    found: dict[int, CachedPeer] = {}
     for msg in messages:
         forward = getattr(msg, "forward", None)
         chat = getattr(forward, "chat", None) if forward is not None else None
@@ -628,7 +629,7 @@ def forward_peers(messages: Iterable[Any]) -> list[tuple[int, str | None, int | 
         access_hash = None if chat.min else chat.access_hash
         if username or access_hash is not None:
             marked = dialogs.peer_id(chat)
-            found[marked] = (marked, username, access_hash)
+            found[marked] = CachedPeer(marked, username, access_hash)
     return list(found.values())
 
 
@@ -651,7 +652,7 @@ class _PeerBook:
         self.users: dict[int, UserRow] = {}
         self.names: dict[int, str] = {}
         self._pending: dict[int, UserRow] = {}
-        self._origins: dict[int, tuple[int, str | None, int | None]] = {}
+        self._origins: dict[int, CachedPeer] = {}
 
     def add(self, msg: Any) -> None:
         for user_id, user in collect_users(peers_of(msg)).items():
@@ -662,7 +663,7 @@ class _PeerBook:
             if user.display_name:
                 self.names[user_id] = user.display_name
         for origin in forward_peers([msg]):
-            self._origins[origin[0]] = origin
+            self._origins[origin.peer_id] = origin
 
     def flush(self, conn: sqlite3.Connection) -> None:
         if self._pending:
@@ -2088,14 +2089,15 @@ async def _sync_chats(
     for account, error in resolution.failed.items():
         tally.warn(account, f"its sources could not be resolved ({error}); they keep what they had")
     unresolved: set[str] = set()
-    for account, source_id, reason in resolution.unresolved:
+    for missed in resolution.unresolved:
         # every source is resolved whatever ``only`` says; a run limited to some reports theirs
-        if only is not None and source_id not in only:
+        if only is not None and missed.source_id not in only:
             continue
-        unresolved.add(source_id)
+        unresolved.add(missed.source_id)
         tally.warn(
-            account,
-            f"source {source_id} did not resolve ({reason}); it keeps the chats it already covered",
+            missed.account,
+            f"source {missed.source_id} did not resolve ({missed.reason}); it keeps the chats it "
+            "already covered",
         )
     run = _SyncPass(
         conn=conn,
@@ -2462,9 +2464,11 @@ async def _fetch_chat(run: _SyncPass, lane: _Lane, chat: ChatRow, source: Source
         # access hashes seeded before it; any other account is warmed for it first
         warmed={lane.account} if lane.account == source.account else (),
     )
-    for account, seconds in outcome.flooded:
-        log.warning("chat %s: flood wait of %ss through account %s", chat.id, seconds, account)
-        run.tally.warn(account, _flood_text(seconds))
+    for flood in outcome.flooded:
+        log.warning(
+            "chat %s: flood wait of %ss through account %s", chat.id, flood.seconds, flood.account
+        )
+        run.tally.warn(flood.account, _flood_text(flood.seconds))
     if outcome.account is not None:
         assert outcome.result is not None
         first = outcome.refusals[0] if outcome.refusals else None
@@ -2480,9 +2484,9 @@ async def _fetch_chat(run: _SyncPass, lane: _Lane, chat: ChatRow, source: Source
             )
         return _Fetch(outcome.account, outcome.result)
     if outcome.failure is not None:
-        return _Fetch(outcome.failure[0], error=outcome.failure[1])
+        return _Fetch(outcome.failure.account, error=outcome.failure.error)
     if outcome.refused is not None:
-        return _Fetch(outcome.refused[0], outcome.refused[1])
+        return _Fetch(outcome.refused.account, outcome.refused.result)
     if outcome.refusals and outcome.refusals[0].error is not None:
         return _Fetch(outcome.refusals[0].account, error=outcome.refusals[0].error)
     return _Fetch(lane.account)
@@ -2574,6 +2578,30 @@ class Refusal:
     error: Exception | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class Flooded:
+    """An account a flood wait stopped, and the seconds Telegram asked to wait."""
+
+    account: str
+    seconds: int
+
+
+@dataclass(frozen=True, slots=True)
+class Failed:
+    """The account whose error ended a chat's turn outright, and that error."""
+
+    account: str
+    error: Exception
+
+
+@dataclass(frozen=True, slots=True)
+class RefusedAnswer[T]:
+    """An account that answered, with a result the caller reads as a refusal."""
+
+    account: str
+    result: T
+
+
 @dataclass(slots=True)
 class Attempt[T]:
     """How :func:`through_accounts` went for one chat.
@@ -2588,9 +2616,9 @@ class Attempt[T]:
     account: str | None = None
     result: T | None = None
     refusals: list[Refusal] = field(default_factory=list)
-    refused: tuple[str, T] | None = None
-    flooded: list[tuple[str, int]] = field(default_factory=list)
-    failure: tuple[str, Exception] | None = None
+    refused: RefusedAnswer[T] | None = None
+    flooded: list[Flooded] = field(default_factory=list)
+    failure: Failed | None = None
 
 
 def _never(_: object) -> bool:
@@ -2655,7 +2683,7 @@ async def through_accounts[T](
                 account,
             )
             stopped.add(account)
-            outcome.flooded.append((account, int(exc.seconds)))
+            outcome.flooded.append(Flooded(account, int(exc.seconds)))
             continue
         except errors.UnauthorizedError as exc:
             tg.reraise_unauthorized(exc, account)
@@ -2664,12 +2692,12 @@ async def through_accounts[T](
             if chat.is_shared and isinstance(exc, _REROUTE_ERRORS):
                 outcome.refusals.append(Refusal(account, str(exc), exc))
                 continue
-            outcome.failure = (account, exc)
+            outcome.failure = Failed(account, exc)
             return outcome
         if chat.is_shared and refused(result):
             outcome.refusals.append(Refusal(account, "Telegram refused it"))
             if outcome.refused is None:
-                outcome.refused = (account, result)
+                outcome.refused = RefusedAnswer(account, result)
             continue
         outcome.account, outcome.result = account, result
         return outcome
@@ -2794,13 +2822,13 @@ class StoredPass:
             act,
             warmed=route[:1],
         )
-        for account, seconds in outcome.flooded:
-            self.warn(account, self.flood_warning(seconds))
+        for flood in outcome.flooded:
+            self.warn(flood.account, self.flood_warning(flood.seconds))
         if outcome.account is not None:
             return outcome.result
         if outcome.failure is not None:
-            account, exc = outcome.failure
-            self.warn(account, f"chat {chat.id} ({chat.title}): {exc}")
+            failed = outcome.failure
+            self.warn(failed.account, f"chat {chat.id} ({chat.title}): {failed.error}")
         elif outcome.refusals:
             last = outcome.refusals[-1]
             self.warn(last.account, f"chat {chat.id} ({chat.title}): {last.reason}")
