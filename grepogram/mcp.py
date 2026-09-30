@@ -82,7 +82,7 @@ from grepogram.rerank import Reranker
 from grepogram.search import UnknownMessage
 from grepogram.sources import AmbiguousTarget, SourceError
 from grepogram.sync import SyncBudget, SyncInProgress, SyncLock
-from grepogram.tg import AuthRequired, SessionError
+from grepogram.tg import AuthRequired, OtherUser, SessionError
 
 log = logging.getLogger(__name__)
 
@@ -552,6 +552,8 @@ def describe(exc: BaseException) -> str:
 
 def hint_for(exc: BaseException) -> str | None:
     """What to do about an expected failure, when there is something to do."""
+    if isinstance(exc, OtherUser):
+        return exc.hint
     if isinstance(exc, AuthRequired):
         return auth_hint(exc.account)
     if isinstance(exc, NotConfigured):

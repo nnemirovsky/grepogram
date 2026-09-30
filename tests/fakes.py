@@ -437,6 +437,15 @@ class FakeClient:
         self.calls.append(("get_me", {}))
         return self.me if self.authorized else None
 
+    async def log_out(self) -> bool:
+        """``auth.logOut``: the authorization ends and the client disconnects, as Telethon's
+        does; ``False`` for a session that holds none."""
+        self.calls.append(("log_out", {}))
+        was = self.authorized
+        self.authorized = False
+        self.connected = False
+        return was
+
     async def start(
         self,
         phone: Any = None,

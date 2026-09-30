@@ -18,6 +18,7 @@ from grepogram import config, db, leads, research, research_db, sync, tg
 from grepogram.filters import UnknownChat
 from grepogram.models import (
     AccountCfg,
+    AccountRow,
     ApprovalItem,
     Candidate,
     CandidateView,
@@ -1935,6 +1936,58 @@ async def test_a_run_needs_the_session_s_own_account(
     with pytest.raises(research.ResearchError, match="not signed in") as refused:
         await research.run(rdb, conn, CFG, paths, {"work": _run_client(_run_world())}, session.id)
     assert refused.value.hint == tg.auth_hint("default")
+
+
+async def test_a_run_never_acts_as_another_telegram_user_than_recorded(
+    rdb: sqlite3.Connection, conn: sqlite3.Connection, paths: Paths
+) -> None:
+    """The approval was given for the account the index recorded; a session file that is now
+    someone else joins, asks and fetches nothing — the run refuses before its first request."""
+    client = _run_client(_run_world())
+    session, found = await _discovered(rdb, conn, client, "@tb_flats")
+    flats = found["@tb_flats"]
+    _approve(rdb, conn, session, _item(flats, "join", "fetch", "add_source"))
+    db.upsert_account(conn, AccountRow(name="default", user_id=99, display_name="Earlier"))
+    client.calls.clear()
+
+    with pytest.raises(tg.OtherUser) as refused:
+        await _run(rdb, conn, paths, client, session)
+
+    assert "accounts rm default" in refused.value.hint
+    assert [name for name, _ in client.calls] == ["get_me"]
+    assert not [r for r in client.requests if isinstance(r, functions.channels.JoinChannelRequest)]
+    assert _marked(FLATS) not in client.members and config.load(paths).sources == []
+    assert _status(rdb, flats).status == "approved" and _live(rdb, flats) != []
+
+
+async def test_discover_never_probes_as_another_telegram_user_than_recorded(
+    rdb: sqlite3.Connection, conn: sqlite3.Connection
+) -> None:
+    client = _run_client(_run_world())
+    _links(conn, "@tb_flats")
+    session = _start(rdb, conn, (str(SEED),))
+    db.upsert_account(conn, AccountRow(name="default", user_id=99, display_name="Earlier"))
+
+    with pytest.raises(tg.OtherUser):
+        await research.discover(rdb, conn, CFG, session.id, client, now=3)
+
+    assert [name for name, _ in client.calls] == ["get_me"]
+    (flats,) = research_db.list_candidates(rdb, session.id)
+    assert flats.probed_at is None, "found offline, never probed"
+
+
+async def test_a_run_as_the_recorded_telegram_user_goes_ahead(
+    rdb: sqlite3.Connection, conn: sqlite3.Connection, paths: Paths
+) -> None:
+    client = _run_client(_run_world())
+    session, found = await _discovered(rdb, conn, client, "@tb_flats")
+    flats = found["@tb_flats"]
+    _approve(rdb, conn, session, _item(flats, "join"))
+    db.upsert_account(conn, AccountRow(name="default", user_id=9, display_name="Me"))
+
+    report = await _run(rdb, conn, paths, client, session)
+
+    assert report.joined == [flats.id]
 
 
 async def test_only_the_approved_chats_of_a_shared_folder_are_joined(

@@ -413,9 +413,13 @@ The account `grepogram auth` signs in without `--account` is `default`. It keeps
 simply is its `default` account. Every other account keeps its session in
 `sessions/<name>.session`. All of them share the one `[telegram]` app, and a source belongs to
 the account named by its `account` key. An account name stays one Telegram user: once a sign-in
-or a sync has recorded who it is, `grepogram auth` under that name as someone else is refused and
-leaves the earlier session as it was, and a sync leaves such a session out with a warning. Sign
-the other user in under a name of its own, or `grepogram accounts rm <name>` first. Its id carries the name, `work/chat:@team_channel` or
+or a sync has recorded who it is, `grepogram auth` under that name as someone else is refused,
+leaves the earlier session as it was and signs the refused one out again; so is a sign-in while
+the index cannot be read, since nothing could say who the name is. A session file put in place
+by hand as someone else is left out of every pass that talks to Telegram — a sync, `extract`,
+`prune-deleted`, `recapture-links` and `sources prune` go on without it and warn, and research
+refuses to discover or run. Sign the other user in under a name of its own, or `grepogram
+accounts rm <name>` first. Its id carries the name, `work/chat:@team_channel` or
 `work/folder:Payroll`, so two accounts can each list `chat = 12345` and mean two different
 private chats.
 

@@ -84,6 +84,30 @@ class AuthRequired(Exception):
         super().__init__(f"{reason} ({self.hint})")
 
 
+class OtherUser(AuthRequired):
+    """The session of ``account`` is Telegram user ``user_id``, not ``recorded``, the user the
+    index recorded under that name.
+
+    Everything tied to an account name — its private chats, the access hashes it stored, its
+    research approvals — belongs to the recorded user, so a pass leaves such an account out
+    rather than act as someone else (:func:`grepogram.sync.check_account`). The way out is not a
+    sign-in under the same name, which ``grepogram auth`` refuses, but removing the account
+    first; ``hint`` says so."""
+
+    def __init__(self, account: str, user_id: int, recorded: int) -> None:
+        super().__init__(
+            f"account {account} is signed in as Telegram user {user_id}, not user {recorded} "
+            "this index recorded for it; nothing was done as it",
+            account,
+        )
+        self.user_id = user_id
+        self.recorded = recorded
+        self.hint = (
+            f"run `grepogram accounts rm {account}` and sign it in again if the change is meant"
+        )
+        self.args = (f"{self.reason} ({self.hint})",)
+
+
 class SessionMissing(AuthRequired):
     """There is no session file for ``account`` yet, so that account cannot talk to Telegram."""
 
@@ -352,10 +376,12 @@ async def connected_all(
 
 @dataclass(frozen=True, slots=True)
 class SignedIn:
-    """Who :func:`login` signed in: the display name and Telegram's user id."""
+    """Who :func:`login` signed in: the display name and Telegram's user id, and whether this
+    sign-in made a new authorization (``fresh``) rather than finding the session signed in."""
 
     name: str
     user_id: int
+    fresh: bool = True
 
 
 async def login(
@@ -367,10 +393,30 @@ async def login(
     when the account has two-step verification enabled.
     """
     try:
+        await client.connect()
+        fresh = not await client.is_user_authorized()
         await client.start(phone=phone, password=password, code_callback=code)
         me = await client.get_me()
     finally:
         await client.disconnect()
     if me is None:
         raise AuthRequired("sign-in did not produce an authorized session")
-    return SignedIn(name=str(utils.get_display_name(me)), user_id=int(me.id))
+    return SignedIn(name=str(utils.get_display_name(me)), user_id=int(me.id), fresh=fresh)
+
+
+async def log_out(client: TelegramClient) -> bool:
+    """End the authorization ``client``'s session holds on Telegram's side
+    (``auth.logOut``); ``True`` when Telegram confirmed it.
+
+    For a sign-in that is not kept (``grepogram auth`` refusing another Telegram user under a
+    recorded name): deleting the staged file alone would leave a live authorization behind whose
+    only key is gone, listed under the user's devices until someone ends it by hand. Best
+    effort — a failure to reach Telegram is ``False`` and never raised, since the sign-in is
+    refused either way."""
+    try:
+        await client.connect()
+        return bool(await client.log_out())
+    except (errors.RPCError, ConnectionError, OSError, sqlite3.Error):
+        return False
+    finally:
+        await client.disconnect()

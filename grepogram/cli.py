@@ -218,7 +218,18 @@ def auth(
             sqlite3.Error,
         ) as exc:
             fail(f"sign-in failed: {exc}")
-        _refuse_another_user(paths, account, who)
+        refusal = _another_user(paths, account, who)
+        if refusal is not None:
+            # the sign-in is not kept, so the authorization it made on Telegram's side must not
+            # outlive the staged file that holds its only key
+            if who.fresh and not asyncio.run(tg.log_out(client)):
+                typer.echo(
+                    "warning: Telegram could not be told to end the refused sign-in; end it in "
+                    "Telegram under Settings → Devices",
+                    err=True,
+                )
+            message, hint = refusal
+            fail(message, hint=hint)
         tg.commit_login(paths, account, staged)
     finally:
         staged.unlink(missing_ok=True)
@@ -250,12 +261,16 @@ def _with_account(cfg: Config, name: str, label: str | None) -> Config:
     return dataclasses.replace(cfg, accounts=accounts)
 
 
-def _refuse_another_user(paths: Paths, account: str, who: tg.SignedIn) -> None:
-    """Refuse a sign-in under ``account`` as a Telegram user other than the one the index
-    recorded for it. Everything tied to the name — its private chats, the access hashes it
-    stored, its research approvals — belongs to that user, and the new one must not inherit it.
-    A name with no user recorded yet (a ``default`` from before accounts existed, one never
-    synced) takes whoever signs in; an index that cannot be read cannot object."""
+def _another_user(paths: Paths, account: str, who: tg.SignedIn) -> tuple[str, str] | None:
+    """Why a sign-in under ``account`` as ``who`` must not be kept — ``(message, hint)`` — or
+    ``None`` when it may.
+
+    Everything tied to the name — its private chats, the access hashes it stored, its research
+    approvals — belongs to the Telegram user the index recorded for it, and another one must not
+    inherit it. A name with no user recorded yet (a ``default`` from before accounts existed,
+    one never synced) takes whoever signs in. An index that cannot be read cannot say who the
+    name is, and that refuses the sign-in too: a session committed unchecked is exactly what the
+    passes that act on Telegram would later run as someone else."""
     try:
         conn = _open_db(paths)
         try:
@@ -263,19 +278,21 @@ def _refuse_another_user(paths: Paths, account: str, who: tg.SignedIn) -> None:
         finally:
             conn.close()
     except (db.SchemaError, db.ExtensionsUnsupported, sqlite3.Error) as exc:
-        typer.echo(f"warning: the index could not say who account {account} was: {exc}", err=True)
-        return
+        return (
+            f"the index could not say who account {account} is ({exc}); the sign-in was not "
+            "stored and its session file is as it was",
+            f"make the index readable (`grepogram sync` names what is wrong), then run "
+            f"{tg.auth_command(account)} again",
+        )
     if recorded is None:
-        return
+        return None
     before = f"{recorded.display_name} " if recorded.display_name else ""
-    fail(
+    return (
         f"account {account} is {before}(Telegram user {recorded.user_id}) in this index, but "
         f"this sign-in is {who.name} (user {who.user_id}); nothing was changed and its session "
         "file still holds the earlier sign-in",
-        hint=(
-            "sign the other user in under a name of its own (`grepogram auth --account <name>`), "
-            f"or remove this account first with `grepogram accounts rm {account}`"
-        ),
+        "sign the other user in under a name of its own (`grepogram auth --account <name>`), "
+        f"or remove this account first with `grepogram accounts rm {account}`",
     )
 
 
@@ -1250,7 +1267,7 @@ def sources_prune(
     try:
         folder_accounts = {source.account for source in cfg.sources if source.folder is not None}
         accounts = tg.make_clients(cfg, paths, sorted(folder_accounts))
-        scan = sources.prunable(cfg, conn, asyncio.run(_folder_membership(accounts, cfg)))
+        scan = sources.prunable(cfg, conn, asyncio.run(_folder_membership(accounts, cfg, conn)))
         for candidate in scan.kept:
             typer.echo(f"kept {_chat_label(candidate.chat)}: {candidate.reason}")
         if scan.unresolved:
@@ -1289,13 +1306,20 @@ def sources_prune(
         conn.close()
 
 
-async def _folder_membership(accounts: tg.Accounts, cfg: Config) -> sources.FolderMembership:
+async def _folder_membership(
+    accounts: tg.Accounts, cfg: Config, conn: sqlite3.Connection
+) -> sources.FolderMembership:
     """Connect every account that owns a folder source and read what each of its folders lists
-    right now; the folder of an account that is not connected is recorded as unchecked."""
+    right now; the folder of an account that is not connected — or whose session is another
+    Telegram user than the index recorded (:func:`grepogram.sync.check_account`), whose folders
+    say nothing about the recorded user's — is recorded as unchecked."""
     if not accounts.clients:
         return await sources.folder_membership(cfg, {})
     async with _connected(accounts) as live:
-        catalogs = {name: dialogs.DialogCatalog(client) for name, client in live.items()}
+        checked, left_out = await sync.checked_accounts(conn, live)
+        for name, reason in left_out.items():
+            typer.echo(f"warning: account {name}: {reason}", err=True)
+        catalogs = {name: dialogs.DialogCatalog(client) for name, client in checked.items()}
         return await sources.folder_membership(cfg, catalogs)
 
 
@@ -1635,6 +1659,8 @@ def research_discover(
                 tg.ensure_session_mode(paths, session.account)
                 client = tg.make_client(cfg, paths, session.account)
                 report = asyncio.run(_discover(client, rdb, conn, cfg, session))
+        except tg.OtherUser as exc:
+            fail(str(exc), hint=exc.hint)
         except (tg.AuthRequired, tg.SessionError) as exc:
             fail(
                 str(exc),

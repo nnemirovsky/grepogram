@@ -1315,6 +1315,102 @@ def test_auth_as_another_telegram_user_under_a_recorded_name_changes_nothing(
     assert _recorded(account) == AccountRow(name=account, user_id=43, display_name="Worker Bee")
 
 
+def _signing_in_once(
+    monkeypatch: pytest.MonkeyPatch, fake: FakeClient, writes: bytes = b"new sign-in"
+) -> list[Path]:
+    """Sign-ins go through ``fake`` and write ``writes`` into the staged file they were handed."""
+    staged: list[Path] = []
+
+    def login_client(
+        cfg: Config, paths: Paths, account: str, *, path: Path | None = None
+    ) -> FakeClient:
+        assert path is not None
+        path.write_bytes(writes)
+        staged.append(path)
+        return fake
+
+    monkeypatch.setattr(tg, "make_login_client", login_client)
+    return staged
+
+
+def test_a_refused_sign_in_is_logged_out_before_its_staged_session_goes(
+    tmp_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The refused sign-in made an authorization on Telegram's side; deleting the only file that
+    holds its key would leave it live under the user's devices, so it is ended first."""
+    (tmp_home / "config.toml").write_text(EXTRACT_KEYS, encoding="utf-8")
+    paths = Paths.from_env()
+    tg.prepare_session(paths).write_bytes(b"the earlier sign-in")
+    _record(DEFAULT_ACCOUNT, 43, "Worker Bee")
+    fake = FakeClient(authorized=False, me=make_user(44, "Someone", "Else"))
+    staged = _signing_in_once(monkeypatch, fake)
+
+    result = runner.invoke(cli.app, ["auth"], input="+15550002222\n4242\n")
+
+    assert result.exit_code == 1 and "nothing was changed" in result.stderr
+    assert ("log_out", {}) in fake.calls and not fake.authorized
+    assert paths.session_file.read_bytes() == b"the earlier sign-in"
+    assert not staged[0].exists()
+
+
+def test_a_refused_session_that_was_already_signed_in_is_not_logged_out(
+    tmp_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A session file that already held another user (copied into place by hand) was not made
+    by this sign-in: refusing it ends nothing on Telegram's side."""
+    (tmp_home / "config.toml").write_text(EXTRACT_KEYS, encoding="utf-8")
+    paths = Paths.from_env()
+    tg.prepare_session(paths).write_bytes(b"a copied session")
+    _record(DEFAULT_ACCOUNT, 43, "Worker Bee")
+    fake = FakeClient(authorized=True, me=make_user(44, "Someone", "Else"))
+    _signing_in_once(monkeypatch, fake, writes=b"a copied session")
+
+    result = runner.invoke(cli.app, ["auth"], input="")
+
+    assert result.exit_code == 1 and "nothing was changed" in result.stderr
+    assert ("log_out", {}) not in fake.calls
+    assert paths.session_file.read_bytes() == b"a copied session"
+
+
+def test_a_warning_says_so_when_telegram_cannot_end_a_refused_sign_in(
+    tmp_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (tmp_home / "config.toml").write_text(EXTRACT_KEYS, encoding="utf-8")
+    _record(DEFAULT_ACCOUNT, 43, "Worker Bee")
+    fake = FakeClient(authorized=False, me=make_user(44, "Someone", "Else"))
+
+    async def unreachable() -> bool:
+        raise ConnectionError("offline")
+
+    monkeypatch.setattr(fake, "log_out", unreachable)
+    _signing_in_once(monkeypatch, fake)
+
+    result = runner.invoke(cli.app, ["auth"], input="+15550002222\n4242\n")
+
+    assert result.exit_code == 1 and "Settings → Devices" in result.stderr
+
+
+def test_auth_refuses_to_store_a_sign_in_the_index_cannot_check(
+    tmp_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An index that cannot be read cannot say who the account is, so the sign-in is not
+    committed — fail closed — and the authorization it made is ended."""
+    (tmp_home / "config.toml").write_text(EXTRACT_KEYS, encoding="utf-8")
+    paths = Paths.from_env()
+    tg.prepare_session(paths).write_bytes(b"the earlier sign-in")
+    paths.db_file.write_bytes(b"this is not a database" * 100)
+    fake = FakeClient(authorized=False, me=make_user(44, "Someone", "Else"))
+    staged = _signing_in_once(monkeypatch, fake)
+
+    result = runner.invoke(cli.app, ["auth"], input="+15550002222\n4242\n")
+
+    assert result.exit_code == 1, result.output
+    assert "could not say who account default is" in result.stderr
+    assert "the sign-in was not stored" in result.stderr
+    assert paths.session_file.read_bytes() == b"the earlier sign-in"
+    assert not staged[0].exists() and ("log_out", {}) in fake.calls
+
+
 def test_auth_as_the_recorded_user_replaces_the_session(
     tmp_home: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -964,6 +964,47 @@ async def test_the_sweep_reads_a_message_empty_slot_as_a_deletion(
     assert _texts(conn, ARG_ID) == {101: "m101", 103: "m103"}
 
 
+async def test_the_sweep_never_runs_as_another_telegram_user_than_recorded(
+    conn: sqlite3.Connection, paths: Paths
+) -> None:
+    """A session file swapped for another user's would answer every stored id empty — that user
+    sees none of the recorded user's history — and a sweep that believed it would delete it all.
+    The account is left out with a warning, and a chat no other account reaches is left alone."""
+    client = _client(messages={ARG_ID: _talk(101, 102, 103)})
+    cfg = _cfg(ARG_SOURCE)
+    await _run(client, conn, paths, cfg)
+    db.upsert_account(conn, AccountRow(name=DEFAULT_ACCOUNT, user_id=99, display_name="Earlier"))
+    client.me = make_user(7, "Someone", "Else")
+    client.messages[ARG_ID] = []
+
+    report = await _prune(client, conn, paths, cfg)
+
+    assert (report.removed, report.checked) == (0, 0)
+    assert report.chats_unreachable == [ARG_ID] and report.chats_done == []
+    assert sorted(_texts(conn, ARG_ID)) == [101, 102, 103]
+    assert _swept(client) == []
+    assert any(
+        "Telegram user 7" in warning and "not user 99" in warning and "accounts rm" in warning
+        for warning in report.warnings
+    ), report.warnings
+
+
+async def test_the_sweep_runs_as_the_recorded_telegram_user(
+    conn: sqlite3.Connection, paths: Paths
+) -> None:
+    client = _client(messages={ARG_ID: _talk(101, 102, 103)})
+    client.me = ME
+    cfg = _cfg(ARG_SOURCE)
+    await _run(client, conn, paths, cfg)
+    recorded = db.get_account(conn, DEFAULT_ACCOUNT)
+    assert recorded is not None and recorded.user_id == ME.id
+    client.messages[ARG_ID] = [m for m in client.messages[ARG_ID] if m.id != 102]
+
+    report = await _prune(client, conn, paths, cfg)
+
+    assert report.removed == 1 and report.warnings == []
+
+
 async def test_the_sweeps_flood_sleep_threshold_shrinks_with_the_time_left(
     conn: sqlite3.Connection, paths: Paths
 ) -> None:

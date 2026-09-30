@@ -1640,6 +1640,7 @@ async def global_search(
             "named",
             "start a session with this question to search for it",
         )
+    await sync.check_account(conn, session.account, client)
     return await _search_telegram(client, rdb, conn, cfg, session, text, wanted, now)
 
 
@@ -2008,12 +2009,15 @@ async def discover(
     The offline half reads the whole index and runs on a worker thread, so a server's event loop
     stays free meanwhile. Global search runs only while ``[research]`` switches it on and a
     ``global_search`` grant is live; without them this call simply does not search. A flood wait
-    while reading pins or searching skips what follows for this call.
+    while reading pins or searching skips what follows for this call. Nothing is sent before
+    :func:`grepogram.sync.check_account` has made sure the client is the Telegram user the index
+    recorded for the session's account (:class:`~grepogram.tg.OtherUser` otherwise).
     """
     report = await asyncio.to_thread(discover_offline, rdb, conn, cfg, session_id, now=now)
     if client is None:
         return report
     session = active_session(rdb, session_id)
+    await sync.check_account(conn, session.account, client)
     pins = await read_pins(client, rdb, conn, cfg, session.id, now=now)
     if pins.flood_wait_s is not None:
         return dataclasses.replace(report, pins=pins)
@@ -3440,7 +3444,9 @@ async def run(
     out leaves the fetch resumable. Grants whose actions are all done are consumed and the rest
     stay for the next run, which is resumable from ``research.db`` alone; progress is recorded
     on the session. A stopped session refuses to run (:class:`SessionStopped`), and every source
-    a run added stays when the session stops.
+    a run added stays when the session stops. A session whose account is signed in as another
+    Telegram user than the index recorded (:func:`grepogram.sync.check_account`) refuses to run
+    with :class:`~grepogram.tg.OtherUser` before anything is sent.
     """
     require_enabled(cfg)
     session = active_session(rdb, session_id)
@@ -3450,6 +3456,8 @@ async def run(
             f"account {session.account} is not signed in for this run",
             tg.auth_hint(session.account),
         )
+    # a run joins, asks and fetches as this account: never as a Telegram user no approval named
+    await sync.check_account(conn, session.account, client)
     limits = session.limits
     if budget is None:
         budget = sync.SyncBudget(limits.run_budget_s, messages=limits.max_messages_per_run)

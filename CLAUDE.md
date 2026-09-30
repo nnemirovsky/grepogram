@@ -109,9 +109,16 @@ never change the git identity.
   once `db.other_user` says the index recorded no *other* Telegram user under that name: an
   account name is one Telegram user, since its scoped private chats, `chat_access` /
   `peer_cache` hashes and research grants are that user's. A name with no user recorded yet (a
-  v0.2.0 `default`) takes whoever signs in; a refused sign-in leaves the old session and deletes
-  the copy. `sync._record_account` holds the same line for a session swapped by hand — that
-  account is left out of the run with a warning, its record untouched. Every other client works on an in-memory
+  v0.2.0 `default`) takes whoever signs in; an index `auth` cannot read refuses the sign-in too
+  (fail closed); a refused sign-in leaves the old session, logs the staged one out on Telegram's
+  side (`tg.log_out`, only when this sign-in made the authorization: `SignedIn.fresh`) and
+  deletes the copy. **Every Telegram-facing pass holds the same line through one check**,
+  `sync.check_account` (`get_me` against `db.other_user`, raising `tg.OtherUser`, an
+  `AuthRequired` whose hint is `accounts rm`): `sync._record_account` in a sync,
+  `StoredPass.start` (`prune-deleted`, `extract`, `recapture-links` — through
+  `sync.checked_accounts`, which leaves the account out with a warning), the folder read of
+  `sources prune`, and `research.run` / `discover` / `global_search`, which refuse. A session
+  swapped by hand never deletes, joins or asks as a user nobody chose. Every other client works on an in-memory
   copy (`tg.make_client` → `tg.load_session`; `tg.make_clients` for every account, reporting a
   missing or unreadable session of an account that owns a source in `Accounts.skipped`
   instead of raising), because two Telethon clients on one session database block each other and fail

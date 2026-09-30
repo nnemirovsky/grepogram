@@ -1516,6 +1516,24 @@ def test_cli_sources_prune_refuses_when_a_source_cannot_be_resolved(
     assert _indexed(paths) == sorted([ARG_ID, LEFT_ID])
 
 
+def test_cli_sources_prune_never_reads_folders_as_another_telegram_user(
+    tmp_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Another user's folders say nothing about the recorded user's: the folder is unchecked,
+    and an unchecked folder stops the prune."""
+    paths = _prune_home(tmp_home, monkeypatch)
+    conn = db.connect(paths)
+    try:
+        db.upsert_account(conn, AccountRow(name="default", user_id=99, display_name="Earlier"))
+    finally:
+        conn.close()
+    monkeypatch.setattr(tg, "make_client", lambda *_: _client(me=make_user(7, "Someone")))
+    result = runner.invoke(cli.app, ["sources", "prune"], input="y\n")
+    assert result.exit_code == 1
+    assert "not user 99" in result.stderr and "nothing was pruned" in result.stderr
+    assert sorted(_indexed(paths)) == sorted([ARG_ID, LEFT_ID])
+
+
 def test_cli_sources_prune_keeps_a_linked_discussion_group_and_says_why(
     tmp_home: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1556,11 +1574,11 @@ def test_cli_sources_prune_resolves_before_it_takes_the_sync_lock(
     order: list[str] = []
 
     async def membership_without_the_lock(
-        accounts: tg.Accounts, cfg: Config
+        accounts: tg.Accounts, cfg: Config, conn: sqlite3.Connection
     ) -> sources.FolderMembership:
         with sync.SyncLock(paths):  # free while the network is being read
             order.append("resolved")
-        return await real_membership(accounts, cfg)
+        return await real_membership(accounts, cfg, conn)
 
     def prune_under_the_lock(
         conn: sqlite3.Connection, candidates: Sequence[sources.PruneCandidate]
