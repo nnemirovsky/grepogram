@@ -352,16 +352,21 @@ voided_at)`, `exclusions(identity PRIMARY KEY, reason, created_at)`,
 **Files:**
 - Modify: `grepogram/tg.py`, `tests/test_tg.py`
 
-- [ ] `load_session`, `make_client`, `make_login_client`, `prepare_session`,
+- [x] `load_session`, `make_client`, `make_login_client`, `prepare_session`,
   `ensure_session_mode` take an `account` (default `DEFAULT_ACCOUNT`) and use
-  `paths.session_file_for`; `prepare_session` creates `sessions/` with `DIR_MODE`
-- [ ] `AuthRequired` / `SessionMissing` carry the account and a hint
-  `run: grepogram auth --account <name>` (unchanged text for `default`)
-- [ ] `make_clients(cfg, paths, accounts)` → `{account: client}` for the accounts that have a
-  session file; accounts without one are reported, not fatal
-- [ ] tests: two accounts get distinct in-memory copies of distinct files, modes 0600/0700,
+  `paths.session_file_for`; `prepare_session` creates `sessions/` with `DIR_MODE`.
+  `wrap_auth_errors` / `connected` take the `account` too, so an auth failure raised while
+  talking to Telegram names the account whose session died
+- [x] `AuthRequired` / `SessionMissing` carry the account and a hint
+  `run: grepogram auth --account <name>` (unchanged text for `default`); `tg.auth_hint(account)`
+  is the one rule
+- [x] `make_clients(cfg, paths, accounts=None)` → `AccountClients(clients={account: client},
+  unavailable={account: SessionMissing | SessionError})` for the accounts that have a session
+  file (all of `cfg.account_names()` when `accounts` is `None`); accounts without one — or with
+  an unreadable one — are reported in `unavailable`, not fatal
+- [x] tests: two accounts get distinct in-memory copies of distinct files, modes 0600/0700,
   hints per account, missing session for one account only
-- [ ] run checks — must pass before task 3
+- [x] run checks — must pass before task 3
 
 ### Task 3: Schema step 7 — chat identity, access and coverage
 

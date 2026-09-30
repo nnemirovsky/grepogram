@@ -12,7 +12,7 @@ from telethon.tl import functions, types
 from typer.testing import CliRunner
 
 from grepogram import cli, tg
-from grepogram.models import Config, SyncCfg, TelegramCfg
+from grepogram.models import AccountCfg, Config, SyncCfg, TelegramCfg
 from grepogram.paths import Paths
 from tests.conftest import file_mode
 from tests.fakes import (
@@ -54,18 +54,35 @@ def test_session_missing_is_an_auth_error_not_a_file_error(tmp_path: Path) -> No
     assert "run: grepogram auth" in str(exc)
 
 
+def test_auth_errors_name_the_account_to_sign_in(tmp_path: Path) -> None:
+    """The default account keeps the hint a single-account install always read; any other
+    account's hint names it, so the user signs the right one in."""
+    assert tg.auth_hint() == tg.auth_hint("default") == "run: grepogram auth"
+    assert tg.auth_hint("work") == "run: grepogram auth --account work"
+    default = tg.AuthRequired()
+    assert default.account == "default"
+    assert str(default) == "Telegram session is not authorized (run: grepogram auth)"
+    work = tg.AuthRequired("session revoked", account="work")
+    assert (work.account, work.hint) == ("work", "run: grepogram auth --account work")
+    assert str(work) == "session revoked (run: grepogram auth --account work)"
+    missing = tg.SessionMissing(tmp_path / "work.session", "work")
+    assert (missing.account, missing.path) == ("work", tmp_path / "work.session")
+    assert str(missing).endswith("(run: grepogram auth --account work)")
+
+
 # --- make_client -----------------------------------------------------------------------------
 
 
 KEY = AuthKey(bytes(range(256)))
 
 
-def _signed_in(paths: Paths) -> SQLiteSession:
+def _signed_in(
+    paths: Paths, account: str = "default", key: AuthKey = KEY, dc: int = 2
+) -> SQLiteSession:
     """A session file as ``grepogram auth`` leaves it: data centre and auth key stored."""
-    tg.prepare_session(paths)
-    stored = SQLiteSession(str(paths.session_file))
-    stored.set_dc(2, "149.154.167.51", 443)
-    stored.auth_key = KEY
+    stored = SQLiteSession(str(tg.prepare_session(paths, account)))
+    stored.set_dc(dc, "149.154.167.51", 443)
+    stored.auth_key = key
     stored.save()
     return stored
 
@@ -201,6 +218,133 @@ def test_ensure_session_mode_raises_session_missing(tmp_path: Path) -> None:
     assert excinfo.value.__cause__ is None
 
 
+# --- per-account sessions --------------------------------------------------------------------
+
+
+WORK_KEY = AuthKey(bytes(reversed(range(256))))
+TWO_ACCOUNTS = Config(
+    telegram=TelegramCfg(api_id=777, api_hash="hash"), accounts=[AccountCfg(name="work")]
+)
+
+
+def test_a_named_account_keeps_its_session_under_sessions(tmp_path: Path) -> None:
+    paths = _paths(tmp_path)
+    path = tg.prepare_session(paths, "work")
+    assert path == paths.sessions_dir / "work.session"
+    assert file_mode(path) == 0o600
+    assert file_mode(paths.sessions_dir) == 0o700
+    assert not paths.session_file.exists()
+    assert tg.ensure_session_mode(paths, "work") == path
+
+
+def test_prepare_session_creates_the_sessions_dir_private_in_an_existing_home(
+    tmp_path: Path,
+) -> None:
+    """A home from before accounts existed has no ``sessions/`` yet; the first named account
+    creates it 0700, while the home itself keeps whatever mode the user gave it."""
+    paths = _paths(tmp_path)
+    paths.config_file.parent.mkdir(mode=0o755, parents=True)
+    paths.config_file.parent.chmod(0o755)
+    tg.prepare_session(paths, "work")
+    assert file_mode(paths.sessions_dir) == 0o700
+    assert file_mode(paths.config_file.parent) == 0o755
+
+
+def test_two_accounts_get_distinct_in_memory_copies_of_distinct_files(tmp_path: Path) -> None:
+    paths = _paths(tmp_path)
+    _signed_in(paths).close()
+    _signed_in(paths, "work", WORK_KEY, dc=4).close()
+    before = {
+        path: path.read_bytes()
+        for path in (paths.session_file, paths.sessions_dir / "work.session")
+    }
+    default = tg.make_client(TWO_ACCOUNTS, paths)
+    work = tg.make_client(TWO_ACCOUNTS, paths, "work")
+    assert default.session is not work.session
+    for client, key, dc in ((default, KEY, 2), (work, WORK_KEY, 4)):
+        session = client.session
+        assert isinstance(session, MemorySession) and not isinstance(session, SQLiteSession)
+        assert session.dc_id == dc
+        assert session.auth_key is not None and session.auth_key.key == key.key
+    assert {path: path.read_bytes() for path in before} == before
+
+
+def test_make_login_client_writes_the_named_accounts_file(tmp_path: Path) -> None:
+    paths = _paths(tmp_path)
+    tg.prepare_session(paths, "work")
+    client = tg.make_login_client(TWO_ACCOUNTS, paths, "work")
+    try:
+        assert isinstance(client.session, SQLiteSession)
+        assert client.session.filename == str(paths.sessions_dir / "work.session")
+        assert file_mode(paths.sessions_dir / "work.session") == 0o600
+    finally:
+        client.session.close()
+    assert not paths.session_file.exists()
+
+
+def test_a_named_accounts_missing_session_names_the_account(tmp_path: Path) -> None:
+    paths = _paths(tmp_path)
+    with pytest.raises(tg.SessionMissing) as excinfo:
+        tg.ensure_session_mode(paths, "work")
+    assert excinfo.value.path == paths.sessions_dir / "work.session"
+    assert excinfo.value.account == "work"
+    assert excinfo.value.hint == "run: grepogram auth --account work"
+
+
+def test_an_invalid_account_name_never_becomes_a_path(tmp_path: Path) -> None:
+    paths = _paths(tmp_path)
+    with pytest.raises(ValueError, match="invalid account name"):
+        tg.prepare_session(paths, "../escape")
+    assert not (tmp_path / "escape.session").exists()
+
+
+def test_make_clients_builds_one_client_per_signed_in_account(tmp_path: Path) -> None:
+    paths = _paths(tmp_path)
+    _signed_in(paths).close()
+    _signed_in(paths, "work", WORK_KEY).close()
+    (paths.sessions_dir / "work.session").chmod(0o644)
+    built = tg.make_clients(TWO_ACCOUNTS, paths)
+    assert list(built.clients) == ["default", "work"]
+    assert built.unavailable == {}
+    work_key = built.clients["work"].session.auth_key
+    assert work_key is not None and work_key.key == WORK_KEY.key
+    assert file_mode(paths.sessions_dir / "work.session") == 0o600
+
+
+def test_make_clients_reports_an_account_without_a_session(tmp_path: Path) -> None:
+    """A second account that was never signed in costs itself and nothing else."""
+    paths = _paths(tmp_path)
+    _signed_in(paths).close()
+    built = tg.make_clients(TWO_ACCOUNTS, paths)
+    assert list(built.clients) == ["default"]
+    missing = built.unavailable["work"]
+    assert isinstance(missing, tg.SessionMissing)
+    assert missing.path == paths.sessions_dir / "work.session"
+    assert missing.hint == "run: grepogram auth --account work"
+
+
+def test_make_clients_reports_a_damaged_session_and_keeps_the_rest(tmp_path: Path) -> None:
+    paths = _paths(tmp_path)
+    tg.prepare_session(paths).write_bytes(b"not a database, not at all, just some bytes " * 4)
+    _signed_in(paths, "work", WORK_KEY).close()
+    built = tg.make_clients(TWO_ACCOUNTS, paths)
+    assert list(built.clients) == ["work"]
+    damaged = built.unavailable["default"]
+    assert isinstance(damaged, tg.SessionError)
+    assert damaged.path == paths.session_file
+
+
+def test_make_clients_builds_only_the_accounts_asked_for(tmp_path: Path) -> None:
+    paths = _paths(tmp_path)
+    _signed_in(paths).close()
+    _signed_in(paths, "work", WORK_KEY).close()
+    built = tg.make_clients(TWO_ACCOUNTS, paths, ["work", "work"])
+    assert list(built.clients) == ["work"]
+    assert built.unavailable == {}
+    none = tg.make_clients(TWO_ACCOUNTS, paths, [])
+    assert (none.clients, none.unavailable) == ({}, {})
+
+
 # --- wrap_auth_errors ------------------------------------------------------------------------
 
 
@@ -251,6 +395,20 @@ async def test_wrap_auth_errors_rejects_an_unauthorized_client_before_the_body()
     assert not ran
     assert excinfo.value.__cause__ is None
     assert ("is_user_authorized", {}) in client.calls
+
+
+async def test_auth_errors_of_a_named_account_carry_its_hint() -> None:
+    with pytest.raises(tg.AuthRequired) as unauthorized:
+        async with tg.connected(FakeClient(authorized=False), "work"):
+            pass
+    assert unauthorized.value.account == "work"
+    assert unauthorized.value.hint == "run: grepogram auth --account work"
+    with pytest.raises(tg.AuthRequired) as rejected:
+        async with tg.wrap_auth_errors(FakeClient(), "work"):
+            raise errors.SessionRevokedError(request=None)
+    assert rejected.value.account == "work"
+    assert "rejected" in str(rejected.value)
+    assert str(rejected.value).endswith("(run: grepogram auth --account work)")
 
 
 async def test_wrap_auth_errors_runs_the_body_for_an_authorized_client() -> None:
