@@ -5,8 +5,9 @@ from pathlib import Path
 
 import pytest
 
-from grepogram import db
+from grepogram import db, research_db
 from grepogram.log import shutdown_logging
+from grepogram.models import ChatKey, ScanCursor
 
 
 @pytest.fixture(autouse=True)
@@ -87,3 +88,9 @@ def v6_conn() -> Iterator[sqlite3.Connection]:
 def file_mode(path: Path) -> int:
     """The permission bits of ``path``, for the 0600 / 0700 assertions."""
     return stat.S_IMODE(path.stat().st_mode)
+
+
+def scan_cursor(rdb: sqlite3.Connection, session_id: int, chat: ChatKey) -> ScanCursor | None:
+    """The cursor a research session keeps for ``chat``, if any (``research.db``'s one reader of
+    them, ``list_scan_cursors``, narrowed to it)."""
+    return next((c for c in research_db.list_scan_cursors(rdb, session_id) if c.chat == chat), None)

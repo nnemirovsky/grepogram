@@ -8,7 +8,7 @@ import pytest
 from grepogram import db, research_db
 from grepogram.models import ChatKey, Grant, ResearchLimits, ScanCursor
 from grepogram.paths import Paths
-from tests.conftest import file_mode
+from tests.conftest import file_mode, scan_cursor
 
 
 @pytest.fixture
@@ -133,13 +133,10 @@ def test_a_session_round_trips(rdb: sqlite3.Connection) -> None:
     assert research_db.get_session(rdb, created.id + 1) is None
 
 
-@pytest.mark.parametrize(("question", "account"), [("  ", "default"), ("q", "Not Valid")])
-def test_a_session_needs_a_question_and_a_valid_account(
-    rdb: sqlite3.Connection, question: str, account: str
-) -> None:
+def test_a_session_needs_a_question(rdb: sqlite3.Connection) -> None:
     with pytest.raises(ValueError):
         research_db.create_session(
-            rdb, question=question, account=account, seeds=[], limits=ResearchLimits()
+            rdb, question="  ", account="default", seeds=[], limits=ResearchLimits()
         )
     assert research_db.list_sessions(rdb) == []
 
@@ -243,10 +240,6 @@ def test_candidate_updates_set_only_what_a_probe_or_run_learns(rdb: sqlite3.Conn
     assert research_db.update_candidate(rdb, cand.id) == updated
     with pytest.raises(ValueError, match="identity"):
         research_db.update_candidate(rdb, cand.id, identity="@y")
-    with pytest.raises(ValueError, match="candidate status"):
-        research_db.update_candidate(rdb, cand.id, status="done")
-    with pytest.raises(ValueError, match="chat type"):
-        research_db.update_candidate(rdb, cand.id, type="forum")
     with pytest.raises(KeyError):
         research_db.update_candidate(rdb, cand.id + 1, note="n")
 
@@ -264,10 +257,6 @@ def test_candidates_list_by_status_and_parent(rdb: sqlite3.Connection) -> None:
     assert [c.id for c in research_db.list_candidates(rdb, sid, parent_id=folder.id)] == [child.id]
     assert [c.id for c in research_db.list_candidates(rdb, sid, ["skipped"])] == [other.id]
     assert research_db.list_candidates(rdb, sid, []) == []
-    with pytest.raises(ValueError):
-        research_db.list_candidates(rdb, sid, ["nope"])
-    with pytest.raises(ValueError):
-        research_db.add_candidate(rdb, sid, "@z", "post", 1)  # type: ignore[arg-type]
     with pytest.raises(ValueError):
         research_db.add_candidate(rdb, sid, "@z", "username", -1)
 
@@ -294,8 +283,6 @@ def test_forwards_of_one_post_corroborate_once(rdb: sqlite3.Connection) -> None:
     assert not research_db.add_evidence(rdb, link.id, "post_search", "search:1:@linked")
     assert len(research_db.list_evidence(rdb, cand.id)) == 12
     assert research_db.corroboration(rdb, [cand.id, link.id, 999]) == {cand.id: 2, link.id: 1}
-    with pytest.raises(ValueError):
-        research_db.add_evidence(rdb, cand.id, "rumour", "k")  # type: ignore[arg-type]
     with pytest.raises(ValueError):
         research_db.add_evidence(rdb, cand.id, "link", "")
 
@@ -498,19 +485,17 @@ def test_searches_are_recorded_per_session(rdb: sqlite3.Connection) -> None:
     assert record.kind == "post_search" and record.results == 12 and record.ran_at == 4
     assert research_db.list_searches(rdb, sid) == [record]
     assert research_db.list_searches(rdb, sid + 1) == []
-    with pytest.raises(ValueError):
-        research_db.record_search(rdb, sid, "web", "q")  # type: ignore[arg-type]
 
 
 def test_a_scan_cursor_never_moves_back_nor_deepens(rdb: sqlite3.Connection) -> None:
     sid = _session(rdb)
     chat = ChatKey("", -10)
-    assert research_db.scan_cursor(rdb, sid, chat) is None
+    assert scan_cursor(rdb, sid, chat) is None
     research_db.set_scan_cursor(rdb, sid, chat, depth=1, index_id="a", lead_seq=50, now=1)
     cursor = research_db.set_scan_cursor(rdb, sid, chat, depth=2, index_id="a", lead_seq=40, now=2)
     assert (cursor.depth, cursor.lead_seq, cursor.scanned_at) == (1, 50, 2)
     research_db.set_scan_cursor(rdb, sid, chat, depth=0, index_id="a", lead_seq=90, now=3)
-    assert research_db.scan_cursor(rdb, sid, chat) == ScanCursor(
+    assert scan_cursor(rdb, sid, chat) == ScanCursor(
         session_id=sid, chat=chat, depth=0, index_id="a", lead_seq=90, scanned_at=3
     )
     research_db.set_scan_cursor(rdb, sid, ChatKey("default", 5), depth=1, index_id="a", now=3)
@@ -535,7 +520,7 @@ def test_pins_and_directories_are_remembered_beside_the_cursor(rdb: sqlite3.Conn
     research_db.set_scan_cursor(rdb, sid, chat, depth=1, index_id="a", lead_seq=7, now=1)
     research_db.mark_pins_read(rdb, sid, chat, depth=2, now=5)
     research_db.mark_directory(rdb, sid, chat, depth=2, now=6)
-    cursor = research_db.scan_cursor(rdb, sid, chat)
+    cursor = scan_cursor(rdb, sid, chat)
     assert cursor is not None
     assert (cursor.depth, cursor.lead_seq, cursor.pins_read_at, cursor.directory) == (1, 7, 5, True)
     fresh = research_db.mark_pins_read(rdb, sid, ChatKey("work", 3), depth=0, now=8)

@@ -62,9 +62,7 @@ from grepogram.models import (
     Candidate,
     CandidateAction,
     CandidateKind,
-    CandidateStatus,
     ChatKey,
-    ChatType,
     Evidence,
     EvidenceVia,
     Exclusion,
@@ -78,7 +76,6 @@ from grepogram.models import (
     SearchKind,
     SearchRecord,
     SessionAction,
-    is_account_name,
 )
 from grepogram.paths import PRIVATE_FILE_MODE, Paths
 
@@ -242,17 +239,13 @@ _V2: tuple[str, ...] = (
 )
 
 MIGRATIONS: dict[int, tuple[str, ...]] = {1: _V1, 2: _V2}
-"""Schema version → the step that brings the file to it, from 1 without a gap; append-only."""
+"""Schema version → the step that brings the file to it, from 1 without a gap (the test suite
+checks that); append-only."""
 SCHEMA_VERSION = max(MIGRATIONS)
 
-_STATES: frozenset[str] = frozenset(get_args(ResearchState))
-_KINDS: frozenset[str] = frozenset(get_args(CandidateKind))
-_STATUSES: frozenset[str] = frozenset(get_args(CandidateStatus))
-_VIAS: frozenset[str] = frozenset(get_args(EvidenceVia))
 _CANDIDATE_ACTIONS: frozenset[str] = frozenset(get_args(CandidateAction))
 _SESSION_ACTIONS: frozenset[str] = frozenset(get_args(SessionAction))
 _CHANNELS: frozenset[str] = frozenset(get_args(GrantChannel))
-_SEARCH_KINDS: frozenset[str] = frozenset(get_args(SearchKind))
 _EXCLUDABLE = ("proposed", "approved", "skipped")
 """Statuses an exclusion moves to ``excluded``: decisions not acted on yet. A chat already
 joined or fetched keeps its status — excluding it undoes nothing on Telegram — but loses every
@@ -366,11 +359,10 @@ def migrate(conn: sqlite3.Connection) -> int:
             f"research.db schema v{current} is newer than this grepogram supports "
             f"(v{SCHEMA_VERSION}); {_KEEP_HINT}"
         )
-    pending = range(current + 1, SCHEMA_VERSION + 1)
-    if current < 0 or any(version not in MIGRATIONS for version in pending):
+    if current < 0:
         raise SchemaError(f"research.db schema v{current} cannot be upgraded; {_KEEP_HINT}")
     with db.transaction(conn):
-        for version in pending:
+        for version in range(current + 1, SCHEMA_VERSION + 1):
             for statement in MIGRATIONS[version]:
                 conn.execute(statement)
         conn.execute(
@@ -391,6 +383,8 @@ def clock(now: int | None = None) -> int:
 
 
 def _check(value: str, allowed: frozenset[str], what: str) -> None:
+    """Refuse a value a grant may not hold: :func:`add_grant` is the consent record, so it checks
+    its channel and actions at run time; every other writer trusts its typed callers."""
     if value not in allowed:
         raise ValueError(f"unknown {what} {value!r}; expected one of {', '.join(sorted(allowed))}")
 
@@ -443,8 +437,6 @@ def create_session(
     :func:`stop_session`."""
     if not question.strip():
         raise ValueError("a research session needs a question")
-    if not is_account_name(account):
-        raise ValueError(f"invalid account name: {account!r}")
     keys = list(dict.fromkeys(ChatKey(str(scope), int(peer)) for scope, peer in seeds))
     with db.transaction(conn):
         row = conn.execute(
@@ -471,7 +463,6 @@ def list_sessions(
     if state is None:
         rows = conn.execute("SELECT * FROM sessions ORDER BY id DESC").fetchall()
     else:
-        _check(state, _STATES, "session state")
         rows = conn.execute(
             "SELECT * FROM sessions WHERE state = ? ORDER BY id DESC", (state,)
         ).fetchall()
@@ -562,7 +553,6 @@ def add_candidate(
     excluded chat, under any spelling it is known by (:func:`excluded_by`), gets no row at all
     and answers ``None`` — exclusions are global, so no session proposes one again.
     """
-    _check(kind, _KINDS, "candidate kind")
     if depth < 0:
         raise ValueError(f"a candidate's depth cannot be negative: {depth}")
     with db.transaction(conn):
@@ -772,8 +762,6 @@ def list_candidates(
     params: list[Any] = [session_id]
     if statuses is not None:
         wanted = list(statuses)
-        for status in wanted:
-            _check(status, _STATUSES, "candidate status")
         if not wanted:
             return []
         clauses.append(f"status IN ({_placeholders(len(wanted))})")
@@ -796,10 +784,6 @@ def update_candidate(conn: sqlite3.Connection, candidate_id: int, **fields: Any)
     unknown = set(fields) - _CANDIDATE_FIELDS
     if unknown:
         raise ValueError(f"cannot set candidate field(s): {', '.join(sorted(unknown))}")
-    if "status" in fields:
-        _check(fields["status"], _STATUSES, "candidate status")
-    if "type" in fields and fields["type"] is not None:
-        _check(fields["type"], frozenset(get_args(ChatType)), "chat type")
     if not fields:
         found = get_candidate(conn, candidate_id)
         if found is None:
@@ -850,7 +834,6 @@ def add_evidence(
 ) -> bool:
     """Record one path to a candidate — found in the message ``msg_id`` of ``chat``, when it was
     found in a message; ``False`` when that exact path is already recorded."""
-    _check(via, _VIAS, "evidence path")
     if not origin_key:
         raise ValueError("evidence needs an origin key")
     scope, peer = (None, None) if chat is None else (chat.scope, chat.peer_id)
@@ -939,8 +922,6 @@ def add_grant(
     _check(via, _CHANNELS, "grant channel")
     if not summary.strip():
         raise ValueError("a grant records the approval text the human saw")
-    if not is_account_name(account):
-        raise ValueError(f"invalid account name: {account!r}")
     wanted = list(dict.fromkeys(actions))
     if not wanted:
         raise ValueError("a grant needs at least one action")
@@ -1226,7 +1207,6 @@ def record_search(
     now: int | None = None,
 ) -> SearchRecord:
     """Record one Telegram-side search a session ran and how many results it answered with."""
-    _check(kind, _SEARCH_KINDS, "search kind")
     with db.transaction(conn):
         row = conn.execute(
             "INSERT INTO searches(session_id, kind, query, ran_at, results, note) "
@@ -1257,14 +1237,6 @@ def _scan(row: sqlite3.Row) -> ScanCursor:
         directory=bool(row["directory"]),
         scanned_at=row["scanned_at"],
     )
-
-
-def scan_cursor(conn: sqlite3.Connection, session_id: int, chat: ChatKey) -> ScanCursor | None:
-    row = conn.execute(
-        "SELECT * FROM chat_scans WHERE session_id = ? AND scope = ? AND peer_id = ?",
-        (session_id, chat.scope, chat.peer_id),
-    ).fetchone()
-    return None if row is None else _scan(row)
 
 
 def list_scan_cursors(conn: sqlite3.Connection, session_id: int) -> list[ScanCursor]:

@@ -34,6 +34,7 @@ from grepogram.models import (
     Source,
 )
 from grepogram.paths import Paths
+from tests.conftest import scan_cursor
 from tests.fakes import (
     FakeChatlist,
     FakeClient,
@@ -406,7 +407,7 @@ def test_discovery_resumes_from_its_cursor(
     _store(conn, SEED, 1, "t.me/alpha_rent", links=(("link", "@alpha_rent"),))
     session = _start(rdb, conn)
     research.discover_offline(rdb, conn, CFG, session.id)
-    cursor = research_db.scan_cursor(rdb, session.id, ChatKey("", SEED))
+    cursor = scan_cursor(rdb, session.id, ChatKey("", SEED))
     assert cursor is not None
     assert (cursor.depth, cursor.lead_seq, cursor.index_id) == (
         0,
@@ -435,7 +436,7 @@ def test_the_cap_keeps_the_best_corroborated_and_rereads_the_rest_next_time(
 
     assert set(_by_identity(rdb, conn, session)) == {"@strong_chan"}
     assert first.over_cap == 1 and first.truncated
-    assert research_db.scan_cursor(rdb, session.id, ChatKey("", SEED)) is None, "held back"
+    assert scan_cursor(rdb, session.id, ChatKey("", SEED)) is None, "held back"
 
     second = research.discover_offline(rdb, conn, CFG, session.id)
     assert set(_by_identity(rdb, conn, session)) == {"@strong_chan", "@weak_chan"}
@@ -2790,7 +2791,7 @@ def test_a_chat_that_lists_many_chats_is_a_directory_and_says_so_on_its_leads(
         assert sorted(e.via for e in view.evidence) == ["directory", "mention"]
         assert view.corroboration == 1, "the directory path is no second origin"
     assert [e.via for e in found["@one_chat"].evidence] == ["mention"]
-    cursor = research_db.scan_cursor(rdb, session.id, ChatKey("", SEED))
+    cursor = scan_cursor(rdb, session.id, ChatKey("", SEED))
     assert cursor is not None and cursor.directory
 
 
@@ -2846,7 +2847,7 @@ def test_the_session_ceiling_bounds_every_call_together(
 
     assert len(first.new_candidates) == 2 and first.over_cap == 1
     assert first.session_full and not first.truncated
-    assert research_db.scan_cursor(rdb, session.id, ChatKey("", SEED)) is not None, (
+    assert scan_cursor(rdb, session.id, ChatKey("", SEED)) is not None, (
         "nothing held back could ever be proposed: the cursor moves on"
     )
     _store(conn, SEED, 4, "@four_chan", links=(("mention", "@four_chan"),))
@@ -2980,7 +2981,7 @@ async def test_a_run_reads_a_fetched_channel_s_comments_one_hop_further(
 
     assert report.fetched == [candidate.id]
     assert _stored(conn, _marked(group)) == [5]
-    cursor = research_db.scan_cursor(rdb, session.id, ChatKey("", _marked(group)))
+    cursor = scan_cursor(rdb, session.id, ChatKey("", _marked(group)))
     assert cursor is not None and cursor.depth == 1, "registered at the channel's depth"
     assert report.discovery is not None
     (deep_id,) = report.discovery.new_candidates
@@ -3019,7 +3020,7 @@ async def test_a_run_as_another_account_joins_and_adds_sources_as_that_account(
     (source,) = config.load(paths).sources
     assert (source.account, source.chat) == ("work", _marked(FLATS))
     assert db.chat_reach(conn, _marked(FLATS)) == ["work"]
-    cursor = research_db.scan_cursor(rdb, session.id, ChatKey("", _marked(FLATS)))
+    cursor = scan_cursor(rdb, session.id, ChatKey("", _marked(FLATS)))
     assert cursor is not None and cursor.depth == 1
 
 
