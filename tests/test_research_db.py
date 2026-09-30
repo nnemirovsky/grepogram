@@ -495,7 +495,7 @@ def test_exclusions_are_global_and_persistent(paths: Paths) -> None:
     conn = research_db.open_store(paths)
     try:
         later = _session(conn, "b")
-        assert research_db.is_excluded(conn, "@spam")
+        assert research_db.excluded_by(conn, "@spam") == "@spam"
         assert research_db.add_candidate(conn, later, "@spam", "username", 1) is None
         assert research_db.list_candidates(conn, later) == []
         exclusions = research_db.list_exclusions(conn)

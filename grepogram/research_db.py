@@ -1169,13 +1169,6 @@ def void_grants(
 # --- exclusions ------------------------------------------------------------------------------
 
 
-def is_excluded(conn: sqlite3.Connection, identity: str) -> bool:
-    """Whether ``identity`` itself is excluded; :func:`excluded_by` also asks every other
-    spelling the chat is known by."""
-    row = conn.execute("SELECT 1 FROM exclusions WHERE identity = ?", (identity,)).fetchone()
-    return row is not None
-
-
 def _spelled(identity: str) -> tuple[int | None, str | None, str | None]:
     """The peer id, username or invite hash an identity names outright: ``peer:<id>``,
     ``@name``, ``+hash``."""
