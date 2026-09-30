@@ -72,7 +72,10 @@ never change the git identity.
   `grepogram/log.py`); `typer.echo` only in `cli.py`, with `err=True` for diagnostics. `mcp.main()`
   and every tool body redirect stdout to stderr, and `tests/test_mcp.py` asserts stdout stays
   empty.
-- Message text never reaches the log above DEBUG; pass it through `log.redact()`.
+- Message text never reaches the log above DEBUG; pass it through `log.redact()`. Neither does
+  an invite or shared-folder link read out of someone's message (a private way in): a research
+  refusal note is logged at DEBUG (`research._refuse_candidate`), and `mcp.tool_failure` logs a
+  `ResearchError` or `SourceError` by its type above DEBUG, its text at DEBUG.
 - Message mapping (`sync.map_message`) reads raw TL attributes only — `msg.message`, `msg.media`
   (its `webpage.url` included), `msg.reply_to`, `msg.fwd_from` (`from_id`, `channel_post`,
   `date`, `saved_from_peer`, `saved_from_msg_id`), `msg.entities`, `msg.reply_markup`,
