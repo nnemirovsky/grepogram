@@ -1968,6 +1968,15 @@ def flood_warning(seconds: int | None, before: str, then: str) -> str:
     return f"flood wait: Telegram asks to wait {wait} before {before}; {then}"
 
 
+def flood_seconds(exc: errors.FloodError) -> int | None:
+    """How long a flood error asks to wait, or ``None`` when it names no time: a
+    ``FloodWaitError`` carries ``seconds``, while the wider ``FloodError`` family a research
+    pass catches (a plain 420, ``FloodTestPhoneWaitError``…) need not. The one reader of it, so
+    :func:`flood_warning` words both alike."""
+    seconds = getattr(exc, "seconds", None)
+    return int(seconds) if isinstance(seconds, int) else None
+
+
 def _flood_text(seconds: int) -> str:
     return flood_warning(seconds, "more history requests", "run sync again later")
 
@@ -2241,7 +2250,7 @@ async def ask_account(
         log.warning("flood wait of %ss asking who account %s is", exc.seconds, account)
         return AccountAnswer(
             left_out=flood_warning(
-                int(exc.seconds), "asking who the account is", "it sat this pass out"
+                flood_seconds(exc), "asking who the account is", "it sat this pass out"
             )
         )
     except errors.RPCError as exc:

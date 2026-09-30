@@ -1015,7 +1015,7 @@ async def read_pins(
                 )
             ]
         except errors.FloodError as exc:
-            report.flood_wait_s = _flood_seconds(exc)
+            report.flood_wait_s = sync.flood_seconds(exc)
             report.warnings.append(
                 sync.flood_warning(report.flood_wait_s, "reading more pinned posts", "stopped")
             )
@@ -1082,11 +1082,6 @@ UNRESOLVABLE_NOTE = (
     "a private chat known only by its id (a forward origin, a t.me/c link); only a link that "
     "names it (an invite, a username) can open it"
 )
-
-
-def _flood_seconds(exc: errors.FloodError) -> int | None:
-    seconds = getattr(exc, "seconds", None)
-    return int(seconds) if isinstance(seconds, int) else None
 
 
 def entity_facts(entity: Any) -> dict[str, Any]:
@@ -1512,7 +1507,7 @@ async def _probe_pass(
         try:
             outcome = await probe(client, rdb, conn, candidate, now=now)
         except errors.FloodError as exc:
-            report.flood_wait_s = _flood_seconds(exc)
+            report.flood_wait_s = sync.flood_seconds(exc)
             report.warnings.append(
                 sync.flood_warning(report.flood_wait_s, "probing again", "probing stopped")
             )
@@ -1672,7 +1667,7 @@ async def _search_telegram(
             else:
                 await _post_search(client, rdb, conn, cfg, session, report, stamp)
         except errors.FloodError as exc:
-            report.flood_wait_s = _flood_seconds(exc)
+            report.flood_wait_s = sync.flood_seconds(exc)
             report.warnings.append(
                 f"{kind}: {sync.flood_warning(report.flood_wait_s, 'searching', 'search stopped')}"
             )
@@ -2766,7 +2761,9 @@ def _is_member(candidate: Candidate) -> bool:
 
 
 def _flood_note(report: RunReport, exc: errors.FloodError, what: str) -> None:
-    report.warnings.append(sync.flood_warning(_flood_seconds(exc), what, "the run stopped there"))
+    report.warnings.append(
+        sync.flood_warning(sync.flood_seconds(exc), what, "the run stopped there")
+    )
     report.stopped_by = "flood"
 
 
