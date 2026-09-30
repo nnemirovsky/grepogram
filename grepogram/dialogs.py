@@ -310,12 +310,22 @@ class DialogCatalog:
 
         Dialog ids are served from the memo; anything else goes through ``client.get_entity``,
         which raises ``ValueError`` (or a Telethon error) when Telegram does not know the peer.
+        What it answers joins the memo under its marked id, so :meth:`access_hash` knows it too.
         """
         if self._dialogs is None:
             await self._load()
         if isinstance(key, int) and key in self._entities:
             return self._entities[key]
-        return await self._client.get_entity(key)
+        entity = await self._client.get_entity(key)
+        self._entities.setdefault(peer_id(entity), entity)
+        return entity
+
+    def access_hash(self, marked_id: int) -> int | None:
+        """The access hash this account addresses ``marked_id`` by, when an entity it has read
+        (a dialog, or one :meth:`entity` resolved) carries one; ``None`` for a legacy group,
+        which needs none, and for a peer this catalog has not seen."""
+        value = getattr(self._entities.get(marked_id), "access_hash", None)
+        return None if value is None else int(value)
 
     def invalidate(self) -> None:
         """Forget the memo so the next call re-reads dialogs and folders from Telegram."""
