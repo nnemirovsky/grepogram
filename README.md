@@ -461,22 +461,34 @@ grepogram research stop 1            # explores no further; the sources it added
   one: `member` (the account is in it), `cached` (the index already holds it, and through which
   accounts) and `authorized` (what you approved).
 - **approve** grants named candidates named actions: `join`, `request` (an admission request),
-  `fetch` and `add_source`. A bare id means what indexing that chat takes, which is `fetch` and
-  `add_source`, plus `join` or `request` for a private chat the account is not in. The exact
-  text of what will happen is shown first. It gives each chat, the account, and each action in
-  words, including that the chat becomes an ongoing source that regular sync and search will
-  include from then on.
+  `fetch` and `add_source`. `fetch` always comes with `add_source`. A bare id means joining the
+  chat, public or private, and fetching it as an ongoing source (`join,fetch,add_source`). It
+  becomes `request` instead of `join` when the chat's admins approve who joins, and just
+  `fetch,add_source` when the account is already in. To read a public chat without joining it,
+  approve `ID:fetch,add_source` explicitly. The exact text of what will happen is shown first.
+  It gives each chat, the account, and each action in words: how the account gets in, whether
+  comments come along, and that the chat becomes an ongoing source that regular sync and search
+  will include from then on. For a chat that a configured source already covers, it names that
+  source, and the account, horizon and comments the fetch will really use. Titles, usernames and
+  the question are printed on one line with any control or invisible formatting character shown
+  as `�`, so a chat's name cannot forge or hide a line. The question itself is limited to one
+  line of plain text of at most 500 characters.
 - **run** re-checks pending admission requests and joins or requests exactly the approved chats.
   It adds each as a source of the session's account, with history back to the session's horizon
-  (`since_days` before the session started) and comments for a channel. It fetches exactly those
+  (`since_days` before the session started) and comments for a channel. It joins and adds the
+  very chat the probe saw: a joined chat's source names it by its id, and a chat whose username
+  has since moved to another chat is refused rather than followed. It fetches exactly those
   chats through an ordinary sync, bounded by `run_budget_s` and `max_messages_per_run`. If
   another sync is already running, the fetch waits for the next run and the report says so
   (`stopped_by: sync_busy`). Then it reads the new messages one hop deeper and
   only *proposes* what they lead to. A run stopped by a budget or a flood wait resumes on the
   next `run`, and approvals it has not carried out yet stay valid.
 - **skip**, **exclude** and **unexclude** only narrow the session and need no confirmation.
-  Skipping sets candidates aside and voids their approvals. An exclusion is global and
-  permanent: that chat is never proposed again, in any session, until you `unexclude` it.
+  Skipping sets candidates aside and voids their approvals, including the fetch still pending for
+  a chat a run already joined. An exclusion is global and permanent: that chat is never proposed
+  again, in any session, until you `unexclude` it. It covers the chat under every name it is
+  known by (`@name`, its id, an invite link), and it withdraws whatever is still approved for
+  it. A chat found under two names in one session is one candidate.
 - **stop** ends the exploring and voids the approvals no run used. **Every source a run added
   stays**: it is an ordinary source now, synced and searched like the rest. Take one out with
   `grepogram sources rm`, which, like every removal, never leaves the chat on Telegram. Leaving
@@ -502,10 +514,12 @@ name) and `post_search` (its public-post search) are `false`. Even with them on,
 searches only after you approve `global_search` for it. That approval's text says that the
 question is sent to Telegram and may bring back snippets from chats you know nothing about. The
 results are stored as candidates and evidence in `research.db` and never as indexed messages.
-Post search has a small free daily quota, which grepogram asks about before every search. Past
-that quota Telegram charges Stars, and grepogram never pays unless `paid_stars_max` is above `0`
-*and* you approved `paid_search` separately. The price must also fit under `paid_stars_max`, and
-one such approval pays for one search.
+A search sends the session's question and nothing else. Post search has a small free daily
+quota, which grepogram asks about before every search. Past that quota Telegram charges Stars,
+and grepogram never pays unless `paid_stars_max` is above `0` *and* you approved `paid_search`
+separately. The price must also fit under `paid_stars_max`, and one such approval pays for one
+search, even when two searches run at once; it is a grant of its own, so spending it leaves the
+`global_search` approval standing.
 
 Research keeps its sessions, candidates, evidence, approvals and exclusions in `research.db`, a
 file of its own next to `index.db`. The index can be deleted and rebuilt with one sync, and your

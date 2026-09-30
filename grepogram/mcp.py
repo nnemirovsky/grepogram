@@ -1103,7 +1103,8 @@ def research_start(
     max_messages_per_run: int | None = None,
     run_budget_s: int | None = None,
 ) -> ToolResult:
-    """Start a research session (offline): a `question` in the user's words, the indexed chats
+    """Start a research session (offline): a `question` in the user's words (one line of plain
+    text, at most 500 characters — it is shown in every approval), the indexed chats
     to start from (`seeds`, each a chat spec as `search`'s `chats` takes it) and the `account`
     that later joins and fetches (the default one when omitted). The limits default to the
     config's [research] section: `max_depth` hops from a seed, `max_candidates` new candidates
@@ -1189,7 +1190,9 @@ async def research_approve(
 ) -> ToolResult:
     """Ask the user to approve candidates and actions. `items` name them: `ID:join,fetch,…` per
     candidate (actions: `join`, `request` — an admission request —, `fetch`, `add_source`), a
-    bare `ID` for what indexing it takes, `global_search` / `paid_search` for the session.
+    bare `ID` for joining it (or requesting to, where its admins approve joins) and fetching it
+    as an ongoing source — `ID:fetch,add_source` reads a public chat without joining, and only
+    when the user asks for that —, `global_search` / `paid_search` for the session.
 
     The user is shown the exact summary (`summary` in the result: each target, the account,
     membership, every action in words, that an added source is ongoing) and answers in their

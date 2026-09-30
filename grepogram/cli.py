@@ -1658,7 +1658,9 @@ def research_approve(
         list[str],
         typer.Argument(
             help="ID:action,… per candidate (join, request, fetch, add_source; a bare ID "
-            "approves what indexing it takes), or global_search / paid_search for the session."
+            "approves joining it, or asking to, and fetching it as a source; ID:fetch,add_source "
+            "reads a public chat without joining), or global_search / paid_search for the "
+            "session."
         ),
     ],
 ) -> None:

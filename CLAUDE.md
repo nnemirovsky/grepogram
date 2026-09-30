@@ -558,6 +558,33 @@ never change the git identity.
   either, syncs through `sync_all(…, recut=False, only=…)`, and discovery over what it stored
   only proposes. Sources a run added are ordinary sources and survive `stop`, which voids the
   unconsumed grants and nothing else.
+- The approval text is the consent, so it says what the run will really do and nothing anyone
+  else wrote can bend it. Every value someone else chose — the question, titles, usernames,
+  folder titles — goes through `research.shown` (control, format and separator characters as
+  U+FFFD, one line) and `_quoted`, and `start_session` refuses a question over
+  `QUESTION_MAX_CHARS` or holding such characters. A fetch through a source that already covers
+  the chat names that source, its account, `since` and comments (`_covering_source`); an
+  `add_source` a configured source already satisfies says it is reused; comments are disclosed
+  on both lines, and only a `type == "channel"` gets them. A bare candidate id is
+  `join,fetch,add_source` (`request` where `request_needed`, which a probe also reads from
+  `Channel.join_request`), public chats included; reading one without joining is an explicit
+  `ID:fetch,add_source`. A run acts on the peer the probe saw: a join goes by the stored
+  peer id and access hash, a username is resolved only without them and must still name that
+  peer (`_OtherChat`), `_mark_joined` never overwrites `peer_id` from a join answer and fails the
+  candidate when Telegram answered with another chat, a member's source names the chat by id,
+  and a public chat read without joining is re-resolved before it is added (`_confirm_public`).
+  `research.grant` validates and writes in one `research.db` transaction; each session action is
+  its own grant row, and a paid search pays only after `consume_grant` (one conditional
+  `UPDATE`) succeeded, so one approval never pays twice. `global_search` sends the session's
+  question and refuses any other query.
+- A candidate is a chat, not a spelling. `research_db.candidate_for` finds the session's row by
+  identity, peer id, username or invite hash, `add_candidate` returns that row rather than a
+  second one, and a probe that ties two rows to one chat folds the undecided one into the other
+  (`research._reconcile` → `research_db.merge_candidate`, never a row with a grant or a decided
+  status). An exclusion names one spelling and covers every other (`research_db.excluded_by`,
+  `_covered`): it moves undecided candidates to `excluded` and voids the live grants of every
+  candidate of the chat, joined or waiting ones included, and `research.authorized` refuses an
+  excluded chat whatever its grants say; `skip` takes joined and waiting candidates too.
 - Files end with a single newline; no trailing blank lines.
 
 ## Environment variables
