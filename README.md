@@ -436,7 +436,7 @@ A session, end to end:
 grepogram research start "where do people compare bank fees?" -s "folder:Argentina" -s @arg_chat
 grepogram research discover 1        # leads in the seeds, then a metadata probe of the best ones
 grepogram research candidates 1      # ranked, with the evidence behind each
-grepogram research approve 1 4 9:join,fetch,add_source   # asks you, on this terminal
+grepogram research approve 1 4 9:join,fetch,add_source   # asks you on this terminal; type the code back
 grepogram research run 1             # carries out exactly that, within the session's budgets
 grepogram research status 1
 grepogram research stop 1            # explores no further; the sources it added stay
@@ -484,11 +484,15 @@ grepogram research stop 1            # explores no further; the sources it added
 
 **Consent is a human's, and only two things can give it.** On a terminal,
 `grepogram research approve` writes the summary to the controlling terminal and reads the answer
-there, never from stdin. A pipe or an agent running the command therefore cannot answer for you,
-without a terminal it refuses, and it has no `--yes`. Through MCP, `research_approve` shows the
-same summary through the client's elicitation dialog. A client without elicitation is answered
-with the exact `grepogram research approve …` command to run instead. No tool argument stands in
-for either. An approval covers the chats it names and nothing found inside them: approving a
+there, never from stdin, and you confirm by typing back a random code it shows. A pipe or a
+blind `yes` cannot answer, without a terminal it refuses, and it has no `--yes`. That check holds
+against an agent that only has the MCP tools. It does not hold against an agent that can run
+shell commands: such an agent can give the command a terminal of its own and read the code off
+it. Run `research approve` yourself, and do not let an agent run it for you. Through MCP,
+`research_approve` shows the same summary through the client's elicitation dialog, which only
+you can answer. A client without elicitation is answered with the exact
+`grepogram research approve …` command for you to type yourself. No tool argument stands in for
+either. An approval covers the chats it names and nothing found inside them: approving a
 chat approves none of the chats its messages lead to, and a shared folder is approved chat by
 chat, never as a whole. A later run reuses an approval until its work is done or the session
 stops, so nothing asks twice for work you already approved.
@@ -529,7 +533,7 @@ advisory; the data next to them is valid.
 | `research_start` | `question`, `seeds: list[str]`, `account=null`, `max_depth`, `max_candidates`, `probe_limit`, `since_days`, `max_messages_per_run`, `run_budget_s` (each `null` = the `[research]` default) | the session, as `grepogram research start --json` prints it: `id`, `question`, `account`, `seeds` (chat ids), `limits`, `state`, `progress`, `horizon` (the date the sources a run adds start from) |
 | `research_discover` | `session_id`, `offline=false` | the discover report: `leads`, `new_candidates`, `updated_candidates`, what was left out (`beyond_depth`, `excluded`, `over_cap`), `probe` (read-only metadata of the best candidates, as the session's account) and `searches` (the global searches the user approved); `offline` asks Telegram nothing |
 | `research_candidates` | `session_id`, `status: list[str] \| null` | `{session_id, question, account, state, candidates}`, best corroborated first; each candidate keeps three facts apart — `member`, `cached` (with `cached_accounts`) and `authorized` — next to `corroboration` (distinct origins: forwards of one post count once), `overlap` and every piece of `evidence` |
-| `research_approve` | `session_id`, `items: list[str]` (`ID:join,fetch,…`, a bare `ID`, `global_search`, `paid_search`) | asks the user through MCP elicitation with the exact approval `summary`; `{approved: true, grants, …}` only when they accept and tick approve, `{approved: false, answer, …}` otherwise; a client without elicitation gets `error` and a `hint` naming the `grepogram research approve …` command to run in a terminal |
+| `research_approve` | `session_id`, `items: list[str]` (`ID:join,fetch,…`, a bare `ID`, `global_search`, `paid_search`) | asks the user through MCP elicitation with the exact approval `summary`; `{approved: true, grants, …}` only when they accept and tick approve, `{approved: false, answer, …}` otherwise; a client without elicitation gets `error` and a `hint` naming the `grepogram research approve …` command for the user to type in their own terminal |
 | `research_skip` | `session_id`, `candidate_ids: list[int]` | `{session_id, skipped}`; approvals they held are voided — narrowing needs no approval |
 | `research_exclude` | `targets: list[str]`, `session_id=null`, `reason=null` | `{excluded, hint}`: never proposed again in any session; lifting an exclusion is `grepogram research unexclude`, in a terminal |
 | `research_run` | `session_id` | the run report as `grepogram research run --json` prints it (`admitted`, `joined`, `pending_admission`, `sources_added`, `fetched`, `partial`, `unavailable`, `failed`, `messages`, `stopped_by`, `discovery`, `warnings`) plus `accounts_skipped` |
@@ -548,8 +552,9 @@ Consent is the user's alone and no tool argument can stand in for it: `research_
 the user the same summary `grepogram research approve` prints on a terminal, through the MCP
 client's elicitation, and grants only on an accepted answer whose `approve` box is ticked —
 a decline, a cancel, an unticked box or a failed request grants nothing. A client that cannot
-elicit is answered with the exact terminal command instead, which asks on the controlling
-terminal and nowhere else.
+elicit is answered with the exact terminal command instead, for the user to type in their own
+terminal; it asks on the controlling terminal and nowhere else, and an agent must never run it
+for them.
 
 Several CLI commands have **no tool here, deliberately**: `sources prune` and `prune-deleted`
 delete indexed history, `extract` is a long flood-exposed network pass, `import` reads a

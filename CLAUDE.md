@@ -177,8 +177,15 @@ never change the git identity.
   left; the MCP `sync` reports the skipped ones in `accounts_skipped`.
 - Every confirmation — `accounts rm`, `leave`, `research approve` — is read from the controlling
   terminal (`cli._terminal` over `/dev/tty`), never stdin, and refused without one
-  (`cli.NoTerminal`); there is no `--yes`. The autouse `no_terminal` fixture runs the suite as if
-  there were no terminal, and a test that answers installs its own.
+  (`cli.NoTerminal`); there is no `--yes`. The yes is a random code the question shows, typed
+  back (`cli._ask`), never `y`: a pipe or a blind `yes` cannot guess it. `cli._open_terminal`
+  opens the tty unbuffered in binary and wraps it for text, because a text-mode `r+` open wants
+  a seekable file and fails on every real terminal. None of this stops an agent with a shell,
+  which can give the command a pty of its own and read the code: the terminal check holds
+  against an MCP-only agent, and every text that names the command says the user types it
+  themselves — never claim more. The autouse `no_terminal` fixture points `cli.TERMINAL` at a
+  path nothing opens, so the real opener runs and refuses; a test that answers installs its own
+  terminal, and `tests/test_cli.py` drives the real opener on an `os.openpty()` pair.
 - Every edit of `config.toml` is a read-modify-write under `config.ConfigLock` (a blocking flock
   on `config.lock` next to the file, held for milliseconds): the CLI goes through
   `config.update(paths, change)` or takes the lock explicitly inside its `SyncLock`, and
@@ -528,11 +535,11 @@ never change the git identity.
   (`research.require_enabled`), and ordinary `search` never widens what it reads.
 - **No parameter stands in for consent.** A grant comes from exactly two places: `grepogram
   research approve`, which writes `research.approval_summary` to the controlling terminal and
-  reads the answer there, and the MCP `research_approve`, which shows the same summary through
-  `ctx.elicit` and grants only on an accepted answer whose strict-boolean `approve` is `true`.
-  Decline, cancel, an unticked box, a client without form elicitation and any failure of the
-  request grant nothing, and the answer's hint is the terminal command
-  (`research.approve_command`). `research_db.add_grant` is the only grant writer and takes `via`
+  reads the typed-back code there, and the MCP `research_approve`, which shows the same summary
+  through `ctx.elicit` and grants only on an accepted answer whose strict-boolean `approve` is
+  `true`. Decline, cancel, an unticked box, a client without form elicitation and any failure of
+  the request grant nothing, and the answer's hint is the terminal command
+  (`research.approve_command`), worded as one the user types in their own terminal themselves. `research_db.add_grant` is the only grant writer and takes `via`
   keyword-only with no default, `grants.via` is `CHECK (via IN ('elicitation', 'cli'))`, and
   `research.grant` rebuilds the summary and grants nothing unless it equals the text the human
   saw. Never add an `approve` / `confirm` / `yes` argument to a tool or a `--yes` to the CLI;

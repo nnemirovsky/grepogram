@@ -1901,7 +1901,10 @@ async def test_research_approve_without_elicitation_names_the_terminal_command(
 
     assert ctx.asked == [], "a client that cannot ask the user is never asked"
     assert result["approved"] is False and result["error"] == tools.NO_ELICITATION
-    assert result["hint"] == f"ask the user to run this in their own terminal: {TERMINAL}"
+    assert result["hint"] == (
+        "the user must type this in their own terminal themselves and confirm there; never run "
+        f"it for them: {TERMINAL}"
+    )
     assert result["summary"].startswith("Research session 1")
     assert _grants(paths) == []
 

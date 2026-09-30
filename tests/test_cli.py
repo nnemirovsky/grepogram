@@ -1,6 +1,8 @@
 import json
 import logging
+import os
 import sys
+import threading
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any, get_args
@@ -1050,10 +1052,21 @@ class Terminal:
         self.closed = True
 
 
+CODE = "k7m2p"
+"""The confirmation code every fake terminal is shown; typing it back is the only yes."""
+YES = f"{CODE}\n"
+
+
 def _answer(monkeypatch: pytest.MonkeyPatch, answer: str) -> Terminal:
     terminal = Terminal(answer)
     monkeypatch.setattr(cli, "_open_terminal", lambda: terminal)
+    monkeypatch.setattr(cli, "_confirmation_code", lambda: CODE)
     return terminal
+
+
+def _question(text: str) -> str:
+    """How :func:`cli._ask` puts ``text`` on the terminal."""
+    return f"{text}\ntype {CODE} to confirm, anything else cancels: "
 
 
 def _two_account_home(tmp_home: Path, sources_toml: str = "") -> Paths:
@@ -1389,10 +1402,10 @@ def test_accounts_rm_keeps_shared_chats_and_deletes_the_accounts_own(
     bob = db.get_chat_by_peer(conn, 2, WORK)
     conn.close()
     assert bob is not None
-    terminal = _answer(monkeypatch, "y\n")
+    terminal = _answer(monkeypatch, YES)
     result = runner.invoke(cli.app, ["accounts", "rm", WORK])
     assert result.exit_code == 0, result.output
-    assert terminal.asked == ["remove account work? [y/N]: "] and terminal.closed
+    assert terminal.asked == [_question("remove account work?")] and terminal.closed
     assert "remove 2 sources: work/chat:@news, work/chat:2" in result.stdout
     assert "removed account work (1 chats deleted)" in result.stdout
     loaded = config.load(paths)
@@ -1417,7 +1430,7 @@ def test_accounts_rm_moves_a_shared_chat_to_the_account_that_stays(
     """Removing the default account, whose source is the channel's primary, keeps the channel
     under the work account's source."""
     paths = _synced_two_accounts(tmp_home, monkeypatch)
-    _answer(monkeypatch, "yes\n")
+    _answer(monkeypatch, YES)
     result = runner.invoke(cli.app, ["accounts", "rm", DEFAULT_ACCOUNT])
     assert result.exit_code == 0, result.output
     assert "removed account default (0 chats deleted, 1 kept under another source)" in (
@@ -1451,7 +1464,7 @@ def test_accounts_rm_refuses_the_only_account_and_an_unknown_one(
     tmp_home: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     _signed_in(tmp_home)
-    _answer(monkeypatch, "y\n")
+    _answer(monkeypatch, YES)
     only = runner.invoke(cli.app, ["accounts", "rm", DEFAULT_ACCOUNT])
     assert only.exit_code == 1
     assert "the default account is the only account" in only.stderr
@@ -1466,7 +1479,7 @@ def test_accounts_rm_refuses_while_a_sync_runs(
 ) -> None:
     paths = _synced_two_accounts(tmp_home, monkeypatch)
     before = paths.config_file.read_text()
-    _answer(monkeypatch, "y\n")
+    _answer(monkeypatch, YES)
     with sync.SyncLock(paths):
         result = runner.invoke(cli.app, ["accounts", "rm", WORK])
     assert result.exit_code == 1
@@ -1515,10 +1528,10 @@ def test_leave_leaves_a_channel_and_keeps_its_source_and_history(
     indexed = _chats(paths)
     clients = _leave_clients()
     _per_account(monkeypatch, clients)
-    terminal = _answer(monkeypatch, "y\n")
+    terminal = _answer(monkeypatch, YES)
     result = runner.invoke(cli.app, ["leave", "@news", "--account", WORK])
     assert result.exit_code == 0, result.output
-    assert terminal.asked == [f"leave channel 'News' (id {NEWS_PEER}) as account work? [y/N]: "]
+    assert terminal.asked == [_question(f"leave channel 'News' (id {NEWS_PEER}) as account work?")]
     assert f"left channel 'News' (id {NEWS_PEER}) as account work" in result.stdout
     [request] = _leaves(clients[WORK])
     assert isinstance(request, functions.channels.LeaveChannelRequest)
@@ -1535,7 +1548,7 @@ def test_leave_a_legacy_group_removes_the_account_from_it(
     _two_account_home(tmp_home)
     clients = _leave_clients()
     _per_account(monkeypatch, clients)
-    _answer(monkeypatch, "y\n")
+    _answer(monkeypatch, YES)
     result = runner.invoke(cli.app, ["leave", "-a", WORK, "--", str(CLUB_PEER)])
     assert result.exit_code == 0, result.output
     [request] = _leaves(clients[WORK])
@@ -1659,7 +1672,7 @@ def test_research_loop_through_the_cli(tmp_home: Path, monkeypatch: pytest.Monke
     assert "0 messages stored" in stopped.stdout, "nothing approved, nothing fetched"
     assert config.load(paths).sources == []
 
-    terminal = _answer(monkeypatch, "y\n")
+    terminal = _answer(monkeypatch, YES)
     conn, rdb = _stores(paths)
     try:
         item = ApprovalItem(candidate_id=1, actions=("fetch", "add_source"))
@@ -1671,7 +1684,7 @@ def test_research_loop_through_the_cli(tmp_home: Path, monkeypatch: pytest.Monke
     approved = runner.invoke(cli.app, ["research", "approve", str(session_id), "1"])
     assert approved.exit_code == 0, approved.output
     assert terminal.asked[0] == f"{summary}\n\n", "the terminal shows exactly the summary"
-    assert terminal.asked[1] == "approve all of the above? [y/N]: "
+    assert terminal.asked[1] == _question("approve all of the above?")
     assert "approved for candidate 1: fetch, add_source" in approved.stdout
 
     status = runner.invoke(cli.app, ["research", "status", str(session_id)])
@@ -1734,7 +1747,10 @@ def test_research_approve_refuses_without_a_terminal(
 
     assert result.exit_code == 1
     assert "asks for a confirmation on a terminal, and there is none" in result.stderr
-    assert "run `grepogram research approve 1 1:fetch,add_source` yourself" in result.stderr
+    assert (
+        "the user must run `grepogram research approve 1 1:fetch,add_source` in their own terminal"
+        in result.stderr
+    )
     assert _grants(paths) == [], "stdin never answers for the human"
 
 
@@ -1751,11 +1767,88 @@ def test_research_approve_grants_nothing_on_a_no(
     assert _grants(paths) == []
 
 
+def test_research_approve_takes_only_the_code_it_showed_as_a_yes(
+    tmp_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    paths = _discovered_home(tmp_home, monkeypatch)
+    for blind in ("y\n", "yes\n", "\n", f"{CODE}x\n", ""):
+        _answer(monkeypatch, blind)
+        result = runner.invoke(cli.app, ["research", "approve", "1", "1:fetch,add_source"])
+        assert result.exit_code == 0, result.output
+        assert result.stdout.strip() == "nothing approved", blind
+    assert _grants(paths) == []
+
+    _answer(monkeypatch, f"  {CODE.upper()}  \n")
+    typed = runner.invoke(cli.app, ["research", "approve", "1", "1:fetch,add_source"])
+    assert typed.exit_code == 0, typed.output
+    assert len(_grants(paths)) == 1, "the code typed back, in any case, is the yes"
+
+
+def test_the_confirmation_code_is_fresh_every_time() -> None:
+    codes = {cli._confirmation_code() for _ in range(20)}
+    assert len(codes) > 1
+    for code in codes:
+        assert len(code) == cli.CODE_LENGTH and set(code) <= set(cli.CODE_ALPHABET)
+
+
+def test_the_real_terminal_is_asked_on_dev_tty_and_never_stdin(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The opener the rest of the suite replaces, on a real pseudo-terminal: a text-mode
+    ``r+`` open fails on every terminal (it is not seekable), which would refuse every
+    confirmation; this is what catches that."""
+    monkeypatch.undo()  # the autouse fixture's unopenable path, to see the real one
+    assert cli.TERMINAL == "/dev/tty"
+
+    class NoStdin:
+        def __getattr__(self, name: str) -> Any:
+            raise AssertionError(f"stdin was read ({name})")
+
+    master, slave = os.openpty()
+    shown: list[bytes] = []
+
+    def human() -> None:
+        """Read what the terminal shows and type back the code it asks for."""
+        seen = b""
+        while b"cancels: " not in seen:
+            chunk = os.read(master, 1024)
+            if not chunk:
+                return
+            seen += chunk
+        shown.append(seen)
+        code = seen.split(b"type ", 1)[1].split(b" ", 1)[0]
+        os.write(master, code + b"\n")
+
+    try:
+        monkeypatch.setattr(cli, "TERMINAL", os.ttyname(slave))
+        monkeypatch.setattr(sys, "stdin", NoStdin())
+        answering = threading.Thread(target=human, daemon=True)
+        answering.start()
+        with cli._terminal("leave") as tty:
+            confirmed = cli._ask(tty, "leave channel 'News'?")
+        answering.join(timeout=5)
+        assert confirmed, "the code typed on the terminal is a yes"
+        assert b"leave channel 'News'?" in shown[0]
+
+        os.write(master, b"y\n")
+        with cli._terminal("leave") as tty:
+            assert not cli._ask(tty, "leave channel 'News'?"), "a y typed ahead is no code"
+    finally:
+        os.close(master)
+        os.close(slave)
+
+    monkeypatch.setattr(cli, "TERMINAL", "/dev/null/not-a-terminal")
+    with pytest.raises(cli.NoTerminal) as refused:
+        with cli._terminal("leave"):
+            pass
+    assert isinstance(refused.value.__cause__, OSError)
+
+
 def test_research_approve_records_the_cli_channel_and_the_text_shown(
     tmp_home: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     paths = _discovered_home(tmp_home, monkeypatch)
-    terminal = _answer(monkeypatch, "yes\n")
+    terminal = _answer(monkeypatch, YES)
 
     result = runner.invoke(cli.app, ["research", "approve", "1", "1:fetch,add_source"])
 
@@ -1780,7 +1873,7 @@ def test_research_approve_refuses_an_invalid_approval_before_asking(
     tmp_home: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     paths = _discovered_home(tmp_home, monkeypatch)
-    terminal = _answer(monkeypatch, "y\n")
+    terminal = _answer(monkeypatch, YES)
 
     fetch_only = runner.invoke(cli.app, ["research", "approve", "1", "1:fetch"])
     malformed = runner.invoke(cli.app, ["research", "approve", "1", "flats"])

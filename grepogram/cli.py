@@ -13,13 +13,17 @@ add`` and ``leave`` take ``--account`` (``default`` when omitted, the account a 
 ``[[accounts]]`` has always had), while ``sync``, ``extract``, ``prune-deleted`` and ``sources
 prune`` use every signed-in account at once. ``accounts rm`` and ``leave`` change things a
 config edit cannot undo, so they ask on the controlling terminal (:func:`_terminal`) and refuse
-without one; no option answers for the human.
+without one; the human confirms by typing back a random code the question shows
+(:func:`_ask`), and no option answers for them.
 ``research`` drives :mod:`grepogram.research` over ``research.db`` and refuses every command while
 ``[research] enabled`` is false. ``research approve`` is the CLI's consent channel: it writes the
 exact :func:`~grepogram.research.approval_summary` to the controlling terminal and reads the answer
 there, so the text the grant records is the text the human read; with no terminal it refuses, and
-no option approves in its place. Its ``--json`` readers print the documents the MCP research
-tools answer with (``research.*_document``).
+no option approves in its place. What that guards against is an MCP-only agent, a pipe and a
+blind ``yes``: an agent that can run shell commands can give the command a terminal of its own
+and read the code off it, so the CLI's confirmation relies on the human being the one who runs
+it. Its ``--json`` readers print the documents the MCP research tools answer with
+(``research.*_document``).
 One search spans every account's chats: ``search --account`` scopes it to what an account reaches
 (a scope, not isolation) and every hit and message names the accounts its chat came through.
 
@@ -34,8 +38,10 @@ import contextlib
 import dataclasses
 import datetime as dt
 import functools
+import io
 import json
 import logging
+import secrets
 import sqlite3
 import time
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
@@ -108,8 +114,12 @@ app.add_typer(accounts_app, name="accounts")
 app.add_typer(research_app, name="research")
 
 TERMINAL = "/dev/tty"
-"""Where :func:`_terminal` asks a confirmation: the controlling terminal, never stdin, so a
-pipe or an agent's tool call cannot answer for the human."""
+"""Where :func:`_terminal` asks a confirmation: the controlling terminal, never stdin, so
+nothing piped into the command answers for the human."""
+CODE_ALPHABET = "abcdefghjkmnpqrstuvwxyz23456789"
+"""What a confirmation code is drawn from: lowercase letters and digits a human cannot misread
+for one another (no ``i``, ``l``, ``o``, ``0``, ``1``)."""
+CODE_LENGTH = 5
 
 _ACCOUNT_HELP = "The account to act as, as `grepogram accounts ls` lists it (default: default)."
 AccountOption = Annotated[str | None, typer.Option("--account", "-a", help=_ACCOUNT_HELP)]
@@ -119,7 +129,7 @@ class NoTerminal(Exception):
     """A command that must ask a human first has no terminal to ask on."""
 
     def __init__(self, command: str) -> None:
-        self.hint = f"run `grepogram {command}` yourself in a terminal"
+        self.hint = f"the user must run `grepogram {command}` in their own terminal themselves"
         super().__init__(f"{command} asks for a confirmation on a terminal, and there is none")
 
 
@@ -1654,8 +1664,9 @@ def research_approve(
 ) -> None:
     """Approve named candidates and actions, after reading exactly what they do.
 
-    The summary is shown and the answer read on the controlling terminal, never stdin, so no
-    pipe and no agent can answer for you; without a terminal this refuses. Approving a chat
+    The summary is shown and the answer read on the controlling terminal, never stdin: you
+    confirm by typing back the code it shows, and without a terminal this refuses. Run it
+    yourself — an agent with a shell could give it a terminal of its own. Approving a chat
     approves nothing found inside it.
     """
     with _research_store() as (_, cfg, conn, rdb):
@@ -1944,16 +1955,28 @@ def _known_account(cfg: Config, name: str) -> str:
 
 
 def _open_terminal() -> TextIO:
-    """The controlling terminal, read and written; ``OSError`` when the process has none."""
-    return open(TERMINAL, "r+", encoding="utf-8")
+    """The controlling terminal, read and written; ``OSError`` when the process has none.
+
+    Opened unbuffered in binary and wrapped for text: a text-mode ``r+`` open wants a seekable
+    file, which a terminal is not, and would fail on every real one.
+    """
+    raw = open(TERMINAL, "r+b", buffering=0)  # noqa: SIM115 - closed with the wrapper
+    try:
+        return io.TextIOWrapper(raw, encoding="utf-8", errors="replace", write_through=True)
+    except BaseException:
+        raw.close()
+        raise
 
 
 @contextlib.contextmanager
 def _terminal(command: str) -> Iterator[TextIO]:
     """The terminal a confirmation of ``command`` is asked on, or :class:`NoTerminal`.
 
-    It is the controlling terminal and never stdin, so nothing piped into the command and no
-    tool call of an agent can answer; there is no option that skips the question either.
+    It is the controlling terminal and never stdin, so nothing piped into the command answers,
+    and there is no option that skips the question. It does not stop an agent that can run
+    shell commands, which can give the command a terminal of its own: the confirmation holds
+    against an MCP-only agent, a pipe and a blind ``yes``, and otherwise relies on the human
+    being the one who runs the command.
     """
     try:
         tty = _open_terminal()
@@ -1963,11 +1986,21 @@ def _terminal(command: str) -> Iterator[TextIO]:
         yield tty
 
 
+def _confirmation_code() -> str:
+    """A fresh random code a confirmation asks the human to type back."""
+    return "".join(secrets.choice(CODE_ALPHABET) for _ in range(CODE_LENGTH))
+
+
 def _ask(tty: TextIO, question: str) -> bool:
-    """Ask ``question`` on ``tty``; only ``y`` or ``yes`` is a yes."""
-    tty.write(f"{question} [y/N]: ")
+    """Ask ``question`` on ``tty``; a yes is the random code it shows typed back, nothing else.
+
+    A code rather than ``y``: a ``yes |`` or an answer written into the command blindly, before
+    the question was ever shown, cannot guess it.
+    """
+    code = _confirmation_code()
+    tty.write(f"{question}\ntype {code} to confirm, anything else cancels: ")
     tty.flush()
-    return tty.readline().strip().casefold() in ("y", "yes")
+    return tty.readline().strip().casefold() == code
 
 
 def _load_config(paths: Paths) -> Config:

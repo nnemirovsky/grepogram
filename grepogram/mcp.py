@@ -119,7 +119,8 @@ chats and the `account` that will join and fetch (what a run adds is reached thr
 three separate facts — `member`, `cached` (and through which accounts), `authorized`; tell the \
 user what was found and why, and ask which to approve; `research_approve` shows the user the \
 exact summary and only their own confirmation grants anything — when it answers with a `hint` \
-naming a terminal command, hand the user that command unchanged and never run it for them; \
+naming a terminal command, hand the user that command unchanged for them to type in their own \
+terminal, and never run it for them, not even through a shell tool; \
 `research_run`; analyse what it fetched with `search`, `thread` and `context`; `research_stop` \
 when done (the sources stay). Approving a chat approves nothing found inside it. \
 `research_skip` and `research_exclude` only narrow and need no approval.
@@ -1196,8 +1197,9 @@ async def research_approve(
     in for it. `approved=true` comes with `grants`; `approved=false` means nothing was granted
     (`answer` says whether the user declined or cancelled). A client that cannot ask the user
     answers with `error` and a `hint` naming the terminal command that asks instead — give the
-    user that command as it is; it only works on their own terminal. Approving a chat approves
-    nothing found inside it. Next: `research_run`.
+    user that command as it is for them to type in their own terminal, and never run it
+    yourself, through a shell tool or otherwise: the confirmation is theirs. Approving a chat
+    approves nothing found inside it. Next: `research_run`.
     """
     state = _app()
     cfg = state.config()
@@ -1211,7 +1213,10 @@ async def research_approve(
         "summary": summary,
         "approved": False,
     }
-    terminal_hint = f"ask the user to run this in their own terminal: {command}"
+    terminal_hint = (
+        "the user must type this in their own terminal themselves and confirm there; never run "
+        f"it for them: {command}"
+    )
     if not _can_elicit(ctx):
         return {**asked, "error": NO_ELICITATION, "hint": terminal_hint}
     try:

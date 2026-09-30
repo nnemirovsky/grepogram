@@ -33,15 +33,12 @@ def plain_cli_output(monkeypatch: pytest.MonkeyPatch) -> None:
 def no_terminal(monkeypatch: pytest.MonkeyPatch) -> None:
     """No test ever asks the developer's real terminal.
 
-    ``accounts rm`` and ``leave`` confirm on the controlling terminal (``cli._open_terminal``),
-    which a local ``pytest`` run has; the suite runs as if there were none, and a test that
-    answers a confirmation installs its own terminal over this one.
+    ``accounts rm``, ``leave`` and ``research approve`` confirm on the controlling terminal
+    (``cli.TERMINAL``), which a local ``pytest`` run has; the suite points it at a path nothing
+    can open, so the real opener runs and refuses as it does without a terminal. A test that
+    answers a confirmation installs its own terminal (``cli._open_terminal``) over this one.
     """
-
-    def refuse() -> None:
-        raise OSError("no terminal in the test suite")
-
-    monkeypatch.setattr("grepogram.cli._open_terminal", refuse)
+    monkeypatch.setattr("grepogram.cli.TERMINAL", "/dev/null/no-terminal-in-the-test-suite")
 
 
 @pytest.fixture(autouse=True)
