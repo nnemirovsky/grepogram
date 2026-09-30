@@ -24,6 +24,7 @@ from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Mappin
 from contextlib import AsyncExitStack, asynccontextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import NoReturn
 
 from telethon import TelegramClient, errors, utils
 from telethon.sessions import MemorySession, SQLiteSession
@@ -200,6 +201,21 @@ def ensure_session_mode(paths: Paths, account: str = DEFAULT_ACCOUNT) -> Path:
     if mode != PRIVATE_FILE_MODE:
         path.chmod(PRIVATE_FILE_MODE)
     return path
+
+
+def reraise_unauthorized(exc: Exception, account: str) -> NoReturn:
+    """Raise what a rejected session inside a multi-account pass becomes: :class:`AuthRequired`
+    naming ``account`` for a dead session, and the error itself for any other
+    ``UnauthorizedError``.
+
+    Several clients run inside one :func:`connected` block each, and an error that unwinds
+    through all of them is claimed by whichever block it leaves first — the last account
+    entered, not the one Telegram rejected. Only the code that made the request knows whose
+    session it was, so it names it here.
+    """
+    if isinstance(exc, AUTH_ERRORS):
+        raise AuthRequired(f"Telegram rejected the session: {exc}", account) from exc
+    raise exc
 
 
 @asynccontextmanager

@@ -476,10 +476,16 @@ class FakeClient:
         ]
 
     async def get_entity(self, key: Any) -> Any:
+        """The entity behind a username, a marked id or a peer. A bare id is held to what
+        Telethon can do with it (:meth:`_require_resolved`): only a peer the session already
+        knows — from a dialog, an answer, or an access hash seeded into it — resolves; a
+        username is looked up the way ``contacts.resolveUsername`` would."""
         self.calls.append(("get_entity", {"key": key}))
         error = self.entity_errors.get(key) if isinstance(key, int | str) else None
         if error is not None:
             raise error
+        if isinstance(key, int):
+            self._require_resolved(key)
         entity = self._find_entity(key)
         if entity is None:
             raise ValueError(f"Could not find the input entity for {key!r}")
@@ -937,7 +943,9 @@ class FakeClient:
 
         This is what ``FakeClient`` used to be more permissive than the real client about, and
         it is why nine review rounds passed over a ``grepogram extract`` that resolved no chat
-        at all on a real account.
+        at all on a real account — and, while ``get_entity(<id>)`` still answered for any peer
+        of the world, why a sync whose primary account could not resolve a group looked as if it
+        fell back to another account when it silently moved the group's primary source instead.
         """
         if not self.strict_entities or marked_id in self.resolved:
             return

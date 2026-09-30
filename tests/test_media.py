@@ -1548,6 +1548,52 @@ async def test_a_flood_wait_stops_one_account_while_the_other_reads_on(
     assert _states(conn) == {1: db.MEDIA_PENDING, 7: db.MEDIA_EXTRACTED}
 
 
+async def test_a_flood_wait_on_a_shared_chat_moves_it_to_the_next_account(
+    conn: sqlite3.Connection, scratch: Path
+) -> None:
+    """A flood wait is about the account, not the chat: the club the default account is
+    flood-limited on is read through the work account, which reaches it too."""
+    _club(conn)
+    world = FakeWorld(entities=[ALICE, CLUB], messages={CLUB_ID: [_pdf_message(CLUB_ID, 5)]})
+    downloads = {(CLUB_ID, 5): SAMPLE_PDF.read_bytes()}
+    flood = errors.FloodWaitError(request=None, capture=600)
+    home = world.client(
+        DEFAULT_ACCOUNT, members=[CLUB], downloads=downloads, failures={CLUB_ID: flood}
+    )
+    work = world.client(WORK, members=[CLUB], downloads=downloads)
+
+    report = await media.run(conn, {DEFAULT_ACCOUNT: home, WORK: work}, _cfg(), SyncBudget())
+
+    assert report.extracted == 1 and _states(conn) == {5: db.MEDIA_EXTRACTED}
+    assert report.warnings == [
+        f"account {DEFAULT_ACCOUNT}: flood wait: Telegram asks to wait 600s before more media "
+        "requests; run `grepogram extract` again later"
+    ]
+
+
+async def test_a_flood_wait_on_the_fallback_account_leaves_the_chat_queued(
+    conn: sqlite3.Connection, scratch: Path
+) -> None:
+    """The default account is refused the club and the work account, asked in its place, is
+    flood-limited: nothing is read, the media stays queued, and each account's warning is its
+    own."""
+    _club(conn)
+    world = FakeWorld(entities=[ALICE, CLUB], messages={CLUB_ID: [_pdf_message(CLUB_ID, 5)]})
+    flood = errors.FloodWaitError(request=None, capture=600)
+    home = world.client(DEFAULT_ACCOUNT, members=[])
+    work = world.client(WORK, members=[CLUB], failures={CLUB_ID: flood})
+
+    report = await media.run(conn, {DEFAULT_ACCOUNT: home, WORK: work}, _cfg(), SyncBudget())
+
+    assert report.extracted == 0 and report.remaining == 1
+    assert report.warnings[0] == (
+        f"account {WORK}: flood wait: Telegram asks to wait 600s before more media requests; "
+        "run `grepogram extract` again later"
+    )
+    assert report.warnings[1].startswith(f"account {DEFAULT_ACCOUNT}: chat {CLUB_ID}")
+    assert _states(conn) == {5: db.MEDIA_PENDING}
+
+
 async def test_a_rejected_session_names_its_account(
     conn: sqlite3.Connection, scratch: Path
 ) -> None:

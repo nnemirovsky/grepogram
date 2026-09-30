@@ -165,9 +165,25 @@ never change the git identity.
   import reaches no account. A scope narrows a query; it is not isolation.
 - `sync.sync_all` takes an account → client mapping, resolves every source once, and fetches
   each chat through the account of its primary source: one queue per account in an
-  `asyncio.TaskGroup` under the one `SyncLock` and `SyncBudget`. A flood wait stops only that
-  account's queue. A *shared* chat Telegram refuses to its account falls back to another in
-  `chat_access`, warmed first; a scoped chat never does. `only=` narrows the fetch to the chats
+  `asyncio.TaskGroup` under the one `SyncLock` and `SyncBudget`. `get_me` and the resolve are
+  guarded per account with the flood-sleep cap applied first: a flood wait or a Telegram error
+  on one account's resolve stops that account with a warning (`sources.Resolution.flooded` /
+  `failed`), and a dead session is raised as `AuthRequired` naming the account
+  (`tg.reraise_unauthorized`, needed because several `connected` blocks would otherwise let the
+  last one entered claim it). `resolve_sources` first seeds each client with every access hash
+  `chat_access` stores for its account (`sources.seed_peers`), re-reads a `chat = "@name"`
+  source's stored chat by id rather than resolving the name each sync, and — the rule that
+  stops primaries flipping — a source that does not resolve (no client, `SourceError`, its
+  account stopped) keeps being the primary of the chats it owns, which are still returned for
+  the fetch. **One order, one retry rule**: `sync.reaching_accounts` (over `recorded_reach`)
+  orders the accounts for a sync, `extract` and `prune-deleted` alike, and
+  `sync.through_accounts` is the one walk down it — flood wait stops that account and moves on,
+  a shared chat's refusal or unaddressable peer moves on, anything else ends the chat's turn.
+  A chat goes to the first account of its route in the run and not stopped, so a chat whose own
+  account is absent is fetched through another that reaches it; one nobody in the run reaches
+  is counted in one warning per account (`_SyncPass.unfetched`), not listed as remaining. A
+  fallback fetch's own warnings carry the fetching account's label. A flood wait stops only
+  that account's queue; a scoped chat never falls back. `only=` narrows the fetch to the chats
   the named sources cover while every source is still resolved, so a narrowed run never moves a
   primary. `index_pending`, `index_stranded`, the re-cut and embedding stay once per run, and a
   report's warnings read `account <name>: …` only when an account other than `default` is in
@@ -377,7 +393,9 @@ never change the git identity.
   process would start writing against a database this one has not finished with. What keeps the
   wait short is the `abort` callback: the embedding step is paced by `SyncBudget`, so a
   cancellation calls `budget.cancel()` and `index.embed_dirty_units` stops at the next batch;
-  the indexing step is one transaction and ends on its own. Only a killed process detaches a
+  the indexing step is one transaction and ends on its own. `abort` runs on a cancellation
+  only, never for a job that raised: the budget it cancels is every account's queue's. Only a
+  killed process detaches a
   writer, and `messages.indexed` plus `index.repair_unit_index` are what the next run repairs it
   with.
 - A channel has at most one discussion group, and the partial unique index on
@@ -623,7 +641,10 @@ never change the git identity.
   and `resolved` is the session cache, which starts empty and is filled by `get_dialogs()`, by a
   successful `get_entity`, and by the `chats` / `users` of any raw answer — Telethon's
   `session.process_entities`. Addressing an unlearned id raises `ValueError: Could not find the
-  input entity` (a legacy `PeerChat` id needs no access hash and is allowed, as in Telethon).
+  input entity` (a legacy `PeerChat` id needs no access hash and is allowed, as in Telethon),
+  and that includes `get_entity(<marked id>)`: no path of the fake resolves a bare id the real
+  client could not. `session.process_entities` with `InputPeer*` objects seeds a hash, which
+  addresses the peer only when it is the account's own.
   `forget_entities()` models the fresh client `extract` and `prune-deleted` each build after a
   sync, and `strict_entities=False` is for a test with no realistic route to warm up. A fake more
   permissive than production is a fake that hides bugs: this one hid a `grepogram extract` that

@@ -404,10 +404,15 @@ async def test_catalog_list_folders_alone_loads_once() -> None:
 
 
 async def test_catalog_entity_lookup_falls_back_to_get_entity() -> None:
+    """A peer outside the dialog list resolves only once the session holds its access hash —
+    a bare id on a fresh client is Telethon's ``ValueError``, like the one never learned."""
     client = _client(entities=[make_channel(999, "Elsewhere")])
     catalog = DialogCatalog(client)
     assert (await catalog.entity(-1000000000100)) is ARG
     assert ("get_entity", {"key": -1000000000100}) not in client.calls
+    with pytest.raises(ValueError, match="Could not find the input entity"):
+        await catalog.entity(-1000000000999)
+    client.session.process_entities([types.InputPeerChannel(999, 999)])
     elsewhere = await catalog.entity(-1000000000999)
     assert elsewhere.title == "Elsewhere"
     assert ("get_entity", {"key": -1000000000999}) in client.calls

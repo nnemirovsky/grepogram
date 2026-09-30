@@ -633,9 +633,16 @@ def test_with_source_appends_and_rejects_duplicates() -> None:
 # --- resolve_sources -------------------------------------------------------------------------
 
 
+async def _resolve(
+    cfg: Config, clients: Mapping[str, FakeClient], conn: sqlite3.Connection
+) -> list[ChatRow]:
+    """The chats :func:`sources.resolve_sources` hands a sync."""
+    return (await sources.resolve_sources(cfg, clients, conn)).chats
+
+
 async def test_resolve_sources_folder_and_dm(conn: sqlite3.Connection) -> None:
     cfg = _cfg(Source(folder="Argentina"), Source(chat="@alice"))
-    rows = await sources.resolve_sources(cfg, {"default": _client()}, conn)
+    rows = await _resolve(cfg, {"default": _client()}, conn)
     assert [(r.id, r.source_id) for r in rows] == [
         (ARG_ID, "folder:Argentina"),
         (NEWS_ID, "folder:Argentina"),
@@ -662,7 +669,7 @@ async def test_resolve_sources_category_folder_and_int_and_link_chats(
     conn: sqlite3.Connection,
 ) -> None:
     cfg = _cfg(Source(folder="People"), Source(chat=GEORGIA_ID), Source(chat="https://t.me/news"))
-    rows = await sources.resolve_sources(cfg, {"default": _client()}, conn)
+    rows = await _resolve(cfg, {"default": _client()}, conn)
     assert [(r.id, r.source_id) for r in rows] == [
         (1, "folder:People"),
         (GEORGIA_ID, f"chat:{GEORGIA_ID}"),
@@ -674,14 +681,14 @@ async def test_resolve_sources_keeps_sync_state_and_first_source(
     conn: sqlite3.Connection,
 ) -> None:
     cfg = _cfg(Source(chat="@arg_chat"), Source(folder="Argentina"))
-    first = await sources.resolve_sources(cfg, {"default": _client()}, conn)
+    first = await _resolve(cfg, {"default": _client()}, conn)
     assert [(r.id, r.source_id) for r in first][:2] == [
         (ARG_ID, "chat:@arg_chat"),
         (NEWS_ID, "folder:Argentina"),
     ]
     db.set_chat_progress(conn, ARG_ID, last_msg_id=77, last_sync_at=1_700_000_000)
     db.set_chat_unavailable(conn, NEWS_ID)
-    again = await sources.resolve_sources(cfg, {"default": _client()}, conn)
+    again = await _resolve(cfg, {"default": _client()}, conn)
     assert len(again) == len(first) == 3
     arg = db.get_chat(conn, ARG_ID)
     assert arg is not None and (arg.last_msg_id, arg.last_sync_at) == (77, 1_700_000_000)
@@ -701,7 +708,7 @@ async def test_resolve_sources_warns_and_skips_unresolvable_sources(
         Source(chat="@alice"),
     )
     with caplog.at_level(logging.WARNING, logger="grepogram.sources"):
-        rows = await sources.resolve_sources(cfg, {"default": _client()}, conn)
+        rows = await _resolve(cfg, {"default": _client()}, conn)
     assert [r.id for r in rows] == [1]
     messages = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
     assert any("skipping source folder:Xyz" in m and "no folder named" in m for m in messages)
@@ -715,9 +722,7 @@ async def test_resolve_sources_warns_for_unresolvable_folder_peers(
     conn: sqlite3.Connection, caplog: pytest.LogCaptureFixture
 ) -> None:
     with caplog.at_level(logging.WARNING, logger="grepogram.sources"):
-        rows = await sources.resolve_sources(
-            _cfg(Source(folder="Argentina")), {"default": _client()}, conn
-        )
+        rows = await _resolve(_cfg(Source(folder="Argentina")), {"default": _client()}, conn)
     assert GHOST_ID not in {r.id for r in rows}
     assert OUTSIDE_ID in {r.id for r in rows}
     assert any(
@@ -728,7 +733,7 @@ async def test_resolve_sources_warns_for_unresolvable_folder_peers(
 
 async def test_resolve_sources_with_no_sources(conn: sqlite3.Connection) -> None:
     client = _client()
-    assert await sources.resolve_sources(_cfg(), {"default": client}, conn) == []
+    assert await _resolve(_cfg(), {"default": client}, conn) == []
     assert db.list_chats(conn) == []
     assert ("get_dialogs", {}) not in client.calls
 
@@ -1110,14 +1115,19 @@ async def test_resolve_sources_skips_private_folder_peers_but_not_flood_waits(
 ) -> None:
     private = _client(entity_errors={GHOST_ID: errors.ChannelPrivateError(request=None)})
     with caplog.at_level(logging.WARNING, logger="grepogram.sources"):
-        rows = await sources.resolve_sources(
-            _cfg(Source(folder="Argentina")), {"default": private}, conn
-        )
+        rows = await _resolve(_cfg(Source(folder="Argentina")), {"default": private}, conn)
     assert {r.id for r in rows} == {ARG_ID, NEWS_ID, OUTSIDE_ID}
     assert any("cannot resolve peer" in r.getMessage() for r in caplog.records)
     flooded = _client(entity_errors={GHOST_ID: errors.FloodWaitError(request=None, capture=30)})
-    with pytest.raises(errors.FloodWaitError):
-        await sources.resolve_sources(_cfg(Source(folder="Argentina")), {"default": flooded}, conn)
+    stopped = await sources.resolve_sources(
+        _cfg(Source(folder="Argentina"), Source(chat="@news")), {"default": flooded}, conn
+    )
+    assert stopped.flooded == {"default": 30}, "the account stops, and says for how long"
+    assert {r.id for r in stopped.chats} == {ARG_ID, NEWS_ID, OUTSIDE_ID}, "kept, not re-read"
+    assert db.chat_source_ids(conn, OUTSIDE_ID) == ["folder:Argentina"]
+    assert [name for name, kw in flooded.calls if kw.get("key") == "@news"] == [], (
+        "the account's other sources are not asked about after its flood wait"
+    )
 
 
 async def test_username_targets_are_served_from_the_dialog_memo() -> None:
@@ -1786,9 +1796,7 @@ async def test_resolve_sources_leaves_an_imported_chat_under_its_import_tag(
     """
     sources.import_chats(conn, _export(_imported(ARG_ID, "Argentina chat"), messages=3))
     with caplog.at_level(logging.INFO, logger="grepogram.sources"):
-        rows = await sources.resolve_sources(
-            _cfg(Source(folder="Argentina")), {"default": _client()}, conn
-        )
+        rows = await _resolve(_cfg(Source(folder="Argentina")), {"default": _client()}, conn)
     assert ARG_ID not in [row.id for row in rows], "an import is not a chat to sync"
     chat = db.get_chat(conn, ARG_ID)
     assert chat is not None and chat.source_id == "import:argentina-chat"
@@ -1939,7 +1947,7 @@ async def test_resolve_sources_stores_a_shared_channel_once_for_two_accounts(
     """One row, the first source its primary, both sources covering it and both accounts
     reaching it — each with the access hash its own client addresses the channel by."""
     cfg = _cfg(Source(chat="@news"), Source(chat="@news", account=WORK))
-    rows = await sources.resolve_sources(cfg, _clients(), conn)
+    rows = await _resolve(cfg, _clients(), conn)
     assert [(r.id, r.source_id) for r in rows] == [(NEWS_ID, "chat:@news")]
     assert db.list_chats(conn) == rows
     assert db.chat_source_ids(conn, NEWS_ID) == ["chat:@news", "work/chat:@news"]
@@ -1954,7 +1962,7 @@ async def test_resolve_sources_keeps_the_private_chats_of_two_accounts_apart(
     """The same person seen from two accounts is two conversations: two rows of one peer, each
     filed under the account whose source reached it — never under ``default`` by omission."""
     cfg = _cfg(Source(chat="@alice", account=WORK), Source(chat="@alice"))
-    rows = await sources.resolve_sources(cfg, _clients(), conn)
+    rows = await _resolve(cfg, _clients(), conn)
     work, default = rows
     assert (work.id, work.peer_id, work.scope, work.source_id) == (1, 1, WORK, "work/chat:@alice")
     assert (default.id, default.peer_id, default.scope) == (db.SYNTHETIC_BASE, 1, "default")
@@ -1969,19 +1977,61 @@ async def test_resolve_sources_skips_an_account_without_a_client_and_keeps_its_c
     conn: sqlite3.Connection, caplog: pytest.LogCaptureFixture
 ) -> None:
     cfg = _cfg(Source(chat="@news"), Source(chat="@news", account=WORK))
-    await sources.resolve_sources(cfg, _clients(), conn)
+    await _resolve(cfg, _clients(), conn)
     with caplog.at_level(logging.WARNING, logger="grepogram.sources"):
-        rows = await sources.resolve_sources(cfg, {"default": _client()}, conn)
+        rows = await _resolve(cfg, {"default": _client()}, conn)
     assert [r.id for r in rows] == [NEWS_ID]
     assert "skipping source work/chat:@news: account work has no signed-in client" in caplog.text
     assert db.chat_source_ids(conn, NEWS_ID) == ["chat:@news", "work/chat:@news"]
+
+
+async def test_a_source_that_does_not_resolve_stays_the_primary_of_its_chats(
+    conn: sqlite3.Connection,
+) -> None:
+    """The work source comes first, so the channel is its. With the work account signed out —
+    or its source not resolving — the default source covering the same channel does not take
+    it over for that run, only to hand it back once the work account is back."""
+    cfg = _cfg(Source(chat="@news", account=WORK), Source(chat="@news"))
+    await _resolve(cfg, _clients(), conn)
+    for clients in ({"default": _client()}, _clients()):
+        rows = await _resolve(cfg, clients, conn)
+        assert [(r.id, r.source_id) for r in rows] == [(NEWS_ID, "work/chat:@news")]
+        news = db.get_chat(conn, NEWS_ID)
+        assert news is not None and news.source_id == "work/chat:@news"
+    gone = _work_client()
+    gone.entity_errors["@news"] = errors.UsernameNotOccupiedError(request=None)
+    gone.dialogs = [d for d in gone.dialogs if d.id != NEWS_ID]
+    gone.entities.pop(NEWS_ID)
+    rows = await _resolve(cfg, {"default": _client(), WORK: gone}, conn)
+    assert [(r.id, r.source_id) for r in rows] == [(NEWS_ID, "work/chat:@news")]
+    assert db.chat_source_ids(conn, NEWS_ID) == ["chat:@news", "work/chat:@news"]
+
+
+async def test_a_handle_the_stored_chat_no_longer_holds_is_resolved_again(
+    conn: sqlite3.Connection,
+) -> None:
+    """Reading ``@name`` by its stored id is only a shortcut while the chat still holds the
+    handle: once it moved to another chat, the source follows the handle."""
+    public = make_channel(900, "Public", username="pubnews")
+    public_id = -1000000000900
+    cfg = _cfg(Source(chat="@pubnews"))
+    first = FakeClient(entities=[public], folders=[])
+    rows = await _resolve(cfg, {"default": first}, conn)
+    assert [r.id for r in rows] == [public_id]
+    renamed = make_channel(900, "Public", username="pubnews_old")
+    taker = make_channel(901, "Squatter", username="pubnews")
+    again = FakeClient(entities=[renamed, taker], folders=[])
+    rows = await _resolve(cfg, {"default": again}, conn)
+    assert ("get_entity", {"key": public_id}) in again.calls, "the stored id first"
+    assert ("get_entity", {"key": "@pubnews"}) in again.calls, "then the name"
+    assert [r.id for r in rows] == [-1000000000901]
 
 
 async def test_resolve_sources_replaces_what_a_source_covers(conn: sqlite3.Connection) -> None:
     """A folder that stops listing a chat stops covering it; a peer it still names but that
     will not resolve right now stays covered — it is listed, only unreachable this run."""
     cfg = _cfg(Source(folder="Argentina"), Source(chat="@news"))
-    await sources.resolve_sources(cfg, {"default": _client()}, conn)
+    await _resolve(cfg, {"default": _client()}, conn)
     assert db.chat_source_ids(conn, NEWS_ID) == ["chat:@news", "folder:Argentina"]
     assert db.chat_source_ids(conn, OUTSIDE_ID) == ["folder:Argentina"]
     # resolved outside the dialogs, by the access hash the folder's InputPeerChannel carries
@@ -1991,7 +2041,7 @@ async def test_resolve_sources_replaces_what_a_source_covers(conn: sqlite3.Conne
         folders=[make_folder(3, "Argentina", include=[ARG, OUTSIDE, GHOST_ID])],
         entity_errors={OUTSIDE_ID: errors.ChannelPrivateError(request=None)},
     )
-    await sources.resolve_sources(cfg, {"default": unpinned}, conn)
+    await _resolve(cfg, {"default": unpinned}, conn)
     assert db.chat_source_ids(conn, NEWS_ID) == ["chat:@news"]
     assert db.chat_source_ids(conn, OUTSIDE_ID) == ["folder:Argentina"]
     assert db.chat_source_ids(conn, ARG_ID) == ["folder:Argentina"]
@@ -2003,7 +2053,7 @@ async def test_resolve_sources_leaves_an_import_alone_for_every_account(
     held = _chat(NEWS_ID, "import:news", type="channel", title="News", unavailable=True)
     _store(conn, held, 1)
     cfg = _cfg(Source(chat="@news", account=WORK))
-    assert await sources.resolve_sources(cfg, _clients(), conn) == []
+    assert await _resolve(cfg, _clients(), conn) == []
     stored = db.get_chat(conn, NEWS_ID)
     assert stored is not None and stored.source_id == "import:news"
     assert db.chat_accounts(conn, NEWS_ID) == []
@@ -2014,7 +2064,7 @@ async def test_removing_one_accounts_source_keeps_a_chat_the_other_still_covers(
     conn: sqlite3.Connection,
 ) -> None:
     cfg = _cfg(Source(chat="@news"), Source(chat="@news", account=WORK))
-    await sources.resolve_sources(cfg, _clients(), conn)
+    await _resolve(cfg, _clients(), conn)
     db.upsert_messages(conn, [MessageRow(chat_id=NEWS_ID, msg_id=1, date=1, text="post")])
     first = sources.remove_source(cfg, conn, sources.parse_target("chat:@news"))
     assert (first.source_id, first.chat_ids, first.kept_chat_ids) == ("chat:@news", [], [NEWS_ID])
@@ -2033,7 +2083,7 @@ async def test_a_linked_discussion_group_follows_its_channel_to_the_remaining_so
     conn: sqlite3.Connection,
 ) -> None:
     cfg = _cfg(Source(chat="@news", comments=True), Source(chat="@news", account=WORK))
-    await sources.resolve_sources(cfg, _clients(), conn)
+    await _resolve(cfg, _clients(), conn)
     group = db.upsert_chat(conn, _chat(ARG_ID, "chat:@news", title="News chat"))
     db.set_discussion_chat(conn, NEWS_ID, group.id)
     removed = sources.remove_source(cfg, conn, sources.parse_target("chat:@news"))
@@ -2049,7 +2099,7 @@ async def test_removing_one_accounts_private_chat_leaves_the_others(
     """``@alice`` names the default account's source when it has one; the work account's
     conversation with her is reached by its own source id and removed on its own."""
     cfg = _cfg(Source(chat="@alice"), Source(chat="@alice", account=WORK))
-    rows = await sources.resolve_sources(cfg, _clients(), conn)
+    rows = await _resolve(cfg, _clients(), conn)
     default, work = rows
     removed = sources.remove_source(cfg, conn, sources.parse_target("@alice"))
     assert (removed.source_id, removed.chat_ids) == ("chat:@alice", [default.id])
@@ -2086,7 +2136,7 @@ async def test_removing_a_source_leaves_an_import_it_never_covered(
 ) -> None:
     _store(conn, _chat(GEORGIA_ID, "import:georgia", title="Georgia", unavailable=True), 2)
     cfg = _cfg(Source(chat="@news"), Source(chat="@news", account=WORK))
-    await sources.resolve_sources(cfg, _clients(), conn)
+    await _resolve(cfg, _clients(), conn)
     sources.remove_source(cfg, conn, sources.parse_target("work/chat:@news"))
     sources.remove_source(cfg, conn, sources.parse_target("chat:@news"))
     stored = db.get_chat(conn, GEORGIA_ID)
@@ -2098,7 +2148,7 @@ async def test_sources_status_lists_a_chat_under_every_source_with_its_account(
     conn: sqlite3.Connection,
 ) -> None:
     cfg = _cfg(Source(chat="@news"), Source(chat="@news", account=WORK))
-    await sources.resolve_sources(cfg, _clients(), conn)
+    await _resolve(cfg, _clients(), conn)
     _store(conn, _chat(GEORGIA_ID, "import:georgia", title="Georgia", unavailable=True))
     statuses = sources.sources_status(cfg, conn)
     assert [(s.source_id, s.account, [c.id for c in s.chats]) for s in statuses] == [

@@ -29,10 +29,10 @@ from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Literal
 
-from telethon import errors
+from telethon import errors, utils
 from telethon.tl import types
 
-from grepogram import db, dialogs
+from grepogram import db, dialogs, tg
 from grepogram.dialogs import DialogCatalog, DialogInfo, FolderInfo, Match
 from grepogram.models import (
     ACCOUNT_NAME,
@@ -870,19 +870,38 @@ def _fuzzy_source(text: str, known: list[str], chats: list[ChatRow]) -> str:
 # --- resolution on sync ----------------------------------------------------------------------
 
 
+@dataclass(frozen=True, slots=True, kw_only=True)
+class Resolution:
+    """What :func:`resolve_sources` made of the configured sources.
+
+    ``chats`` are the rows a sync fetches: every chat a source resolved to, and every chat whose
+    primary source did not resolve this run (it keeps that source, and a sync still reaches it
+    through whichever account can). ``flooded`` maps an account whose resolve Telegram stopped
+    with a flood wait to the seconds asked, and ``failed`` one another Telegram error stopped to
+    the error: that account's sources were all skipped, keeping what they covered.
+    """
+
+    chats: list[ChatRow] = dataclasses.field(default_factory=list)
+    flooded: dict[str, int] = dataclasses.field(default_factory=dict)
+    failed: dict[str, str] = dataclasses.field(default_factory=dict)
+
+
 async def resolve_sources(
     cfg: Config, clients: Mapping[str, Any], conn: sqlite3.Connection
-) -> list[ChatRow]:
+) -> Resolution:
     """Upsert a ``chats`` row for every chat the configured sources currently cover.
 
     ``clients`` maps an account to its connected client, and each source is resolved through
     its own account's (one :class:`~grepogram.dialogs.DialogCatalog` per account): folder
-    membership and entities are re-read from Telegram each time. A source whose account has no
-    client in the mapping — not signed in, or not part of this run — is logged at WARNING and
-    skipped like a source that no longer resolves. Sync state on existing rows is preserved,
-    and so is a stored ``discussion_of`` (:func:`grepogram.db.upsert_chat`): a channel's
-    discussion group listed by a source is synced as a chat of its own and keeps holding the
-    channel's comments.
+    membership and entities are re-read from Telegram each time. Before an account's first
+    source, its client's session is handed every access hash the index stores for it
+    (:func:`seed_peers`), so a chat outside its dialog list — a ``chat:<id>`` of a group it no
+    longer shows, a public chat it reads without joining — is addressed by that hash rather than
+    not at all, and a ``chat = "@name"`` source whose chat the index already holds is re-read by
+    its id instead of by a ``contacts.resolveUsername`` on every sync (:func:`source_dialogs`).
+    Sync state on existing rows is preserved, and so is a stored ``discussion_of``
+    (:func:`grepogram.db.upsert_chat`): a channel's discussion group listed by a source is
+    synced as a chat of its own and keeps holding the channel's comments.
 
     Every row is stored through the account whose source reached it — a private chat or legacy
     group as that account's own row, a channel or supergroup as the one shared row
@@ -891,8 +910,18 @@ async def resolve_sources(
     ``source_id``; each covering source is recorded in ``chat_sources`` and each account that
     reached it in ``chat_access``, with the access hash its client addresses the chat by. The
     coverage of a source that resolved is replaced by what it lists now, the chats a folder
-    names but whose entity would not resolve included (they are still listed); a source that
-    did not resolve keeps what it had, since an error says nothing about what it covers.
+    names but whose entity would not resolve included (they are still listed).
+
+    **A source that did not resolve keeps what it had** — an error says nothing about what it
+    covers — and that includes being the *primary* of the chats it owns: they are returned as
+    they are stored, so a later source covering the same chat never takes it over for one run
+    and hands it back the next. That holds for every way a source can fail to resolve: its
+    account has no client in this run (not signed in, or not part of it), the chat or folder no
+    longer resolves (:class:`SourceError`), or Telegram stopped its account's resolve — a flood
+    wait (``flooded``) or another Telegram error (``failed``), after which every other source
+    of that account is skipped the same way rather than asked again. A rejected session is
+    re-raised as :class:`~grepogram.tg.AuthRequired` naming its account
+    (:func:`~grepogram.tg.reraise_unauthorized`).
 
     **A chat held as an ``import:`` is left alone**, logged and not returned. ``upsert_chat``
     writes ``source_id`` unconditionally, so without this a resolve would quietly replace
@@ -911,7 +940,13 @@ async def resolve_sources(
     stored: dict[tuple[str, int], ChatRow] = {}
     held_back: set[tuple[str, int]] = set()
     coverage: dict[str, set[int]] = {}
+    flooded: dict[str, int] = {}
+    failed: dict[str, str] = {}
     now = int(time.time())
+
+    def keep(source: Source) -> None:
+        _keep_primary(conn, source, stored, rows)
+
     for source in cfg.sources:
         client = clients.get(source.account)
         if client is None:
@@ -920,12 +955,45 @@ async def resolve_sources(
                 source.id,
                 source.account,
             )
+            keep(source)
             continue
-        catalog = catalogs.setdefault(source.account, DialogCatalog(client))
+        if source.account in flooded or source.account in failed:
+            log.warning(
+                "skipping source %s: account %s stopped resolving", source.id, source.account
+            )
+            keep(source)
+            continue
+        catalog = catalogs.get(source.account)
+        if catalog is None:
+            seed_peers(client, db.stored_peers(conn, source.account))
+            catalog = catalogs[source.account] = DialogCatalog(client)
         try:
-            infos, named = await _source_listing(source, catalog)
+            infos, named = await _source_listing(source, catalog, conn)
         except SourceError as exc:
             log.warning("skipping source %s: %s", source.id, exc)
+            keep(source)
+            continue
+        except errors.UnauthorizedError as exc:
+            tg.reraise_unauthorized(exc, source.account)
+        except errors.FloodWaitError as exc:
+            log.warning(
+                "flood wait of %ss resolving source %s; skipping every source of account %s",
+                exc.seconds,
+                source.id,
+                source.account,
+            )
+            flooded[source.account] = int(exc.seconds)
+            keep(source)
+            continue
+        except errors.RPCError as exc:
+            log.warning(
+                "resolving source %s failed: %s; skipping every source of account %s",
+                source.id,
+                exc,
+                source.account,
+            )
+            failed[source.account] = str(exc)
+            keep(source)
             continue
         covered = coverage.setdefault(source.id, set())
         covered |= _still_named(conn, source, named)
@@ -971,7 +1039,59 @@ async def resolve_sources(
     for source_id, chat_ids in coverage.items():
         db.set_source_chats(conn, source_id, chat_ids)
     log.info("resolved %d chats from %d sources", len(rows), len(cfg.sources))
-    return rows
+    return Resolution(chats=rows, flooded=flooded, failed=failed)
+
+
+def _keep_primary(
+    conn: sqlite3.Connection,
+    source: Source,
+    stored: dict[tuple[str, int], ChatRow],
+    rows: list[ChatRow],
+) -> None:
+    """Hold on to the chats ``source`` — one that did not resolve this run — is the primary
+    source of: they join ``rows`` as they are stored and are claimed in ``stored``, so no later
+    source in config order becomes their primary for this run alone."""
+    for chat_id in db.source_chat_ids(conn, source.id):
+        chat = db.get_chat(conn, chat_id)
+        if chat is None or chat.source_id != source.id:
+            continue
+        key = (chat.scope, chat.peer_id)
+        if key in stored:
+            continue
+        stored[key] = chat
+        rows.append(chat)
+
+
+def seed_peers(client: Any, peers: Iterable[tuple[int, int | None]]) -> set[int]:
+    """Hand ``client``'s session the access hashes of ``peers`` — ``(marked id, hash)`` pairs the
+    index stored for this client's account — and return the marked ids now addressable.
+
+    ``session.process_entities`` is the call Telethon feeds every answer through, so a peer
+    seeded here is addressed by its bare id with no request at all. A legacy group counts
+    without a hash (Telethon turns a ``PeerChat`` straight into an ``InputPeerChat``); any other
+    peer without one is left out. The hash has to be this account's own: another account's would
+    address the peer as a different user, and Telegram refuses it.
+    """
+    ready: set[int] = set()
+    inputs: list[Any] = []
+    for peer, access_hash in peers:
+        if peer in ready:
+            continue
+        bare, kind = utils.resolve_id(peer)
+        if kind is types.PeerChat:
+            ready.add(peer)
+            continue
+        if access_hash is None:
+            continue
+        if kind is types.PeerChannel:
+            inputs.append(types.InputPeerChannel(bare, access_hash))
+        else:
+            inputs.append(types.InputPeerUser(bare, access_hash))
+        ready.add(peer)
+    if inputs:
+        client.session.process_entities(inputs)
+        log.debug("seeded %d stored access hashes", len(inputs))
+    return ready
 
 
 def _source_chat(info: DialogInfo, source: Source) -> ChatRow:
@@ -989,11 +1109,11 @@ def _source_chat(info: DialogInfo, source: Source) -> ChatRow:
 
 
 async def _source_listing(
-    source: Source, catalog: DialogCatalog
+    source: Source, catalog: DialogCatalog, conn: sqlite3.Connection
 ) -> tuple[list[DialogInfo], frozenset[int]]:
     """What ``source`` covers now, plus the peers a folder names outright (resolvable or not)."""
     if source.folder is None:
-        return await source_dialogs(source, catalog), frozenset()
+        return await source_dialogs(source, catalog, conn), frozenset()
     folder = await find_folder(source.folder, catalog)
     named = (folder.include_ids | folder.pinned_ids) - folder.exclude_ids
     return await folder_dialogs(folder, catalog), frozenset(named)
@@ -1037,17 +1157,60 @@ def imported_tag(conn: sqlite3.Connection, chat_id: int, *, scope: str | None = 
     return source_id if source_id.startswith(IMPORT_PREFIX) else None
 
 
-async def source_dialogs(source: Source, catalog: DialogCatalog) -> list[DialogInfo]:
-    """The chats one source covers right now."""
+async def source_dialogs(
+    source: Source, catalog: DialogCatalog, conn: sqlite3.Connection | None = None
+) -> list[DialogInfo]:
+    """The chats one source covers right now.
+
+    With ``conn``, a ``chat = "@name"`` source whose chat the index already holds is re-read by
+    its stored id (:func:`_stored_handle`) before anything asks Telegram to resolve the name.
+    """
     if source.folder is not None:
         return await folder_dialogs(await find_folder(source.folder, catalog), catalog)
-    resolved = await resolve_target(parse_target(str(source.chat)), catalog)
+    target = parse_target(str(source.chat))
+    if conn is not None and target.kind == "username":
+        known = await _stored_handle(target.text, source, catalog, conn)
+        if known is not None:
+            return [known]
+    resolved = await resolve_target(target, catalog)
     if isinstance(resolved, FolderInfo):
         raise UnknownTarget(
             f"chat {source.chat!r} names the folder {resolved.title!r}; "
             f"use folder = {resolved.title!r} instead"
         )
     return [resolved]
+
+
+async def _stored_handle(
+    name: str, source: Source, catalog: DialogCatalog, conn: sqlite3.Connection
+) -> DialogInfo | None:
+    """The chat ``@name`` is, read without ``contacts.resolveUsername`` when that can be done.
+
+    A dialog of the account answers first, as it always did. Otherwise a chat this source
+    already covers under the same handle, with an access hash stored for the account (and so
+    seeded into its session by :func:`resolve_sources`), is read by that id — a public channel
+    the account follows without joining has no dialog, and resolving its name on every sync, the
+    automatic one inside a search included, is the request Telegram rate-limits hardest. The
+    answer counts only while the chat still holds the handle; ``None`` sends the caller to
+    resolve the name after all, which is also what a handle that moved to another chat needs.
+    """
+    wanted = name.casefold()
+    for info in await catalog.list_dialogs():
+        if info.username and info.username.casefold() == wanted:
+            return info
+    for chat_id in db.source_chat_ids(conn, source.id):
+        chat = db.get_chat(conn, chat_id)
+        if chat is None or (chat.username or "").casefold() != wanted:
+            continue
+        if db.access_hash(conn, chat.id, source.account) is None:
+            continue
+        try:
+            info = dialogs.dialog_info(await catalog.entity(chat.peer_id))
+        except ENTITY_ERRORS as exc:
+            log.debug("chat %s: its stored access hash did not resolve: %s", chat.id, exc)
+            return None
+        return info if (info.username or "").casefold() == wanted else None
+    return None
 
 
 def discussion_source_id(group: ChatRow | None, channel: ChatRow) -> str | None:
@@ -1107,9 +1270,11 @@ async def folder_membership(cfg: Config, catalogs: Mapping[str, DialogCatalog]) 
     An ``UnauthorizedError`` is re-raised rather than recorded, the way
     :func:`grepogram.sync._sync_chats` re-raises it: every ``UnauthorizedError`` is an
     ``RPCError``, and a session revoked mid-scan is not a source Telegram would not answer for
-    but a session that answers for none. Raised, it reaches
-    :func:`grepogram.tg.wrap_auth_errors` and the user is told to run ``grepogram auth``
-    instead of to try again once Telegram comes back.
+    but a session that answers for none. A dead session is raised as
+    :class:`~grepogram.tg.AuthRequired` naming the folder's account
+    (:func:`~grepogram.tg.reraise_unauthorized`) — the clients of every account are connected at
+    once, and left to unwind it would be claimed by whichever was connected last — so the user
+    is told to sign *that* account in again instead of to try again once Telegram comes back.
     """
     listed: dict[str, set[int]] = {}
     failed: dict[str, str] = {}
@@ -1123,8 +1288,8 @@ async def folder_membership(cfg: Config, catalogs: Mapping[str, DialogCatalog]) 
         try:
             folder = await find_folder(source.folder, catalog)
             members = await folder_dialogs(folder, catalog)
-        except errors.UnauthorizedError:
-            raise
+        except errors.UnauthorizedError as exc:
+            tg.reraise_unauthorized(exc, source.account)
         except (SourceError, errors.RPCError) as exc:
             log.warning("cannot check source %s: %s", source.id, exc)
             failed[source.id] = str(exc)

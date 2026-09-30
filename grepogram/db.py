@@ -1041,6 +1041,17 @@ def access_hash(conn: sqlite3.Connection, chat_id: int, account: str) -> int | N
     return None if row is None or row["access_hash"] is None else int(row["access_hash"])
 
 
+def stored_peers(conn: sqlite3.Connection, account: str) -> list[tuple[int, int]]:
+    """``(peer_id, access_hash)`` of every chat ``account`` has an access hash stored for — what
+    its client can address with no request at all once the session is handed them."""
+    rows = conn.execute(
+        "SELECT c.peer_id, a.access_hash FROM chat_access a JOIN chats c ON c.id = a.chat_id "
+        "WHERE a.account = ? AND a.access_hash IS NOT NULL ORDER BY c.id",
+        (account,),
+    )
+    return [(int(row["peer_id"]), int(row["access_hash"])) for row in rows]
+
+
 def set_chat_sources(conn: sqlite3.Connection, chat_id: int, source_ids: Iterable[str]) -> None:
     """Make ``source_ids`` the whole set of sources covering chat ``chat_id``.
 

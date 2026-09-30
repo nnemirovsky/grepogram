@@ -405,11 +405,12 @@ local user and every source is opt-in, so a scope decides what you search, not w
 
 **How the commands split the work.** `sync`, `extract` and `prune-deleted` use every signed-in
 account. Each chat goes through the account of the source that owns it. When Telegram refuses a
-shared chat to that account, the chat is tried through another account that reaches it. A flood
-wait stops only the account it hit, and the others carry on. `extract` and `prune-deleted` report
-a chat that no connected account reaches as unreachable, not as an error. An account with no
-session, or one Telegram has signed out, is left out with a warning (the MCP `sync` lists it under
-`accounts_skipped`) and the rest still sync. `dialogs`, `sources add`, `import` and `leave` act as
+shared chat to that account, or that account is not signed in, the chat is tried through another
+account that reaches it, and it stays the first source's chat either way. A flood wait stops
+only the account it hit, even while its sources are being read, and the others carry on.
+`extract` and `prune-deleted` report a chat that no connected account reaches as unreachable, not
+as an error. An account with no session, or one Telegram has signed out, is left out with a
+warning (the MCP `sync` lists it under `accounts_skipped`) and the rest still sync. `dialogs`, `sources add`, `import` and `leave` act as
 one account, `default` unless `--account` names another.
 
 **Removing.** A chat that two sources cover (a channel two accounts configured, or a chat that a

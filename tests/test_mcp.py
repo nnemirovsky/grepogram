@@ -710,7 +710,6 @@ UNSET = Config(search=CFG.search, units=CFG.units, sources=CFG.sources)
             tools.AUTH_HINT,
             id="unauthorized",
         ),
-        pytest.param(CFG, _flooded, "telegram error: ", None, id="flood-wait"),
         pytest.param(CFG, _offline, "connection error: offline", None, id="offline"),
         pytest.param(UNSET, _client, "[telegram] api_id and api_hash", tools.SETUP_HINT, id="keys"),
         pytest.param(
@@ -735,6 +734,19 @@ async def test_sync_errors_carry_hints(
     assert result["error"].startswith(error)
     assert result["hint"] == hint
     assert "new" not in result
+
+
+async def test_a_flood_wait_while_resolving_is_a_warning_not_an_error(
+    state: tools.AppState, bind: Callable[..., tools.AppState]
+) -> None:
+    """A flood wait on one account's resolve stops that account for the run; the sync itself
+    answers, and says so, instead of failing every account's run with a Telegram error."""
+    bind(CFG, _flooded())
+    result = await tools.sync()
+    assert "error" not in result
+    assert result["warnings"] == [
+        "flood wait: Telegram asks to wait 30s before more history requests; run sync again later"
+    ]
 
 
 async def test_sync_without_a_session_file_carries_the_auth_hint(
@@ -1325,8 +1337,10 @@ async def test_auto_sync_refreshes_every_account_and_warns_about_a_refused_one(
     assert result["synced"] is True and _has(result, NEWS_ID, 3)
     assert result["warnings"] == [
         "auto-sync: account work skipped: Telegram session is not authorized; "
-        f"{tools.auth_hint(WORK)}"
-    ]
+        f"{tools.auth_hint(WORK)}",
+        "auto-sync: 1 chats were not fetched: no account in this run reaches them, and account "
+        "work itself is not signed in or not part of it",
+    ], "its chat with Bob is not reported as behind: syncing again would not fetch it"
 
 
 async def test_dialogs_reads_the_account_it_is_given(accounts: Accounts) -> None:
