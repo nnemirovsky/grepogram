@@ -16,7 +16,7 @@ import dataclasses
 import datetime as dt
 import os
 import tomllib
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Any, get_type_hints
 
@@ -39,6 +39,7 @@ from grepogram.models import (
     is_account_name,
 )
 from grepogram.paths import PRIVATE_FILE_MODE, FileLock, Paths
+from grepogram.tg import auth_command
 
 TEMPLATE = """\
 [telegram]
@@ -149,6 +150,27 @@ class ConfigError(Exception):
     def __init__(self, message: str, hint: str | None = None) -> None:
         super().__init__(message)
         self.hint = hint
+
+
+class UnknownAccount(ConfigError):
+    """An account was named that the config does not list; ``hint`` is how to sign it in."""
+
+    def __init__(self, name: str, known: Sequence[str]) -> None:
+        self.name = name
+        super().__init__(
+            f"unknown account {name!r}; known: {', '.join(known)}",
+            f"sign it in first: {auth_command(name)}",
+        )
+
+
+def require_account(cfg: Config, name: str) -> str:
+    """``name`` when ``cfg`` lists it (:meth:`~grepogram.models.Config.account_names`), else
+    :class:`UnknownAccount` naming the ones it knows. The one check every command and tool that
+    is told which account to act as puts first."""
+    known = cfg.account_names()
+    if name not in known:
+        raise UnknownAccount(name, known)
+    return name
 
 
 def load(paths: Paths) -> Config:

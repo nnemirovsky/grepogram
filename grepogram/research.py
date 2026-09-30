@@ -245,7 +245,8 @@ def start_session(
     ``seeds`` are chat specs as ``search --chat`` takes them (:func:`grepogram.filters.
     resolve_chats`: an id, ``@name``, a link, a folder, free text, ``account:<name>``); one that
     selects nothing raises :class:`~grepogram.filters.UnknownChat`. ``account`` is the account a
-    later run joins and fetches as, and must be one the config knows. The limits are the
+    later run joins and fetches as, and must be one the config knows
+    (:class:`~grepogram.config.UnknownAccount` otherwise). The limits are the
     ``[research]`` section's with ``overrides`` (:class:`ResearchLimits` field → value, ``None``
     for "keep the config's") applied — the one place a front end's limits are checked
     (:func:`session_limits`). The question is shown in every approval summary, so it is one
@@ -267,12 +268,7 @@ def start_session(
             "terminal escape, a direction override)",
             "write it as one line of plain text",
         )
-    known = cfg.account_names()
-    if account not in known:
-        raise ResearchError(
-            f"unknown account {account!r}; known: {', '.join(known)}",
-            f"sign it in with `{tg.auth_command(account)}` first",
-        )
+    config.require_account(cfg, account)
     limits = session_limits(cfg, overrides)
     if not seeds:
         raise ResearchError(

@@ -1382,8 +1382,7 @@ def accounts_rm(
     """
     paths, cfg, conn = _load()
     try:
-        if name not in cfg.account_names():
-            fail(f"unknown account {name!r}; known: {', '.join(cfg.account_names())}")
+        _known_account(cfg, name)
         if name == DEFAULT_ACCOUNT and not cfg.accounts:
             fail(
                 "the default account is the only account and cannot be removed",
@@ -1644,7 +1643,7 @@ def research_start(
     }
     with _research_store() as (_, cfg, conn, rdb):
         try:
-            name = _known_account(cfg, account or DEFAULT_ACCOUNT)
+            name = account or DEFAULT_ACCOUNT
             session = research.start_session(rdb, conn, cfg, question, seed, name, overrides)
         except _RESEARCH_ERRORS as exc:
             fail(str(exc), hint=getattr(exc, "hint", None))
@@ -2139,15 +2138,12 @@ def fail(message: str, code: int = 1, *, hint: str | None = None) -> NoReturn:
 
 
 def _known_account(cfg: Config, name: str) -> str:
-    """``name`` when the config knows it (:meth:`~grepogram.models.Config.account_names`), else
-    exit naming the ones it knows and how to add it."""
-    known = cfg.account_names()
-    if name not in known:
-        fail(
-            f"unknown account {name!r}; known: {', '.join(known)}",
-            hint=f"sign it in first: grepogram auth --account {name}",
-        )
-    return name
+    """``name`` when the config knows it (:func:`grepogram.config.require_account`), else exit
+    naming the ones it knows and how to add it."""
+    try:
+        return config.require_account(cfg, name)
+    except config.UnknownAccount as exc:
+        fail(str(exc), hint=exc.hint)
 
 
 def _open_terminal() -> TextIO:

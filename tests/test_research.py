@@ -184,7 +184,7 @@ def test_start_refuses_a_malformed_session(
     account: str,
     message: str,
 ) -> None:
-    with pytest.raises(research.ResearchError, match=message):
+    with pytest.raises((research.ResearchError, config.UnknownAccount), match=message):
         research.start_session(rdb, conn, CFG, question, seeds, account)
     assert research_db.list_sessions(rdb) == []
 

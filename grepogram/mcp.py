@@ -219,14 +219,6 @@ class NotConfigured(ConfigError):
         super().__init__(f"[telegram] api_id and api_hash are not set in {path}")
 
 
-class UnknownAccount(ConfigError):
-    """A tool was asked to act as an account the config does not know."""
-
-    def __init__(self, name: str, known: Sequence[str]) -> None:
-        self.name = name
-        super().__init__(f"unknown account {name!r}; known: {', '.join(known)}", auth_hint(name))
-
-
 def auth_hint(account: str = DEFAULT_ACCOUNT) -> str:
     """What to do about ``account``'s missing or rejected session: sign it in from a terminal
     with its own command (:func:`grepogram.tg.auth_command`)."""
@@ -419,12 +411,9 @@ class AppState:
 
     def account(self, cfg: Config, name: str | None) -> str:
         """``name`` (the default account when ``None``) if ``cfg`` knows it, else
-        :class:`UnknownAccount` naming the known ones and how to sign the new one in."""
-        chosen = name or DEFAULT_ACCOUNT
-        known = cfg.account_names()
-        if chosen not in known:
-            raise UnknownAccount(chosen, known)
-        return chosen
+        :class:`~grepogram.config.UnknownAccount` naming the known ones
+        (:func:`grepogram.config.require_account`)."""
+        return config.require_account(cfg, name or DEFAULT_ACCOUNT)
 
     def _require_keys(self, cfg: Config) -> None:
         if cfg.telegram.api_id == 0 or not cfg.telegram.api_hash:
@@ -440,7 +429,7 @@ class AppState:
         client that once found itself unauthorized (Telethon remembers that per instance) is
         never asked again — on a private in-memory copy, so concurrent blocks (and a CLI sync
         in another process) share neither a connection nor a session database. Raises
-        :class:`UnknownAccount` for an account the config does not know,
+        :class:`~grepogram.config.UnknownAccount` for an account the config does not know,
         :class:`NotConfigured` without API keys, :class:`~grepogram.tg.SessionMissing` before
         any client is built when there is no session file, :class:`~grepogram.tg.SessionError`
         when the file cannot be read, and :class:`~grepogram.tg.AuthRequired` for a session
@@ -558,6 +547,8 @@ def hint_for(exc: BaseException) -> str | None:
         return auth_hint(exc.account)
     if isinstance(exc, NotConfigured):
         return SETUP_HINT
+    if isinstance(exc, config.UnknownAccount):
+        return auth_hint(exc.name)
     if isinstance(exc, ConfigError):
         return exc.hint or CONFIG_HINT
     if isinstance(exc, SessionError):
@@ -1095,7 +1086,7 @@ def research_start(
     state = _app()
     cfg = state.config()
     rdb = state.research_store(cfg)
-    name = state.account(cfg, account)
+    name = account or DEFAULT_ACCOUNT
     overrides = {
         "max_depth": max_depth,
         "max_candidates": max_candidates,
