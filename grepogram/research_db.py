@@ -179,14 +179,20 @@ _V1: tuple[str, ...] = (
     )""",
 )
 
-_LEGACY_SCOPE = """CASE WHEN {id} <= -1000000000000 THEN ''
-    ELSE (SELECT account FROM sessions WHERE sessions.id = {session}) END"""
+# The two numbers step 2 reads v1 ids by are frozen here rather than imported: a migration step
+# says what a file of *that* version held, and must not move if the live constants ever do.
+_CHANNEL_MARK = -1000000000000
+"""The top of the marked-id range of channels and supergroups (Telethon marks one as
+``-(1000000000000 + id)``): a v1 id at or below it named a shared row, scope ``''``."""
+_SYNTHETIC = 1 << 62
+"""What :data:`grepogram.db.SYNTHETIC_BASE` was when v1 stored its ids: a v1 id at or above it
+was an index row id and names no peer at all, so step 2 cannot carry it over."""
+
+_LEGACY_SCOPE = f"""CASE WHEN {{id}} <= {_CHANNEL_MARK} THEN ''
+    ELSE (SELECT account FROM sessions WHERE sessions.id = {{session}}) END"""
 """The scope of a v1 ``chats.id`` value: a channel's or supergroup's marked id names a shared
 row (scope ``''``); anything else was the session's own account's, the only account a v1 file's
 chats were stored through."""
-_SYNTHETIC = 1 << 62
-""":data:`grepogram.db.SYNTHETIC_BASE`: a v1 id at or above it was an index row id and names no
-peer at all, so step 2 cannot carry it over."""
 
 _V2: tuple[str, ...] = (
     # a seed chat as Telegram names it — (scope, peer id) — rather than by an index row id,
@@ -226,7 +232,7 @@ _V2: tuple[str, ...] = (
     "ALTER TABLE evidence RENAME COLUMN chat_id TO peer_id",
     "ALTER TABLE evidence ADD COLUMN scope TEXT",
     f"""UPDATE evidence SET scope = CASE WHEN peer_id IS NULL OR peer_id >= {_SYNTHETIC} THEN NULL
-        WHEN peer_id <= -1000000000000 THEN ''
+        WHEN peer_id <= {_CHANNEL_MARK} THEN ''
         ELSE (SELECT s.account FROM candidates AS c JOIN sessions AS s ON s.id = c.session_id
               WHERE c.id = evidence.candidate_id) END""",
     f"UPDATE evidence SET peer_id = NULL WHERE peer_id >= {_SYNTHETIC}",
