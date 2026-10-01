@@ -18,10 +18,11 @@ Usernames are case-insensitive in Telegram and are lowercased; invite hashes and
 are not, and keep their case. :func:`normalize` accepts its own output, so a stored target reads
 back into the same :class:`LeadTarget`.
 
-:func:`text_leads` is the fallback for rows stored before links were captured
-(``meta['links_captured_from']``): it finds only what the text shows — visible URLs and
-``@mentions`` — never a hidden ``text_url`` hyperlink or a button, which only the message's
-entities and markup carried.
+:func:`text_leads` is the fallback for rows whose links were never read
+(``messages.links_read = 0``: stored before links were captured, imported from an export, or
+not yet re-read by ``recapture-links``) — a per-row fact, never an id threshold. It finds only
+what the text shows — visible URLs and ``@mentions`` — never a hidden ``text_url`` hyperlink or
+a button, which only the message's entities and markup carried.
 """
 
 import re
