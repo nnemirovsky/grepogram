@@ -412,6 +412,13 @@ approval; a candidate carrying a decision is never given a parent folder afterwa
    <ids…>` (the exact items), worded as a command the user types in their own terminal. The CLI
    prints the same summary and reads the confirmation from `/dev/tty`; with no TTY it refuses.
    There is no `--yes`.
+   **Superseded after PR review (owner's decision):** agents must be able to confirm too. Without
+   a terminal, `research approve`, `accounts rm` and `leave` print the summary, a token bound to
+   it (`grepogram/consent.py`) and the confirming command, change nothing and exit 3; the same
+   command with `--confirm <token>` acts, and a token whose summary changed is refused. The MCP
+   tool does the same for a client without elicitation (`confirm` argument, `via='confirm'`,
+   research.db v5). The human gate for an agent is the harness's permission prompt (Claude Code
+   "ask" rules); the token only binds the confirmation to exactly what was shown.
 4. As built, the terminal confirmation is a random five-character code the question shows and
    the human types back (`cli._ask`), not `y`: a pipe or a blind `yes` cannot answer it. It
    does not stop an agent that has a shell, which can give the command a pty of its own and read
