@@ -108,9 +108,10 @@ The scope is required. One logical change per commit. No `Co-Authored-By` or oth
   `tg.connected(client, account)`.
 - Addressing Telegram or building a link with `chat.id`. That is the index row, which a private
   chat of a second account holds under a synthetic id; Telegram's id is `chat.peer_id`.
-- A way around a human's consent: a tool parameter shaped like one (`approve`, `confirm`,
-  `yes`), a `--yes` option, or a confirmation read from stdin instead of the controlling
-  terminal. Research approvals, `accounts rm` and `leave` are the user's to answer.
+- A confirmation not bound to the exact summary shown: a bare `--yes`, an `approve=true`, or a
+  confirmation read from stdin. Research approvals, `accounts rm` and `leave` confirm either with
+  the code typed back on the controlling terminal, through the MCP client's dialog, or with the
+  `--confirm` / `confirm` token of the summary that was printed (`grepogram/consent.py`).
 - A writer in `db.py` outside `db.transaction(conn)`.
 - A file that ends with a trailing blank line, or without a newline.
 

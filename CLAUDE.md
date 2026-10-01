@@ -259,17 +259,24 @@ never change the git identity.
   about only when it owns a source) or one Telegram signed out, and fail only when no account is
   left; the MCP `sync` reports the skipped ones in `accounts_skipped`.
 - Every confirmation of consent or of a change a config edit cannot undo — `accounts rm`,
-  `leave`, `research approve` — is read from the controlling terminal (`cli._terminal` over
-  `/dev/tty`), never stdin, and refused without one (`cli.NoTerminal`); there is no `--yes`.
-  `sources prune` is the one question still asked through `typer.confirm` on stdin: it deletes
-  indexed rows only, after printing them, and changes nothing on Telegram or in the config. The yes is a random code the question shows, typed
-  back (`cli._ask`), never `y`: a pipe or a blind `yes` cannot guess it. `cli._open_terminal`
-  opens the tty unbuffered in binary and wraps it for text, because a text-mode `r+` open wants
-  a seekable file and fails on every real terminal. None of this stops an agent with a shell,
-  which can give the command a pty of its own and read the code: the terminal check holds
-  against an MCP-only agent, and every text that names the command says the user types it
-  themselves — never claim more. The autouse `no_terminal` fixture points `cli.TERMINAL` at a
-  path nothing opens, so the real opener runs and refuses; a test that answers installs its own
+  `leave`, `research approve` — happens in one of two ways, and never through stdin or a bare
+  `--yes`. At a controlling terminal (`cli._terminal` over `/dev/tty`) the yes is a random code
+  the question shows, typed back (`cli._ask`), never `y`. Without one — an agent running the
+  command — the command prints the exact summary, a token bound to it (`grepogram.consent`) and
+  the exact confirming command, changes nothing and exits `cli.CONFIRM_EXIT` (3); the same
+  command with `--confirm <token>` acts, and a token whose rebuilt summary differs (state
+  changed, other items, another chat) is refused with a fresh summary and token, also exit 3.
+  The token is a short SHA-256 over the command, the normalized request and the summary — for
+  `research approve` the request includes each named candidate's status, since a skip leaves the
+  summary unchanged. It is not a secret and not proof of a human: for an agent the human gate is
+  the harness's own permission prompt (Claude Code "ask" rules on these commands), and the token
+  only guarantees that what is confirmed is exactly what was shown. Never claim more for it.
+  `--json` never prompts. `sources prune` is the one question still asked through
+  `typer.confirm` on stdin: it deletes indexed rows only, after printing them, and changes
+  nothing on Telegram or in the config. `cli._open_terminal` opens the tty unbuffered in binary
+  and wraps it for text, because a text-mode `r+` open wants a seekable file and fails on every
+  real terminal. The autouse `no_terminal` fixture points `cli.TERMINAL` at a path nothing opens,
+  so the real opener runs and the token path is taken; a test that answers installs its own
   terminal, and `tests/test_cli.py` drives the real opener on an `os.openpty()` pair.
 - Every edit of `config.toml` is a read-modify-write under `config.ConfigLock` (a blocking flock
   on `config.lock` next to the file, held for milliseconds): the CLI goes through
@@ -688,18 +695,21 @@ never change the git identity.
   on a `meta['links_recapture:<chat>']` cursor. It writes `message_links`, `fwd_*`, `links_read`
   and a lead-clock tick and nothing else — no text, no `indexed`, no unit, no sync cursor — and
   leaves a message Telegram no longer has to `prune-deleted`; imports are never re-read.
-- **No parameter stands in for consent.** A grant comes from exactly two places: `grepogram
-  research approve`, which writes `research.approval.approval_summary` to the controlling terminal and
-  reads the typed-back code there, and the MCP `research_approve`, which shows the same summary
-  through `ctx.elicit` and grants only on an accepted answer whose strict-boolean `approve` is
-  `true`. Decline, cancel, an unticked box, a client without form elicitation and any failure of
-  the request grant nothing, and the answer's hint is the terminal command
-  (`research.approval.approve_command`), worded as one the user types in their own terminal themselves. `research_db.add_grant` is the only grant writer and takes `via`
-  keyword-only with no default, `grants.via` is `CHECK (via IN ('elicitation', 'cli'))`, and
-  `research.approval.grant` rebuilds the summary and grants nothing unless it equals the text the human
-  saw. Never add an `approve` / `confirm` / `yes` argument to a tool or a `--yes` to the CLI;
-  `tests/test_mcp.py` asserts no research tool takes a consent-shaped parameter. Skip and
-  exclude only narrow and need no consent.
+- **A confirmation names the exact summary that was shown.** A grant comes from exactly three
+  places, each recorded in `grants.via`: `cli` — `grepogram research approve` at a terminal,
+  which writes `research.approval.approval_summary` there and reads the typed-back code;
+  `elicitation` — the MCP `research_approve` on a client with a dialog, granting only on an
+  accepted answer whose strict-boolean `approve` is `true` (decline, cancel, an unticked box and
+  any failure grant nothing, and such a client cannot use a token); and `confirm` — the CLI's
+  `--confirm <token>` or the MCP `confirm` argument on a client without a dialog, valid only
+  for the token of the summary rebuilt at confirm time (`grepogram.consent`). The agent is
+  expected to show the user the summary and confirm on their say-so; the gate that makes that a
+  human's decision is the agent harness's permission prompt, not the token. `research_db.add_grant`
+  is the only grant writer and takes `via` keyword-only with no default, `grants.via` is
+  `CHECK (via IN ('elicitation', 'cli', 'confirm'))` (research.db v5), and
+  `research.approval.grant` rebuilds the summary and grants nothing unless it equals the text
+  shown. Never add a confirmation that is not bound to the exact summary — a bare `--yes`, an
+  `approve=true`. Skip and exclude only narrow and need no consent.
 - A grant names one candidate (or the session, for `global_search` / `paid_search`), the
   session's account and concrete actions (`join`, `request`, `fetch`, `add_source`), and
   `research.grants.authorized(target, action)` is the one check before every outward step of a run:
