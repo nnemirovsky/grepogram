@@ -616,6 +616,79 @@ def test_step_four_leaves_an_earlier_join_grant_with_no_route(rdb: sqlite3.Conne
         v3.close()
 
 
+def test_step_five_admits_the_confirm_channel_and_keeps_every_earlier_grant() -> None:
+    """A v4 file's grants carry over row for row — channel, terms, route, consumed and voided —
+    and the rebuilt table takes ``confirm`` while its CHECK still refuses anything else."""
+    v4 = research_db.connect(":memory:")
+    try:
+        for version in (1, 2, 3, 4):
+            for statement in research_db.MIGRATIONS[version]:
+                v4.execute(statement)
+        v4.execute("INSERT INTO meta(key, value) VALUES ('schema_version', '4')")
+        v4.execute(
+            "INSERT INTO sessions(id, question, account, limits, created_at) "
+            "VALUES (1, 'q', 'default', '{}', 1)"
+        )
+        v4.execute(
+            "INSERT INTO candidates(id, session_id, identity, kind, depth, created_at) "
+            "VALUES (1, 1, '@x', 'username', 1, 1)"
+        )
+        v4.execute(
+            "INSERT INTO grants(id, session_id, candidate_id, account, actions, via, summary, "
+            "granted_at, consumed_at, join_route) VALUES "
+            "(4, 1, 1, 'default', '[\"join\"]', 'cli', 'join @x', 2, 3, 'username')"
+        )
+        v4.execute(
+            "INSERT INTO grants(id, session_id, account, actions, via, summary, granted_at, "
+            "voided_at, search_kinds, stars_max) VALUES (7, 1, 'default', "
+            "'[\"global_search\", \"paid_search\"]', 'elicitation', 'search', 5, 6, "
+            "'[\"post_search\"]', 9)"
+        )
+        with pytest.raises(sqlite3.IntegrityError):
+            v4.execute(
+                "INSERT INTO grants(session_id, account, actions, via, summary, granted_at) "
+                "VALUES (1, 'default', '[\"global_search\"]', 'confirm', 's', 0)"
+            )
+
+        assert research_db.migrate(v4) == research_db.SCHEMA_VERSION == 5
+
+        joined, searched = research_db.list_grants(v4, 1)
+        assert (joined.id, joined.via, joined.actions, joined.summary) == (
+            4,
+            "cli",
+            ("join",),
+            "join @x",
+        )
+        assert (joined.granted_at, joined.consumed_at, joined.join_route) == (
+            2,
+            3,
+            WayIn("username"),
+        )
+        assert (searched.id, searched.via, searched.voided_at) == (7, "elicitation", 6)
+        assert (searched.search_kinds, searched.stars_max) == (("post_search",), 9)
+        confirmed = research_db.add_grant(
+            v4,
+            session_id=1,
+            candidate_id=1,
+            account="default",
+            actions=["fetch", "add_source"],
+            via="confirm",
+            summary="fetch @x",
+        )
+        assert confirmed.via == "confirm" and confirmed.id == 8
+        assert [g.id for g in research_db.live_grants(v4, 1, 1)] == [8], "the index is rebuilt"
+        with pytest.raises(sqlite3.IntegrityError):
+            v4.execute(
+                "INSERT INTO grants(session_id, account, actions, via, summary, granted_at) "
+                "VALUES (1, 'default', '[\"global_search\"]', 'api', 's', 0)"
+            )
+        indexes = {row[0] for row in v4.execute("SELECT name FROM pragma_index_list('grants')")}
+        assert "grants_live" in indexes
+        assert v4.execute("PRAGMA foreign_key_check").fetchall() == []
+    finally:
+        v4.close()
+
+
 @pytest.mark.parametrize(
     ("actions", "route", "match"),
     [

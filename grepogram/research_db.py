@@ -27,8 +27,9 @@ The tables:
     path was found in is ``(scope, peer_id)`` too, indexed or not.
 ``grants``
     one human approval each: the concrete actions on one candidate, or session-wide search
-    actions, by one account, **through one channel** — ``elicitation`` or ``cli``, enforced by
-    a ``CHECK`` and by :func:`add_grant`, the only writer, which takes it as a required argument.
+    actions, by one account, **through one channel** — ``elicitation``, ``cli`` or ``confirm``
+    (step 5 rebuilt the table to admit the last), enforced by a ``CHECK`` and by
+    :func:`add_grant`, the only writer, which takes it as a required argument.
     A session-wide grant keeps the terms its summary named (step 3: ``search_kinds``,
     ``stars_max``), and a ``join`` or ``request`` the way in it named (step 4: ``join_route``),
     the only one a run takes.
@@ -264,7 +265,40 @@ _V4: tuple[str, ...] = (
     "ALTER TABLE grants ADD COLUMN join_route TEXT",
 )
 
-MIGRATIONS: dict[int, tuple[str, ...]] = {1: _V1, 2: _V2, 3: _V3, 4: _V4}
+_GRANT_COLUMNS = (
+    "id, session_id, candidate_id, account, actions, via, summary, granted_at, consumed_at, "
+    "voided_at, search_kinds, stars_max, join_route"
+)
+"""Every column a v4 ``grants`` table holds, in its order: what step 5 carries over."""
+
+_V5: tuple[str, ...] = (
+    # a third channel an approval is confirmed through: a token bound to the exact summary that
+    # was shown ('confirm'), the path an agent takes behind its own permission prompt. SQLite
+    # cannot alter a CHECK, so the table is rebuilt with every row it holds; nothing references
+    # grants, so dropping the old one cascades nowhere
+    """CREATE TABLE grants_v5(
+        id INTEGER PRIMARY KEY,
+        session_id INTEGER NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+        candidate_id INTEGER REFERENCES candidates(id) ON DELETE CASCADE,
+        account TEXT NOT NULL,
+        actions TEXT NOT NULL,
+        via TEXT NOT NULL CHECK (via IN ('elicitation', 'cli', 'confirm')),
+        summary TEXT NOT NULL CHECK (summary <> ''),
+        granted_at INTEGER NOT NULL,
+        consumed_at INTEGER,
+        voided_at INTEGER,
+        search_kinds TEXT,
+        stars_max INTEGER,
+        join_route TEXT
+    )""",
+    f"INSERT INTO grants_v5({_GRANT_COLUMNS}) SELECT {_GRANT_COLUMNS} FROM grants",
+    "DROP TABLE grants",
+    "ALTER TABLE grants_v5 RENAME TO grants",
+    """CREATE INDEX grants_live ON grants(session_id, candidate_id)
+        WHERE consumed_at IS NULL AND voided_at IS NULL""",
+)
+
+MIGRATIONS: dict[int, tuple[str, ...]] = {1: _V1, 2: _V2, 3: _V3, 4: _V4, 5: _V5}
 """Schema version → the step that brings the file to it, from 1 without a gap (the test suite
 checks that); append-only."""
 SCHEMA_VERSION = max(MIGRATIONS)

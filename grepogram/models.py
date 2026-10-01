@@ -68,9 +68,11 @@ CandidateAction = Literal["fetch", "join", "request", "add_source"]
 SessionAction = Literal["global_search", "paid_search"]
 """What a grant may allow for a whole session rather than one candidate."""
 GrantAction = CandidateAction | SessionAction
-GrantChannel = Literal["elicitation", "cli"]
-"""Where a human approved a grant: an MCP elicitation answered in the host, or the CLI reading
-the controlling terminal. Nothing else can produce one — there is no third channel."""
+GrantChannel = Literal["elicitation", "cli", "confirm"]
+"""How an approval was confirmed: an MCP elicitation answered in the host, the code typed back
+on the controlling terminal (``cli``), or a confirmation token bound to the exact summary that
+was shown (``confirm``: ``research approve --confirm`` or ``research_approve(confirm=…)``, the
+path an agent takes behind its own permission prompt). Nothing else can produce one."""
 SearchKind = Literal["chat_search", "post_search"]
 """A Telegram-side search research ran (``searches.kind``)."""
 ProbeResult = Literal["probed", "unavailable", "unresolvable"]
