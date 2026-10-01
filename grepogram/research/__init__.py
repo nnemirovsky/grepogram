@@ -132,9 +132,11 @@ Message text never reaches the log above DEBUG; counts do.
 from grepogram.research.approval import (
     APPROVAL_GRAMMAR,
     DESCENDANTS_NOTE,
+    Approval,
     approval_args,
     approval_summary,
     approve_command,
+    confirm_token,
     exclude,
     grant,
     parse_approval,
@@ -206,6 +208,7 @@ from grepogram.research.sessions import (
 
 __all__ = [
     "APPROVAL_GRAMMAR",
+    "Approval",
     "DESCENDANTS_NOTE",
     "DIRECTORY_MIN_CHATS",
     "ENABLE_HINT",
@@ -228,6 +231,7 @@ __all__ = [
     "candidate_views",
     "candidates_document",
     "chat_key",
+    "confirm_token",
     "discover",
     "discover_offline",
     "exclude",

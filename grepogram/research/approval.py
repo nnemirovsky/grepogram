@@ -13,7 +13,7 @@ from collections.abc import Collection, Sequence
 from dataclasses import dataclass
 from typing import NoReturn
 
-from grepogram import db, leads, research_db, sources
+from grepogram import consent, db, leads, research_db, sources
 from grepogram.models import (
     PEOPLE_CHAT_TYPES,
     SHARED_CHAT_TYPES,
@@ -554,13 +554,15 @@ def grant(
 ) -> list[Grant]:
     """Record what a human approved after reading ``summary`` through ``via``.
 
-    Only the two consent channels call this — the CLI after reading the controlling terminal
-    (``cli``) and the MCP server after an accepted elicitation (``elicitation``) — and ``via``
-    has no default. The approval is validated again and its summary rebuilt: when it no longer
-    matches the text the human saw (a probe changed what a candidate is, another approval landed
-    meanwhile) nothing is granted. One grant per candidate holds the actions not already live,
-    and one per session action; a ``proposed``, ``skipped`` or ``failed`` candidate becomes
-    ``approved``. The validation and the writing are one ``research.db`` transaction.
+    Only the consent channels call this — the CLI after reading the controlling terminal
+    (``cli``), the MCP server after an accepted elicitation (``elicitation``), and either one
+    after a :func:`confirm_token` that matches the summary rebuilt at confirm time
+    (``confirm``) — and ``via`` has no default. The approval is validated again and its
+    summary rebuilt: when it no longer matches the text the human saw (a probe changed what a
+    candidate is, another approval landed meanwhile) nothing is granted. One grant per
+    candidate holds the actions not already live, and one per session action; a ``proposed``,
+    ``skipped`` or ``failed`` candidate becomes ``approved``. The validation and the writing
+    are one ``research.db`` transaction.
     """
     stamp = research_db.clock(now)
     granted: list[Grant] = []
@@ -771,7 +773,8 @@ def approval_args(items: Sequence[ApprovalItem]) -> list[str]:
 
 
 def approve_command(session_id: int, items: Sequence[ApprovalItem]) -> str:
-    """The command a human runs in a terminal to approve exactly ``items``."""
+    """The command that approves exactly ``items``: at a terminal it asks for the typed-back
+    code, elsewhere it prints the summary and the token :attr:`Approval.confirm_command` takes."""
     return " ".join([APPROVE_COMMAND, str(session_id), *approval_args(items)])
 
 
@@ -804,14 +807,44 @@ def with_default_actions(
     return filled
 
 
+CONFIRM_SCOPE = "research approve"
+"""What :func:`grepogram.consent.token` names an approval's token by, so no other command's
+token can confirm one."""
+
+
+def confirm_token(
+    rdb: sqlite3.Connection, session_id: int, items: Sequence[ApprovalItem], summary: str
+) -> str:
+    """The token that confirms approving exactly ``items`` of ``session_id`` after ``summary``
+    was shown: :func:`grepogram.consent.token` over the session, the normalized items, the
+    status of every candidate they name and the summary. The status is there because a skip
+    leaves the summary as it was, and a token handed out before it must not revive the
+    candidate. The CLI's ``--confirm`` and the MCP ``confirm`` argument take the same one."""
+    statuses: list[str] = []
+    for item in items:
+        if item.candidate_id is not None:
+            candidate = research_db.get_candidate(rdb, item.candidate_id)
+            statuses.append(f"{item.candidate_id}={'-' if candidate is None else candidate.status}")
+    request = [str(session_id), *approval_args(items), *statuses]
+    return consent.token(CONFIRM_SCOPE, request, summary)
+
+
 @dataclass(frozen=True, slots=True)
 class Approval:
     """An approval ready to put to a human: the items with their default actions filled in,
-    the exact :func:`approval_summary` to show, and the terminal command that asks for it."""
+    the exact :func:`approval_summary` to show, the terminal command that asks for it, and the
+    :func:`confirm_token` bound to that summary with the command that confirms through it."""
 
     items: tuple[ApprovalItem, ...]
     summary: str
     command: str
+    token: str
+
+    @property
+    def confirm_command(self) -> str:
+        """:attr:`command` with ``--confirm`` and :attr:`token`: approves exactly what
+        :attr:`summary` says, and refuses once it would say anything else."""
+        return f"{self.command} --confirm {self.token}"
 
 
 def prepare_approval(
@@ -821,9 +854,15 @@ def prepare_approval(
     session_id: int,
     tokens: Sequence[str],
 ) -> Approval:
-    """What both consent channels show before :func:`grant`: ``tokens`` in the approval grammar
-    (:func:`parse_approval`) with :func:`with_default_actions` applied, their summary, and the
-    command (:func:`approve_command`) the terminal channel asks through."""
+    """What every consent channel shows before :func:`grant`: ``tokens`` in the approval grammar
+    (:func:`parse_approval`) with :func:`with_default_actions` applied, their summary, the
+    command (:func:`approve_command`) the terminal channel asks through, and the token
+    (:func:`confirm_token`) a confirmation without a terminal or a dialog must name."""
     items = with_default_actions(rdb, session_id, parse_approval(tokens))
     summary = approval_summary(rdb, conn, cfg, session_id, items)
-    return Approval(tuple(items), summary, approve_command(session_id, items))
+    return Approval(
+        tuple(items),
+        summary,
+        approve_command(session_id, items),
+        confirm_token(rdb, session_id, items, summary),
+    )

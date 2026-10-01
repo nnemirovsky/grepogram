@@ -15,7 +15,7 @@ import pytest
 from telethon import errors, utils
 from telethon.tl import functions, types
 
-from grepogram import config, db, leads, research, research_db, sources, sync, tg
+from grepogram import config, consent, db, leads, research, research_db, sources, sync, tg
 from grepogram.filters import UnknownChat
 from grepogram.models import (
     AccountCfg,
@@ -4032,11 +4032,12 @@ def test_a_stored_session_with_a_huge_horizon_still_answers(rdb: sqlite3.Connect
     assert research.session_document(session)["horizon"] == "0001-01-01"
 
 
-def test_prepare_approval_is_what_both_consent_channels_show(
+def test_prepare_approval_is_what_every_consent_channel_shows(
     rdb: sqlite3.Connection, conn: sqlite3.Connection
 ) -> None:
     """The CLI and the MCP tool both put this to the human: the defaults a bare id stands for,
-    the summary :func:`research.grant` checks against, and the command that asks on a terminal."""
+    the summary :func:`research.grant` checks against, the command that asks on a terminal and
+    the token bound to that summary."""
     session = _start(rdb, conn)
     flats = _flats(rdb, session)
 
@@ -4048,6 +4049,19 @@ def test_prepare_approval_is_what_both_consent_channels_show(
         approval.command
         == f"grepogram research approve {session.id} {flats.id}:join,fetch,add_source"
     )
+    assert approval.token == research.confirm_token(
+        rdb, session.id, approval.items, approval.summary
+    )
+    assert approval.confirm_command == f"{approval.command} --confirm {approval.token}"
+    again = research.prepare_approval(
+        rdb, conn, CFG, session.id, [f"{flats.id}:join,fetch,add_source"]
+    )
+    assert again.token == approval.token, "a bare id and its spelled-out defaults are one request"
+    assert consent.problem(f"  {approval.token.upper()} ", approval.token) is None
+    altered = research.confirm_token(
+        rdb, session.id, approval.items, approval.summary.replace("Research", "research")
+    )
+    assert altered != approval.token, "the token is bound to the summary's every byte"
     with pytest.raises(research.ResearchError, match="not an approval item"):
         research.prepare_approval(rdb, conn, CFG, session.id, ["nine"])
 
