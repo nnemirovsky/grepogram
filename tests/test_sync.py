@@ -4417,7 +4417,9 @@ async def test_an_account_refused_the_chat_outright_is_still_a_witness(
     """The default account fetched the group's history and has since left it: Telegram refuses
     it the chat entirely. The work account may be a late joiner the group hides that history
     from, so its empty answer alone is no proof — nothing of the chat is removed, this run or
-    any later one while the default account is still recorded as reaching it."""
+    any later one while the default account is still recorded as reaching it. Since no rerun
+    changes that, the chat is reported held back, not as one to sweep again, and the warning
+    names the account and the `accounts rm` that releases it."""
     world = _world()
     cfg = _shared_club()
     await _run_accounts({DEFAULT_ACCOUNT: _home(world), WORK: _work(world)}, conn, paths, cfg)
@@ -4428,11 +4430,41 @@ async def test_an_account_refused_the_chat_outright_is_still_a_witness(
     for _ in range(2):
         report = await _prune_accounts({DEFAULT_ACCOUNT: left, WORK: work}, conn, paths, cfg)
 
-        assert report.removed == 0 and report.chats_remaining == [PRIV_ID]
+        assert report.removed == 0 and report.chats_held == [PRIV_ID]
+        assert report.chats_remaining == []
         [warning] = report.warnings
-        assert warning.startswith(f"account {DEFAULT_ACCOUNT}: chat {PRIV_ID} (Private club): ")
+        assert warning.startswith(
+            f"account {DEFAULT_ACCOUNT}: chat {PRIV_ID} (Private club) is held back: Telegram "
+            f"refuses it to account {DEFAULT_ACCOUNT} ("
+        )
+        assert "nothing was removed" in warning and "will not change that" in warning
+        assert f"`grepogram accounts rm {DEFAULT_ACCOUNT}`" in warning
         assert _texts(conn, PRIV_ID) == {1: "club 1", 2: "club 2", 3: "club 3"}
         assert db.prune_cursor(conn, PRIV_ID) == 0
+
+
+async def test_a_chat_every_witness_is_refused_is_left_to_carry_on_not_held(
+    conn: sqlite3.Connection, paths: Paths
+) -> None:
+    """When no recorded account answers at all, the chat is out of everyone's reach rather than
+    held back by one of them: each refusal is reported as Telegram gave it, no account is named
+    as holding it, and the chat is one a later run (after a sync marks it unavailable) settles."""
+    world = _world()
+    cfg = _shared_club()
+    await _run_accounts({DEFAULT_ACCOUNT: _home(world), WORK: _work(world)}, conn, paths, cfg)
+    refused = {PRIV_ID: errors.ChannelPrivateError(request=None)}
+    clients = {
+        DEFAULT_ACCOUNT: _home(world, failures=refused),
+        WORK: _work(world, failures=refused),
+    }
+
+    report = await _prune_accounts(clients, conn, paths, cfg)
+
+    assert report.removed == 0 and report.chats_remaining == [PRIV_ID]
+    assert report.chats_held == []
+    assert len(report.warnings) == 2
+    assert not any("held back" in warning for warning in report.warnings)
+    assert _texts(conn, PRIV_ID) == {1: "club 1", 2: "club 2", 3: "club 3"}
 
 
 # Every state a witness of the sweep can be in, as the default account, and whether its state
@@ -4519,9 +4551,14 @@ async def test_the_sweep_through_two_accounts_deletes_only_when_both_answer_empt
     assert sorted(_texts(conn, PRIV_ID)) == ([1, 3] if deleted else [1, 2, 3])
     if state in (_EMPTY, _PRESENT):
         assert report.chats_done == [PRIV_ID]
+    elif state.startswith("refused: "):
+        assert report.chats_held == [PRIV_ID] and report.chats_remaining == []
+        [warning] = report.warnings
+        assert "held back" in warning and f"accounts rm {DEFAULT_ACCOUNT}" in warning
     else:
-        assert report.chats_remaining == [PRIV_ID]
+        assert report.chats_remaining == [PRIV_ID] and report.chats_held == []
         assert report.warnings, "a chat kept for want of an answer says why"
+        assert not any("held back" in warning for warning in report.warnings)
 
 
 def _news_world() -> FakeWorld:
@@ -4575,7 +4612,12 @@ async def test_an_account_recorded_only_through_the_channel_is_a_witness_of_its_
 
     report = await _prune_accounts(clients, conn, paths, cfg, chat_id=NEWS_ID)
 
-    assert report.removed == 0 and DISC_ID in report.chats_remaining
+    assert report.removed == 0
+    # alone, the refused account leaves the group out of every account's reach; beside one
+    # that answers, it holds the group back until `accounts rm`
+    assert DISC_ID in (
+        report.chats_remaining if accounts_ == [DEFAULT_ACCOUNT] else report.chats_held
+    )
     assert sorted(_texts(conn, DISC_ID)) == [1, 2, 9]
 
     clients = {name: gone_but_two(name) for name in accounts_}

@@ -584,13 +584,17 @@ class PruneReport:
     that came back empty and were dropped. A chat is in ``chats_done`` once the sweep reached the
     end of its history and in ``chats_remaining`` when a budget, a flood wait or an error stopped
     it partway — its cursor stays where it got to, so the next run carries on from there. A
-    chat no connected account reaches is in ``chats_unreachable`` and was not asked about.
+    shared chat Telegram refuses to one recorded account while another still answers is in
+    ``chats_held``: nothing of it was removed, and no rerun finishes it until ``grepogram
+    accounts rm`` forgets that account's reach (the warnings name it). A chat no connected
+    account reaches is in ``chats_unreachable`` and was not asked about.
     """
 
     removed: int = 0
     checked: int = 0
     chats_done: list[int] = field(default_factory=list)
     chats_remaining: list[int] = field(default_factory=list)
+    chats_held: list[int] = field(default_factory=list)
     chats_unreachable: list[int] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
 

@@ -53,7 +53,7 @@ import time
 from collections import deque
 from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Literal
 
 from telethon import errors, helpers, utils
 from telethon.tl import functions, types
@@ -2466,22 +2466,25 @@ class _PruneTally:
     checked: int = 0
     done: list[int] = field(default_factory=list)
     remaining: list[int] = field(default_factory=list)
+    held: list[int] = field(default_factory=list)
     unreachable: list[int] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
 
     def report(self) -> PruneReport:
         log.info(
-            "prune-deleted: %d of %d checked messages were gone, %d chats swept, %d left",
+            "prune-deleted: %d of %d checked messages were gone, %d chats swept, %d left, %d held",
             self.removed,
             self.checked,
             len(self.done),
             len(self.remaining),
+            len(self.held),
         )
         return PruneReport(
             removed=self.removed,
             checked=self.checked,
             chats_done=self.done,
             chats_remaining=self.remaining,
+            chats_held=self.held,
             chats_unreachable=self.unreachable,
             warnings=self.warnings,
         )
@@ -2527,8 +2530,10 @@ async def prune_deleted(
     taking its word alone would delete what neither can serve again. The price is deliberate: a
     shared chat one recorded account can no longer reach is never pruned again, until ``grepogram
     accounts rm`` forgets that account's reach (:func:`grepogram.db.forget_account` — removing a
-    source alone leaves ``chat_access`` as it is). A chat no connected account reaches is left
-    alone and reported in ``chats_unreachable`` — its cursor untouched, nothing removed.
+    source alone leaves ``chat_access`` as it is). Such a chat is reported in ``chats_held``
+    rather than ``chats_remaining``, with a warning naming the refused account and that remedy,
+    because running the sweep again would not finish it. A chat no connected account reaches is
+    left alone and reported in ``chats_unreachable`` — its cursor untouched, nothing removed.
 
     Addressing a chat by its stored id is only possible once the client knows that peer, and a
     client grepogram builds knows none: :func:`~grepogram.accounts.warm_peer_cache` seeds the stored
@@ -2570,8 +2575,8 @@ async def prune_deleted(
             if budget.expired:
                 tally.remaining.extend(rest.id for rest in routed[position:])
                 break
-            complete = await _sweep_chat(route, conn, cfg, chat, budget, tally)
-            (tally.done if complete else tally.remaining).append(chat.id)
+            ended = {"done": tally.done, "remaining": tally.remaining, "held": tally.held}
+            ended[await _sweep_chat(route, conn, cfg, chat, budget, tally)].append(chat.id)
         return tally.report()
 
 
@@ -2755,6 +2760,17 @@ def refetchable(chat: ChatRow) -> bool:
     return True
 
 
+type _SweepEnd = Literal["done", "remaining", "held"]
+"""How one chat's turn of the sweep ended: the end of its history reached, stopped partway for
+a later run to carry on (a budget, a flood wait, an account that cannot answer this run), or
+held back by a recorded account Telegram refuses the chat to, which no rerun changes
+(:func:`_confirmed_gone`)."""
+
+
+_HELD: Literal["held"] = "held"
+""":func:`_confirmed_gone`'s answer for a page a refused account holds back."""
+
+
 async def _sweep_chat(
     route: StoredPass,
     conn: sqlite3.Connection,
@@ -2762,8 +2778,10 @@ async def _sweep_chat(
     chat: ChatRow,
     budget: SyncBudget,
     tally: _PruneTally,
-) -> bool:
-    """One chat from its cursor on; ``True`` once the sweep has reached the end of its history.
+) -> _SweepEnd:
+    """One chat from its cursor on; ``"done"`` once the sweep has reached the end of its
+    history, ``"held"`` when a refused account holds it back (:func:`_confirmed_gone`) and
+    ``"remaining"`` when anything else ended its turn.
 
     A page of stored ids, one request per witness, one transaction: the ids every witness
     answered empty (:func:`_confirmed_gone`) are deleted, the units holding them are cut again
@@ -2792,30 +2810,33 @@ async def _sweep_chat(
             "was stopped; nothing was removed, since only every account that reaches a chat "
             "can tell a deletion from history one of them cannot see",
         )
-        return False
+        return "remaining"
     witnesses = list(route.routes[chat.id])
     cursor = db.prune_cursor(conn, chat.id)
     while not budget.expired:
         page = db.message_ids_after(conn, chat.id, cursor, PRUNE_BATCH)
         if not page:
             db.clear_prune_cursor(conn, chat.id)
-            return True
+            return "done"
         gone = await _confirmed_gone(route, chat, page, witnesses)
         if gone is None:
-            return False
+            return "remaining"
+        if isinstance(gone, str):  # _HELD
+            return "held"
         tally.checked += len(page)
         cursor = page[-1]
         tally.removed += await joined_to_thread(
             functools.partial(_prune_batch, conn, cfg, chat, gone, cursor), budget.cancel
         )
-    return False
+    return "remaining"
 
 
 async def _confirmed_gone(
     route: StoredPass, chat: ChatRow, page: Sequence[int], witnesses: Sequence[str]
-) -> list[int] | None:
+) -> list[int] | Literal["held"] | None:
     """The ids of ``page`` every account of ``witnesses`` answered empty, or ``None`` when that
-    cannot be told this run — the chat's turn then ends with nothing removed.
+    cannot be told this run — the chat's turn then ends with nothing removed — or
+    :data:`_HELD` when a witness Telegram refuses the chat to holds it back for good.
 
     The first witness is asked about the whole page, each next one only about what the ones
     before it answered empty, so a chat one account reaches costs what it always did. **Every
@@ -2827,8 +2848,19 @@ async def _confirmed_gone(
     index holds may be exactly the history it fetched before it lost the chat, and its refusal
     says nothing about whether they are gone, while the account still answering may be a late
     joiner the group hides that history from.
+
+    That last case is told apart from the others, because no later run changes it: the refused
+    account stays a witness until ``grepogram accounts rm`` forgets its reach. The other
+    witnesses are still asked, and when one of them answers the chat is :data:`_HELD`, with a
+    warning that names the refused account, says nothing was removed and why, and names that
+    remedy — rather than Telegram's bare refusal, which a user would read as a chat to sweep
+    again. When none answers, the chat is out of every account's reach (a sync marks such a chat
+    unavailable, and the sweep leaves it alone from then on), so each refusal is reported as it
+    is and the turn ends like any other.
     """
     asked = list(page)
+    refused: list[tuple[str, Exception]] = []
+    answered = False
     for account in witnesses:
         client = route.clients[account]
         cap_flood_sleep(client, route.sync_cfg, route.budget)
@@ -2842,10 +2874,17 @@ async def _confirmed_gone(
             return None
         except errors.UnauthorizedError as exc:
             tg.reraise_unauthorized(exc, account)
+        except UNAVAILABLE_ERRORS as refusal:
+            log.warning(
+                "chat %s (%s) through account %s: %s", chat.id, chat.title, account, refusal
+            )
+            refused.append((account, refusal))
+            continue
         except (errors.RPCError, ValueError) as exc:
             log.warning("chat %s (%s) through account %s: %s", chat.id, chat.title, account, exc)
             route.warn(account, f"chat {chat.id} ({chat.title}): {exc}")
             return None
+        answered = True
         empty = _empty_slots(asked, answer)
         if empty is None:
             log.warning(
@@ -2865,7 +2904,22 @@ async def _confirmed_gone(
         asked = empty
         if not asked:
             break
-    return asked
+    if not refused:
+        return asked
+    if not answered:
+        for account, reason in refused:
+            route.warn(account, f"chat {chat.id} ({chat.title}): {reason}")
+        return None
+    for account, reason in refused:
+        route.warn(
+            account,
+            f"chat {chat.id} ({chat.title}) is held back: Telegram refuses it to account "
+            f"{account} ({reason}), which may have fetched history the other accounts cannot "
+            "see, so nothing was removed from it and running prune-deleted again will not "
+            f"change that; `grepogram accounts rm {account}` forgets what that account reached "
+            "and lets the chat be pruned again",
+        )
+    return _HELD
 
 
 def _empty_slots(page: Sequence[int], answer: Any) -> list[int] | None:

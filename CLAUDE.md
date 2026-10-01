@@ -241,7 +241,11 @@ never change the git identity.
   left, and the account still answering may be a late joiner that sees that history as empty —
   the deletion would be unrecoverable. The accepted price is that a shared chat one recorded
   account can no longer reach is never pruned again until `accounts rm` forgets that account's
-  reach (`db.forget_account`; removing a source alone leaves `chat_access` as it is). `only=` narrows the fetch to the chats
+  reach (`db.forget_account`; removing a source alone leaves `chat_access` as it is). Because no
+  rerun changes that, the sweep still asks the other witnesses and, when one answers, reports the
+  chat in `PruneReport.chats_held` with a warning naming the refused account and that remedy —
+  never in `chats_remaining`, whose CLI line says to run again; a chat no witness answers at all
+  stays in `chats_remaining` with Telegram's refusals. `only=` narrows the fetch to the chats
   the named sources cover while every source is still resolved, so a narrowed run never moves a
   primary. `index_pending`, `index_stranded`, the re-cut and embedding stay once per run, and a
   report's warnings read `account <name>: …` only when an account other than `default` is in

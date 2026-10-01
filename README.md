@@ -452,7 +452,9 @@ as deleted while another still reads them: it removes a message only when every 
 reaches the chat says it is gone, and leaves the chat alone while one of them is signed out,
 flood-stopped or refused the chat by Telegram. An account that has left or was banned from a group
 may be the one that fetched its older history, so a chat one of your accounts can no longer reach
-is not pruned again until `accounts rm` removes that account.
+is not pruned again until `accounts rm` removes that account. The report lists such a chat as
+held back rather than unfinished, and its warning names the account, since running
+`prune-deleted` again would not change it.
 `extract`, `prune-deleted` and `recapture-links` report a chat that no connected account reaches
 as unreachable, not as an error. `sources prune` reads each folder through the account that owns
 its source, and a folder whose account cannot connect counts as a folder that did not resolve:

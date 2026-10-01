@@ -764,6 +764,31 @@ def test_prune_deleted_passes_the_chat_and_the_budget_through(
     assert "warning: careful" in result.stderr
 
 
+def test_prune_deleted_reports_a_held_chat_apart_from_the_unfinished_ones(
+    tmp_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A held chat is no run's to finish: it is listed on its own line, which does not say to
+    run again, while the unfinished one keeps the advice to carry on."""
+    paths = _signed_in(tmp_home)
+    _prune_chat(paths)
+    held = "account work: chat 55 (Club) is held back: … `grepogram accounts rm work` …"
+
+    async def record(*_: Any, **__: Any) -> PruneReport:
+        return PruneReport(chats_remaining=[PRUNE_ID], chats_held=[55], warnings=[held])
+
+    monkeypatch.setattr(tg, "make_client", lambda *_: FakeClient())
+    monkeypatch.setattr(sync, "prune_deleted", record)
+    result = runner.invoke(cli.app, ["prune-deleted"])
+    assert result.exit_code == 0, result.output
+    [unfinished] = [line for line in result.stdout.splitlines() if "not finished" in line]
+    assert str(PRUNE_ID) in unfinished and "55" not in unfinished
+    assert "run prune-deleted again" in unfinished
+    [line] = [line for line in result.stdout.splitlines() if line.startswith("chats held back")]
+    assert line.startswith("chats held back: 1 (55); nothing removed")
+    assert "again" not in line
+    assert f"warning: {held}" in result.stderr
+
+
 def test_recapture_links_reads_the_links_of_rows_stored_without_them(
     tmp_home: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

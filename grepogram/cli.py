@@ -628,6 +628,12 @@ def _print_prune_report(report: PruneReport) -> None:
             f"chats not finished: {len(report.chats_remaining)} ({ids}); "
             "run prune-deleted again to carry on"
         )
+    if report.chats_held:
+        ids = ", ".join(str(chat_id) for chat_id in report.chats_held)
+        typer.echo(
+            f"chats held back: {len(report.chats_held)} ({ids}); nothing removed, since Telegram "
+            "refuses each to an account that reaches it — see the warnings for which"
+        )
     if report.chats_unreachable:
         ids = ", ".join(str(chat_id) for chat_id in report.chats_unreachable)
         typer.echo(f"chats no signed-in account reaches: {len(report.chats_unreachable)} ({ids})")
