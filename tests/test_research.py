@@ -2314,6 +2314,97 @@ async def test_an_invite_join_answer_naming_the_probed_chat_among_others_is_take
     assert report.joined == [door.id] and _status(rdb, door).peer_id == _marked(OPEN)
 
 
+@pytest.mark.parametrize("moved", [False, True], ids=["same-chat", "invite-moved"])
+async def test_an_invite_already_joined_is_checked_for_where_it_leads_now(
+    rdb: sqlite3.Connection, conn: sqlite3.Connection, paths: Paths, moved: bool
+) -> None:
+    """``USER_ALREADY_PARTICIPANT`` on an invite only says the account is in the chat the invite
+    leads to *now*: it is the approved chat only when a fresh check of the invite names it."""
+    world = _run_world()
+    client = _run_client(world)
+    session, found = await _discovered(rdb, conn, client, "https://t.me/+PeekIn")
+    peek = found["+PeekIn"]
+    assert peek.peer_id == _marked(PEEK)
+    _approve(rdb, conn, session, _item(peek, "join", "fetch", "add_source"))
+    if moved:
+        world.invites["PeekIn"] = FakeInvite(OPEN)  # the link now opens a chat the account is in
+        client.join(OPEN)
+    else:
+        client.join(PEEK)  # the account got into the approved chat some other way
+
+    report = await _run(rdb, conn, paths, client, session)
+
+    stored = _status(rdb, peek)
+    assert stored.peer_id == _marked(PEEK), "the approved peer is never overwritten"
+    if moved:
+        assert report.failed == [peek.id] and report.joined == report.fetched == []
+        assert stored.status == "failed" and stored.member is not True
+        assert f'different chat "Open door" (id {_marked(OPEN)})' in (stored.note or "")
+        assert _live(rdb, peek) == [] and config.load(paths).sources == []
+        assert _read(client) == set()
+    else:
+        assert report.joined == [peek.id] and report.failed == []
+        assert stored.status in ("joined", "fetched") and stored.member is True
+
+
+@pytest.mark.parametrize(
+    ("check", "why"),
+    [
+        pytest.param(
+            errors.InviteHashExpiredError(request=None),
+            "checking the invite again failed",
+            id="check-refused",
+        ),
+        pytest.param(
+            types.ChatInvite(
+                title="Peekable", photo=types.PhotoEmpty(id=0), participants_count=1, color=0
+            ),
+            "no longer says which chat that is",
+            id="check-names-no-chat",
+        ),
+    ],
+)
+async def test_an_invite_already_joined_whose_check_names_no_chat_is_not_taken(
+    rdb: sqlite3.Connection, conn: sqlite3.Connection, paths: Paths, check: Any, why: str
+) -> None:
+    world = _run_world()
+    client = _run_client(world)
+    session, found = await _discovered(rdb, conn, client, "https://t.me/+PeekIn")
+    peek = found["+PeekIn"]
+    _approve(rdb, conn, session, _item(peek, "join"))
+    client.join(PEEK)
+    client.responses[functions.messages.CheckChatInviteRequest] = check
+
+    report = await _run(rdb, conn, paths, client, session)
+
+    stored = _status(rdb, peek)
+    assert report.failed == [peek.id] and report.joined == []
+    assert stored.status == "failed" and why in (stored.note or "")
+    assert _live(rdb, peek) == []
+
+
+async def test_a_username_join_already_in_takes_the_probed_chat_without_rechecking(
+    rdb: sqlite3.Connection, conn: sqlite3.Connection, paths: Paths
+) -> None:
+    """A join by username or id names the probed peer itself, so Telegram's
+    ``USER_ALREADY_PARTICIPANT`` is about that chat and nothing is asked again."""
+    already = errors.UserAlreadyParticipantError(request=None)
+    client = _run_client(_run_world(), responses={functions.channels.JoinChannelRequest: already})
+    session, found = await _discovered(rdb, conn, client, "@tb_flats")
+    flats = found["@tb_flats"]
+    _approve(rdb, conn, session, _item(flats, "join"))
+    asked = len(client.requests)
+
+    report = await _run(rdb, conn, paths, client, session)
+
+    stored = _status(rdb, flats)
+    assert report.joined == [flats.id] and stored.peer_id == _marked(FLATS)
+    assert stored.member is True and stored.note == "the account was already a member"
+    assert not any(
+        isinstance(r, functions.messages.CheckChatInviteRequest) for r in client.requests[asked:]
+    )
+
+
 async def test_a_flood_wait_on_a_join_stops_the_run_and_keeps_the_grants(
     rdb: sqlite3.Connection, conn: sqlite3.Connection, paths: Paths
 ) -> None:

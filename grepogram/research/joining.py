@@ -44,6 +44,8 @@ _JOIN_UNREACHABLE: tuple[type[Exception], ...] = (*_JOIN_REFUSED, ValueError)
 
 PENDING_NOTE = "an admission request is waiting for the chat's admins"
 
+ALREADY_NOTE = "the account was already a member"
+
 
 def _fresh(rdb: sqlite3.Connection, candidate: Candidate) -> Candidate:
     current = research_db.get_candidate(rdb, candidate.id)
@@ -328,6 +330,51 @@ async def _resolve_approved(client: Any, candidate: Candidate) -> Any:
     return entity
 
 
+async def _already_through_invite(
+    client: Any,
+    rdb: sqlite3.Connection,
+    session: ResearchSession,
+    candidate: Candidate,
+    report: RunReport,
+) -> None:
+    """Settle an invite join Telegram answered with ``USER_ALREADY_PARTICIPANT``.
+
+    That answer only says the account is in the chat the invite leads to *now*, which need not
+    be the chat probed and approved: so the invite is checked again (read-only), and its
+    ``ChatInviteAlready`` (or a preview's) chat goes through :func:`_mark_joined`, which takes
+    it for the candidate only when it is that very chat and fails the candidate otherwise. A
+    check that names no chat, or fails, fails the candidate as well — nothing is fetched or
+    added for a chat no one can tell apart. A flood wait propagates, as on the join itself.
+
+    The ``username`` and ``id`` routes need none of this: their join names the probed peer
+    itself (:func:`_input_channel`), so Telegram's answer is about that chat.
+    """
+    assert candidate.invite_hash is not None
+    try:
+        answer = await client(functions.messages.CheckChatInviteRequest(hash=candidate.invite_hash))
+    except errors.FloodError:
+        raise
+    except errors.UnauthorizedError as exc:
+        tg.reraise_unauthorized(exc, session.account)
+    except errors.RPCError as exc:
+        note = (
+            "Telegram says the account is already in the chat the invite leads to, but checking "
+            f"the invite again failed: {exc}; nothing was fetched or added"
+        )
+        _refuse_candidate(rdb, session, candidate, "failed", note, report)
+        return
+    entity = getattr(answer, "chat", None)
+    if entity is None:
+        note = (
+            "Telegram says the account is already in the chat the invite leads to, but the "
+            "invite no longer says which chat that is; nothing was fetched or added — check "
+            f"which chats account {session.account} is in now"
+        )
+        _refuse_candidate(rdb, session, candidate, "failed", note, report)
+        return
+    _mark_joined(rdb, session, candidate, entity, report, ALREADY_NOTE)
+
+
 async def _join_one(
     client: Any,
     rdb: sqlite3.Connection,
@@ -366,9 +413,10 @@ async def _join_one(
     except errors.UnauthorizedError as exc:
         tg.reraise_unauthorized(exc, account)
     except errors.UserAlreadyParticipantError:
-        joined = _mark_joined(
-            rdb, session, candidate, None, report, "the account was already a member"
-        )
+        if way_in.route == "invite" and candidate.invite_hash:
+            await _already_through_invite(client, rdb, session, candidate, report)
+            return
+        joined = _mark_joined(rdb, session, candidate, None, report, ALREADY_NOTE)
         if joined is not None and joined.peer_id is None:
             await probe(client, rdb, conn, joined, now=stamp)
         return
@@ -484,7 +532,7 @@ async def _join_folder(
     for child in children:
         entity = None if child.peer_id is None else entities.get(child.peer_id)
         if child.peer_id in already:
-            _mark_joined(rdb, session, child, entity, report, "the account was already a member")
+            _mark_joined(rdb, session, child, entity, report, ALREADY_NOTE)
         elif child.peer_id not in offered or entity is None:
             note = f"the shared folder t.me/addlist/{slug} no longer lists it"
             _refuse_candidate(rdb, session, child, "unavailable", note, report)
