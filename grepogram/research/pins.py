@@ -91,9 +91,12 @@ async def read_pins(
         (asked if _pin_reader(target.chat, session) else foreign).append(target)
     del asked[max(limit, 0) :]
     if asked:
-        await accounts.warm_peer_cache(
-            client, [target.chat for target in asked], conn, session.account
-        )
+        try:
+            await accounts.warm_peer_cache(
+                client, [target.chat for target in asked], conn, session.account
+            )
+        except errors.UnauthorizedError as exc:
+            tg.reraise_unauthorized(exc, session.account)
     scan = LeadScan()
     done: list[ScanTarget] = list(foreign)
     extra: dict[int, set[str]] = {}

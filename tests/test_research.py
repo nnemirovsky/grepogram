@@ -3475,6 +3475,27 @@ async def test_the_pinned_posts_of_a_seed_are_read_for_leads_and_stored_nowhere(
         await research.read_pins(client, rdb, conn, Config(), session.id)
 
 
+async def test_a_session_rejected_while_warming_up_for_pins_names_the_account(
+    rdb: sqlite3.Connection, conn: sqlite3.Connection
+) -> None:
+    """The warm-up before the pin reads is the session's first request: a rejection there is
+    the session's account's, named as such, not a bare error claimed by whichever account's
+    connected block it unwinds through last."""
+    world = _world(messages={SEED: [tl.mention_message(SEED, 1, "@tb_flats", pinned=True)]})
+    client = world.client("default")
+    _store(conn, SEED, 2, "loose")
+    session = _start(rdb, conn)
+
+    async def rejected(*_: Any, **__: Any) -> list[Any]:
+        raise errors.AuthKeyUnregisteredError(request=None)
+
+    client.get_dialogs = rejected  # type: ignore[method-assign]
+    with pytest.raises(tg.AuthRequired) as caught:
+        await research.read_pins(client, rdb, conn, CFG, session.id, now=2)
+    assert caught.value.account == "default"
+    assert _pin_reads(client) == []
+
+
 async def test_a_run_reads_the_pinned_posts_of_what_it_fetched_whatever_their_age(
     rdb: sqlite3.Connection, conn: sqlite3.Connection, paths: Paths
 ) -> None:
