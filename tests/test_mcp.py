@@ -932,6 +932,33 @@ async def test_sources_remove_deletes_data_and_saves_the_config(
     assert unknown["hint"] is None
 
 
+def test_sources_remove_of_a_stray_chat_keeps_its_source_and_says_so(
+    state: tools.AppState, conn: sqlite3.Connection, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A chat held under a ``chat:`` source that resolved to another chat goes alone: the
+    source stays configured, and the log says the chat went, not the source."""
+    geo_source = f"chat:{GEO}"
+    db.set_source_chats(conn, geo_source, [GEO])
+    left = -1000000000777
+    db.upsert_chat(conn, ChatRow(id=left, type="supergroup", title="Left", source_id=geo_source))
+
+    with caplog.at_level(logging.INFO, logger="grepogram"):
+        removed = tools.sources_remove(str(left))
+
+    assert removed == {
+        "source_id": geo_source,
+        "removed_chat_ids": [left],
+        "kept_chat_ids": [],
+        "undecided_chat_ids": [],
+        "config_updated": False,
+    }
+    assert db.get_chat(conn, left) is None and db.get_chat(conn, GEO) is not None
+    assert state.config().sources == CFG.sources
+    assert f"removed chat {left}, held under {geo_source} which does not cover it" in caplog.text
+    assert "that source stays" in caplog.text
+    assert f"source {geo_source} removed" not in caplog.text
+
+
 def test_config_is_reread_when_the_file_changes(state: tools.AppState, paths: Paths) -> None:
     assert [s["source_id"] for s in tools.sources()["sources"]] == [
         "folder:Argentina",

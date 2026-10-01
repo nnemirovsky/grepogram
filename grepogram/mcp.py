@@ -1013,7 +1013,14 @@ def sources_remove(target: str) -> ToolResult:
         )
         if removed.source is not None:
             state.save_config(removed.config)
-    log.info("source %s removed (%d chats)", removed.source_id, len(removed.chat_ids))
+    if removed.stray:
+        log.info(
+            "removed chat %s, held under %s which does not cover it; that source stays",
+            removed.chat_ids[0],
+            removed.source_id,
+        )
+    else:
+        log.info("source %s removed (%d chats)", removed.source_id, len(removed.chat_ids))
     return {
         "source_id": removed.source_id,
         "removed_chat_ids": removed.chat_ids,
