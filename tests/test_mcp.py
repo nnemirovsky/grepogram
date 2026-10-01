@@ -1550,8 +1550,8 @@ def test_instructions_carry_the_playbook() -> None:
     assert "`sources`" in text and "`dialogs`" in text and "`sources_add`" in text
     assert "`accounts`" in text and "signs it in" in text
     assert "`research_start`" in text and "`research_approve`" in text
-    assert "only their own confirmation grants anything" in text
-    assert "never run it for them" in text
+    assert "show the user that summary verbatim" in text
+    assert "never confirm on your own judgement" in text
     assert "forwards and copies of one post are one source" in text
     assert "not independent confirmation" in text
     assert "Name the account a claim came through" in text

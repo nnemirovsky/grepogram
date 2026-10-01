@@ -35,11 +35,14 @@ another terminal can overwrite each other's save.
 
 The ``research_*`` tools drive :mod:`grepogram.research` over ``research.db``
 (:meth:`AppState.research_store`) and answer with the documents ``grepogram research … --json``
-prints. Each refuses while ``[research] enabled`` is false. Consent is the user's alone:
-``research_approve`` puts the exact :func:`~grepogram.research.approval_summary` to the user
-through MCP elicitation and grants (``via="elicitation"``) only on an accepted answer whose
-``approve`` is ``true``; a client that cannot elicit gets the terminal command that asks
-instead (:func:`~grepogram.research.approve_command`), and no tool parameter approves.
+prints. Each refuses while ``[research] enabled`` is false. ``research_approve`` puts the exact
+:func:`~grepogram.research.approval_summary` to the user: through MCP elicitation when the client
+can show a dialog, granting (``via="elicitation"``) only on an accepted answer whose ``approve``
+is ``true``; otherwise it answers with the summary and a ``confirm`` token bound to it
+(:mod:`grepogram.consent`), and a second call with that token grants (``via="confirm"``). The
+token only binds the confirmation to exactly what was shown; the agent is expected to show the
+user the summary and confirm on their say-so, and a token whose summary no longer matches is
+refused. A client with a dialog cannot use the token.
 """
 
 import argparse
@@ -130,10 +133,11 @@ index does not hold that chat) and its three separate facts — `member`, `cache
 which accounts), `authorized`; tell the \
 user what was found and why, and ask which to approve (only a candidate an online \
 `research_discover` probed can be approved; one found offline or past `probe_limit` needs \
-another online discover first); `research_approve` shows the user the \
-exact summary and only their own confirmation grants anything — when it answers with a `hint` \
-naming a terminal command, hand the user that command unchanged for them to type in their own \
-terminal, and never run it for them, not even through a shell tool; \
+another online discover first); `research_approve` either shows the user the \
+exact summary in a dialog, or answers with `needs_confirmation`, the `summary` and a `confirm` \
+token — then show the user that summary verbatim, and only when they agree call \
+`research_approve` again with the same `items` and `confirm` (a token whose summary changed is \
+refused with a fresh one; never confirm on your own judgement); \
 `research_run`; analyse what it fetched with `search`, `thread` and `context`; `research_stop` \
 when done (the sources stay). Approving a chat approves nothing found inside it. \
 `research_skip` and `research_exclude` only narrow and need no approval.

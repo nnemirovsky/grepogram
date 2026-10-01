@@ -13,18 +13,19 @@ add``, ``leave`` and ``research start`` take ``--account`` (``default`` when omi
 a config without ``[[accounts]]`` has always had), while ``sync``, ``extract``,
 ``prune-deleted``, ``recapture-links`` and ``sources prune`` use every signed-in account at
 once; the offline ``import --account`` names the account an export was made from. ``accounts
-rm`` and ``leave`` change things a config edit cannot undo, so they ask on the controlling terminal
-(:func:`_terminal`) and refuse without one; the human confirms by typing back a random code the
-question shows (:func:`_ask`), and no option answers for them.
+rm``, ``leave`` and ``research approve`` change things a config edit cannot undo, and each
+confirms in one of two ways. At a controlling terminal (:func:`_terminal`) it shows the exact
+summary and asks for a random code typed back (:func:`_ask`). Without one — an agent running the
+command — it prints the summary, a token bound to it (:mod:`grepogram.consent`) and the exact
+command that confirms it, changes nothing and exits with :data:`CONFIRM_EXIT`; the same command
+with ``--confirm <token>`` then acts, and a token whose summary no longer matches is refused with
+a fresh one. The token is not proof of a human: for an agent, the human gate is the agent's own
+permission prompt (Claude Code "ask" rules on these commands), and the token only makes sure what
+is confirmed is exactly what was shown. There is no bare ``--yes``. A research grant records how it
+was confirmed (``cli`` for the typed code, ``confirm`` for the token).
 ``research`` drives :mod:`grepogram.research` over ``research.db`` and refuses every command while
-``[research] enabled`` is false. ``research approve`` is the CLI's consent channel: it writes the
-exact :func:`~grepogram.research.approval_summary` to the controlling terminal and reads the answer
-there, so the text the grant records is the text the human read; with no terminal it refuses, and
-no option approves in its place. What that guards against is an MCP-only agent, a pipe and a
-blind ``yes``: an agent that can run shell commands can give the command a terminal of its own
-and read the code off it, so the CLI's confirmation relies on the human being the one who runs
-it. Its ``--json`` readers print the documents the MCP research tools answer with
-(``research.*_document``).
+``[research] enabled`` is false. Its ``--json`` readers print the documents the MCP research tools
+answer with (``research.*_document``).
 One search spans every account's chats: ``search --account`` scopes it to what an account reaches
 (a scope, not isolation) and every hit and message names the accounts its chat came through.
 
@@ -122,7 +123,8 @@ app.add_typer(research_app, name="research")
 
 TERMINAL = "/dev/tty"
 """Where :func:`_terminal` asks a confirmation: the controlling terminal, never stdin, so
-nothing piped into the command answers for the human."""
+nothing piped into the command answers the typed-back code. Without one the command takes the
+token path instead (``--confirm``)."""
 CODE_ALPHABET = "abcdefghjkmnpqrstuvwxyz23456789"
 """What a confirmation code is drawn from: lowercase letters and digits a human cannot misread
 for one another (no ``i``, ``l``, ``o``, ``0``, ``1``)."""
@@ -2300,11 +2302,10 @@ def _open_terminal() -> TextIO:
 def _terminal(command: str) -> Iterator[TextIO]:
     """The terminal a confirmation of ``command`` is asked on, or :class:`NoTerminal`.
 
-    It is the controlling terminal and never stdin, so nothing piped into the command answers,
-    and there is no option that skips the question. It does not stop an agent that can run
-    shell commands, which can give the command a terminal of its own: the confirmation holds
-    against an MCP-only agent, a pipe and a blind ``yes``, and otherwise relies on the human
-    being the one who runs the command.
+    It is the controlling terminal and never stdin, so nothing piped into the command answers
+    the code. A process with no terminal — an agent's shell — is not refused outright: the
+    command prints the summary and a ``--confirm`` token instead, and the human gate for it is
+    the agent's own permission prompt.
     """
     try:
         tty = _open_terminal()
