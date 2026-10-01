@@ -297,7 +297,9 @@ batches of a hundred oldest first, and removes the ones Telegram no longer has, 
 channel to its discussion group so a deleted *comment* is caught too. That is about one request
 per hundred stored messages, which is why it is yours to run and never a sync's; a run stopped by
 `--budget` or a flood wait keeps every batch it finished and the next one carries on from its
-cursor. Anything Telegram declines for some other reason is left where it is.
+cursor. Anything Telegram declines for some other reason is left where it is: a chat Telegram
+refuses to an account that reaches it keeps every message, since a deletion there could never be
+told apart from history that account can no longer see.
 
 `recapture-links` fills in what an older index never kept. Messages stored before grepogram
 captured links carry only their text: their hidden hyperlinks, URL buttons and forward origins
@@ -447,7 +449,10 @@ source whose chat or folder no longer resolves for its account is a warning of t
 keeps the chats it already covered.
 `prune-deleted` is stricter, because an account that joined a group late can see older messages
 as deleted while another still reads them: it removes a message only when every account that
-reaches the chat says it is gone, and leaves the chat alone while one of them is signed out.
+reaches the chat says it is gone, and leaves the chat alone while one of them is signed out,
+flood-stopped or refused the chat by Telegram. An account that has left or was banned from a group
+may be the one that fetched its older history, so a chat one of your accounts can no longer reach
+is not pruned again until `accounts rm` removes that account.
 `extract`, `prune-deleted` and `recapture-links` report a chat that no connected account reaches
 as unreachable, not as an error. `sources prune` reads each folder through the account that owns
 its source, and a folder whose account cannot connect counts as a folder that did not resolve:

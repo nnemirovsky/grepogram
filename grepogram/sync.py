@@ -62,7 +62,6 @@ from grepogram import db, dialogs, index, leads, tg, units
 from grepogram.accounts import (
     UNAVAILABLE_ERRORS,
     AccountStopped,
-    Refusal,
     StoredPass,
     account_warning,
     ask_account,
@@ -2513,11 +2512,18 @@ async def prune_deleted(
     group hides its history from — sees older messages as empty while another account still
     reads them, and the index holds whatever the account that fetched it could see. So a message
     is removed only when every account the index records as reaching the chat
-    (:func:`recorded_reach`) answers it empty (:func:`_confirmed_gone`): one of them not in this
-    run or stopped by a flood wait leaves the chat untouched with a warning, and an account
-    Telegram refuses the chat to outright is no witness either way and is passed over — though
-    at least one account must answer. A chat no connected account reaches is left alone and
-    reported in ``chats_unreachable`` — its cursor untouched, nothing removed.
+    (:func:`recorded_reach`) answers it empty (:func:`_confirmed_gone`). Every one of them that
+    cannot answer is "cannot tell", and the chat keeps everything this run, with a warning: one
+    not in this run (no session, or left out as another Telegram user than recorded), one
+    stopped by a flood wait, one whose client cannot address the peer — and one Telegram refuses
+    the chat to outright (:data:`UNAVAILABLE_ERRORS`). That last one is not passed over, because
+    the rows the index holds may be exactly the history it fetched before it left or was banned,
+    while the account still in the group may be a late joiner that sees that history as empty:
+    taking its word alone would delete what neither can serve again. The price is deliberate: a
+    shared chat one recorded account can no longer reach is never pruned again, until ``grepogram
+    accounts rm`` forgets that account's reach (:func:`grepogram.db.forget_account` — removing a
+    source alone leaves ``chat_access`` as it is). A chat no connected account reaches is left
+    alone and reported in ``chats_unreachable`` — its cursor untouched, nothing removed.
 
     Addressing a chat by its stored id is only possible once the client knows that peer, and a
     client grepogram builds knows none: :func:`~grepogram.accounts.warm_peer_cache` seeds the stored
@@ -2801,25 +2807,24 @@ async def _sweep_chat(
 
 
 async def _confirmed_gone(
-    route: StoredPass, chat: ChatRow, page: Sequence[int], witnesses: list[str]
+    route: StoredPass, chat: ChatRow, page: Sequence[int], witnesses: Sequence[str]
 ) -> list[int] | None:
     """The ids of ``page`` every account of ``witnesses`` answered empty, or ``None`` when that
     cannot be told this run — the chat's turn then ends with nothing removed.
 
     The first witness is asked about the whole page, each next one only about what the ones
-    before it answered empty, so a chat one account reaches costs what it always did. A flood
-    wait stops the account (:meth:`StoredPass.stop`) and a Telegram error is reported, both
-    ending the turn. A shared chat Telegram refuses to one account outright
-    (:data:`UNAVAILABLE_ERRORS`) drops that account from ``witnesses`` for the rest of the chat:
-    it sees nothing, so it hides nothing either — but when no witness answered at all, nothing
-    is removed. A peer the account's client cannot address (``ValueError``: its cache was never
-    warmed for it) is no such answer — the account is unknown, not refused, and may still hold
-    what the others answer empty — so it ends the turn with nothing removed, like any error.
+    before it answered empty, so a chat one account reaches costs what it always did. **Every
+    witness has to answer**: anything else is "cannot tell". A flood wait stops the account
+    (:meth:`StoredPass.stop`); a Telegram refusal of the chat (:data:`UNAVAILABLE_ERRORS`: the
+    account left, was banned, the chat went private for it), any other Telegram error, and a peer
+    the account's client cannot address (``ValueError``: its cache was never warmed for it) are
+    reported — and all of them end the turn. A refused account is not passed over: the rows the
+    index holds may be exactly the history it fetched before it lost the chat, and its refusal
+    says nothing about whether they are gone, while the account still answering may be a late
+    joiner the group hides that history from.
     """
     asked = list(page)
-    answered = False
-    refusal: Refusal | None = None
-    for account in list(witnesses):
+    for account in witnesses:
         client = route.clients[account]
         cap_flood_sleep(client, route.sync_cfg, route.budget)
         try:
@@ -2834,12 +2839,6 @@ async def _confirmed_gone(
             tg.reraise_unauthorized(exc, account)
         except (errors.RPCError, ValueError) as exc:
             log.warning("chat %s (%s) through account %s: %s", chat.id, chat.title, account, exc)
-            if chat.is_shared and isinstance(exc, UNAVAILABLE_ERRORS):
-                witnesses.remove(account)
-                refusal = Refusal(account, str(exc), exc)
-                continue
-            # a ValueError is the client failing to address the peer — a local miss, never
-            # Telegram's word — so that account stays a witness and the turn ends here
             route.warn(account, f"chat {chat.id} ({chat.title}): {exc}")
             return None
         empty = _empty_slots(asked, answer)
@@ -2858,14 +2857,9 @@ async def _confirmed_gone(
                 f"{len(asked)} ids asked about; nothing was removed",
             )
             return None
-        answered = True
         asked = empty
         if not asked:
             break
-    if not answered:
-        if refusal is not None:
-            route.warn(refusal.account, f"chat {chat.id} ({chat.title}): {refusal.reason}")
-        return None
     return asked
 
 

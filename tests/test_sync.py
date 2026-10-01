@@ -4411,11 +4411,13 @@ async def test_a_flood_wait_on_a_shared_chat_stops_the_sweep_of_it(
     assert _texts(conn, PRIV_ID) == {1: "club 1", 2: "club 2", 3: "club 3"}
 
 
-async def test_an_account_refused_the_chat_outright_is_no_witness(
+async def test_an_account_refused_the_chat_outright_is_still_a_witness(
     conn: sqlite3.Connection, paths: Paths
 ) -> None:
-    """The default account has left the group: Telegram refuses it the chat entirely, which
-    hides nothing — the work account's answer alone decides."""
+    """The default account fetched the group's history and has since left it: Telegram refuses
+    it the chat entirely. The work account may be a late joiner the group hides that history
+    from, so its empty answer alone is no proof — nothing of the chat is removed, this run or
+    any later one while the default account is still recorded as reaching it."""
     world = _world()
     cfg = _shared_club()
     await _run_accounts({DEFAULT_ACCOUNT: _home(world), WORK: _work(world)}, conn, paths, cfg)
@@ -4423,10 +4425,164 @@ async def test_an_account_refused_the_chat_outright_is_no_witness(
     work = _work(world)
     work.messages[PRIV_ID] = [m for m in work.messages[PRIV_ID] if m.id != 2]
 
-    report = await _prune_accounts({DEFAULT_ACCOUNT: left, WORK: work}, conn, paths, cfg)
+    for _ in range(2):
+        report = await _prune_accounts({DEFAULT_ACCOUNT: left, WORK: work}, conn, paths, cfg)
 
-    assert report.removed == 1 and report.chats_done == [PRIV_ID]
-    assert _texts(conn, PRIV_ID) == {1: "club 1", 3: "club 3"}
+        assert report.removed == 0 and report.chats_remaining == [PRIV_ID]
+        [warning] = report.warnings
+        assert warning.startswith(f"account {DEFAULT_ACCOUNT}: chat {PRIV_ID} (Private club): ")
+        assert _texts(conn, PRIV_ID) == {1: "club 1", 2: "club 2", 3: "club 3"}
+        assert db.prune_cursor(conn, PRIV_ID) == 0
+
+
+# Every state a witness of the sweep can be in, as the default account, and whether its state
+# lets message 2 go. Only an answer that leaves it empty does; everything else is "cannot tell".
+_EMPTY = "answered empty"
+_PRESENT = "answered present"
+_ABSENT = "absent from the run"
+_OTHER_USER = "another Telegram user"
+_WITNESS_STATES: dict[str, bool] = {
+    _EMPTY: True,
+    _PRESENT: False,
+    **{f"refused: {error.__name__}": False for error in accounts.UNAVAILABLE_ERRORS},
+    "flood-stopped": False,
+    _ABSENT: False,
+    _OTHER_USER: False,
+    "unaddressable peer": False,
+}
+
+
+def _witness(world: FakeWorld, conn: sqlite3.Connection, state: str) -> dict[str, FakeClient]:
+    """The default account's client in ``state`` for the sweep of the private group, or no
+    client at all when it is absent."""
+    failures: dict[int, Exception] = {}
+    if state.startswith("refused: "):
+        # every class of UNAVAILABLE_ERRORS is an RPCError, built from the request it answers
+        [refusal] = [e for e in accounts.UNAVAILABLE_ERRORS if state == f"refused: {e.__name__}"]
+        rpc_error: Any = refusal
+        failures[PRIV_ID] = rpc_error(request=None)
+    elif state == "flood-stopped":
+        failures[PRIV_ID] = errors.FloodWaitError(request=None, capture=60)
+    elif state == "unaddressable peer":
+        failures[PRIV_ID] = ValueError("Could not find the input entity")
+    elif state == _ABSENT:
+        return {}
+    elif state == _OTHER_USER:
+        db.upsert_account(conn, AccountRow(name=DEFAULT_ACCOUNT, user_id=99, display_name="Else"))
+    home = _home(world, failures=failures)
+    if state == _EMPTY:
+        home.messages[PRIV_ID] = [m for m in home.messages[PRIV_ID] if m.id != 2]
+    return {DEFAULT_ACCOUNT: home}
+
+
+@pytest.mark.parametrize("state", list(_WITNESS_STATES))
+async def test_the_sweep_through_one_account_deletes_only_on_its_empty_answer(
+    conn: sqlite3.Connection, paths: Paths, state: str
+) -> None:
+    """The group is the default account's alone: message 2 goes only when that account answers
+    it empty, and every other state keeps the whole chat."""
+    world = _world()
+    cfg = _cfg(Source(chat=PRIV_ID))
+    await _run_accounts({DEFAULT_ACCOUNT: _home(world)}, conn, paths, cfg)
+
+    report = await _prune_accounts(_witness(world, conn, state), conn, paths, cfg)
+
+    deleted = _WITNESS_STATES[state]
+    assert report.removed == int(deleted)
+    assert sorted(_texts(conn, PRIV_ID)) == ([1, 3] if deleted else [1, 2, 3])
+    if state in (_EMPTY, _PRESENT):
+        assert report.chats_done == [PRIV_ID] and report.warnings == []
+    elif state in (_ABSENT, _OTHER_USER):
+        assert report.chats_unreachable == [PRIV_ID]
+    else:
+        assert report.chats_remaining == [PRIV_ID] and report.warnings
+
+
+@pytest.mark.parametrize("state", list(_WITNESS_STATES))
+async def test_the_sweep_through_two_accounts_deletes_only_when_both_answer_empty(
+    conn: sqlite3.Connection, paths: Paths, state: str
+) -> None:
+    """Both accounts reach the group and the work account answers message 2 empty: it goes
+    only when the default account answers it empty too. Refused, flood-stopped, absent, left
+    out as another user or unable to address the peer, the default account cannot tell — and
+    the chat keeps everything this run."""
+    world = _world()
+    cfg = _shared_club()
+    await _run_accounts({DEFAULT_ACCOUNT: _home(world), WORK: _work(world)}, conn, paths, cfg)
+    work = _work(world)
+    work.messages[PRIV_ID] = [m for m in work.messages[PRIV_ID] if m.id != 2]
+
+    report = await _prune_accounts({**_witness(world, conn, state), WORK: work}, conn, paths, cfg)
+
+    deleted = _WITNESS_STATES[state]
+    assert report.removed == int(deleted)
+    assert sorted(_texts(conn, PRIV_ID)) == ([1, 3] if deleted else [1, 2, 3])
+    if state in (_EMPTY, _PRESENT):
+        assert report.chats_done == [PRIV_ID]
+    else:
+        assert report.chats_remaining == [PRIV_ID]
+        assert report.warnings, "a chat kept for want of an answer says why"
+
+
+def _news_world() -> FakeWorld:
+    """A public channel whose discussion group holds the three comments of :func:`_comments`."""
+    comments = _comments()
+    return FakeWorld(
+        entities=[NEWS, DISC, ALICE, BOB],
+        messages={NEWS_ID: _posts(), DISC_ID: [m for pool in comments.values() for m in pool]},
+        comments=comments,
+    )
+
+
+def _news_reader(world: FakeWorld, account: str, **kwargs: Any) -> FakeClient:
+    return world.client(
+        account,
+        members=[NEWS],
+        me=ME if account == DEFAULT_ACCOUNT else WORK_ME,
+        responses={
+            functions.channels.GetFullChannelRequest: _full_channel(201, chats=[NEWS, DISC])
+        },
+        **kwargs,
+    )
+
+
+@pytest.mark.parametrize(
+    "accounts_", [[DEFAULT_ACCOUNT], [DEFAULT_ACCOUNT, WORK]], ids=["one account", "two accounts"]
+)
+async def test_an_account_recorded_only_through_the_channel_is_a_witness_of_its_group(
+    conn: sqlite3.Connection, paths: Paths, accounts_: list[str]
+) -> None:
+    """A discussion group is reached through its channel's link, so no account has an access row
+    of its own for it: its witnesses are the accounts that reach the channel. Each one of them
+    counts — refused the group, it cannot tell, and the comments stay; answering empty, they go."""
+    world = _news_world()
+    cfg = _cfg(*(Source(chat="@news", comments=True, account=name) for name in accounts_))
+    await _run_accounts({name: _news_reader(world, name) for name in accounts_}, conn, paths, cfg)
+    group = db.get_chat(conn, DISC_ID)
+    assert group is not None and group.discussion_of == NEWS_ID
+    assert db.chat_accounts(conn, DISC_ID) == [], "reached only through the channel"
+    assert accounts.recorded_reach(conn, group) == accounts_
+    assert sorted(_texts(conn, DISC_ID)) == [1, 2, 9]
+
+    def gone_but_two(name: str, **kwargs: Any) -> FakeClient:
+        client = _news_reader(world, name, **kwargs)
+        client.messages[DISC_ID] = [m for m in client.messages[DISC_ID] if m.id != 2]
+        return client
+
+    refused = {DISC_ID: errors.ChannelPrivateError(request=None)}
+    clients = {name: gone_but_two(name) for name in accounts_}
+    clients[DEFAULT_ACCOUNT] = gone_but_two(DEFAULT_ACCOUNT, failures=refused)
+
+    report = await _prune_accounts(clients, conn, paths, cfg, chat_id=NEWS_ID)
+
+    assert report.removed == 0 and DISC_ID in report.chats_remaining
+    assert sorted(_texts(conn, DISC_ID)) == [1, 2, 9]
+
+    clients = {name: gone_but_two(name) for name in accounts_}
+    report = await _prune_accounts(clients, conn, paths, cfg, chat_id=NEWS_ID)
+
+    assert report.removed == 1 and DISC_ID in report.chats_done
+    assert sorted(_texts(conn, DISC_ID)) == [1, 9]
 
 
 async def test_an_account_whose_client_cannot_address_the_chat_is_still_a_witness(
