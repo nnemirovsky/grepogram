@@ -2071,10 +2071,14 @@ async def _sync_chats(
     Every chat goes to the queue of the first account :func:`reaching_accounts` names that is in
     the run and not stopped — its primary source's account when that one can — so a channel two
     accounts' sources cover is one row fetched once, and a chat whose own account has no client
-    this run goes through another account that reaches it or, when none does, is reported as
-    remaining. The queues run concurrently: each account talks to Telegram over its own
-    connection and is rate-limited on its own, and the one database connection serialises their
-    writes (:class:`grepogram.db.Connection`), every transaction being free of ``await``.
+    this run goes through another account that reaches it. When no account can take it
+    (:func:`_enqueue`), it is remaining only if a flood wait stopped an account that reaches it —
+    the next run fetches it; when no account of this run reaches it at all, it is counted in
+    :attr:`_SyncPass.unfetched` and the report carries one warning per account instead, since
+    running the sync again would not fetch it. The queues run concurrently: each account talks
+    to Telegram over its own connection and is rate-limited on its own, and the one database
+    connection serialises their writes (:class:`grepogram.db.Connection`), every transaction
+    being free of ``await``.
     Everything the queues share is in :class:`_SyncPass`. A failure that ends the run (an
     unauthorized session) cancels the other queues, which still index what they committed on
     their way out, and is re-raised as itself; a second account failing at the same time is
