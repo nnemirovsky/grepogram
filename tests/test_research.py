@@ -2167,6 +2167,47 @@ async def test_a_run_takes_the_folder_route_its_approval_recorded(
     assert not [r for r in client.requests if isinstance(r, functions.channels.JoinChannelRequest)]
 
 
+@pytest.mark.parametrize(
+    ("check", "status"),
+    [
+        pytest.param(
+            errors.BadRequestError(None, "INVITE_SLUG_EXPIRED", 400), "unavailable", id="dead-slug"
+        ),
+        pytest.param(errors.ServerError(None, "INTERNAL", 500), "failed", id="transient"),
+        pytest.param(errors.FloodWaitError(request=None, capture=30), "approved", id="flood"),
+    ],
+)
+async def test_a_folder_check_error_refuses_the_chats_only_when_the_link_is_refused(
+    rdb: sqlite3.Connection, conn: sqlite3.Connection, paths: Paths, check: Any, status: str
+) -> None:
+    """A dead link makes the folder's chats ``unavailable`` through it; an error that says
+    nothing about the folder leaves them ``failed`` for a new approval, and a flood wait keeps
+    the grant for the next run — as a single join's errors do."""
+    client = _run_client(_run_world())
+    session, found = await _discovered(rdb, conn, client, "https://t.me/addlist/Tbilisi1")
+    private = found[f"peer:{_marked(FOLDER_PRIVATE)}"]
+    _approve(rdb, conn, session, _item(private, "join"))
+    client.responses[functions.chatlists.CheckChatlistInviteRequest] = check
+
+    report = await _run(rdb, conn, paths, client, session)
+
+    stored = _status(rdb, private)
+    assert stored.status == status and report.joined == [] and client.chatlist_joins == []
+    if status == "approved":
+        assert report.stopped_by == "flood" and _live(rdb, private)
+        return
+    assert _live(rdb, private) == []
+    assert (report.unavailable, report.failed) == (
+        ([private.id], []) if status == "unavailable" else ([], [private.id])
+    )
+    if status == "failed":
+        assert "checking its shared folder" in (stored.note or "")
+        assert _approve(rdb, conn, session, _item(private, "join")), "approvable again"
+    else:
+        with pytest.raises(research.ResearchError):
+            _approve(rdb, conn, session, _item(private, "join"))
+
+
 async def test_a_grant_that_recorded_no_way_in_is_failed_for_a_new_approval(
     rdb: sqlite3.Connection, conn: sqlite3.Connection, paths: Paths
 ) -> None:

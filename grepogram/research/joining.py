@@ -38,6 +38,14 @@ _JOIN_REFUSED: tuple[type[Exception], ...] = (
 banned from it. The candidate is ``unavailable``; no later run would do better."""
 
 
+def _folder_refused(exc: errors.RPCError) -> bool:
+    """Whether Telegram refused a shared folder's link itself — ``INVITE_SLUG_EMPTY``,
+    ``INVITE_SLUG_EXPIRED`` and the like, which Telethon has no class for — so that its chats
+    are ``unavailable`` through it, as :data:`_JOIN_REFUSED` makes a chat. Any other error says
+    nothing about the folder, and its chats are ``failed`` for a new approval instead."""
+    return str(getattr(exc, "message", "")).startswith("INVITE_SLUG_")
+
+
 _JOIN_UNREACHABLE: tuple[type[Exception], ...] = (*_JOIN_REFUSED, ValueError)
 """Those, and a chat this account cannot address at all (a username no longer held)."""
 
@@ -497,7 +505,9 @@ async def _join_folder(
     The folder is checked again first, so the peers go out with the access hashes this account
     holds now: a folder not imported yet is joined with ``chatlists.joinChatlistInvite``, one
     already imported gets its missing chats through ``chatlists.joinChatlistUpdates``. A chat
-    the folder no longer lists is ``unavailable``; one the account is already in is ``joined``.
+    the folder no longer lists is ``unavailable``, and so is every chat when Telegram refuses
+    the link itself (:func:`_folder_refused`); any other error on the check fails them for a new
+    approval. One the account is already in is ``joined``.
     Every child's approval is asked about again (:func:`authorized`) before the check and once
     more after it, right before the join: one withdrawn — or the session stopped — while
     Telegram answered is left out of the request, which is not sent at all when none is left.
@@ -515,9 +525,14 @@ async def _join_folder(
     except errors.UnauthorizedError as exc:
         tg.reraise_unauthorized(exc, account)
     except errors.RPCError as exc:
+        refused = _folder_refused(exc)
         for child in children:
-            note = f"its shared folder t.me/addlist/{slug} is refused: {exc}"
-            _refuse_candidate(rdb, session, child, "unavailable", note, report)
+            if refused:
+                note = f"its shared folder t.me/addlist/{slug} is refused: {exc}"
+                _refuse_candidate(rdb, session, child, "unavailable", note, report)
+            else:
+                note = f"checking its shared folder t.me/addlist/{slug} failed: {exc}"
+                _refuse_candidate(rdb, session, child, "failed", note, report)
         return
     entities = {dialogs.peer_id(e): e for e in (*answer.chats, *answer.users)}
     filter_id: int | None = None

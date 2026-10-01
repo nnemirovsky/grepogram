@@ -101,7 +101,8 @@ classes of Telethon 1.44 / layer 227 for the exact fields):
   ``TextWithEntities``, ``peers``, ``chats``, ``users``) or, once the folder is imported,
   ``chatlists.chatlistInviteAlready`` (``filter_id``, ``missing_peers`` not joined yet,
   ``already_peers``); a dead slug is an RPC error Telethon has no class for (``INVITE_SLUG_*``),
-  hence the plain ``RPCError`` catch.
+  hence the plain ``RPCError`` catch and the match on its message
+  (:func:`grepogram.research.joining._folder_refused`).
 - ``messages.search`` with ``inputMessagesFilterPinned`` (what ``iter_messages(filter=…)``
   sends) answers a chat's pinned messages, newest first, whatever their date.
 - ``messageFwdHeader``: ``from_id`` + ``channel_post`` address a channel post; ``from_name``
