@@ -1787,6 +1787,13 @@ class FakeContext:
         return self.answer
 
 
+async def _approve(
+    ctx: FakeContext, items: list[str], confirm: str | None = None
+) -> tools.ToolResult:
+    """``research_approve`` of session 1 through ``ctx``, with ``confirm`` when given."""
+    return await tools.research_approve(1, items, ctx, confirm=confirm)  # type: ignore[arg-type]
+
+
 def _accept(approve: bool = True) -> AcceptedElicitation[tools.Confirm]:
     return AcceptedElicitation(data=tools.Confirm(approve=approve))
 
@@ -2013,6 +2020,8 @@ async def test_research_approve_grants_nothing_once_the_session_changed_under_th
 async def test_research_approve_that_cannot_ask_grants_nothing(
     researching: FakeClient, paths: Paths, failure: Exception
 ) -> None:
+    """A dialog that cannot be shown grants nothing; the token and the shell command that
+    confirms it come back instead, since this client refuses ``confirm`` itself."""
     await _discovered()
     ctx = FakeContext(answer=failure)
 
@@ -2020,7 +2029,8 @@ async def test_research_approve_that_cannot_ask_grants_nothing(
 
     assert result["approved"] is False
     assert result["error"].startswith("the confirmation could not be asked")
-    assert result["hint"].endswith(TERMINAL)
+    assert result["hint"] == tools.DIALOG_FAILED_HINT
+    assert result["command"] == f"{TERMINAL} --confirm {result['confirm']}"
     assert _grants(paths) == []
 
 
@@ -2034,22 +2044,77 @@ async def test_research_approve_that_cannot_ask_grants_nothing(
         ),
     ],
 )
-async def test_research_approve_without_elicitation_names_the_terminal_command(
-    researching: FakeClient, paths: Paths, capabilities: mcp_types.ClientCapabilities | None
+async def test_research_approve_without_elicitation_answers_the_summary_and_a_token(
+    researching: FakeClient,
+    paths: Paths,
+    capabilities: mcp_types.ClientCapabilities | None,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
+    """The ask step: the exact summary, the token bound to it and the CLI command that takes
+    the same token — and nothing granted until the call comes back with it."""
     await _discovered()
     ctx = FakeContext(capabilities=capabilities, answer=_accept())
 
-    result = await tools.research_approve(1, ["1"], ctx)  # type: ignore[arg-type]
+    asked = await tools.research_approve(1, ["1"], ctx)  # type: ignore[arg-type]
 
     assert ctx.asked == [], "a client that cannot ask the user is never asked"
-    assert result["approved"] is False and result["error"] == tools.NO_ELICITATION
-    assert result["hint"] == (
-        "the user must type this in their own terminal themselves and confirm there; never run "
-        f"it for them: {TERMINAL}"
-    )
-    assert result["summary"].startswith("Research session 1")
+    assert asked["approved"] is False and asked["needs_confirmation"] is True
+    assert "error" not in asked and asked["hint"] == tools.CONFIRM_HINT
+    assert asked["summary"].startswith("Research session 1")
+    assert asked["command"] == f"{TERMINAL} --confirm {asked['confirm']}"
     assert _grants(paths) == []
+
+    confirmed = await _approve(ctx, ["1"], confirm=asked["confirm"])
+
+    assert ctx.asked == []
+    assert confirmed["approved"] is True and confirmed["hint"] == tools.RUN_NEXT_HINT
+    [document] = confirmed["grants"]
+    assert (document["via"], document["actions"]) == ("confirm", ["join", "fetch", "add_source"])
+    (grant,) = _grants(paths)
+    assert (grant.via, grant.summary) == ("confirm", asked["summary"])
+    assert capsys.readouterr().out == ""
+
+
+async def test_research_approve_refuses_a_wrong_malformed_or_stale_token(
+    researching: FakeClient, paths: Paths
+) -> None:
+    await _discovered()
+    ctx = FakeContext(capabilities=None)
+    token = (await _approve(ctx, ["1"]))["confirm"]
+
+    wrong = await _approve(ctx, ["1"], confirm="0" * 12)
+    malformed = await _approve(ctx, ["1"], confirm="yes")
+    other = await _approve(ctx, ["1:fetch,add_source"], confirm=token)
+    rdb = research_db.open_store(paths)
+    try:
+        research_db.update_candidate(rdb, 1, title="Tbilisi flats, renamed")
+    finally:
+        rdb.close()
+    stale = await _approve(ctx, ["1"], confirm=token)
+
+    for refused in (wrong, other, stale):
+        assert refused["approved"] is False and "does not match" in refused["error"]
+    assert "is not a confirmation token" in malformed["error"]
+    assert other["confirm"] != token and stale["confirm"] != token
+    assert "renamed" in stale["summary"] and stale["hint"] == tools.CONFIRM_HINT
+    assert _grants(paths) == []
+
+
+async def test_research_approve_takes_no_token_where_the_user_answers_a_dialog(
+    researching: FakeClient, paths: Paths
+) -> None:
+    """A client that can show the dialog is asked through it; a token passed there approves
+    nothing and asks nobody."""
+    await _discovered()
+    token = (await _approve(FakeContext(capabilities=None), ["1"]))["confirm"]
+    ctx = FakeContext(answer=_accept())
+
+    result = await _approve(ctx, ["1"], confirm=token)
+
+    assert result["approved"] is False
+    assert (result["error"], result["hint"]) == (tools.ELICIT_INSTEAD, tools.ELICIT_INSTEAD_HINT)
+    assert "confirm" not in result
+    assert ctx.asked == [] and _grants(paths) == []
 
 
 async def test_research_approve_refuses_an_invalid_approval_before_asking(
@@ -2101,27 +2166,40 @@ async def test_research_approve_elicits_over_a_real_session(
     assert grant.via == "elicitation" and asked == [grant.summary] * 3
 
 
-async def test_research_approve_over_a_session_without_elicitation_asks_nobody(
+async def test_research_approve_over_a_session_without_elicitation_confirms_by_token(
     researching: FakeClient, paths: Paths
 ) -> None:
     await _discovered()
     async with create_connected_server_and_client_session(tools.build_server()) as session:
-        result = await session.call_tool("research_approve", {"session_id": 1, "items": ["1"]})
-    assert result.structuredContent is not None
-    assert result.structuredContent["error"] == tools.NO_ELICITATION
-    assert result.structuredContent["hint"].endswith(TERMINAL)
-    assert _grants(paths) == []
+        asked = await session.call_tool("research_approve", {"session_id": 1, "items": ["1"]})
+        assert asked.structuredContent is not None
+        assert asked.structuredContent["needs_confirmation"] is True
+        assert _grants(paths) == [], "asking grants nothing"
+        token = asked.structuredContent["confirm"]
+        confirmed = await session.call_tool(
+            "research_approve", {"session_id": 1, "items": ["1"], "confirm": token}
+        )
+    assert confirmed.structuredContent is not None
+    assert confirmed.structuredContent["approved"] is True
+    (grant,) = _grants(paths)
+    assert (grant.via, grant.summary) == ("confirm", asked.structuredContent["summary"])
 
 
-async def test_no_research_tool_takes_a_consent_parameter(state: tools.AppState) -> None:
+async def test_only_a_summary_bound_token_stands_in_for_a_dialog(state: tools.AppState) -> None:
+    """``research_approve`` takes ``confirm`` — a string, the token bound to the summary it
+    answered with, never required — and no research tool takes a bare yes of any shape."""
     async with create_connected_server_and_client_session(tools.build_server()) as session:
         listed = {tool.name: tool for tool in (await session.list_tools()).tools}
     approve = listed["research_approve"].inputSchema
-    assert set(approve["properties"]) == {"session_id", "items"}
+    assert set(approve["properties"]) == {"session_id", "items", "confirm"}
     assert approve["required"] == ["session_id", "items"]
-    consent = {"approve", "approved", "confirm", "confirmed", "yes", "force", "consent"}
+    kinds = {branch.get("type") for branch in approve["properties"]["confirm"]["anyOf"]}
+    assert kinds == {"string", "null"}, "a token, never a boolean"
+    bare = {"approve", "approved", "confirmed", "yes", "force", "consent"}
     for tool in RESEARCH_TOOLS:
-        assert not consent & set(listed[tool.__name__].inputSchema["properties"]), tool.__name__
+        properties = set(listed[tool.__name__].inputSchema["properties"])
+        assert not bare & properties, tool.__name__
+        assert tool is tools.research_approve or "confirm" not in properties, tool.__name__
 
 
 async def test_research_skip_and_exclude_need_no_approval(researching: FakeClient) -> None:

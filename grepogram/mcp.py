@@ -65,7 +65,7 @@ from mcp.server.fastmcp import Context, FastMCP
 from pydantic import BaseModel, ConfigDict, Field
 from telethon import errors as tg_errors
 
-from grepogram import config, db, embed, filters, research, research_db, tg
+from grepogram import config, consent, db, embed, filters, research, research_db, tg
 from grepogram import rerank as reranking
 from grepogram import search as retrieval
 from grepogram import sources as sourcing
@@ -80,6 +80,7 @@ from grepogram.models import (
     DEFAULT_ACCOUNT,
     Config,
     Filters,
+    Grant,
     LimitOverrides,
     MessageView,
     SearchMode,
@@ -170,10 +171,21 @@ CONFIG_HINT = (
 NO_SOURCES_HINT = "find chats with dialogs, add them with sources_add, then sync"
 ACCOUNTS_HINT = "`accounts` lists the accounts; a new one is signed in from a terminal"
 SYNC_NEXT_HINT = "call sync to fetch and index its history"
-NO_ELICITATION = (
-    "this MCP client cannot ask the user to confirm an approval, and nothing else may approve "
-    "for them"
+CONFIRM_HINT = (
+    "nothing was granted yet: show the user `summary` exactly as written and ask whether to "
+    "approve it; only once they agree, call research_approve again with the same items and "
+    "`confirm` set to this result's `confirm` token. The token approves exactly this summary "
+    "and is refused once it would say anything else"
 )
+DIALOG_FAILED_HINT = (
+    "nothing was granted: show the user `summary` exactly as written; once they agree, "
+    "`command` confirms exactly it from a shell"
+)
+ELICIT_INSTEAD = (
+    "this MCP client asks the user through its own dialog, so a confirmation token is not taken "
+    "here"
+)
+ELICIT_INSTEAD_HINT = "call research_approve again without `confirm`; the user answers the dialog"
 DECLINED_HINT = (
     "nothing was granted; ask the user what they want instead — research_skip sets a candidate "
     "aside, research_exclude never proposes it again"
@@ -1182,6 +1194,7 @@ async def research_approve(
     session_id: int,
     items: list[str],
     ctx: Context,  # type: ignore[type-arg]
+    confirm: str | None = None,
 ) -> ToolResult:
     """Ask the user to approve candidates and actions. `items` name them: `ID:join,fetch,…` per
     candidate (actions: `join`, `request` — an admission request —, `fetch`, `add_source`), a
@@ -1189,14 +1202,16 @@ async def research_approve(
     as an ongoing source — `ID:fetch,add_source` reads a public chat without joining, and only
     when the user asks for that —, `global_search` / `paid_search` for the session.
 
-    The user is shown the exact summary (`summary` in the result: each target, the account,
-    membership, every action in words, that an added source is ongoing) and answers in their
-    client; only their confirmation grants anything, and nothing any tool is passed can stand
-    in for it. `approved=true` comes with `grants`; `approved=false` means nothing was granted
-    (`answer` says whether the user declined or cancelled). A client that cannot ask the user
-    answers with `error` and a `hint` naming the terminal command that asks instead — give the
-    user that command as it is for them to type in their own terminal, and never run it
-    yourself, through a shell tool or otherwise: the confirmation is theirs. Approving a chat
+    `summary` in the result is the exact text being approved: each target, the account,
+    membership, every action in words, that an added source is ongoing. A client with form
+    elicitation shows it to the user in a dialog and only their answer there grants anything
+    (`confirm` is refused on such a client). A client without one answers with
+    `needs_confirmation=true`, the `summary`, a `confirm` token bound to that exact summary and
+    the equivalent shell `command`: show the user the summary as written, and only after they
+    agree call this again with the same `items` and `confirm` — a token whose summary no longer
+    matches (a probe changed a candidate, other items) is refused with the fresh summary and
+    token. `approved=true` comes with `grants`; `approved=false` means nothing was granted
+    (`answer` says whether the user declined or cancelled the dialog). Approving a chat
     approves nothing found inside it. Next: `research_run`.
 
     Refused before anything is asked: a candidate not probed yet (run `research_discover`
@@ -1218,32 +1233,73 @@ async def research_approve(
         "summary": summary,
         "approved": False,
     }
-    terminal_hint = (
-        "the user must type this in their own terminal themselves and confirm there; never run "
-        f"it for them: {approval.command}"
+    to_confirm: ToolResult = {
+        **asked,
+        "needs_confirmation": True,
+        "confirm": approval.token,
+        "command": approval.confirm_command,
+    }
+    if _can_elicit(ctx):
+        if confirm is not None:
+            return {**asked, "error": ELICIT_INSTEAD, "hint": ELICIT_INSTEAD_HINT}
+        return await _elicit_approval(ctx, state, cfg, rdb, session_id, approval, asked, to_confirm)
+    if confirm is None:
+        return {**to_confirm, "hint": CONFIRM_HINT}
+    refused = consent.problem(confirm, approval.token)
+    if refused:
+        log.info("research session %d: a confirmation token was refused", session_id)
+        return {**to_confirm, "error": refused, "hint": CONFIRM_HINT}
+    granted = research.grant(
+        rdb, state.conn, cfg, session_id, approval.items, via="confirm", summary=summary
     )
-    if not _can_elicit(ctx):
-        return {**asked, "error": NO_ELICITATION, "hint": terminal_hint}
+    return _approved(rdb, session_id, granted, asked)
+
+
+async def _elicit_approval(
+    ctx: Context,  # type: ignore[type-arg]
+    state: "AppState",
+    cfg: Config,
+    rdb: sqlite3.Connection,
+    session_id: int,
+    approval: research.Approval,
+    asked: ToolResult,
+    to_confirm: ToolResult,
+) -> ToolResult:
+    """Put ``approval`` to the user in a dialog and grant (``via="elicitation"``) only on an
+    accepted answer whose ``approve`` is ``true``. A dialog that cannot be shown grants nothing
+    and hands back the token with the shell command that confirms it."""
     try:
-        answer = await ctx.elicit(message=summary, schema=Confirm)
+        answer = await ctx.elicit(message=approval.summary, schema=Confirm)
     except Exception as exc:  # any failure to ask is a refusal, never a grant
         log.warning("research_approve: the confirmation could not be asked: %s", exc)
         return {
-            **asked,
+            **to_confirm,
             "error": f"the confirmation could not be asked: {exc}",
-            "hint": terminal_hint,
+            "hint": DIALOG_FAILED_HINT,
         }
     approved = isinstance(answer, AcceptedElicitation) and answer.data.approve is True
     if not approved:
         log.info("research session %d: the user did not approve (%s)", session_id, answer.action)
         return {**asked, "answer": answer.action, "hint": DECLINED_HINT}
     granted = research.grant(
-        rdb, state.conn, cfg, session_id, approval.items, via="elicitation", summary=summary
+        rdb,
+        state.conn,
+        cfg,
+        session_id,
+        approval.items,
+        via="elicitation",
+        summary=approval.summary,
     )
+    return {**_approved(rdb, session_id, granted, asked), "answer": answer.action}
+
+
+def _approved(
+    rdb: sqlite3.Connection, session_id: int, granted: Sequence[Grant], asked: ToolResult
+) -> ToolResult:
+    """What ``research_approve`` answers once ``granted`` is recorded."""
     return {
         **asked,
         "approved": True,
-        "answer": answer.action,
         "grants": research.grant_documents(
             granted, {c.id: c for c in research_db.list_candidates(rdb, session_id)}
         ),
