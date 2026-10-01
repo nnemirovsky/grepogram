@@ -1730,8 +1730,9 @@ async def recut_pending_chats(
     just finished, and never hooked into :func:`on_chat_synced`: nothing is left flagged outside
     the transaction that rebuilds it, so no later run — least of all a 20-second auto-sync inside
     a ``search`` — inherits a whole-index backlog to drain. Who may start one is decided by the
-    caller, not by how many seconds are left: :func:`sync_all` takes ``recut``, and the automatic
-    sync inside an MCP ``search`` is the one caller that passes ``False``.
+    caller, not by how many seconds are left: :func:`sync_all` takes ``recut``, and two callers
+    pass ``False`` — the automatic sync inside an MCP ``search``
+    (:func:`grepogram.mcp._auto_sync`) and a research run (:func:`grepogram.research.running.run`).
 
     The procedure, in order:
 

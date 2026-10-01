@@ -704,8 +704,9 @@ async def _auto_sync(state: AppState, cfg: Config) -> tuple[bool, list[str]]:
     are resolved from the config as it is once the sync lock is held (``state.config``), so a
     source removed while this call was loading its model or connecting stays removed.
 
-    This is the one caller that passes ``recut=False``: a search refreshes messages and never
-    starts the one-time unit re-cut, whatever ``search.auto_sync_budget_s`` is set to.
+    It passes ``recut=False``, as a research run (``research.running.run``) does — the only two
+    callers that do: a search refreshes messages and never starts the one-time unit re-cut,
+    whatever ``search.auto_sync_budget_s`` is set to.
     """
     budget_s = cfg.search.auto_sync_budget_s
     try:

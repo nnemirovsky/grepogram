@@ -358,8 +358,10 @@ never change the git identity.
   transaction, so no chat is ever left flagged outside the transaction that rebuilds it and no
   later run — least of all a 20-second auto-sync — inherits a whole-index backlog for
   `_sync_chats`'s unbudgeted deferred `index_pending` loop to drain. **Who may start one is the
-  caller, not the budget**: `sync_all` takes `recut: bool = True` and `mcp._auto_sync` — the
-  refresh inside a `search` — is the one caller passing `False`. A budget floor was tried and
+  caller, not the budget**: `sync_all` takes `recut: bool = True`, and exactly two callers pass
+  `False` — `mcp._auto_sync`, the refresh inside a `search`, and a research run
+  (`research.running.run`), whose fetch of the chats it adds is not the place for a whole-index
+  re-cut either. A budget floor was tried and
   removed: `search.auto_sync_budget_s` is user-editable, so a floor made a search's own refresh
   start whole-index re-cutting the moment the number was raised, while an explicit sync whose
   fetch had eaten the budget never got to start one. An explicit sync makes whatever progress its
