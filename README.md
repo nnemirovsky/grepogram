@@ -225,7 +225,7 @@ diagnostics and logs to stderr and the log file.
 | `grepogram config path` | print the resolved paths of the config, the default session, the `sessions/` directory of the other accounts, the index, `research.db`, the sync lock and the log |
 | `grepogram auth [--account NAME] [--label L]` | sign in (phone, code, optional 2FA password) and store the session; `--account` signs in another account, which is added to `[[accounts]]` once the sign-in succeeds |
 | `grepogram accounts ls` | every account with its label, session state (`missing`, `present`, `authorized`), the Telegram user it signed in as, its sources and the chats it reaches; offline |
-| `grepogram accounts rm <name>` | remove an account: its sources, the chats only they cover, what it was recorded as reaching, its research sessions' unused approvals, and its session file; asks on the terminal first. Nothing changes on Telegram |
+| `grepogram accounts rm <name>` | remove an account: its sources, the chats only they cover, what it was recorded as reaching, its research sessions' unused approvals, and its session file; asks first (a typed-back code on a terminal, or the summary and a `--confirm` token for an agent). Nothing changes on Telegram |
 | `grepogram dialogs <query> [-n N] [--account NAME]` | find chats and folders of the account whose title, `@username` or folder name matches; prints kind, id, type, title, username, folders, score |
 | `grepogram sources add <target> [--since YYYY-MM-DD] [--comments] [--account NAME]` | add a source and save the config; `target` is a chat id, `@username`, `t.me` link, `folder:<name>` or a fuzzy chat / folder title, and an `<account>/` prefix on it names the account as `--account` does |
 | `grepogram sources ls` | every source the index holds chats under, with the account that fetches it — the configured ones first, then any others still in the database: an `import:<slug>` from `grepogram import`, and a source removed from the config whose chats are still stored — each with its chats, message counts and last sync |
@@ -240,7 +240,7 @@ diagnostics and logs to stderr and the log file.
 | `grepogram search <query> …` | search the index, see below |
 | `grepogram thread <chat> <msg_id> [--json]` | print the whole reply thread a message belongs to, root first; for a channel post, the post followed by its comments from the linked discussion group |
 | `grepogram context <chat> <msg_id> [--before N] [--after N] [--json]` | print the messages around one in its chat, bounded to the message's own thread or forum topic where Telegram gave it one, the message included (15 each way by default) |
-| `grepogram leave <target> [--account NAME]` | leave a group or channel on Telegram as the account, after asking on the terminal; the one command that changes an account on Telegram, and it changes nothing in the config or the index |
+| `grepogram leave <target> [--account NAME]` | leave a group or channel on Telegram as the account, after confirmation (a typed-back code on a terminal, or the summary and a `--confirm` token for an agent); the one command that changes an account on Telegram, and it changes nothing in the config or the index |
 | `grepogram research …` | discover chats the index does not hold yet, from a question and seed chats: `start`, `discover`, `candidates`, `approve`, `skip`, `exclude`, `unexclude`, `run`, `status`, `stop`; off until `[research] enabled = true`. See [Research](#research-finding-chats-you-do-not-index-yet) |
 | `grepogram-mcp [-v]` | the MCP server over stdio (what an MCP client launches) |
 
@@ -475,13 +475,13 @@ keep nothing. A chat left under a `chat` entry that resolved to another chat is 
 `accounts rm <name>`
 removes that account's sources under the same rule, all of it or nothing. It also forgets which
 chats the account reached and the peers its syncs cached, stops its research sessions so no approval outlives it, and deletes its
-session file, after asking on the terminal. The only account left cannot be removed. `default`
+session file, after confirmation (see research approvals below for how). The only account left cannot be removed. `default`
 can be removed while another account exists: that deletes `session.session` and the `default`
 sources, and `accounts ls` still lists `default` with its session `missing` until
 `grepogram auth` signs it in again. `--label` belongs to a named account; `auth --label`
 without `--account` is refused, `default` having no `[[accounts]]` entry to hold it.
 **Neither command leaves anything on Telegram.** `grepogram leave <target> --account <name>` is
-the one command that does. It asks on the terminal first, naming the Telegram user the session
+the one command that does. It asks for confirmation first, naming the Telegram user the session
 is signed in as, refuses a session that is another Telegram user than the one the index recorded
 for the account, refuses private chats, bots and folders, and touches neither the config nor the
 index.
@@ -502,7 +502,7 @@ A session, end to end:
 grepogram research start "where do people compare bank fees?" -s "folder:Argentina" -s @arg_chat
 grepogram research discover 1        # leads in the seeds, then a metadata probe of the best ones
 grepogram research candidates 1      # ranked, with the evidence behind each
-grepogram research approve 1 4 9:join,fetch,add_source   # asks you on this terminal; type the code back
+grepogram research approve 1 4 9:join,fetch,add_source   # shows the summary; confirm it (see below)
 grepogram research run 1             # carries out exactly that, within the session's budgets
 grepogram research status 1
 grepogram research stop 1            # explores no further; the sources it added stay
@@ -601,17 +601,36 @@ grepogram research stop 1            # explores no further; the sources it added
   `grepogram sources rm`, which, like every removal, never leaves the chat on Telegram. Leaving
   is `grepogram leave`.
 
-**Consent is a human's, and only two things can give it.** On a terminal,
-`grepogram research approve` writes the summary to the controlling terminal and reads the answer
-there, never from stdin, and you confirm by typing back a random code it shows. A pipe or a
-blind `yes` cannot answer, without a terminal it refuses, and it has no `--yes`. That check holds
-against an agent that only has the MCP tools. It does not hold against an agent that can run
-shell commands: such an agent can give the command a terminal of its own and read the code off
-it. Run `research approve` yourself, and do not let an agent run it for you. Through MCP,
-`research_approve` shows the same summary through the client's elicitation dialog, which only
-you can answer. A client without elicitation is answered with the exact
-`grepogram research approve …` command for you to type yourself. No tool argument stands in for
-either. An approval covers the chats it names and nothing found inside them: approving a
+**Every approval confirms the exact summary it was shown with.** There are three ways:
+
+- **At a terminal**, `grepogram research approve` prints the summary there and you type back a
+  random code it shows. Stdin never answers it.
+- **From an agent** (Claude Code, Codex, a script — anything without a terminal), the same command
+  prints the summary, a token and the exact command that confirms it, changes nothing and exits
+  with code 3. The agent shows you the summary; running the same command with
+  `--confirm <token>` then grants it. The token is bound to that summary: if anything changed in
+  between — another candidate state, other items — it is refused and a fresh summary and token
+  are printed. `accounts rm` and `leave` work the same way.
+- **Through MCP**, `research_approve` shows the summary in the client's dialog where it has one.
+  A client without a dialog gets the summary and a `confirm` token, and calls again with it.
+
+The token is not proof that a person agreed — an agent that runs the first step can read it. The
+human gate for an agent is the agent's own permission prompt, so keep these commands behind one.
+For Claude Code, add "ask" rules to `~/.claude/settings.json`:
+
+```json
+{
+  "permissions": {
+    "ask": [
+      "Bash(grepogram research approve:*)",
+      "Bash(grepogram accounts rm:*)",
+      "Bash(grepogram leave:*)"
+    ]
+  }
+}
+```
+
+There is no bare `--yes`. An approval covers the chats it names and nothing found inside them: approving a
 chat approves none of the chats its messages lead to, and a shared folder is approved chat by
 chat, never as a whole. A later run reuses an approval until its work is done or the session
 stops, so nothing asks twice for work you already approved.
@@ -661,7 +680,7 @@ advisory; the data next to them is valid.
 | `research_start` | `question`, `seeds: list[str]`, `account=null`, `max_depth`, `max_candidates`, `probe_limit`, `since_days`, `max_messages_per_run`, `run_budget_s` (each `null` = the `[research]` default) | the session, as `grepogram research start --json` prints it: `id`, `question`, `account`, `seeds` (each `{scope, peer_id}`, the chat as Telegram names it), `limits`, `state`, `progress`, `horizon` (the date the sources a run adds start from) |
 | `research_discover` | `session_id`, `offline=false` | the discover report: `leads`, `new_candidates`, `updated_candidates`, what was left out (`beyond_depth`, `excluded`, `over_cap`, `session_full`), `directories`, `pins` (the pinned posts of the session's chats, read once each for leads and never indexed), `probe` (read-only metadata of the best candidates, as the session's account) and `searches` (the global searches the user approved); `offline` asks Telegram nothing |
 | `research_candidates` | `session_id`, `status: list[str] \| null` | `{session_id, question, account, state, candidates}`, best corroborated first; each candidate keeps three facts apart — `member`, `cached` (with `cached_accounts`) and `authorized` — next to `corroboration` (distinct origins: forwards of one post count once), `overlap` and every piece of `evidence`: its `via`, the chat it was found in as `scope` and `peer_id`, and as `chat_id` — that chat's index row now, what `thread` and `context` take, `null` for a chat the index does not hold — with `msg_id`, `origin_key` and a `snippet` |
-| `research_approve` | `session_id`, `items: list[str]` (`ID:join,fetch,…`, a bare `ID`, `global_search`, `paid_search`) | asks the user through MCP elicitation with the exact approval `summary`; `{approved: true, grants, …}` only when they accept and tick approve, `{approved: false, answer, …}` otherwise; a client without elicitation gets `error` and a `hint` naming the `grepogram research approve …` command for the user to type in their own terminal |
+| `research_approve` | `session_id`, `items: list[str]` (`ID:join,fetch,…`, a bare `ID`, `global_search`, `paid_search`) | asks the user through MCP elicitation with the exact approval `summary`; `{approved: true, grants, …}` only when they accept and tick approve, `{approved: false, answer, …}` otherwise; a client without elicitation gets `needs_confirmation`, the `summary`, a `confirm` token and the CLI `command`; calling again with `confirm` set to that token grants it (`via=confirm`), a stale token is refused with a fresh one |
 | `research_skip` | `session_id`, `candidate_ids: list[int]` | `{session_id, skipped}`; approvals they held are voided — narrowing needs no approval |
 | `research_exclude` | `targets: list[str]`, `session_id=null`, `reason=null` | `{excluded, hint}`: never proposed again in any session; lifting an exclusion is `grepogram research unexclude`, in a terminal |
 | `research_run` | `session_id` | the run report as `grepogram research run --json` prints it (`admitted`, `joined`, `pending_admission`, `sources_added`, `fetched`, `partial`, `unavailable`, `failed`, `messages`, `stopped_by`, `pins`, `discovery`, `warnings`) plus `accounts_skipped` |
@@ -676,13 +695,13 @@ ids collide with the channel's post ids (both number from 1), so pass a message'
 back to `context` alongside its `msg_id`.
 
 The `research_*` tools refuse with `error` and `hint` while `[research] enabled` is `false`.
-Consent is the user's alone and no tool argument can stand in for it: `research_approve` shows
-the user the same summary `grepogram research approve` prints on a terminal, through the MCP
-client's elicitation, and grants only on an accepted answer whose `approve` box is ticked —
-a decline, a cancel, an unticked box or a failed request grants nothing. A client that cannot
-elicit is answered with the exact terminal command instead, for the user to type in their own
-terminal; it asks on the controlling terminal and nowhere else, and an agent must never run it
-for them.
+`research_approve` shows the user the same summary `grepogram research approve` prints. A client
+with an elicitation dialog asks there and grants only on an accepted answer whose `approve` box
+is ticked — a decline, a cancel, an unticked box or a failed request grants nothing — and such a
+client cannot use a token. A client without one is answered with `needs_confirmation`, the
+`summary`, a `confirm` token and the equivalent CLI `command`; the agent shows the user the
+summary and, when they agree, calls `research_approve` again with the same `items` and that
+`confirm`. A token whose summary no longer matches is refused with a fresh one.
 
 Several CLI commands have **no tool here, deliberately**: `sources prune` and `prune-deleted`
 delete indexed history, `extract` and `recapture-links` are long flood-exposed network passes,
