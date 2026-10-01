@@ -43,6 +43,7 @@ import io
 import json
 import logging
 import secrets
+import shlex
 import sqlite3
 from collections.abc import AsyncIterator, Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import asdict
@@ -57,6 +58,7 @@ from telethon import errors as tg_errors
 from grepogram import (
     __version__,
     config,
+    consent,
     db,
     dialogs,
     embed,
@@ -85,6 +87,7 @@ from grepogram.models import (
     ChatRow,
     Config,
     DiscoverReport,
+    GrantChannel,
     LimitOverrides,
     MediaReport,
     MessageView,
@@ -129,11 +132,33 @@ _ACCOUNT_HELP = "The account to act as, as `grepogram accounts ls` lists it (def
 AccountOption = Annotated[str | None, typer.Option("--account", "-a", help=_ACCOUNT_HELP)]
 
 
+CONFIRM_EXIT = 3
+"""The exit code of a command that needs a confirmation and did nothing: ``research approve``,
+``accounts rm`` and ``leave`` run without ``--confirm`` and without a terminal to ask on (or with
+``--json``), or with a ``--confirm`` token that does not match the summary as it is now. Its
+output is the summary, the token that confirms exactly it and the command that does."""
+
+_CONFIRM_HELP = (
+    "Confirm without a terminal: the token the same command printed with the summary when run "
+    "without it (exit code 3). Valid only while that summary is unchanged."
+)
+ConfirmOption = Annotated[
+    str | None, typer.Option("--confirm", metavar="TOKEN", help=_CONFIRM_HELP)
+]
+ConfirmJsonOption = Annotated[
+    bool,
+    typer.Option(
+        "--json",
+        help="Never ask on the terminal: print the summary, token and confirm command (or, "
+        "with --confirm, the result) as JSON.",
+    ),
+]
+
+
 class NoTerminal(Exception):
     """A command that must ask a human first has no terminal to ask on."""
 
     def __init__(self, command: str) -> None:
-        self.hint = f"the user must run `{command}` in their own terminal themselves"
         super().__init__(f"{command} asks for a confirmation on a terminal, and there is none")
 
 
@@ -1396,16 +1421,40 @@ def accounts_ls() -> None:
     _print_table(("account", "label", "session", "user", "sources", "chats"), rows)
 
 
+ACCOUNTS_RM_SCOPE = "accounts rm"
+"""What :func:`grepogram.consent.token` names an ``accounts rm`` token by."""
+
+
+def _account_removal(cfg: Config, paths: Paths, name: str) -> str:
+    """What removing account ``name`` will do, as the confirmation shows it."""
+    owned = [source.id for source in cfg.sources if source.account == name]
+    return "\n".join(
+        [
+            f"removing account {name} will:",
+            f"  remove {len(owned)} sources{': ' + ', '.join(owned) if owned else ''}",
+            "  delete the chats no other source covers, with everything indexed from them",
+            "  forget which chats this account reaches",
+            "  stop its research sessions and void their unused approvals",
+            f"  delete its session file {paths.session_file_for(name)}",
+        ]
+    )
+
+
 @accounts_app.command("rm")
 def accounts_rm(
     name: Annotated[str, typer.Argument(help="The account to remove, as `accounts ls` lists it.")],
+    confirm: ConfirmOption = None,
+    as_json: ConfirmJsonOption = False,
 ) -> None:
     """Remove an account: its sources, the chats only they cover, and its session file.
 
-    Asks on the terminal first and refuses without one. A chat another account's source still
-    covers stays indexed (a channel both accounts configured); the account only stops being
-    recorded as reaching it. Its research sessions are stopped, so no approval given to it
-    outlives it. Nothing is changed on Telegram — `leave` is its own command.
+    At a terminal it asks there first (type back the code it shows). Without one, or with
+    --json, it prints what it would do and a confirmation token, removes nothing and exits 3;
+    the same command with --confirm TOKEN removes it while that summary still holds. A chat
+    another account's source still covers stays indexed (a channel both accounts configured);
+    the account only stops being recorded as reaching it. Its research sessions are stopped, so
+    no approval given to it outlives it. Nothing is changed on Telegram — `leave` is its own
+    command.
     """
     paths, cfg, conn = _load()
     try:
@@ -1415,23 +1464,36 @@ def accounts_rm(
                 "the default account is the only account and cannot be removed",
                 hint="delete its sources with `grepogram sources rm` instead",
             )
-        owned = [source.id for source in cfg.sources if source.account == name]
-        session = paths.session_file_for(name)
-        typer.echo(f"removing account {name} will:")
-        typer.echo(f"  remove {len(owned)} sources{': ' + ', '.join(owned) if owned else ''}")
-        typer.echo("  delete the chats no other source covers, with everything indexed from them")
-        typer.echo("  forget which chats this account reaches")
-        typer.echo("  stop its research sessions and void their unused approvals")
-        typer.echo(f"  delete its session file {session}")
-        with _terminal("grepogram accounts rm") as tty:
-            confirmed = _ask(tty, f"remove account {name}?")
-        if not confirmed:
-            typer.echo("nothing removed")
-            return
+        summary = _account_removal(cfg, paths, name)
+        if confirm is None:
+            if as_json:
+                raise NoTerminal("grepogram accounts rm")
+            with _terminal("grepogram accounts rm") as tty:
+                typer.echo(summary)
+                confirmed = _ask(tty, f"remove account {name}?")
+            if not confirmed:
+                typer.echo("nothing removed")
+                return
         with sync.SyncLock(paths), config.ConfigLock(paths):
+            if confirm is not None:
+                # rebuilt under the locks from the config as it is now, so the token confirms
+                # exactly what is removed and not a summary some other command has since changed
+                summary = _account_removal(config.load(paths), paths, name)
+                token = consent.token(ACCOUNTS_RM_SCOPE, [name], summary)
+                refused = consent.problem(confirm, token)
+                if refused:
+                    _needs_confirmation(
+                        summary,
+                        token,
+                        _with_confirm(["grepogram", "accounts", "rm"], token, name),
+                        as_json=as_json,
+                        error=refused,
+                    )
             removed = sources.remove_account(conn, paths, name)
-    except NoTerminal as exc:
-        fail(str(exc), hint=exc.hint)
+    except NoTerminal:
+        token = consent.token(ACCOUNTS_RM_SCOPE, [name], summary)
+        command = _with_confirm(["grepogram", "accounts", "rm"], token, name)
+        _needs_confirmation(summary, token, command, as_json=as_json)
     except (sources.SourceError, sync.SyncInProgress, ConfigError) as exc:
         fail(str(exc), hint=getattr(exc, "hint", None))
     except (db.SchemaError, sqlite3.Error) as exc:
@@ -1439,10 +1501,24 @@ def accounts_rm(
     finally:
         conn.close()
     kept, stopped = removed.kept_chat_ids, removed.stopped_sessions
+    deleted = len(removed.chat_ids)
+    if as_json:
+        _echo_json(
+            {
+                "removed": name,
+                "chats_deleted": deleted,
+                "kept_chat_ids": list(kept),
+                "stopped_sessions": list(stopped),
+            }
+        )
+        return
     kept_note = f", {len(kept)} kept under another source" if kept else ""
     stopped_note = f", {len(stopped)} research sessions stopped" if stopped else ""
-    deleted = len(removed.chat_ids)
     typer.echo(f"removed account {name} ({deleted} chats deleted{kept_note}{stopped_note})")
+
+
+LEAVE_SCOPE = "leave"
+"""What :func:`grepogram.consent.token` names a ``leave`` token by."""
 
 
 @app.command("leave")
@@ -1452,16 +1528,25 @@ def leave_cmd(
         typer.Argument(help="The group or channel: id, @username, t.me link or a title (fuzzy)."),
     ],
     account: AccountOption = None,
+    confirm: ConfirmOption = None,
+    as_json: ConfirmJsonOption = False,
 ) -> None:
-    """Leave a group or channel on Telegram as an account; asks on the terminal first.
+    """Leave a group or channel on Telegram as an account, after a confirmation.
 
-    This is the one command that changes the account on Telegram, and it changes nothing here:
-    the sources stay in the config and everything indexed from the chat stays searchable
-    (`grepogram sources rm` removes those). Removing a source never leaves a chat.
+    The chat is resolved and the session checked first. At a terminal it then asks there (type
+    back the code it shows); without one, or with --json, it prints what it would leave and a
+    confirmation token, sends nothing and exits 3, and the same command with --confirm TOKEN
+    leaves while that still holds. This is the one command that changes the account on
+    Telegram, and it changes nothing here: the sources stay in the config and everything
+    indexed from the chat stays searchable (`grepogram sources rm` removes those). Removing a
+    source never leaves a chat.
     """
     paths = Paths.from_env()
     cfg = _load_config(paths)
     _require_api_keys(cfg, paths)
+    # the summary put and not answered: the ask step, or a --confirm that does not match it
+    unanswered: list[str] = []
+    refused: str | None = None
     try:
         parsed = sources.parse_target(target)
         if account and parsed.account and account.casefold() != parsed.account:
@@ -1470,23 +1555,61 @@ def leave_cmd(
             )
         name = _known_account(cfg, account or parsed.account or DEFAULT_ACCOUNT)
         tg.ensure_session_mode(paths, name)
+
+        def token_of(summary: str) -> str:
+            return consent.token(LEAVE_SCOPE, [name, target], summary)
+
+        def ask_only(question: str) -> bool:
+            unanswered.append(question.removesuffix("?"))
+            return False
+
+        def by_token(question: str) -> bool:
+            nonlocal refused
+            refused = consent.problem(confirm or "", token_of(question.removesuffix("?")))
+            if refused is None:
+                return True
+            return ask_only(question)
+
         conn = _open_db(paths)
         try:
-            with _terminal("grepogram leave") as tty:
+
+            def put(decide: Callable[[str], bool]) -> DialogInfo | None:
                 client = tg.make_client(cfg, paths, name)
-                left = asyncio.run(_leave(client, conn, parsed, name, functools.partial(_ask, tty)))
+                return asyncio.run(_leave(client, conn, parsed, name, decide))
+
+            if confirm is not None:
+                left = put(by_token)
+            elif as_json:
+                left = put(ask_only)
+            else:
+                try:
+                    with _terminal("grepogram leave") as tty:
+                        left = put(functools.partial(_ask, tty))
+                except NoTerminal:
+                    left = put(ask_only)
         finally:
             conn.close()
-    except NoTerminal as exc:
-        fail(str(exc), hint=exc.hint)
     except (db.SchemaError, db.ExtensionsUnsupported) as exc:
         fail(str(exc))
     except (sources.SourceError, tg.AuthRequired, tg.SessionError) as exc:
         fail(str(exc), hint=getattr(exc, "hint", None))
     except (tg_errors.RPCError, ConnectionError) as exc:
         fail(f"telegram error: {exc}")
+    if unanswered:
+        summary = unanswered[0]
+        token = token_of(summary)
+        command = _with_confirm(["grepogram", "leave"], token, target, ["--account", name])
+        _needs_confirmation(summary, token, command, as_json=as_json, error=refused)
     if left is None:
         typer.echo("nothing changed")
+        return
+    if as_json:
+        _echo_json(
+            {
+                "left": {"id": left.id, "type": left.type, "title": left.title},
+                "account": name,
+            }
+        )
         return
     typer.echo(f"left {left.type} {left.title!r} (id {left.id}) as account {name}")
     typer.echo("its sources and indexed history are unchanged")
@@ -1823,30 +1946,63 @@ def research_approve(
             "session."
         ),
     ],
+    confirm: ConfirmOption = None,
+    as_json: ConfirmJsonOption = False,
 ) -> None:
     """Approve named candidates and actions, after reading exactly what they do.
 
-    The summary is shown and the answer read on the controlling terminal, never stdin: you
-    confirm by typing back the code it shows, and without a terminal this refuses. Run it
-    yourself — an agent with a shell could give it a terminal of its own. Approving a chat
-    approves nothing found inside it.
+    At a terminal the summary is shown there and you confirm by typing back the code it shows
+    (never read from stdin). Without one — an agent's shell — or with --json, it prints the
+    summary and a confirmation token, approves nothing and exits 3; the same command with
+    --confirm TOKEN then approves exactly that summary, and refuses once it would say anything
+    else. An agent shows the user the summary before confirming. Approving a chat approves
+    nothing found inside it.
     """
     with _research_store() as (_, cfg, conn, rdb):
         try:
             approval = research.prepare_approval(rdb, conn, cfg, session_id, items)
-            with _terminal(approval.command) as tty:
-                tty.write(f"{approval.summary}\n\n")
-                confirmed = _ask(tty, "approve all of the above?")
-            if not confirmed:
-                typer.echo("nothing approved")
-                return
+            if confirm is not None:
+                refused = consent.problem(confirm, approval.token)
+                if refused:
+                    _needs_confirmation(
+                        approval.summary,
+                        approval.token,
+                        approval.confirm_command,
+                        as_json=as_json,
+                        error=refused,
+                    )
+                via: GrantChannel = "confirm"
+            else:
+                if as_json:
+                    raise NoTerminal(approval.command)
+                with _terminal(approval.command) as tty:
+                    tty.write(f"{approval.summary}\n\n")
+                    confirmed = _ask(tty, "approve all of the above?")
+                if not confirmed:
+                    typer.echo("nothing approved")
+                    return
+                via = "cli"
             granted = research.grant(
-                rdb, conn, cfg, session_id, approval.items, via="cli", summary=approval.summary
+                rdb, conn, cfg, session_id, approval.items, via=via, summary=approval.summary
             )
-        except NoTerminal as exc:
-            fail(str(exc), hint=exc.hint)
+        except NoTerminal:
+            _needs_confirmation(
+                approval.summary, approval.token, approval.confirm_command, as_json=as_json
+            )
         except _RESEARCH_ERRORS as exc:
             fail(str(exc), hint=getattr(exc, "hint", None))
+        if as_json:
+            candidates = {c.id: c for c in research_db.list_candidates(rdb, session_id)}
+            _echo_json(
+                {
+                    "session_id": session_id,
+                    "items": research.approval_args(approval.items),
+                    "summary": approval.summary,
+                    "approved": True,
+                    "grants": research.grant_documents(granted, candidates),
+                }
+            )
+            return
     for approved in granted:
         target = (
             "the session"
@@ -2156,6 +2312,46 @@ def _terminal(command: str) -> Iterator[TextIO]:
         raise NoTerminal(command) from exc
     with tty:
         yield tty
+
+
+def _needs_confirmation(
+    summary: str, token: str, command: str, *, as_json: bool, error: str | None = None
+) -> NoReturn:
+    """The ask step: print ``summary``, the ``token`` bound to it and the ``command`` that
+    confirms through it, then exit :data:`CONFIRM_EXIT` with nothing done.
+
+    ``error`` says why a ``--confirm`` given was refused (malformed or stale); the fresh summary
+    and token follow it. The text ends with ``command`` alone on its last line, so an agent can
+    show the user the summary and then run it, behind its own permission prompt; ``--json``
+    prints ``{"summary", "confirm", "command"}`` (and ``error``) instead.
+    """
+    if error:
+        typer.echo(f"error: {error}", err=True)
+    if as_json:
+        document: dict[str, str] = {"summary": summary, "confirm": token, "command": command}
+        if error:
+            document["error"] = error
+        _echo_json(document)
+    else:
+        typer.echo(summary)
+        typer.echo("")
+        typer.echo("nothing was changed: this needs the user's confirmation of exactly the above.")
+        typer.echo(f"confirmation token: {token}")
+        typer.echo("once the user has read it and agreed, confirm with:")
+        typer.echo(command)
+    raise typer.Exit(CONFIRM_EXIT)
+
+
+def _with_confirm(
+    command: Sequence[str], token: str, target: str, options: Sequence[str] = ()
+) -> str:
+    """``command target options --confirm token``, ``target`` and ``options`` quoted for a
+    shell — and ``target`` last, after ``--``, when it starts with a dash, so a negative chat id
+    is not read as an option."""
+    quoted = shlex.quote(target)
+    tail = [*(shlex.quote(option) for option in options), "--confirm", token]
+    words = [*command, *tail, "--", quoted] if target.startswith("-") else [*command, quoted, *tail]
+    return " ".join(words)
 
 
 def _confirmation_code() -> str:

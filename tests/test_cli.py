@@ -2,8 +2,10 @@ import dataclasses
 import json
 import logging
 import os
+import shlex
 import sys
 import threading
+from collections.abc import Callable
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any, get_args
@@ -45,6 +47,7 @@ from grepogram.models import (
     RecaptureReport,
     RunReport,
     SearchMode,
+    Source,
 )
 from grepogram.paths import Paths
 from tests.conftest import file_mode
@@ -1702,18 +1705,83 @@ def test_accounts_ls_lists_sessions_users_sources_and_chats(
     ]
 
 
-def test_accounts_rm_refuses_without_a_terminal_and_changes_nothing(
+def test_accounts_rm_without_a_terminal_asks_for_a_token_and_changes_nothing(
     tmp_home: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     paths = _synced_two_accounts(tmp_home, monkeypatch)
     before = paths.config_file.read_text()
     chats = _chats(paths)
     result = runner.invoke(cli.app, ["accounts", "rm", WORK], input="y\n")
-    assert result.exit_code == 1
-    assert "accounts rm asks for a confirmation on a terminal, and there is none" in result.stderr
+    token, command = _confirmation(result)
+    assert result.stdout.startswith(
+        "removing account work will:\n  remove 2 sources: work/chat:@news, work/chat:2\n"
+    )
+    assert command == f"grepogram accounts rm work --confirm {token}"
     assert paths.config_file.read_text() == before
     assert _chats(paths) == chats
     assert paths.session_file_for(WORK).exists()
+
+
+def test_accounts_rm_confirmed_with_the_token_removes_the_account(
+    tmp_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    paths = _synced_two_accounts(tmp_home, monkeypatch)
+    _, command = _confirmation(runner.invoke(cli.app, ["accounts", "rm", WORK]))
+    result = runner.invoke(cli.app, _argv(command))
+    assert result.exit_code == 0, result.output
+    assert "removed account work (1 chats deleted)" in result.stdout
+    assert config.load(paths).accounts == []
+    assert not paths.session_file_for(WORK).exists()
+
+
+def test_accounts_rm_refuses_a_stale_or_malformed_token(
+    tmp_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A source the account gained after the summary was shown is one the summary never named:
+    the token is refused and the fresh summary names it."""
+    paths = _synced_two_accounts(tmp_home, monkeypatch)
+    token, command = _confirmation(runner.invoke(cli.app, ["accounts", "rm", WORK]))
+    config.update(
+        paths,
+        lambda cfg: dataclasses.replace(
+            cfg, sources=[*cfg.sources, Source(chat="@extra", account=WORK)]
+        ),
+    )
+    before = paths.config_file.read_text()
+
+    stale = runner.invoke(cli.app, _argv(command))
+    malformed = runner.invoke(cli.app, ["accounts", "rm", WORK, "--confirm", "yes"])
+
+    fresh, _ = _confirmation(stale)
+    assert fresh != token and "does not match" in stale.stderr
+    assert "work/chat:@extra" in stale.stdout
+    _confirmation(malformed)
+    assert "'yes' is not a confirmation token" in malformed.stderr
+    assert paths.config_file.read_text() == before
+    assert paths.session_file_for(WORK).exists()
+
+
+def test_accounts_rm_json_documents_the_ask_and_the_removal(
+    tmp_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    paths = _synced_two_accounts(tmp_home, monkeypatch)
+    terminal = _answer(monkeypatch, YES)
+    asked = runner.invoke(cli.app, ["accounts", "rm", WORK, "--json"])
+    assert asked.exit_code == cli.CONFIRM_EXIT, asked.output
+    document = json.loads(asked.stdout)
+    assert set(document) == {"summary", "confirm", "command"}
+    assert document["summary"].startswith("removing account work will:")
+    assert terminal.asked == [] and paths.session_file_for(WORK).exists()
+
+    removed = runner.invoke(cli.app, [*_argv(document["command"]), "--json"])
+
+    assert removed.exit_code == 0, removed.output
+    assert json.loads(removed.stdout) == {
+        "removed": WORK,
+        "chats_deleted": 1,
+        "kept_chat_ids": [],
+        "stopped_sessions": [],
+    }
 
 
 def test_accounts_rm_keeps_shared_chats_and_deletes_the_accounts_own(
@@ -1911,7 +1979,10 @@ def _leave_clients() -> dict[str, FakeClient]:
     return clients
 
 
-def test_leave_refuses_without_a_terminal_and_never_edits_config(
+LEFT_NEWS = f"leave channel 'News' (id {NEWS_PEER}) as account work, signed in as Worker (user 43)"
+
+
+def test_leave_without_a_terminal_asks_for_a_token_and_sends_nothing(
     tmp_home: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     paths = _synced_two_accounts(tmp_home, monkeypatch)
@@ -1919,10 +1990,90 @@ def test_leave_refuses_without_a_terminal_and_never_edits_config(
     clients = _leave_clients()
     _per_account(monkeypatch, clients)
     result = runner.invoke(cli.app, ["leave", "@news", "--account", WORK], input="y\n")
-    assert result.exit_code == 1
-    assert "leave asks for a confirmation on a terminal, and there is none" in result.stderr
-    assert clients[WORK].calls == [] and clients[WORK].requests == []
+    token, command = _confirmation(result)
+    assert result.stdout.startswith(f"{LEFT_NEWS}\n\n")
+    assert command == f"grepogram leave @news --account work --confirm {token}"
+    assert _leaves(clients[WORK]) == [] and clients[DEFAULT_ACCOUNT].calls == []
     assert paths.config_file.read_text() == before
+
+
+def test_leave_confirmed_with_the_token_leaves_the_chat(
+    tmp_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    paths = _synced_two_accounts(tmp_home, monkeypatch)
+    before = paths.config_file.read_text()
+    clients = _leave_clients()
+    _per_account(monkeypatch, clients)
+    _, command = _confirmation(runner.invoke(cli.app, ["leave", "@news", "--account", WORK]))
+
+    result = runner.invoke(cli.app, _argv(command))
+
+    assert result.exit_code == 0, result.output
+    assert f"left channel 'News' (id {NEWS_PEER}) as account work" in result.stdout
+    [request] = _leaves(clients[WORK])
+    assert isinstance(request, functions.channels.LeaveChannelRequest)
+    assert paths.config_file.read_text() == before
+
+
+def test_leave_refuses_a_token_for_another_chat_or_a_malformed_one(
+    tmp_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _synced_two_accounts(tmp_home, monkeypatch)
+    clients = _leave_clients()
+    _per_account(monkeypatch, clients)
+    token, _ = _confirmation(runner.invoke(cli.app, ["leave", "@news", "--account", WORK]))
+
+    other = runner.invoke(
+        cli.app, ["leave", "Old club", "--account", WORK, "--confirm", token, "--json"]
+    )
+    malformed = runner.invoke(cli.app, ["leave", "@news", "--account", WORK, "--confirm", "y"])
+
+    assert other.exit_code == cli.CONFIRM_EXIT, other.output
+    document = json.loads(other.stdout)
+    assert document["summary"].startswith(f"leave group 'Old club' (id {CLUB_PEER})")
+    assert document["confirm"] != token and "does not match" in document["error"]
+    assert document["command"] == (
+        f"grepogram leave 'Old club' --account work --confirm {document['confirm']}"
+    )
+    _confirmation(malformed)
+    assert "'y' is not a confirmation token" in malformed.stderr
+    assert _leaves(clients[WORK]) == []
+
+
+def test_leave_json_confirmation_and_a_negative_id_in_the_command(
+    tmp_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A negative chat id goes after ``--`` in the printed command, so it is not read as an
+    option, and the command runs as printed."""
+    _synced_two_accounts(tmp_home, monkeypatch)
+    clients = _leave_clients()
+    _per_account(monkeypatch, clients)
+    asked = runner.invoke(cli.app, ["leave", "--account", WORK, "--json", "--", str(CLUB_PEER)])
+    assert asked.exit_code == cli.CONFIRM_EXIT, asked.output
+    document = json.loads(asked.stdout)
+    assert document["command"] == (
+        f"grepogram leave --account work --confirm {document['confirm']} -- {CLUB_PEER}"
+    )
+
+    printed = _argv(document["command"])
+    left = runner.invoke(cli.app, [*printed[:-2], "--json", *printed[-2:]])
+
+    assert left.exit_code == 0, left.output
+    assert json.loads(left.stdout) == {
+        "left": {"id": CLUB_PEER, "type": "group", "title": "Old club"},
+        "account": WORK,
+    }
+    [request] = _leaves(clients[WORK])
+    assert isinstance(request, functions.messages.DeleteChatUserRequest)
+
+
+def test_confirm_commands_quote_their_target() -> None:
+    assert cli._with_confirm(["grepogram", "leave"], "abc", "a b", ["--account", "w"]) == (
+        "grepogram leave 'a b' --account w --confirm abc"
+    )
+    assert cli._with_confirm(["grepogram", "leave"], "abc", "-5", ["--account", "w"]) == (
+        "grepogram leave --account w --confirm abc -- -5"
+    )
 
 
 def test_leave_leaves_a_channel_and_keeps_its_source_and_history(
@@ -2214,20 +2365,168 @@ def _grants(paths: Paths) -> list[Any]:
         conn.close()
 
 
-def test_research_approve_refuses_without_a_terminal(
+def _confirmation(result: Any) -> tuple[str, str]:
+    """The token and the confirm command an ask step printed, after checking it is one: exit
+    code 3, and the command alone on the last line."""
+    assert result.exit_code == cli.CONFIRM_EXIT, result.output
+    command = result.stdout.splitlines()[-1]
+    token = command.split("--confirm ", 1)[1].split(" ", 1)[0]
+    assert f"confirmation token: {token}" in result.stdout
+    return token, command
+
+
+def _argv(command: str) -> list[str]:
+    """The arguments of a printed ``grepogram …`` command, as the runner takes them."""
+    words = shlex.split(command)
+    assert words[0] == "grepogram"
+    return words[1:]
+
+
+def test_research_approve_without_a_terminal_shows_the_summary_and_a_token(
     tmp_home: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """The ask step: what would be approved, the token bound to it and the command that
+    confirms it, exit code 3 — and nothing granted, whatever stdin says."""
     paths = _discovered_home(tmp_home, monkeypatch)
+    conn, rdb = _stores(paths)
+    try:
+        approval = research.prepare_approval(rdb, conn, config.load(paths), 1, ["1"])
+    finally:
+        rdb.close()
+        conn.close()
 
     result = runner.invoke(cli.app, ["research", "approve", "1", "1"], input="y\n")
 
-    assert result.exit_code == 1
-    assert "asks for a confirmation on a terminal, and there is none" in result.stderr
-    assert (
-        "the user must run `grepogram research approve 1 1:join,fetch,add_source` in their "
-        "own terminal" in result.stderr
-    )
+    token, command = _confirmation(result)
+    assert result.stdout.startswith(f"{approval.summary}\n\n"), "the exact summary, first"
+    assert token == approval.token
+    assert command == f"grepogram research approve 1 1:join,fetch,add_source --confirm {token}"
+    assert result.stderr == ""
     assert _grants(paths) == [], "stdin never answers for the human"
+
+
+def test_research_approve_confirmed_with_the_token_records_the_confirm_channel(
+    tmp_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    paths = _discovered_home(tmp_home, monkeypatch)
+    asked = runner.invoke(cli.app, ["research", "approve", "1", "1"])
+    token, command = _confirmation(asked)
+
+    confirmed = runner.invoke(cli.app, _argv(command))
+
+    assert confirmed.exit_code == 0, confirmed.output
+    assert "approved for candidate 1: join, fetch, add_source" in confirmed.stdout
+    (grant,) = _grants(paths)
+    assert (grant.via, grant.actions) == ("confirm", ("join", "fetch", "add_source"))
+    assert asked.stdout.startswith(f"{grant.summary}\n\n"), "the grant records the text shown"
+    again = runner.invoke(cli.app, _argv(command))
+    assert again.exit_code == 1 and "everything named is already approved" in again.stderr
+
+
+def _retitle(paths: Paths) -> None:
+    """What a probe that read the chat again would do: the summary names another title."""
+    conn, rdb = _stores(paths)
+    try:
+        research_db.update_candidate(rdb, 1, title="Tbilisi flats, renamed")
+    finally:
+        rdb.close()
+        conn.close()
+
+
+def _skip(paths: Paths) -> None:
+    result = runner.invoke(cli.app, ["research", "skip", "1", "1"])
+    assert result.exit_code == 0, result.output
+
+
+def _cover(paths: Paths) -> None:
+    """A source added for the candidate's chat: its fetch now goes through that source."""
+    config.update(
+        paths,
+        lambda cfg: dataclasses.replace(cfg, sources=[*cfg.sources, Source(chat="@tb_flats")]),
+    )
+
+
+@pytest.mark.parametrize("change", [_retitle, _skip, _cover], ids=["probed", "skipped", "source"])
+def test_research_approve_refuses_a_token_whose_summary_changed(
+    tmp_home: Path, monkeypatch: pytest.MonkeyPatch, change: Callable[[Paths], None]
+) -> None:
+    paths = _discovered_home(tmp_home, monkeypatch)
+    token, command = _confirmation(runner.invoke(cli.app, ["research", "approve", "1", "1"]))
+    change(paths)
+
+    stale = runner.invoke(cli.app, _argv(command))
+
+    fresh, fresh_command = _confirmation(stale)
+    assert "error: the confirmation token does not match what this command would do now" in (
+        stale.stderr
+    )
+    assert fresh != token and fresh_command == command.replace(token, fresh)
+    assert _grants(paths) == []
+    confirmed = runner.invoke(cli.app, _argv(fresh_command))
+    assert confirmed.exit_code == 0, confirmed.output
+    assert [grant.via for grant in _grants(paths)] == ["confirm"]
+
+
+def test_research_approve_refuses_a_token_given_for_other_items(
+    tmp_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    paths = _discovered_home(tmp_home, monkeypatch)
+    token, _ = _confirmation(
+        runner.invoke(cli.app, ["research", "approve", "1", "1:fetch,add_source"])
+    )
+
+    other = runner.invoke(cli.app, ["research", "approve", "1", "1", "--confirm", token])
+
+    fresh, _ = _confirmation(other)
+    assert fresh != token and "does not match" in other.stderr
+    assert _grants(paths) == []
+
+
+@pytest.mark.parametrize("given", ["nope", "", "0" * 11, "g" * 12, "0" * 13, "000000000000"])
+def test_research_approve_refuses_a_malformed_or_wrong_token(
+    tmp_home: Path, monkeypatch: pytest.MonkeyPatch, given: str
+) -> None:
+    paths = _discovered_home(tmp_home, monkeypatch)
+
+    result = runner.invoke(cli.app, ["research", "approve", "1", "1", "--confirm", given])
+
+    _confirmation(result)
+    reason = "does not match" if given == "000000000000" else "is not a confirmation token"
+    assert reason in result.stderr
+    assert _grants(paths) == []
+
+
+def test_research_approve_json_documents_the_ask_and_the_confirmation(
+    tmp_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``--json`` never asks the terminal, even with one installed: it is the ask step."""
+    paths = _discovered_home(tmp_home, monkeypatch)
+    terminal = _answer(monkeypatch, YES)
+
+    asked = runner.invoke(cli.app, ["research", "approve", "1", "1", "--json"])
+
+    assert asked.exit_code == cli.CONFIRM_EXIT, asked.output
+    document = json.loads(asked.stdout)
+    assert set(document) == {"summary", "confirm", "command"}
+    assert document["command"] == (
+        f"grepogram research approve 1 1:join,fetch,add_source --confirm {document['confirm']}"
+    )
+    assert terminal.asked == [] and _grants(paths) == []
+    stale = runner.invoke(
+        cli.app, ["research", "approve", "1", "1", "--confirm", "000000000000", "--json"]
+    )
+    assert stale.exit_code == cli.CONFIRM_EXIT
+    assert json.loads(stale.stdout)["error"].startswith("the confirmation token does not match")
+    assert _grants(paths) == []
+
+    confirmed = runner.invoke(cli.app, [*_argv(document["command"]), "--json"])
+
+    assert confirmed.exit_code == 0, confirmed.output
+    result = json.loads(confirmed.stdout)
+    assert (result["approved"], result["summary"]) == (True, document["summary"])
+    assert result["items"] == ["1:join,fetch,add_source"]
+    [grant] = result["grants"]
+    assert (grant["candidate_id"], grant["via"]) == (1, "confirm")
 
 
 def test_research_approve_grants_nothing_on_a_no(
@@ -2335,13 +2634,20 @@ def test_research_approve_records_the_cli_channel_and_the_text_shown(
     assert "next: grepogram research run 1" in result.stdout
 
 
-def test_research_approve_has_no_option_that_answers_for_the_human(
-    tmp_home: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize(
+    "command",
+    [["research", "approve", "1", "1"], ["accounts", "rm", "work"], ["leave", "@news"]],
+    ids=["approve", "accounts-rm", "leave"],
+)
+def test_no_option_confirms_without_naming_the_summary(
+    tmp_home: Path, monkeypatch: pytest.MonkeyPatch, command: list[str]
 ) -> None:
+    """A confirmation without a terminal carries the token bound to the summary: there is no
+    bare yes, and ``--confirm`` takes a value."""
     paths = _discovered_home(tmp_home, monkeypatch)
-    for flag in ("--yes", "-y", "--force"):
-        result = runner.invoke(cli.app, ["research", "approve", "1", "1", flag])
-        assert result.exit_code != 0, flag
+    for flag in ("--yes", "-y", "--force", "--approve", "--confirm"):
+        result = runner.invoke(cli.app, [*command, flag])
+        assert result.exit_code == 2, (flag, result.output)
     assert _grants(paths) == []
 
 
