@@ -45,6 +45,10 @@ uv run mypy
 as the package. `ruff` is configured at 100 columns with the `E`, `F`, `I`, `UP` and `B` rule
 sets.
 
+A change under `plugin/` also needs `claude plugin validate .` to pass; try it in a session with
+`claude --plugin-dir ./plugin`. The marketplace serves `./plugin` from `main`, so a merge to
+`main` publishes the plugin.
+
 The slow suite is separate and deselected by default. It loads the real `bge-m3` embedder and the
 real `bge-reranker-v2-m3` cross-encoder, so both must already be in the Hugging Face cache:
 
@@ -113,9 +117,7 @@ The scope is required. One logical change per commit. No `Co-Authored-By` or oth
 - A raised CLI floor (`grepogram >= X.Y.Z` in the skills and commands) without a skill that needs
   the newer CLI surface. It is one phrase per file, all equal, never above `__version__`.
 - A plugin hook script that sources another file, uses a heredoc, installs anything or prints
-  anything but its JSON decision: it stays one self-contained `/bin/bash` 3.2 script. Check plugin
-  changes with `claude plugin validate .` and run them with `claude --plugin-dir ./plugin`; the
-  marketplace serves `./plugin` from `main`, so a merge publishes it.
+  anything but its JSON decision: it stays one self-contained `/bin/bash` 3.2 script.
 - A schema change that edits `_V5`. The base schema is frozen now that v0.1.0 is tagged; append a
   migration step above `db.BASE_VERSION` instead. A step may fill the columns and tables it adds
   from values already stored; it never rewrites a stored value, because an imported history
