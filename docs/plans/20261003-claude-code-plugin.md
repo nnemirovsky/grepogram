@@ -238,12 +238,17 @@ The marketplace serves `./plugin` from the default branch: merging to `main` pub
   path, `uv run grepogram` and chained commands are covered. (History: the first pattern was
   `grepogram.*--confirm` alone, then required the subcommand words to be adjacent and missed
   those forms; the final pattern below replaced both.) Deliberate obfuscation (`grepogra""m`)
-  still gets past a regex; the hook is defence in depth and the docs say so. Final pattern, `sep` being whitespace, quotes and JSON escapes
-  (`\t`, `\n`, `\r`, `\"`, `\\`):
-  `grepogram.*(--confirm|research${sep}approve|accounts${sep}rm)|grepogram(${sep}-[-[:alnum:]]*)*${sep}leave`.
-  The two words of a command must be adjacent and `leave` must be the subcommand (after `-v` /
-  `--verbose` at most), so a search for the word leave or for `accounts form` stays silent; a
-  query holding `research approve`, `accounts rm` or `--confirm` still asks.
+  still gets past a regex; the hook is defence in depth and the docs say so. Final pattern,
+  `sep` being whitespace, quotes and JSON escapes (`\t`, `\n`, `\r`, `\"`, `\\`) and `opt`
+  being `(${sep}-[-[:alnum:]]*)*`:
+  `grepogram.*(--confirm|research${opt}${sep}approve|accounts${opt}${sep}rm)|grepogram${opt}${sep}leave`.
+  A `--` or another option-shaped token may sit between the two words of a command and between
+  grepogram and `leave`, since click accepts `grepogram research -- approve`, `grepogram accounts
+  -- rm` and `grepogram -v -- leave` (anything may sit before the group word, so `grepogram --
+  research approve` asks too); nothing else may, and `leave` must be the subcommand, so a search
+  for the word leave or for `accounts form` stays silent; a query holding `research approve`,
+  `accounts rm` or `--confirm` still asks. (Review 4 found the `--` form; the earlier pattern
+  allowed dash-led tokens only before `leave`.)
 - **Accepted over-asks** (decided in review 2, the script left alone): the gate matches the raw
   payload, so the Bash `description` field (or a `cwd`) naming `research approve` or `grepogram
   leave …` forces a prompt on a pre-allowed call, and `accounts${sep}rm` has no right boundary, so

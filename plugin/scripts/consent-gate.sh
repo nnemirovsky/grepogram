@@ -7,10 +7,13 @@
 #
 # It asks, ignoring case, on a payload naming grepogram and then --confirm, `research approve`,
 # `accounts rm`, or `leave` as the subcommand. Between the two words of a command, and between
-# grepogram and `leave` (where -v / --verbose may also sit), it accepts only what an honest call
-# puts there: whitespace, quotes and JSON escapes (a tab arrives as \t, a line continuation as
-# \\\n, so no word boundary before rm). It matches the raw payload, so it over-asks (a query or
-# a cwd naming the words) rather than under-asks; `leave` must be the subcommand, so a search
+# grepogram and `leave`, it accepts what an honest call puts there: whitespace, quotes and JSON
+# escapes (a tab arrives as \t, a line continuation as \\\n, so no word boundary before rm),
+# and dash-led tokens, since click takes `--` (and the root takes -v / --verbose) there:
+# `grepogram research -- approve` and `grepogram -v -- leave` are valid calls. Anything may sit
+# between grepogram and the group word, which covers `grepogram -- research approve`. It
+# matches the raw payload, so it over-asks (a query or a cwd naming the words) rather than
+# under-asks; the words must be separated by nothing but those, so `accounts form` or a search
 # for the word leave stays silent.
 #
 # A regex over the command text is defence in depth, not a sandbox: deliberate obfuscation
@@ -20,7 +23,8 @@ payload=$(cat)
 
 shopt -s nocasematch
 sep='([[:space:]'\''"]|\\[tnr"\\])*'
-pattern="grepogram.*(--confirm|research${sep}approve|accounts${sep}rm)|grepogram(${sep}-[-[:alnum:]]*)*${sep}leave"
+opt="(${sep}-[-[:alnum:]]*)*"
+pattern="grepogram.*(--confirm|research${opt}${sep}approve|accounts${opt}${sep}rm)|grepogram${opt}${sep}leave"
 if [[ "$payload" =~ $pattern ]]; then
   printf '%s\n' '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"ask","permissionDecisionReason":"grepogram: this approves research, removes an account or leaves a chat, or prints the command that does; check it matches what you agreed to"}}'
 fi

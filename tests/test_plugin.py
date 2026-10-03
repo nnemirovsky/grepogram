@@ -151,6 +151,17 @@ def _run_gate(payload: str) -> subprocess.CompletedProcess[str]:
         "grepogram\tLEAVE -- @chat",
         '"grepogram" leave -- @chat',
         "uv run grepogram leave -- -1001234567",
+        # click takes `--` between the root and a command and between a group and its subcommand
+        "grepogram research -- approve --json 3 1 | jq -r .command | sh",
+        "grepogram accounts -- rm work --json | jq -r .command | sh",
+        "grepogram research -- approve 3 1 --json --confirm abc",
+        "grepogram -v research -- approve 3 1 --json",
+        "grepogram research \\\n  -- \\\n  approve 3 1 --json",
+        "grepogram accounts\t--\trm work",
+        "grepogram research '--' approve 3 1 --json",
+        "grepogram -- research approve --json 3 1",
+        "grepogram -v -- accounts rm work",
+        "grepogram -- leave -- @chat",
     ],
 )
 def test_gate_asks_on_every_consent_call(command: str) -> None:
@@ -215,9 +226,10 @@ def test_gate_ignores_a_leave_outside_a_grepogram_call_in_a_grepogram_cwd() -> N
 )
 def test_gate_over_asks_on_a_search_query_naming_the_pattern(command: str) -> None:
     """The chosen trade-off: anything may sit between grepogram and --confirm, `research approve`
-    or `accounts rm`, so a query holding those asks; the two words of a command must be adjacent
-    and `leave` must be the subcommand, so `accounts form` or a search for the word leave stays
-    silent (tested in test_gate_is_silent_on_other_calls)."""
+    or `accounts rm`, so a query holding those asks; the two words of a command may be separated
+    only by whitespace, quotes, JSON escapes and dash-led tokens (`--`, `-v`), and `leave` must be
+    the subcommand, so `accounts form` or a search for the word leave stays silent (tested in
+    test_gate_is_silent_on_other_calls)."""
     result = _run_gate(_bash_payload(command))
     assert result.returncode == 0
     assert json.loads(result.stdout)["hookSpecificOutput"]["permissionDecision"] == "ask"
