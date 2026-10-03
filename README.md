@@ -1240,8 +1240,9 @@ uv run ruff check . && uv run ruff format --check . && uv run mypy
 ```
 
 [CONTRIBUTING.md](CONTRIBUTING.md) has the setup, the gates and the commit convention;
-[CLAUDE.md](CLAUDE.md) has the invariants a change is reviewed against, written for coding
-agents and equally the contributor guide.
+[CLAUDE.md](CLAUDE.md) and the module rules under [.claude/rules/](.claude/rules/) have the
+invariants a change is reviewed against, written for coding agents and equally the contributor
+guide.
 
 ## License
 
