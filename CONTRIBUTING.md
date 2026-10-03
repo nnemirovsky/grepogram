@@ -1,8 +1,9 @@
 # Contributing
 
 Issues and pull requests are welcome. This file is what a change has to satisfy before it can be
-merged; the invariants a reviewer will actually check it against live in [CLAUDE.md](CLAUDE.md),
-which is written for coding agents and doubles as the contributor guide.
+merged; the invariants a reviewer will actually check it against live in [CLAUDE.md](CLAUDE.md)
+and the module rules under [.claude/rules/](.claude/rules/), which are written for coding agents and
+double as the contributor guide.
 
 ## Setup
 
