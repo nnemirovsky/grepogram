@@ -445,16 +445,16 @@ The marketplace serves `./plugin` from the default branch: merging to `main` pub
 
 ### Task 9: [Final] Update documentation
 
-- [ ] README: a "Claude Code plugin" install path first in Setup (marketplace add, install,
+- [x] README: a "Claude Code plugin" install path first in Setup (marketplace add, install,
       `/grepogram:setup`); keep `claude mcp add` for other clients and for users who want MCP;
       the hand-written "ask" rules block becomes "the plugin installs this gate; without it, add
       these rules"; claim no more about bypass/auto mode than the manual check recorded
-- [ ] CLAUDE.md: the plugin layout, the version lock (a release bumps `__version__` and
+- [x] CLAUDE.md: the plugin layout, the version lock (a release bumps `__version__` and
       `plugin.json`), the floor rule (raised on purpose when a skill needs newer CLI surface),
       `--` before positional chat ids, the drift check, the hook script constraints; never name
       the icon file
-- [ ] CONTRIBUTING.md: the same release, floor and drift rules where it covers releasing
-- [ ] move this plan to `docs/plans/completed/`
+- [x] CONTRIBUTING.md: the same release, floor and drift rules where it covers releasing
+- [x] move this plan to `docs/plans/completed/` (done by the orchestrator at completion)
 
 ## Post-Completion
 

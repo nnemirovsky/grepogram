@@ -100,7 +100,15 @@ The scope is required. One logical change per commit. No `Co-Authored-By` or oth
   alone, with `err=True` for anything diagnostic.
 - Message text in the log above DEBUG. Pass it through `log.redact()`.
 - A version string anywhere but `grepogram/__init__.py`, which hatch and `grepogram --version`
-  both read.
+  both read. The one exception is `version` in `plugin/.claude-plugin/plugin.json`, which a
+  release bumps together with it; `release.yml` and `tests/test_plugin.py` refuse a mismatch.
+- A plugin skill or command that names a CLI command or flag that does not exist, or puts an
+  option after a positional chat id (options first, `--` before the id). The drift check in
+  `tests/test_plugin.py` parses them against the real CLI.
+- A raised CLI floor (`grepogram >= X.Y.Z` in the skills and commands) without a skill that needs
+  the newer CLI surface. It is one phrase per file, all equal, never above `__version__`.
+- A plugin hook script that sources another file, uses a heredoc, installs anything or prints
+  anything but its JSON decision: it stays one self-contained `/bin/bash` 3.2 script.
 - A schema change that edits `_V5`. The base schema is frozen now that v0.1.0 is tagged; append a
   migration step above `db.BASE_VERSION` instead. A step may fill the columns and tables it adds
   from values already stored; it never rewrites a stored value, because an imported history
