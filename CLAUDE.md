@@ -36,7 +36,9 @@ Python 3.12 pinned, `uv` only (no pip, no global installs), developed on macOS.
 
 `.github/workflows/release.yml` runs on a `v*` tag. In order:
 
-1. bump `__version__` in `grepogram/__init__.py`, commit, and push to `main`;
+1. bump `__version__` in `grepogram/__init__.py` **and** `version` in
+   `plugin/.claude-plugin/plugin.json` together, commit, and push to `main` (`release.yml` and a
+   test in `tests/test_plugin.py` both refuse a mismatch);
 2. tag it `vX.Y.Z` and push the tag — the workflow refuses a tag whose name does not match
    `__version__`, so the two can never drift;
 3. it runs `uv build`, uploads `dist/` as an artifact (before the release step, so a failed
@@ -52,6 +54,10 @@ Python 3.12 pinned, `uv` only (no pip, no global installs), developed on macOS.
    environment, `id-token: write`, no API token). Until the variable is set the job skips, so a
    tag pushed before the PyPI publisher exists still cuts a GitHub release instead of failing the
    workflow.
+
+The plugin's CLI floor is the phrase `grepogram >= X.Y.Z` in each skill and command markdown file
+(one per file, all equal, never above `__version__`; a test enforces it). It is raised on purpose,
+only when a skill starts needing CLI surface the older release lacks, and not on every release.
 
 `ci.yml` is the per-push suite and is separate from this.
 
@@ -208,5 +214,19 @@ history, `extract` and `recapture-links` are long flood-exposed network passes, 
 directory the server
 cannot see, `auth` and `accounts rm` sign accounts in and out, `leave` is the one command that
 changes an account on Telegram, and `research unexclude` lifts the user's own decision.
+
+`plugin/` is the Claude Code plugin, listed by the root `.claude-plugin/marketplace.json`:
+`.claude-plugin/plugin.json` (manifest, whose version tracks `__version__`, and the icon PNG),
+`skills/search` and `skills/research` (`SKILL.md`), `commands/setup.md`, `hooks/hooks.json` and
+`scripts/consent-gate.sh`. It bundles no MCP server; the CLI is what it drives. Rules for it,
+checked by `tests/test_plugin.py`:
+
+- skills and commands put options first and `--` before a positional chat id; a drift check
+  parses every command and flag they and their `allowed-tools` name against the real Typer app, so
+  a renamed command or flag fails the suite;
+- the hook is one self-contained `/bin/bash` 3.2 script: no sourcing, no heredocs, no installers,
+  nothing on stdout but the hook's JSON decision. It only forces a permission prompt on the
+  `--confirm` calls; `PRIVACY.md` covers what the plugin reads;
+- never write the icon's file name in any text file (a test scans for it).
 
 Plans live in `docs/plans/`, finished ones in `docs/plans/completed/`.
