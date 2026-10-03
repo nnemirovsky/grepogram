@@ -349,25 +349,25 @@ The marketplace serves `./plugin` from the default branch: merging to `main` pub
 - Create: `plugin/skills/research/SKILL.md`
 - Modify: `tests/test_plugin.py` (only if the drift check needs a new case)
 
-- [ ] write the frontmatter: `name: research`, `description` for finding chats the user does not
+- [x] write the frontmatter: `name: research`, `description` for finding chats the user does not
       index yet / an explicit research request; `allowed-tools` for `research start`,
       `discover`, `candidates`, `status`, `skip`, `stop` (not `approve`, `run`, `exclude`)
-- [ ] write the body: the same floor and preflight; `[research] enabled` false → say so and stop
+- [x] write the body: the same floor and preflight; `[research] enabled` false → say so and stop
       (the CLI's own error names the key); `research start` needs `--seed` (one or more indexed
       chats) and an `--account`; the flow start → discover → candidates (evidence; `member`,
       `cached`, `authorized` kept apart; only probed candidates can be approved) → report and ask
-- [ ] write the approval step: always `--json` on both calls (it never reads a terminal); the
+- [x] write the approval step: always `--json` on both calls (it never reads a terminal); the
       first call exits 3 — the expected "needs confirmation" result, not a failure to retry — and
       prints `summary`, `confirm` (the token) and `command`; show `summary` verbatim; only after
       the user agrees, run the same command with `--confirm <token>`; expect a permission prompt
       on both calls; a refused token comes back with `error` and a fresh summary — show it again,
       never confirm on own judgement
-- [ ] write run → analyse with `search` / `thread` / `context` (with `--`) → `stop` (sources
+- [x] write run → analyse with `search` / `thread` / `context` (with `--`) → `stop` (sources
       stay); `skip` and `exclude` only narrow, `exclude` takes marked ids after `--`; global and
       paid search need their own approvals
-- [ ] confirm the drift and floor checks cover this file (they glob); add a case only if the file
+- [x] confirm the drift and floor checks cover this file (they glob); add a case only if the file
       uses a form the parser did not meet before
-- [ ] run the full checks — must pass before Task 5
+- [x] run the full checks — must pass before Task 5
 
 ### Task 5: `/grepogram:setup`
 
