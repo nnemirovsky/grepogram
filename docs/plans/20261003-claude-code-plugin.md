@@ -374,28 +374,28 @@ The marketplace serves `./plugin` from the default branch: merging to `main` pub
 **Files:**
 - Create: `plugin/commands/setup.md`
 
-- [ ] write the frontmatter: `description`, `disable-model-invocation: true`, `allowed-tools` for
+- [x] write the frontmatter: `description`, `disable-model-invocation: true`, `allowed-tools` for
       `grepogram --version`, `config path`, `accounts ls`, `dialogs`, `sources ls`; the floor
       phrase once
-- [ ] step 1: no `uv` → tell the user to install it from https://docs.astral.sh/uv/ themselves
+- [x] step 1: no `uv` → tell the user to install it from https://docs.astral.sh/uv/ themselves
       (Claude runs no installer script); CLI missing or below the floor → ask which extras
       (`dense` ≈ 4.5 GB of models, `media` for OCR/PDF/DOCX) → show `uv tool install
       --managed-python --python 3.12 'grepogram[…]'` (or `uv tool upgrade grepogram`) and run it
       only under the normal prompt; `grepogram` not on PATH afterwards → `uv tool update-shell`
       and a restart (the pre-allowed rules match the bare command only)
-- [ ] steps 2–3: `config init` if absent and `config path`; the user pastes `api_id` / `api_hash`
+- [x] steps 2–3: `config init` if absent and `config path`; the user pastes `api_id` / `api_hash`
       into the file themselves; **never Read `config.toml`** — check the keys are set without
       printing values (`grep -cE '^api_hash = "[^"]+"'` and the `api_id` equivalent, or the
       missing-keys error of `grepogram dialogs <x>`); `grepogram auth` (and `auth --account
       <name>`) in a separate terminal, verified with `accounts ls`
-- [ ] steps 4–6: ask what to index, `dialogs <query>`, `sources add` per pick; first
+- [x] steps 4–6: ask what to index, `dialogs <query>`, `sources add` per pick; first
       `grepogram sync --budget 600` in the background, progress reported, resumable; mention
       research exists and is off, do not enable it
-- [ ] step 7: offer MCP (default no): `claude mcp get grepogram` first (README users may already
+- [x] step 7: offer MCP (default no): `claude mcp get grepogram` first (README users may already
       have it) → `claude mcp add grepogram -s user -- "$(uv tool dir --bin)/grepogram-mcp"`; say
       a restart or `/mcp` reconnect picks it up; name the undo `claude mcp remove grepogram -s
       user`; every step re-checks its state first so re-running setup is safe
-- [ ] confirm the drift and floor checks cover this file; run the full checks — must pass before
+- [x] confirm the drift and floor checks cover this file; run the full checks — must pass before
       Task 6
 
 ### Task 6: Privacy policy
