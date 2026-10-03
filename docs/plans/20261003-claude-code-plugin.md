@@ -403,19 +403,19 @@ The marketplace serves `./plugin` from the default branch: merging to `main` pub
 **Files:**
 - Create: `PRIVACY.md`
 
-- [ ] verify each claim against the code before writing it: what is read (opt-in sources through
+- [x] verify each claim against the code before writing it: what is read (opt-in sources through
       the user's own sessions; research probes metadata of candidates, joins only what was
       approved, global search sends the session question only after its approval); what is
       written (`config.toml`, sessions, `index.db`, `research.db`, locks, `logs/` under
       `~/.config/grepogram` or `GREPOGRAM_HOME`, 0600 / 0700; the Hugging Face cache)
-- [ ] network: Telegram (MTProto via Telethon) and the first-use model downloads from
+- [x] network: Telegram (MTProto via Telethon) and the first-use model downloads from
       huggingface.co (huggingface_hub sends its own user-agent headers); grepogram itself sends
       no telemetry; the plugin's hook makes no request
-- [ ] what reaches Claude's context: hit snippets and message text, sender names, chat titles and
+- [x] what reaches Claude's context: hit snippets and message text, sender names, chat titles and
       usernames, links — personal data of chat members; it leaves the machine only as part of the
       user's Claude conversation; the API keys never do (setup never reads the config)
-- [ ] write a test that `PRIVACY.md` exists and that the manifest's `privacyPolicyUrl` names it
-- [ ] run the full checks — must pass before Task 7
+- [x] write a test that `PRIVACY.md` exists and that the manifest's `privacyPolicyUrl` names it
+- [x] run the full checks — must pass before Task 7
 
 ### Task 7: Icon
 
