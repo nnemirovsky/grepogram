@@ -103,12 +103,19 @@ The scope is required. One logical change per commit. No `Co-Authored-By` or oth
   both read. The one exception is `version` in `plugin/.claude-plugin/plugin.json`, which a
   release bumps together with it; `release.yml` and `tests/test_plugin.py` refuse a mismatch.
 - A plugin skill or command that names a CLI command or flag that does not exist, or puts an
-  option after a positional chat id (options first, `--` before the id). The drift check in
-  `tests/test_plugin.py` parses them against the real CLI.
+  option after a positional chat id or query (options first, `--` before the value). The drift
+  check in `tests/test_plugin.py` parses them against the real CLI. It catches names, not
+  meaning: a change to the MCP `INSTRUCTIONS` or to a CLI JSON shape the skills read is mirrored
+  in `plugin/skills/*` by hand.
+- A plugin `allowed-tools` entry for a command that changes something: `research approve`, `run`
+  or `exclude`, `accounts rm`, `leave`, `sources add`, a config edit, an install or the MCP
+  registration. Those keep the normal permission prompt.
 - A raised CLI floor (`grepogram >= X.Y.Z` in the skills and commands) without a skill that needs
   the newer CLI surface. It is one phrase per file, all equal, never above `__version__`.
 - A plugin hook script that sources another file, uses a heredoc, installs anything or prints
-  anything but its JSON decision: it stays one self-contained `/bin/bash` 3.2 script.
+  anything but its JSON decision: it stays one self-contained `/bin/bash` 3.2 script. Check plugin
+  changes with `claude plugin validate .` and run them with `claude --plugin-dir ./plugin`; the
+  marketplace serves `./plugin` from `main`, so a merge publishes it.
 - A schema change that edits `_V5`. The base schema is frozen now that v0.1.0 is tagged; append a
   migration step above `db.BASE_VERSION` instead. A step may fill the columns and tables it adds
   from values already stored; it never rewrites a stored value, because an imported history

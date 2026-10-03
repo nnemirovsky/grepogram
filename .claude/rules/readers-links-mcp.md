@@ -27,7 +27,8 @@ paths:
   `search.thread` follows a channel post with its discussion group's comments, and post ids and
   comment ids both number from 1, so `msg_id` alone names two different messages. The top-level
   `chat_id` of `mcp._messages_result` is the argument, not where every message lives; the tool
-  docs, the server `INSTRUCTIONS` and README say to pass a message's own `chat_id` back.
+  docs, the server `INSTRUCTIONS`, README and the plugin skills (`plugin/skills/*/SKILL.md`) say
+  to pass a message's own `chat_id` back.
 - `mcp` stays `<2`: `grepogram/mcp.py` targets the 1.x `FastMCP` API (2.x renamed it).
 - Never instantiate `FastMCP` at module level; `mcp.build_server()` runs after `setup_logging()`
   because `FastMCP.__init__` calls `logging.basicConfig`, and `main()` lowers the `mcp` logger to

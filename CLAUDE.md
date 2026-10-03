@@ -1,7 +1,8 @@
 # CLAUDE.md
 
 grepogram: local hybrid search over opt-in Telegram chats of one or more signed-in accounts,
-served to Claude Code over MCP, with an opt-in research mode that finds chats beyond them.
+served to agents over MCP and the CLI (the Claude Code plugin in `plugin/` drives the CLI), with
+an opt-in research mode that finds chats beyond them.
 Python 3.12 pinned, `uv` only (no pip, no global installs), developed on macOS.
 
 ## Commands
@@ -29,8 +30,12 @@ Python 3.12 pinned, `uv` only (no pip, no global installs), developed on macOS.
   around: a module-level `import docx` in a test file makes the whole module uncollectable on CI
 - `uv.lock` is committed and CI installs with `--locked`: after touching dependencies run
   `uv lock` and commit the lockfile
-- the version lives in `grepogram/__init__.py` only (`__version__`, read by hatch and
-  `grepogram --version`)
+- the version lives in `grepogram/__init__.py` (`__version__`, read by hatch and
+  `grepogram --version`) and is mirrored in `plugin/.claude-plugin/plugin.json` `version`; a test
+  and `release.yml` refuse a mismatch
+- `claude plugin validate .` and `claude plugin validate plugin/.claude-plugin/plugin.json` check
+  the marketplace and the manifest; `claude --plugin-dir ./plugin` runs the working tree, since a
+  marketplace install is cached by `version` and does not pick up edits
 
 ## Releasing
 
@@ -58,6 +63,10 @@ Python 3.12 pinned, `uv` only (no pip, no global installs), developed on macOS.
 The plugin's CLI floor is the phrase `grepogram >= X.Y.Z` in each skill and command markdown file
 (one per file, all equal, never above `__version__`; a test enforces it). It is raised on purpose,
 only when a skill starts needing CLI surface the older release lacks, and not on every release.
+
+The marketplace serves `./plugin` from `main`, so merging publishes the plugin: the tag and the
+PyPI upload of a version the plugin needs follow right away. Installed users get a plugin-only
+change only with the next version bump, because Claude Code caches the plugin by `version`.
 
 `ci.yml` is the per-push suite and is separate from this.
 
@@ -221,12 +230,24 @@ changes an account on Telegram, and `research unexclude` lifts the user's own de
 `scripts/consent-gate.sh`. It bundles no MCP server; the CLI is what it drives. Rules for it,
 checked by `tests/test_plugin.py`:
 
-- skills and commands put options first and `--` before a positional chat id; a drift check
-  parses every command and flag they and their `allowed-tools` name against the real Typer app, so
-  a renamed command or flag fails the suite;
+- skills and commands put options first and `--` before a positional value that takes free text
+  or a chat (a query, a question, a chat id); a drift check parses every command and flag they and
+  their `allowed-tools` name against the real Typer app, so a renamed command or flag fails the
+  suite;
+- `allowed-tools` pre-allow only commands that change nothing (`READ_ONLY` in the test): never
+  `research approve`, `run` or `exclude`, `accounts rm`, `leave`, `sources add`, a config edit,
+  an install or the MCP registration. The hook is a second layer, not the gate: a hook that fails
+  or times out does not block;
 - the hook is one self-contained `/bin/bash` 3.2 script: no sourcing, no heredocs, no installers,
-  nothing on stdout but the hook's JSON decision. It only forces a permission prompt on the
-  `--confirm` calls; `PRIVACY.md` covers what the plugin reads;
-- never write the icon's file name in any text file (a test scans for it).
+  nothing on stdout but the hook's JSON decision. It asks for a permission prompt on any payload
+  naming `grepogram` and `--confirm`, in any case, and never under-asks on an honest call; a
+  regex cannot stop deliberate obfuscation, so it is defence in depth. `PRIVACY.md` covers what
+  the plugin reads;
+- the drift check catches names, not meaning: the skills restate `mcp.INSTRUCTIONS` and depend on
+  CLI JSON shapes (`index_age_min`, the hit and candidate fields, `summary` / `confirm` /
+  `command` with exit 3), and a change to any of them is mirrored in `plugin/skills/*` (a test
+  pins the field names and constants the skills quote);
+- never write the icon's file name in any text file (a test scans the top-level files and the
+  project's own directories for it).
 
 Plans live in `docs/plans/`, finished ones in `docs/plans/completed/`.
