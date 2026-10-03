@@ -249,6 +249,8 @@ checked by `tests/test_plugin.py`:
   CLI JSON shapes (`index_age_min`, the hit and candidate fields, `summary` / `confirm` /
   `command` with exit 3), and a change to any of them is mirrored in `plugin/skills/*` (a test
   pins the field names and constants the skills quote);
+- the markdown under `plugin/` is deliberately not wrapped at 100 columns, unlike the rest of the
+  repo's markdown: Claude reads it, and a paragraph per line diffs fine;
 - never write the icon's file name in any text file (a test scans the top-level files and the
   project's own directories for it).
 
