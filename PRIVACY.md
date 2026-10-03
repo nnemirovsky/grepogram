@@ -1,8 +1,9 @@
 # Privacy
 
 grepogram is a local tool. It indexes the Telegram chats you choose on your own machine and
-answers searches over them for Claude Code. There is no grepogram server, account or telemetry:
-the project operates no service that receives your data.
+answers searches over them for an agent such as Claude Code, through its CLI or its MCP server.
+There is no grepogram server, account or telemetry: the project operates no service that
+receives your data.
 
 This document covers the `grepogram` CLI, the `grepogram-mcp` server and the Claude Code plugin
 in `plugin/`.
@@ -12,7 +13,10 @@ in `plugin/`.
 - **Your opt-in sources only.** grepogram reads the chats, folders and channels you add with
   `grepogram sources add` (or import from a Telegram Desktop export with `grepogram import`),
   through your own Telegram session, using the Telegram app credentials (`api_id`, `api_hash`)
-  you created at my.telegram.org. It does not read other chats.
+  you created at my.telegram.org. It does not read the message history of other chats.
+- **Your chat list, to find a source.** `grepogram dialogs` reads the account's dialog list and
+  folders from Telegram (chat names, usernames and types, not history) to match what you ask
+  for, and `grepogram sources add` resolves the target you name.
 - **Attachments, when media extraction is on.** `grepogram extract` downloads PDF, DOCX and
   photo attachments of stored messages to a scratch file, extracts the text (OCR runs locally on
   macOS Vision), stores the text and deletes the scratch file. It is a separate command, never
@@ -28,15 +32,18 @@ in `plugin/`.
     when `chat_search` / `post_search` is enabled in the config and you approved the search for
     that session. The phrase is the research session's question. A paid post search needs its own
     approval and a star ceiling in the config, and the default ceiling is zero.
-- Nothing is sent to Telegram on your behalf as a message. The one command that changes your
-  account on Telegram is `grepogram leave`, and it needs an explicit confirmation.
+- Nothing is sent to Telegram on your behalf as a message. Apart from the joins and admission
+  requests a research run makes for what you approved, and the login session `grepogram auth`
+  creates, the one command that changes your account on Telegram is `grepogram leave`, and it
+  needs an explicit confirmation.
 
 ## What it writes
 
-Everything lives under one directory tree. By default the config and sessions are in
-`~/.config/grepogram`, the index and the sync lock in `~/Library/Application Support/grepogram`
-and the logs in `~/Library/Logs/grepogram`. With `GREPOGRAM_HOME=<dir>` all of it goes under
-`<dir>`. `grepogram config path` prints the actual locations.
+Everything lives in grepogram's own directories: three by default, one with `GREPOGRAM_HOME`.
+By default the config and sessions are in `~/.config/grepogram`, the index and the sync lock in
+`~/Library/Application Support/grepogram` and the logs in `~/Library/Logs/grepogram`. With
+`GREPOGRAM_HOME=<dir>` all of it goes under `<dir>`. `grepogram config path` prints the actual
+locations.
 
 | File | Contents |
 | --- | --- |
@@ -45,7 +52,7 @@ and the logs in `~/Library/Logs/grepogram`. With `GREPOGRAM_HOME=<dir>` all of i
 | `index.db` | stored messages (text, sender names, chat titles and usernames, links, extracted attachment text), the full-text index and the embedding vectors |
 | `research.db` | research sessions, candidate chats, evidence and your approvals and exclusions; mode 0600 |
 | `config.lock`, `sync.lock` | lock files, empty; mode 0600 |
-| `logs/grepogram.log` | operational log, rotated at 5 MB with three backups |
+| `grepogram.log` (in `~/Library/Logs/grepogram`, or `logs/` under `GREPOGRAM_HOME`) | operational log, rotated at 5 MB with three backups |
 
 Directories grepogram creates get mode 0700. A directory that already exists, such as your own
 `GREPOGRAM_HOME`, keeps its mode. `index.db` holds your chat content in plain text on disk, so
@@ -61,6 +68,10 @@ outside grepogram's tree.
 
 The plugin itself stores nothing. Its only active component is a hook that asks for a permission
 prompt before a consent confirmation command runs; it makes no network request and writes no file.
+`/grepogram:setup` runs other tools' commands only after you agree to each at its permission
+prompt: `uv tool install` writes the tool into uv's tool directory, `uv tool update-shell` edits
+your shell profile, and `claude mcp add` (offered once, default no) edits Claude Code's user
+configuration.
 
 ## Network destinations
 
@@ -72,6 +83,9 @@ prompt before a consent confirmation command runs; it makes no network request a
    as a user agent, which grepogram does not control; set `HF_HUB_OFFLINE=1` to forbid the
    network entirely, and search then degrades instead of downloading. After the first download
    everything runs locally.
+3. **PyPI and uv's Python downloads**, only when you install or upgrade the tool: that is uv's
+   own traffic (`uv tool install --managed-python` may also download a Python build), and
+   `/grepogram:setup` runs it only under a permission prompt.
 
 grepogram itself sends no telemetry, analytics or crash reports. Embedding, ranking and OCR run
 on your machine.
@@ -79,11 +93,31 @@ on your machine.
 ## What reaches Claude
 
 When Claude Code calls a grepogram tool or runs a grepogram command, the result enters your
-Claude conversation. That result is read-only content from your index: message text and snippets,
-sender names, chat titles and usernames, message links and dates. This is personal data of the
-people in your chats, not only yours. It leaves your machine only as part of that conversation,
-under your agreement with Anthropic, and only for what a search or reader returned. grepogram
-does not push the index anywhere. The tools search and read; they do not send messages.
+Claude conversation. A search or reader returns content from your index: message text and
+snippets, sender names, chat titles and usernames, message links and dates. Other commands return
+more than the index holds:
+
+- `grepogram dialogs` lists matching chats and folders from the account's whole chat list
+  (names, usernames and types), indexed or not;
+- `grepogram accounts ls` prints each signed-in account's display name and Telegram user id;
+- `grepogram research candidates` and `status` return the titles and member counts of chats you
+  do not index, and evidence snippets, including global-search results from chats you know
+  nothing about;
+- `grepogram config path` prints local file paths.
+
+This is personal data of the people in your chats, not only yours. It leaves your machine only as
+part of that conversation, under your agreement with Anthropic, and only for what a command
+returned. grepogram does not push the index anywhere. The tools search and read; they do not send
+messages.
+
+The plugin's skills pre-allow only the commands that change nothing on your account or in your
+config: `search`, `thread`, `context`, `sync`, `dialogs`, `sources ls`, `accounts ls`,
+`config path` and the research steps that find, list or set aside candidates (`start`, `discover`,
+`candidates`, `status`, `skip`, `stop`). `sync`, `dialogs` and an online `discover` reach
+Telegram. Anything that changes the config, the install, an account or an approval keeps the
+normal permission prompt, and `research approve`, `run` and `exclude` are never pre-allowed. The
+hook adds a prompt on the confirming `--confirm` calls; it reads the command text, so it is
+defence in depth, not a sandbox.
 
 Your Telegram `api_id`, `api_hash`, login code and 2FA password never go to Claude:
 
@@ -105,8 +139,8 @@ grepogram keeps what it has indexed until you delete it; there is no automatic e
 - `grepogram accounts rm <name>` removes an account, its sources, the chats only they cover, its
   session file and stops its research sessions. Nothing changes on Telegram. To revoke the login
   itself, end that session in Telegram under Settings, Devices.
-- To remove everything, delete the grepogram directories shown by `grepogram config path`, or
-  your `GREPOGRAM_HOME` directory. Uninstall the tool with `uv tool uninstall grepogram`. The
+- To remove everything, delete the directories holding the files `grepogram config path` prints,
+  or your `GREPOGRAM_HOME` directory. Uninstall the tool with `uv tool uninstall grepogram`. The
   Hugging Face model cache is separate; delete it from that cache's directory if you want the
   space back.
 
