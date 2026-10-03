@@ -345,3 +345,13 @@ def test_plugin_text_has_no_absolute_paths_or_image_names() -> None:
         text = path.read_text(encoding="utf-8")
         assert not re.search(r"/(Users|home)/\w+", text.replace("/Users/x/", "")), path
         assert not re.search(r"\.(png|jpe?g|svg|ico)\b", text, re.IGNORECASE), path
+
+
+def test_privacy_policy_exists_and_the_manifest_names_it() -> None:
+    url = load(MANIFEST)["privacyPolicyUrl"]
+    assert url.startswith(load(MANIFEST)["repository"])
+    assert url.rsplit("/", 1)[-1] == "PRIVACY.md"
+    text = (ROOT / "PRIVACY.md").read_text(encoding="utf-8")
+    assert "huggingface.co" in text
+    assert "telemetry" in text
+    assert not re.search(r"\.(png|jpe?g|svg|ico)\b", text, re.IGNORECASE)
