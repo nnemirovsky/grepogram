@@ -7,7 +7,7 @@ import pytest
 
 from grepogram import db, filters
 from grepogram.filters import AmbiguousChat, FilterError, InvalidDate, UnknownChat
-from grepogram.models import ChatRow, Config, Filters, Source
+from grepogram.models import AccountCfg, ChatRow, Config, Filters, Source
 
 ARG_CHAT = -1000000000100
 ARG_NEWS = -1000000000101
@@ -504,3 +504,121 @@ def test_resolve_filters_propagates_errors(conn: sqlite3.Connection) -> None:
         filters.resolve_filters(conn, CFG, ["@nobody"], None, None, NOW)
     with pytest.raises(InvalidDate):
         filters.resolve_filters(conn, CFG, ["@alice"], "soon", None, NOW)
+
+
+# --- accounts --------------------------------------------------------------------------------
+
+WORK_NEWS = -1000000000600
+
+
+def _work_chats(conn: sqlite3.Connection) -> ChatRow:
+    """The work account's copy of Alice's private chat (a synthetic row of peer 777), a channel
+    only the work account's folder lists, and the Argentina chat that folder covers as well."""
+    work_alice = db.upsert_chat(
+        conn,
+        ChatRow(
+            id=ALICE,
+            type="user",
+            title="Alice Liddell",
+            username="alice",
+            source_id="work/chat:777",
+            scope="work",
+        ),
+        "work",
+    )
+    db.upsert_chat(
+        conn,
+        ChatRow(id=WORK_NEWS, type="channel", title="Work news", source_id="work/folder:Argentina"),
+    )
+    db.set_source_chats(conn, "work/folder:Argentina", [WORK_NEWS, ARG_CHAT])
+    return work_alice
+
+
+def test_a_folder_spec_selects_every_chat_its_source_covers(conn: sqlite3.Connection) -> None:
+    """A chat the work account's folder covers as a second source is selected by it, and an
+    unprefixed folder spec reaches both accounts' folders of that name."""
+    _work_chats(conn)
+    assert filters.resolve_chats(conn, CFG, ["work/folder:Argentina"]) == {WORK_NEWS, ARG_CHAT}
+    assert filters.resolve_chats(conn, CFG, ["folder:Argentina"]) == ARGENTINA | {WORK_NEWS}
+
+
+def test_an_id_spec_names_a_chat_by_its_peer_or_its_row_id(conn: sqlite3.Connection) -> None:
+    work_alice = _work_chats(conn)
+    assert work_alice.id >= db.SYNTHETIC_BASE
+    assert filters.resolve_chats(conn, CFG, [str(ALICE)]) == {ALICE, work_alice.id}
+    assert filters.resolve_chats(conn, CFG, [str(work_alice.id)]) == {work_alice.id}
+    assert filters.resolve_chats(conn, CFG, [f"work/chat:{ALICE}"]) == {work_alice.id}
+    assert filters.resolve_chats(conn, CFG, ["work/chat:@arg_chat"]) == {ARG_CHAT}
+
+
+def test_a_prefixed_spec_hints_only_at_its_own_accounts_source(conn: sqlite3.Connection) -> None:
+    cfg = Config(sources=[*CFG.sources, Source(chat="@ghost_channel", account="work")])
+    with pytest.raises(UnknownChat) as excinfo:
+        filters.resolve_chats(conn, cfg, ["work/chat:@ghost_channel"])
+    assert excinfo.value.hint is not None and "work/chat:@ghost_channel" in excinfo.value.hint
+
+
+def _work_access(conn: sqlite3.Connection) -> ChatRow:
+    """:func:`_work_chats` with the access a sync records: the work account reaches its Alice,
+    its news channel and the Argentina News channel (whose discussion group it reaches through
+    the link alone); the default account reaches its own Alice."""
+    work_alice = _work_chats(conn)
+    for chat_id in (work_alice.id, WORK_NEWS, ARG_NEWS):
+        db.set_chat_access(conn, chat_id, "work")
+    db.set_chat_access(conn, ALICE, "default")
+    return work_alice
+
+
+def test_an_account_spec_selects_every_chat_the_account_reaches(
+    conn: sqlite3.Connection,
+) -> None:
+    work_alice = _work_access(conn)
+    reached = {work_alice.id, WORK_NEWS, ARG_NEWS, ARG_DISCUSSION}
+    assert filters.resolve_chats(conn, CFG, ["account:work"]) == reached
+    assert filters.resolve_chats(conn, CFG, [" Account:WORK "]) == reached
+    assert filters.resolve_chats(conn, CFG, ["account:default"]) == {ALICE}
+    assert filters.resolve_chats(conn, CFG, ["account:default", "@arg_chat"]) == {ALICE, ARG_CHAT}
+    assert filters.account_chats(conn, CFG, ["work", "default"]) == reached | {ALICE}
+
+
+def test_an_account_spec_naming_no_account_or_an_empty_one_is_refused(
+    conn: sqlite3.Connection,
+) -> None:
+    _work_access(conn)
+    with pytest.raises(UnknownChat) as unknown:
+        filters.resolve_chats(conn, CFG, ["account:home"])
+    assert unknown.value.candidates == ["account:default", "account:work"]
+    assert unknown.value.hint == "no account is named 'home'; known accounts: default, work"
+    spare = Config(accounts=[AccountCfg(name="spare")], sources=CFG.sources)
+    with pytest.raises(UnknownChat) as empty:
+        filters.account_chats(conn, spare, ["spare"])
+    assert empty.value.spec == "account:spare"
+    assert empty.value.hint == "account spare reaches no indexed chat yet; sync its sources first"
+
+
+def test_a_bare_peer_two_accounts_share_is_ambiguous_to_a_reader(
+    conn: sqlite3.Connection,
+) -> None:
+    """One person's private chats with two accounts are two rows of one peer id: a reader must
+    be told which, and each candidate is the spec that names it."""
+    work_alice = _work_chats(conn)
+    with pytest.raises(AmbiguousChat) as excinfo:
+        filters.resolve_chat(conn, CFG, str(ALICE))
+    assert excinfo.value.candidates == [
+        f"'Alice Liddell' (default/{ALICE}, @alice)",
+        f"'Alice Liddell' (work/{ALICE}, @alice)",
+    ]
+    assert filters.resolve_chat(conn, CFG, f"work/{ALICE}") == work_alice.id
+    assert filters.resolve_chat(conn, CFG, f"default/{ALICE}") == ALICE
+    assert filters.resolve_chat(conn, CFG, "Work/@alice") == work_alice.id
+    assert filters.resolve_chat(conn, CFG, str(work_alice.id)) == work_alice.id
+    assert filters.resolve_chat(conn, CFG, f"work/{ARG_CHAT}") == ARG_CHAT
+
+
+def test_a_prefix_that_names_no_account_is_not_one(conn: sqlite3.Connection) -> None:
+    """``home/777`` is free text while no account is called ``home``: a title may hold a slash."""
+    _work_chats(conn)
+    with pytest.raises(UnknownChat):
+        filters.resolve_chat(conn, CFG, f"home/{ALICE}")
+    with pytest.raises(UnknownChat):
+        filters.resolve_chat(conn, CFG, f"work/{ALICE + 1}")

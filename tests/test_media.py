@@ -16,6 +16,7 @@ from telethon.tl import functions, types
 from grepogram import db, extract, index, media, search, sync, tg, units
 from grepogram.extract import ExtractError
 from grepogram.models import (
+    DEFAULT_ACCOUNT,
     ChatRow,
     Config,
     Filters,
@@ -27,7 +28,7 @@ from grepogram.models import (
 )
 from grepogram.paths import Paths
 from grepogram.sync import SyncBudget
-from tests.fakes import FakeClient, make_channel, make_dialog
+from tests.fakes import FakeClient, FakeWorld, make_channel, make_dialog, make_user
 from tests.fixtures import tl
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
@@ -123,8 +124,8 @@ def _client(**kwargs: Any) -> FakeClient:
 
     ``tg.make_client`` hands the command a private in-memory copy of the session file holding the
     data centre and the auth key alone, so nothing is addressable by bare id until the pass warms
-    the cache itself (:func:`grepogram.sync.warm_peer_cache`). Every client here starts that way,
-    which is what makes these tests able to fail when it does not.
+    the cache itself (:func:`grepogram.accounts.warm_peer_cache`). Every client here starts that
+    way, which is what makes these tests able to fail when it does not.
     """
     kwargs.setdefault("dialogs", [make_dialog(entity) for entity in ACCOUNT])
     kwargs.setdefault("responses", {functions.channels.GetFullChannelRequest: _news_full()})
@@ -329,7 +330,7 @@ async def test_a_document_nothing_can_read_is_never_downloaded(
         messages={CHAT_ID: [tl.document_message(CHAT_ID, 1, "prices.xlsx")]},
         downloads={(CHAT_ID, 1): b"x" * 5_000_000},
     )
-    report = await media.run(conn, client, _cfg(), SyncBudget())
+    report = await media.run(conn, {DEFAULT_ACCOUNT: client}, _cfg(), SyncBudget())
     assert (report.unsupported, report.failed, report.remaining) == (1, 0, 0)
     assert client.calls == []
     assert _states(conn) == {1: db.MEDIA_UNSUPPORTED}
@@ -392,7 +393,9 @@ async def test_the_offline_states_are_resolved_with_no_client_call_at_all(
         extract, "registry", lambda: {"document": extract.extract_document, "photo": _stub()}
     )
     client = _client()
-    report = await media.run(conn, client, _cfg(ocr=False, documents=False), SyncBudget())
+    report = await media.run(
+        conn, {DEFAULT_ACCOUNT: client}, _cfg(ocr=False, documents=False), SyncBudget()
+    )
     assert client.calls == []
     assert report.disabled == 2
     assert report.unsupported == len(media.ALL_KINDS) - 2
@@ -410,7 +413,7 @@ async def test_a_pdf_is_downloaded_extracted_and_stored(
     # the stranded state the flag is kept raised for, which its own test below covers
     _synced(conn, [_pdf_row(CHAT_ID, 1)], _cfg())
     client = _pdf_client(1)
-    report = await media.run(conn, client, _cfg(), SyncBudget())
+    report = await media.run(conn, {DEFAULT_ACCOUNT: client}, _cfg(), SyncBudget())
     assert report.extracted == 1
     assert report.remaining == 0
     stored = _text(conn, 1)
@@ -421,12 +424,40 @@ async def test_a_pdf_is_downloaded_extracted_and_stored(
     assert [name for name, _ in client.calls if name == "download_media"]
 
 
+async def test_a_dm_under_a_synthetic_id_is_re_fetched_by_its_peer_id(
+    conn: sqlite3.Connection, scratch: Path
+) -> None:
+    """A second account's private chat with a person the default account also talks to is stored
+    under a synthetic id: the re-fetch and the download name the peer, the text lands on the
+    row under that synthetic id, and the default account's conversation is not touched."""
+    alice = make_user(1, "Alice")
+    db.upsert_chat(conn, ChatRow(id=1, type="user", title="Alice", source_id="chat:@alice"))
+    chat = db.upsert_chat(
+        conn,
+        ChatRow(id=1, type="user", title="Alice", source_id="work/chat:@alice", scope="work"),
+        "work",
+    )
+    assert chat.id == db.SYNTHETIC_BASE and chat.peer_id == 1
+    sync.on_chat_synced(conn, chat, _cfg(), db.upsert_messages(conn, [_pdf_row(chat.id, 1)]))
+    client = _client(
+        dialogs=[make_dialog(alice)],
+        messages={1: [tl.document_message(1, 1, "note.pdf")]},
+        downloads={(1, 1): SAMPLE_PDF.read_bytes()},
+    )
+    report = await media.run(conn, {"work": client}, _cfg(), SyncBudget())
+    assert report.extracted == 1 and report.warnings == []
+    assert _fetches(client) == [{"chat_id": 1, "limit": None, "ids": [1]}]
+    [stored] = db.get_messages(conn, chat.id)
+    assert stored.extracted_text and "sample pdf" in stored.extracted_text.lower()
+    assert db.get_messages(conn, 1) == []
+
+
 async def test_the_temp_file_is_removed_after_a_success(
     conn: sqlite3.Connection, scratch: Path
 ) -> None:
     db.upsert_chat(conn, _chat())
     db.upsert_messages(conn, [_pdf_row(CHAT_ID, 1)])
-    await media.run(conn, _pdf_client(1), _cfg(), SyncBudget())
+    await media.run(conn, {DEFAULT_ACCOUNT: _pdf_client(1)}, _cfg(), SyncBudget())
     assert list(scratch.iterdir()) == []
 
 
@@ -439,7 +470,7 @@ async def test_the_temp_file_is_removed_after_a_failed_extraction(
         messages={CHAT_ID: [tl.document_message(CHAT_ID, 1, "note.pdf")]},
         downloads={(CHAT_ID, 1): b"not a pdf at all"},
     )
-    report = await media.run(conn, client, _cfg(), SyncBudget())
+    report = await media.run(conn, {DEFAULT_ACCOUNT: client}, _cfg(), SyncBudget())
     assert report.failed == 1
     assert _states(conn) == {1: db.MEDIA_FAILED}
     assert list(scratch.iterdir()) == []
@@ -452,7 +483,7 @@ async def test_the_temp_file_carries_the_extension_the_dispatcher_reads(
     db.upsert_chat(conn, _chat())
     db.upsert_messages(conn, [_pdf_row(CHAT_ID, 1, name="../../../etc/pass wd.PDF")])
     client = _pdf_client(1, name="../../../etc/pass wd.PDF")
-    await media.run(conn, client, _cfg(), SyncBudget())
+    await media.run(conn, {DEFAULT_ACCOUNT: client}, _cfg(), SyncBudget())
     [call] = [args for name, args in client.calls if name == "download_media"]
     assert Path(str(call["file"])).name == f"{CHAT_ID}_1.pdf"
     assert Path(str(call["file"])).parent == scratch
@@ -468,7 +499,7 @@ async def test_a_file_over_the_cap_is_skipped_before_it_is_downloaded(
     message = tl.document_message(CHAT_ID, 1, "huge.pdf")
     message.media.document.size = 21 * 1024 * 1024
     client = _client(messages={CHAT_ID: [message]}, downloads={(CHAT_ID, 1): b"never read"})
-    report = await media.run(conn, client, _cfg(), SyncBudget())
+    report = await media.run(conn, {DEFAULT_ACCOUNT: client}, _cfg(), SyncBudget())
     assert report.skipped == 1
     assert _states(conn) == {1: db.MEDIA_SKIPPED}
     assert _indexed(conn) == {1: 1}, "nothing was read, so nothing needs a rebuild"
@@ -485,7 +516,7 @@ async def test_a_file_at_the_cap_is_still_downloaded(
     client = _client(
         messages={CHAT_ID: [message]}, downloads={(CHAT_ID, 1): SAMPLE_PDF.read_bytes()}
     )
-    report = await media.run(conn, client, _cfg(), SyncBudget())
+    report = await media.run(conn, {DEFAULT_ACCOUNT: client}, _cfg(), SyncBudget())
     assert report.extracted == 1
 
 
@@ -494,7 +525,9 @@ async def test_a_message_telegram_no_longer_returns_is_failed_not_lost(
 ) -> None:
     db.upsert_chat(conn, _chat())
     db.upsert_messages(conn, [_pdf_row(CHAT_ID, 1)])
-    report = await media.run(conn, _client(messages={CHAT_ID: []}), _cfg(), SyncBudget())
+    report = await media.run(
+        conn, {DEFAULT_ACCOUNT: _client(messages={CHAT_ID: []})}, _cfg(), SyncBudget()
+    )
     assert report.failed == 1
     assert _states(conn) == {1: db.MEDIA_FAILED}
 
@@ -505,7 +538,7 @@ async def test_media_that_will_not_download_is_failed(
     db.upsert_chat(conn, _chat())
     db.upsert_messages(conn, [_pdf_row(CHAT_ID, 1)])
     client = _client(messages={CHAT_ID: [tl.document_message(CHAT_ID, 1, "note.pdf")]})
-    report = await media.run(conn, client, _cfg(), SyncBudget())
+    report = await media.run(conn, {DEFAULT_ACCOUNT: client}, _cfg(), SyncBudget())
     assert report.failed == 1
     assert _states(conn) == {1: db.MEDIA_FAILED}
 
@@ -519,12 +552,14 @@ async def test_a_failed_extraction_is_retried_only_with_retry_failed(
         messages={CHAT_ID: [tl.document_message(CHAT_ID, 1, "note.pdf")]},
         downloads={(CHAT_ID, 1): b"not a pdf at all"},
     )
-    assert (await media.run(conn, broken, _cfg(), SyncBudget())).failed == 1
+    assert (await media.run(conn, {DEFAULT_ACCOUNT: broken}, _cfg(), SyncBudget())).failed == 1
     good = _pdf_client(1)
-    again = await media.run(conn, good, _cfg(), SyncBudget())
+    again = await media.run(conn, {DEFAULT_ACCOUNT: good}, _cfg(), SyncBudget())
     assert (again.extracted, again.requeued) == (0, 0)
     assert good.calls == [], "a failed row stays out of the queue until it is asked for"
-    retried = await media.run(conn, good, _cfg(), SyncBudget(), retry_failed=True)
+    retried = await media.run(
+        conn, {DEFAULT_ACCOUNT: good}, _cfg(), SyncBudget(), retry_failed=True
+    )
     assert (retried.extracted, retried.requeued) == (1, 1)
     assert _states(conn) == {1: db.MEDIA_EXTRACTED}
 
@@ -540,12 +575,16 @@ async def test_retry_failed_requeues_what_an_earlier_build_could_not_read(
         downloads={(CHAT_ID, 1): b"jpeg bytes"},
     )
     monkeypatch.setattr(extract, "registry", dict)
-    assert (await media.run(conn, client, _cfg(), SyncBudget())).unsupported >= 1
+    assert (await media.run(conn, {DEFAULT_ACCOUNT: client}, _cfg(), SyncBudget())).unsupported >= 1
     assert _states(conn) == {1: db.MEDIA_UNSUPPORTED}
-    assert (await media.run(conn, client, _cfg(), SyncBudget(), retry_failed=True)).requeued == 0
+    assert (
+        await media.run(conn, {DEFAULT_ACCOUNT: client}, _cfg(), SyncBudget(), retry_failed=True)
+    ).requeued == 0
     assert _states(conn) == {1: db.MEDIA_UNSUPPORTED}, "still no extractor, still nothing to queue"
     monkeypatch.setattr(extract, "registry", lambda: {"photo": _stub("now readable")})
-    report = await media.run(conn, client, _cfg(), SyncBudget(), retry_failed=True)
+    report = await media.run(
+        conn, {DEFAULT_ACCOUNT: client}, _cfg(), SyncBudget(), retry_failed=True
+    )
     assert (report.requeued, report.extracted) == (1, 1)
     assert _text(conn, 1) == "now readable"
 
@@ -561,7 +600,7 @@ async def test_a_photo_is_read_by_the_registered_extractor(
         messages={CHAT_ID: [tl.photo_message(CHAT_ID, 1)]},
         downloads={(CHAT_ID, 1): b"jpeg bytes"},
     )
-    report = await media.run(conn, client, _cfg(), SyncBudget())
+    report = await media.run(conn, {DEFAULT_ACCOUNT: client}, _cfg(), SyncBudget())
     assert report.extracted == 1
     assert _text(conn, 1) == f"read {CHAT_ID}_1"
 
@@ -576,7 +615,7 @@ async def test_an_image_holding_no_text_is_extracted_not_failed(
         messages={CHAT_ID: [tl.photo_message(CHAT_ID, 1)]},
         downloads={(CHAT_ID, 1): b"jpeg bytes"},
     )
-    assert (await media.run(conn, client, _cfg(), SyncBudget())).extracted == 1
+    assert (await media.run(conn, {DEFAULT_ACCOUNT: client}, _cfg(), SyncBudget())).extracted == 1
     assert _states(conn) == {1: db.MEDIA_EXTRACTED}
     assert _text(conn, 1) == ""
 
@@ -592,7 +631,7 @@ async def test_a_kind_with_no_extractor_that_reaches_the_loop_is_parked_not_down
         messages={CHAT_ID: [tl.document_message(CHAT_ID, 1, "clip.mp4")]},
         downloads={(CHAT_ID, 1): b"video bytes"},
     )
-    report = await media.run(conn, client, _cfg(), SyncBudget())
+    report = await media.run(conn, {DEFAULT_ACCOUNT: client}, _cfg(), SyncBudget())
     assert report.unsupported == 1
     assert _states(conn) == {1: db.MEDIA_UNSUPPORTED}
     assert not [name for name, _ in client.calls if name == "download_media"]
@@ -603,7 +642,7 @@ async def test_the_pass_is_off_when_media_enabled_is_false(conn: sqlite3.Connect
     ids = db.upsert_messages(conn, [_pdf_row(CHAT_ID, 1)])
     db.mark_indexed(conn, ids)
     client = _pdf_client(1)
-    report = await media.run(conn, client, _cfg(enabled=False), SyncBudget())
+    report = await media.run(conn, {DEFAULT_ACCOUNT: client}, _cfg(enabled=False), SyncBudget())
     assert client.calls == []
     assert report.extracted == 0
     assert report.remaining == 1
@@ -630,12 +669,12 @@ async def test_the_budget_stops_the_pass_and_the_next_run_resumes(
         return str(real_read(extractor, path))
 
     monkeypatch.setattr(media, "_read", read_then_run_out)
-    report = await media.run(conn, client, _cfg(), budget)
+    report = await media.run(conn, {DEFAULT_ACCOUNT: client}, _cfg(), budget)
     assert report.extracted == 1
     assert report.remaining == 2
     assert _states(conn) == {1: db.MEDIA_EXTRACTED, 2: db.MEDIA_PENDING, 3: db.MEDIA_PENDING}
     monkeypatch.setattr(media, "_read", real_read)
-    rest = await media.run(conn, client, _cfg(), SyncBudget())
+    rest = await media.run(conn, {DEFAULT_ACCOUNT: client}, _cfg(), SyncBudget())
     assert rest.extracted == 2
     assert _states(conn) == dict.fromkeys((1, 2, 3), db.MEDIA_EXTRACTED)
 
@@ -647,7 +686,7 @@ async def test_an_expired_budget_reads_nothing_and_still_resolves_the_offline_st
     client = _client()
     budget = SyncBudget()
     budget.cancel()
-    report = await media.run(conn, client, _cfg(), budget)
+    report = await media.run(conn, {DEFAULT_ACCOUNT: client}, _cfg(), budget)
     assert client.calls == []
     assert report.unsupported >= 1
     assert report.extracted == 0
@@ -661,11 +700,11 @@ async def test_the_flood_sleep_threshold_shrinks_with_the_time_left(
     db.upsert_messages(conn, [_pdf_row(CHAT_ID, 1)])
     client = _pdf_client(1)
     client.flood_sleep_threshold = 120
-    await media.run(conn, client, _cfg(), SyncBudget(5.0))
+    await media.run(conn, {DEFAULT_ACCOUNT: client}, _cfg(), SyncBudget(5.0))
     assert client.flood_sleep_threshold == 5
     client.flood_sleep_threshold = 120
     db.set_media_state(conn, [1], db.MEDIA_PENDING)
-    await media.run(conn, client, _cfg(), SyncBudget())
+    await media.run(conn, {DEFAULT_ACCOUNT: client}, _cfg(), SyncBudget())
     assert client.flood_sleep_threshold == 120, "an unlimited run leaves the configured threshold"
 
 
@@ -690,7 +729,7 @@ async def test_the_threshold_is_capped_before_the_warm_up_asks_anything(
         return await listed(*args, **kwargs)
 
     monkeypatch.setattr(client, "get_dialogs", watched)
-    await media.run(conn, client, _cfg(), SyncBudget(5.0))
+    await media.run(conn, {DEFAULT_ACCOUNT: client}, _cfg(), SyncBudget(5.0))
 
     assert seen == [5], "the budget bounds the warm-up too, not only the extraction behind it"
 
@@ -704,7 +743,7 @@ async def test_a_flood_wait_keeps_what_the_run_earned_and_stops(
     # OTHER_ID sorts first (marked ids are negative), so it is read before the flood wait lands
     client = _pdf_client(1, chat_id=OTHER_ID)
     client.failures[CHAT_ID] = errors.FloodWaitError(request=None, capture=30)
-    report = await media.run(conn, client, _cfg(), SyncBudget())
+    report = await media.run(conn, {DEFAULT_ACCOUNT: client}, _cfg(), SyncBudget())
     assert report.extracted == 1
     assert report.remaining == 1
     assert report.warnings and "flood wait" in report.warnings[0]
@@ -726,7 +765,7 @@ async def test_an_rpc_error_costs_one_chat_its_turn_and_the_rest_runs(
         downloads={(CHAT_ID, 1): payload, (OTHER_ID, 2): payload},
         failures={CHAT_ID: errors.ChannelPrivateError(request=None)},
     )
-    report = await media.run(conn, client, _cfg(), SyncBudget())
+    report = await media.run(conn, {DEFAULT_ACCOUNT: client}, _cfg(), SyncBudget())
     assert report.extracted == 1
     assert report.warnings and str(CHAT_ID) in report.warnings[0]
     assert _states(conn) == {1: db.MEDIA_PENDING, 2: db.MEDIA_EXTRACTED}
@@ -751,7 +790,7 @@ async def test_a_session_revoked_mid_pass_stops_it_with_the_auth_hint(
 
     with pytest.raises(tg.AuthRequired):
         async with tg.connected(client):
-            await media.run(conn, client, _cfg(), SyncBudget())
+            await media.run(conn, {DEFAULT_ACCOUNT: client}, _cfg(), SyncBudget())
 
 
 async def test_an_unresolvable_peer_is_a_warning_not_a_traceback(
@@ -767,7 +806,7 @@ async def test_an_unresolvable_peer_is_a_warning_not_a_traceback(
     db.upsert_chat(conn, _chat(gone))
     db.upsert_messages(conn, [_pdf_row(gone, 1)])
     client = _client()
-    report = await media.run(conn, client, _cfg(), SyncBudget())
+    report = await media.run(conn, {DEFAULT_ACCOUNT: client}, _cfg(), SyncBudget())
     assert report.warnings and "Could not find the input entity" in report.warnings[0]
     assert _states(conn) == {1: db.MEDIA_PENDING}
 
@@ -788,7 +827,7 @@ async def test_the_pass_resolves_its_chats_before_it_re_fetches_by_id(
     client = _pdf_client(1)
     assert client.resolved == set(), "a client built from the session file knows nothing"
 
-    report = await media.run(conn, client, _cfg(), SyncBudget())
+    report = await media.run(conn, {DEFAULT_ACCOUNT: client}, _cfg(), SyncBudget())
 
     assert [name for name, _ in client.calls][0] == "get_dialogs", "the dialog list comes first"
     assert (report.extracted, report.warnings) == (1, [])
@@ -811,12 +850,12 @@ async def test_a_link_only_discussion_group_is_resolved_through_its_channel(
     assert GROUP_ID not in {int(dialog.id) for dialog in await client.get_dialogs()}
     client.forget_entities()
 
-    unlinked = await media.run(conn, client, _cfg(), SyncBudget())
+    unlinked = await media.run(conn, {DEFAULT_ACCOUNT: client}, _cfg(), SyncBudget())
     assert (unlinked.extracted, unlinked.warnings[0].startswith(f"chat {GROUP_ID}")) == (0, True)
 
     db.upsert_chat(conn, ChatRow(id=GROUP_ID, type="supergroup", discussion_of=CHANNEL_ID))
     client.forget_entities()
-    linked = await media.run(conn, client, _cfg(), SyncBudget())
+    linked = await media.run(conn, {DEFAULT_ACCOUNT: client}, _cfg(), SyncBudget())
     assert (linked.extracted, linked.warnings) == (1, [])
     assert _states(conn) == {1: db.MEDIA_EXTRACTED}
 
@@ -835,7 +874,7 @@ async def test_an_imported_chat_is_never_re_fetched(
     )
     db.upsert_messages(conn, [_pdf_row(CHAT_ID, 1), _pdf_row(OTHER_ID, 2)])
     client = _pdf_client(1)
-    report = await media.run(conn, client, _cfg(), SyncBudget())
+    report = await media.run(conn, {DEFAULT_ACCOUNT: client}, _cfg(), SyncBudget())
     assert report.extracted == 1
     assert _fetches(client) == [{"chat_id": CHAT_ID, "limit": None, "ids": [1]}]
     assert _states(conn) == {1: db.MEDIA_EXTRACTED, 2: db.MEDIA_PENDING}
@@ -855,7 +894,7 @@ async def test_an_unavailable_chat_is_never_re_fetched(
     can ever do would make that signal permanently wrong."""
     db.upsert_chat(conn, dataclasses.replace(_chat(), unavailable=True))
     db.upsert_messages(conn, [_pdf_row(CHAT_ID, 1)])
-    report = await media.run(conn, _pdf_client(1), _cfg(), SyncBudget())
+    report = await media.run(conn, {DEFAULT_ACCOUNT: _pdf_client(1)}, _cfg(), SyncBudget())
     assert (report.extracted, report.remaining, report.unreachable) == (0, 0, 1)
     assert _states(conn) == {1: db.MEDIA_PENDING}
 
@@ -867,7 +906,7 @@ async def test_a_chat_that_fails_is_not_retried_in_the_same_run(
     db.upsert_chat(conn, _chat())
     db.upsert_messages(conn, [_pdf_row(CHAT_ID, i) for i in (1, 2)])
     client = _client(failures={CHAT_ID: errors.ChannelPrivateError(request=None)})
-    report = await media.run(conn, client, _cfg(), SyncBudget())
+    report = await media.run(conn, {DEFAULT_ACCOUNT: client}, _cfg(), SyncBudget())
     assert report.remaining == 2
     assert len([name for name, _ in client.calls if name == "get_messages"]) == 1
 
@@ -934,7 +973,7 @@ async def test_an_extract_error_out_of_the_registry_becomes_a_failed_row(
     db.upsert_chat(conn, _chat())
     db.upsert_messages(conn, [_pdf_row(CHAT_ID, 1)])
     monkeypatch.setattr(extract, "registry", lambda: {"document": boom})
-    report = await media.run(conn, _pdf_client(1), _cfg(), SyncBudget())
+    report = await media.run(conn, {DEFAULT_ACCOUNT: _pdf_client(1)}, _cfg(), SyncBudget())
     assert report.failed == 1
 
 
@@ -992,7 +1031,7 @@ async def test_ocr_text_reaches_the_closed_window_the_photo_sits_in(
         messages={CHAT_ID: [tl.photo_message(CHAT_ID, 2)]},
         downloads={(CHAT_ID, 2): b"jpeg bytes"},
     )
-    assert (await media.run(conn, client, cfg, SyncBudget())).extracted == 1
+    assert (await media.run(conn, {DEFAULT_ACCOUNT: client}, cfg, SyncBudget())).extracted == 1
     assert "[photo] ОТКРЫТО с 9:00" in _units(conn)[(1, 2, 3)]
     assert any("ОТКРЫТО с 9:00" in raw for raw in _fts(conn)), "and it is searchable"
     assert not index.unit_index_gaps(conn, CHAT_ID)
@@ -1018,7 +1057,9 @@ async def test_one_batch_recuts_the_chat_once_not_once_per_message(
         messages={CHAT_ID: [tl.photo_message(CHAT_ID, i) for i in ids]},
         downloads={(CHAT_ID, i): b"jpeg bytes" for i in ids},
     )
-    assert (await media.run(conn, client, cfg, SyncBudget())).extracted == len(ids)
+    assert (await media.run(conn, {DEFAULT_ACCOUNT: client}, cfg, SyncBudget())).extracted == len(
+        ids
+    )
     assert calls == [len(ids)]
     assert all("[photo] read" in text for text in _units(conn).values())
 
@@ -1038,7 +1079,7 @@ async def test_a_batch_that_read_nothing_recuts_nothing(
     monkeypatch.setattr(units, "invalidate_units_for", never)
     monkeypatch.setattr(extract, "registry", lambda: {"photo": _stub("never reached")})
     client = _client(messages={CHAT_ID: [tl.photo_message(CHAT_ID, 1)]})
-    assert (await media.run(conn, client, cfg, SyncBudget())).failed == 1
+    assert (await media.run(conn, {DEFAULT_ACCOUNT: client}, cfg, SyncBudget())).failed == 1
     assert calls == []
     assert _units(conn) == before
 
@@ -1060,7 +1101,7 @@ async def test_a_chat_whose_row_is_gone_extracts_without_recutting(
         messages={CHAT_ID: [tl.photo_message(CHAT_ID, 1)]},
         downloads={(CHAT_ID, 1): b"jpeg bytes"},
     )
-    assert (await media.run(conn, client, cfg, SyncBudget())).extracted == 1
+    assert (await media.run(conn, {DEFAULT_ACCOUNT: client}, cfg, SyncBudget())).extracted == 1
     assert _text(conn, 1) == "read anyway"
     assert "[photo] read anyway" not in " ".join(_units(conn).values())
 
@@ -1096,7 +1137,7 @@ async def test_the_extracted_text_reaches_msg_fts_and_anchors_the_hit(
         messages={CHAT_ID: [tl.photo_message(CHAT_ID, 4)]},
         downloads={(CHAT_ID, 4): b"jpeg bytes"},
     )
-    assert (await media.run(conn, client, cfg, SyncBudget())).extracted == 1
+    assert (await media.run(conn, {DEFAULT_ACCOUNT: client}, cfg, SyncBudget())).extracted == 1
     assert _msg_fts(conn)[4] == "ОТКРЫТО с 9:00"
     hits = search.lexical_messages(conn, "ОТКРЫТО", Filters(), 10)
     assert [hit.anchor_msg_id for hit in hits] == [4]
@@ -1137,15 +1178,15 @@ async def test_a_sync_after_an_extraction_keeps_the_text_and_finds_nothing_to_re
         downloads={(CHAT_ID, 2): b"jpeg bytes"},
     )
     async with tg.connected(client):
-        await sync.sync_all(client, conn, cfg, paths, SyncBudget())
+        await sync.sync_all({DEFAULT_ACCOUNT: client}, conn, cfg, paths, SyncBudget())
     assert "[photo]" in _units(conn)[(1, 2, 3)]
 
     monkeypatch.setattr(extract, "registry", lambda: {"photo": _stub("ОТКРЫТО с 9:00")})
-    assert (await media.run(conn, client, cfg, SyncBudget())).extracted == 1
+    assert (await media.run(conn, {DEFAULT_ACCOUNT: client}, cfg, SyncBudget())).extracted == 1
     assert db.chats_with_unindexed(conn) == [], "no backlog is handed to the next sync"
 
     async with tg.connected(client):
-        await sync.sync_all(client, conn, cfg, paths, SyncBudget())
+        await sync.sync_all({DEFAULT_ACCOUNT: client}, conn, cfg, paths, SyncBudget())
     assert "[photo] ОТКРЫТО с 9:00" in _units(conn)[(1, 2, 3)]
     assert _msg_fts(conn)[2] == "ОТКРЫТО с 9:00"
     assert _text(conn, 2) == "ОТКРЫТО с 9:00"
@@ -1174,7 +1215,7 @@ async def test_a_reordered_answer_still_matches_each_row_by_its_id(
         return list(reversed(await answer(*args, **kwargs)))
 
     monkeypatch.setattr(client, "get_messages", reversed_answer)
-    report = await media.run(conn, client, _cfg(), SyncBudget())
+    report = await media.run(conn, {DEFAULT_ACCOUNT: client}, _cfg(), SyncBudget())
     assert (report.extracted, report.failed) == (1, 1)
     assert _states(conn) == {1: db.MEDIA_EXTRACTED, 2: db.MEDIA_FAILED}
 
@@ -1192,7 +1233,7 @@ async def test_a_truncated_answer_leaves_the_rows_it_left_out_for_a_retry(
         return (await answer(*args, **kwargs))[-1:]
 
     monkeypatch.setattr(client, "get_messages", last_only)
-    report = await media.run(conn, client, _cfg(), SyncBudget())
+    report = await media.run(conn, {DEFAULT_ACCOUNT: client}, _cfg(), SyncBudget())
     assert (report.extracted, report.failed) == (1, 1)
     assert _states(conn) == {1: db.MEDIA_FAILED, 2: db.MEDIA_EXTRACTED}
     assert [args["msg_id"] for name, args in client.calls if name == "download_media"] == [2]
@@ -1260,7 +1301,7 @@ async def test_ocr_on_a_comment_reaches_the_channels_post_thread(
         messages={GROUP_ID: [tl.photo_message(GROUP_ID, 2)]},
         downloads={(GROUP_ID, 2): b"jpeg bytes"},
     )
-    assert (await media.run(conn, client, cfg, SyncBudget())).extracted == 1
+    assert (await media.run(conn, {DEFAULT_ACCOUNT: client}, cfg, SyncBudget())).extracted == 1
     assert "[photo] ОТКРЫТО с 9:00" in _units(conn, GROUP_ID)[(1, 2)], "the group's own window"
     assert "[photo] ОТКРЫТО с 9:00" in _post_thread(conn), "and the channel's post thread"
     assert not index.unit_index_gaps(conn, CHANNEL_ID)
@@ -1284,7 +1325,7 @@ async def test_a_photo_that_is_not_a_comment_costs_the_channel_nothing(
         messages={GROUP_ID: [tl.photo_message(GROUP_ID, 3)]},
         downloads={(GROUP_ID, 3): b"jpeg bytes"},
     )
-    assert (await media.run(conn, client, cfg, SyncBudget())).extracted == 1
+    assert (await media.run(conn, {DEFAULT_ACCOUNT: client}, cfg, SyncBudget())).extracted == 1
     assert _post_thread(conn) == before
 
 
@@ -1306,7 +1347,7 @@ async def test_a_chat_with_no_units_keeps_the_flag_for_index_stranded(
         messages={CHAT_ID: [tl.photo_message(CHAT_ID, 1)]},
         downloads={(CHAT_ID, 1): b"jpeg bytes"},
     )
-    assert (await media.run(conn, client, cfg, SyncBudget())).extracted == 1
+    assert (await media.run(conn, {DEFAULT_ACCOUNT: client}, cfg, SyncBudget())).extracted == 1
     assert _text(conn, 1) == "ОТКРЫТО"
     assert _indexed(conn) == {1: 0}, "the repair keeps its only handle on the row"
 
@@ -1330,6 +1371,239 @@ async def test_a_row_a_window_holds_is_unflagged_even_when_nothing_changed(
         messages={CHAT_ID: [tl.photo_message(CHAT_ID, 1)]},
         downloads={(CHAT_ID, 1): b"jpeg bytes"},
     )
-    assert (await media.run(conn, client, cfg, SyncBudget())).extracted == 1
+    assert (await media.run(conn, {DEFAULT_ACCOUNT: client}, cfg, SyncBudget())).extracted == 1
     assert _units(conn) == before
     assert _indexed(conn) == {1: 1}
+
+
+# --- several accounts ------------------------------------------------------------------------
+
+
+WORK = "work"
+ALICE = make_user(1, "Alice", username="alice")
+CLUB = make_channel(300, "Private club", megagroup=True)
+CLUB_ID = -1000000000300
+
+
+def _pdf_message(chat_id: int, msg_id: int) -> types.Message:
+    return tl.document_message(chat_id, msg_id, "note.pdf")
+
+
+def _account_dms(conn: sqlite3.Connection) -> tuple[ChatRow, ChatRow]:
+    """Both accounts' private chats with Alice, each holding one pending PDF under its own ids.
+
+    The default account's chat keeps Alice's id; the work account's is filed under a synthetic
+    one. Each carries the access hash its own account addresses Alice by, as a resolve records.
+    """
+    home = db.upsert_chat(conn, ChatRow(id=1, type="user", title="Alice", source_id="chat:@alice"))
+    work = db.upsert_chat(
+        conn,
+        ChatRow(id=1, type="user", title="Alice", source_id="work/chat:@alice", scope=WORK),
+        WORK,
+    )
+    for chat, msg_id in ((home, 1), (work, 7)):
+        db.set_chat_access(
+            conn, chat.id, chat.scope, access_hash=FakeWorld.access_hash(chat.scope, 1)
+        )
+        sync.on_chat_synced(
+            conn, chat, _cfg(), db.upsert_messages(conn, [_pdf_row(chat.id, msg_id)])
+        )
+    return home, work
+
+
+def _world() -> FakeWorld:
+    return FakeWorld(entities=[ALICE, CLUB])
+
+
+def _account_client(
+    world: FakeWorld, account: str, msg_id: int, *, members: list[Any] | None = None, **kw: Any
+) -> FakeClient:
+    """``account``'s client with its own chat with Alice holding the PDF ``msg_id``, cache empty."""
+    kw.setdefault("messages", {1: [_pdf_message(1, msg_id)]})
+    kw.setdefault("downloads", {(1, msg_id): SAMPLE_PDF.read_bytes()})
+    return world.client(account, members=members or [], **kw)
+
+
+def _requests(client: FakeClient, name: str) -> list[dict[str, Any]]:
+    return [args for called, args in client.calls if called == name]
+
+
+async def test_a_second_accounts_dm_is_extracted_through_that_account(
+    conn: sqlite3.Connection, scratch: Path
+) -> None:
+    """Each account's chat with Alice is re-fetched through its own client, by its own message
+    ids — and addressed by the access hash the index stored for that account, with no dialog
+    walk: the clients start as fresh as ``grepogram extract`` builds them."""
+    home_chat, work_chat = _account_dms(conn)
+    world = _world()
+    home = _account_client(world, DEFAULT_ACCOUNT, 1)
+    work = _account_client(world, WORK, 7)
+
+    report = await media.run(conn, {DEFAULT_ACCOUNT: home, WORK: work}, _cfg(), SyncBudget())
+
+    assert (report.extracted, report.warnings, report.chats_unreachable) == (2, [], [])
+    assert [(f["chat_id"], f["ids"]) for f in _fetches(home)] == [(1, [1])]
+    assert [(f["chat_id"], f["ids"]) for f in _fetches(work)] == [(1, [7])]
+    assert _requests(home, "get_dialogs") == [] and _requests(work, "get_dialogs") == []
+    assert _text(conn, 1) and _text(conn, 7)
+    stored = db.get_messages(conn, work_chat.id)
+    assert [row.msg_id for row in stored] == [7] and home_chat.id != work_chat.id
+
+
+async def test_a_chat_no_connected_account_reaches_is_counted_not_fetched(
+    conn: sqlite3.Connection, scratch: Path
+) -> None:
+    """Only the default account is signed in: the work account's chat with Alice is never asked
+    about through it — that would read the default account's conversation into the work row —
+    and its media is reported as unreachable rather than as work a rerun could do."""
+    _, work_chat = _account_dms(conn)
+    home = _account_client(_world(), DEFAULT_ACCOUNT, 1)
+
+    report = await media.run(conn, {DEFAULT_ACCOUNT: home}, _cfg(), SyncBudget())
+
+    assert (report.extracted, report.remaining, report.unreachable) == (1, 0, 1)
+    assert report.chats_unreachable == [work_chat.id] and report.warnings == []
+    assert [f["ids"] for f in _fetches(home)] == [[1]]
+    assert _states(conn) == {1: db.MEDIA_EXTRACTED, 7: db.MEDIA_PENDING}
+
+
+async def test_a_disabled_pass_counts_unreachable_chats_too(conn: sqlite3.Connection) -> None:
+    _, work_chat = _account_dms(conn)
+    home = _account_client(_world(), DEFAULT_ACCOUNT, 1)
+    report = await media.run(conn, {DEFAULT_ACCOUNT: home}, _cfg(enabled=False), SyncBudget())
+    assert (report.remaining, report.unreachable, report.chats_unreachable) == (
+        1,
+        1,
+        [work_chat.id],
+    )
+    assert home.calls == []
+
+
+def _club(conn: sqlite3.Connection) -> ChatRow:
+    """A private supergroup the default account's source covers and both accounts reach."""
+    chat = db.upsert_chat(
+        conn,
+        ChatRow(id=CLUB_ID, type="supergroup", title="Private club", source_id=f"chat:{CLUB_ID}"),
+    )
+    for account in (DEFAULT_ACCOUNT, WORK):
+        db.set_chat_access(
+            conn, CLUB_ID, account, access_hash=FakeWorld.access_hash(account, CLUB_ID)
+        )
+    sync.on_chat_synced(conn, chat, _cfg(), db.upsert_messages(conn, [_pdf_row(CLUB_ID, 5)]))
+    return chat
+
+
+async def test_a_shared_chat_its_primary_account_is_refused_falls_back(
+    conn: sqlite3.Connection, scratch: Path
+) -> None:
+    """The default account left the club; the work account is still in it. The club is one
+    shared row, so its media is read through the work account instead of being skipped."""
+    _club(conn)
+    world = FakeWorld(entities=[ALICE, CLUB], messages={CLUB_ID: [_pdf_message(CLUB_ID, 5)]})
+    downloads = {(CLUB_ID, 5): SAMPLE_PDF.read_bytes()}
+    home = world.client(DEFAULT_ACCOUNT, members=[], downloads=downloads)
+    work = world.client(WORK, members=[CLUB], downloads=downloads)
+
+    report = await media.run(conn, {DEFAULT_ACCOUNT: home, WORK: work}, _cfg(), SyncBudget())
+
+    assert (report.extracted, report.warnings) == (1, [])
+    assert [f["chat_id"] for f in _fetches(home)] == [CLUB_ID], "the primary account first"
+    assert [f["chat_id"] for f in _fetches(work)] == [CLUB_ID]
+    assert _requests(work, "get_dialogs") == [], "warmed from the stored access hash"
+    assert _states(conn) == {5: db.MEDIA_EXTRACTED}
+
+
+async def test_a_shared_chat_every_account_is_refused_is_reported_once(
+    conn: sqlite3.Connection, scratch: Path
+) -> None:
+    _club(conn)
+    world = FakeWorld(entities=[ALICE, CLUB], messages={CLUB_ID: [_pdf_message(CLUB_ID, 5)]})
+    home = world.client(DEFAULT_ACCOUNT, members=[])
+    work = world.client(WORK, members=[])
+
+    report = await media.run(conn, {DEFAULT_ACCOUNT: home, WORK: work}, _cfg(), SyncBudget())
+
+    assert report.extracted == 0 and report.remaining == 1
+    assert len(report.warnings) == 1
+    assert report.warnings[0].startswith(f"account {WORK}: chat {CLUB_ID} (Private club)")
+    assert _states(conn) == {5: db.MEDIA_PENDING}
+
+
+async def test_a_flood_wait_stops_one_account_while_the_other_reads_on(
+    conn: sqlite3.Connection, scratch: Path
+) -> None:
+    _account_dms(conn)
+    world = _world()
+    flood = errors.FloodWaitError(request=None, capture=600)
+    home = _account_client(world, DEFAULT_ACCOUNT, 1, failures={1: flood})
+    work = _account_client(world, WORK, 7)
+
+    report = await media.run(conn, {DEFAULT_ACCOUNT: home, WORK: work}, _cfg(), SyncBudget())
+
+    assert report.extracted == 1 and report.remaining == 1
+    assert report.warnings == [
+        f"account {DEFAULT_ACCOUNT}: flood wait: Telegram asks to wait 600s before more media "
+        "requests; run `grepogram extract` again later"
+    ]
+    assert _states(conn) == {1: db.MEDIA_PENDING, 7: db.MEDIA_EXTRACTED}
+
+
+async def test_a_flood_wait_on_a_shared_chat_moves_it_to_the_next_account(
+    conn: sqlite3.Connection, scratch: Path
+) -> None:
+    """A flood wait is about the account, not the chat: the club the default account is
+    flood-limited on is read through the work account, which reaches it too."""
+    _club(conn)
+    world = FakeWorld(entities=[ALICE, CLUB], messages={CLUB_ID: [_pdf_message(CLUB_ID, 5)]})
+    downloads = {(CLUB_ID, 5): SAMPLE_PDF.read_bytes()}
+    flood = errors.FloodWaitError(request=None, capture=600)
+    home = world.client(
+        DEFAULT_ACCOUNT, members=[CLUB], downloads=downloads, failures={CLUB_ID: flood}
+    )
+    work = world.client(WORK, members=[CLUB], downloads=downloads)
+
+    report = await media.run(conn, {DEFAULT_ACCOUNT: home, WORK: work}, _cfg(), SyncBudget())
+
+    assert report.extracted == 1 and _states(conn) == {5: db.MEDIA_EXTRACTED}
+    assert report.warnings == [
+        f"account {DEFAULT_ACCOUNT}: flood wait: Telegram asks to wait 600s before more media "
+        "requests; run `grepogram extract` again later"
+    ]
+
+
+async def test_a_flood_wait_on_the_fallback_account_leaves_the_chat_queued(
+    conn: sqlite3.Connection, scratch: Path
+) -> None:
+    """The default account is refused the club and the work account, asked in its place, is
+    flood-limited: nothing is read, the media stays queued, and each account's warning is its
+    own."""
+    _club(conn)
+    world = FakeWorld(entities=[ALICE, CLUB], messages={CLUB_ID: [_pdf_message(CLUB_ID, 5)]})
+    flood = errors.FloodWaitError(request=None, capture=600)
+    home = world.client(DEFAULT_ACCOUNT, members=[])
+    work = world.client(WORK, members=[CLUB], failures={CLUB_ID: flood})
+
+    report = await media.run(conn, {DEFAULT_ACCOUNT: home, WORK: work}, _cfg(), SyncBudget())
+
+    assert report.extracted == 0 and report.remaining == 1
+    assert report.warnings[0] == (
+        f"account {WORK}: flood wait: Telegram asks to wait 600s before more media requests; "
+        "run `grepogram extract` again later"
+    )
+    assert report.warnings[1].startswith(f"account {DEFAULT_ACCOUNT}: chat {CLUB_ID}")
+    assert _states(conn) == {5: db.MEDIA_PENDING}
+
+
+async def test_a_rejected_session_names_its_account(
+    conn: sqlite3.Connection, scratch: Path
+) -> None:
+    _account_dms(conn)
+    world = _world()
+    home = _account_client(world, DEFAULT_ACCOUNT, 1)
+    dead = errors.AuthKeyUnregisteredError(request=None)
+    work = _account_client(world, WORK, 7, failures={1: dead})
+
+    with pytest.raises(tg.AuthRequired) as raised:
+        await media.run(conn, {DEFAULT_ACCOUNT: home, WORK: work}, _cfg(), SyncBudget())
+
+    assert raised.value.account == WORK

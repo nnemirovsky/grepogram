@@ -167,6 +167,51 @@ def test_a_forward_keeps_its_origin(export: Export) -> None:
     assert row.fwd_from == "Valencia Expats"
 
 
+def test_links_come_from_the_runs_as_a_sync_reads_them(tmp_path: Path) -> None:
+    """Visible URLs, hidden ``text_link`` hyperlinks and mentions — by name and by id — are
+    what research reads off an import; a web page that is not Telegram is not a link."""
+    runs = [
+        {"type": "plain", "text": "see "},
+        {"type": "link", "text": "https://t.me/rent_chan/12"},
+        {"type": "plain", "text": " and "},
+        {"type": "text_link", "text": "this", "href": "https://t.me/+AbCdEf_12"},
+        {"type": "mention", "text": "@Other_Chan"},
+        {"type": "mention_name", "text": "Ann", "user_id": 4242},
+        {"type": "link", "text": "https://example.com"},
+        {"type": "bold", "text": "t.me/not_a_link_run"},
+    ]
+    row = _one(tmp_path, text_entities=runs, text=runs)
+    assert row.links == (
+        ("link", "@rent_chan/12"),
+        ("mention", "@other_chan"),
+        ("mention", "peer:4242"),
+        ("text_url", "+AbCdEf_12"),
+    )
+
+
+def test_links_are_read_from_an_old_export_s_text_runs(tmp_path: Path) -> None:
+    old = ["join ", {"type": "text_link", "text": "here", "href": "https://t.me/hidden_chan"}]
+    row = _one(tmp_path, text=old, text_entities=None)
+    assert row.links == (("text_url", "@hidden_chan"),)
+
+
+def test_a_message_with_no_runs_has_its_links_unread(tmp_path: Path) -> None:
+    """A plain-string text spells no entities: ``None`` says the links were never read, so
+    research falls back to the visible text rather than taking the message for linkless."""
+    message = _message(text="plain t.me/visible_chan")
+    del message["text_entities"]
+    path = _write(tmp_path, _account([_chat_entry([message])]))
+    (row,) = read_export(path).chats[0].messages
+    assert row.links is None
+    assert _one(tmp_path, text="nothing", text_entities=[]).links == ()
+
+
+def test_a_forward_names_its_origin_where_the_export_does(tmp_path: Path) -> None:
+    row = _one(tmp_path, forwarded_from="Rent", forwarded_from_id="channel1234567890")
+    assert (row.fwd_from, row.fwd_peer_id, row.fwd_msg_id) == ("Rent", -1001234567890, None)
+    assert _one(tmp_path, forwarded_from="Someone").fwd_peer_id is None
+
+
 def test_media_kinds_from_the_fixture(export: Export) -> None:
     expats = {row.msg_id: row for row in _chat(export, EXPATS).messages}
     boat = {row.msg_id: row for row in _chat(export, BOAT).messages}

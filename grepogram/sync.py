@@ -2,7 +2,8 @@
 
 :func:`sync_all` is the one entry point every caller (CLI ``sync``, MCP ``sync``, auto-sync in
 ``search``) goes through: it takes the cross-process :class:`SyncLock`, re-resolves the configured
-sources, syncs chats in ``last_sync_at`` order until the :class:`SyncBudget` runs out, runs
+sources of every account it holds a client for, syncs chats in ``last_sync_at`` order — one queue
+per account, the queues concurrently, each chat once — until the :class:`SyncBudget` runs out, runs
 :func:`on_chat_synced` — the unit rebuild followed by the lexical index — over every stored row
 that no rebuild has covered yet, and finally embeds the dirty units when an embedder is given.
 :func:`sync_chat` fetches one chat: new messages after ``last_msg_id`` in batches, then a
@@ -30,15 +31,15 @@ A run that dies between a commit and the rebuild therefore leaves nothing behind
 does not pick up (:func:`grepogram.db.unindexed_message_ids`). The rebuild, the
 indexing and the flag are one transaction, so the flag never clears over derived data that is not
 there; the worker thread they run on is joined even when the surrounding tool call is cancelled
-(:func:`_joined_to_thread`), so the :class:`SyncLock` outlives every write it covers.
+(:func:`joined_to_thread`), so the :class:`SyncLock` outlives every write it covers.
 
-:func:`map_message` reads raw TL attributes only — ``msg.message``, ``msg.media``,
-``msg.reply_to``, ``msg.fwd_from``, ``msg.reactions``, ``msg.from_id``, ``msg.post``, ``msg.date``,
-``msg.edit_date`` — and never the client-bound helpers (``msg.text``, ``msg.file``, ``msg.sender``,
-``msg.chat``), so a message built without a client (the test fixtures) maps exactly like one
-Telethon yields from ``iter_messages``. Display names come from a ``names`` map built with
-:func:`collect_users` out of the users and chats Telegram returns alongside messages
-(:func:`peers_of`); the same rows feed the ``users`` upsert.
+:func:`map_message` reads raw TL attributes only — ``msg.message``, ``msg.entities``,
+``msg.media``, ``msg.reply_markup``, ``msg.reply_to``, ``msg.fwd_from``, ``msg.reactions``,
+``msg.from_id``, ``msg.post``, ``msg.date``, ``msg.edit_date`` — and never the client-bound
+helpers (``msg.text``, ``msg.file``, ``msg.sender``, ``msg.chat``), so a message built without a
+client (the test fixtures) maps exactly like one Telethon yields from ``iter_messages``. Display
+names come from a ``names`` map built with :func:`collect_users` out of the users and chats
+Telegram returns alongside messages (:func:`peers_of`); the same rows feed the ``users`` upsert.
 """
 
 import asyncio
@@ -46,36 +47,55 @@ import dataclasses
 import datetime as dt
 import functools
 import logging
-import math
 import sqlite3
 import threading
 import time
 from collections import deque
-from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Literal
 
-from telethon import errors, utils
+from telethon import errors, helpers, utils
 from telethon.tl import functions, types
 
-from grepogram import db, dialogs, index, units
+from grepogram import db, dialogs, index, leads, tg, units
+from grepogram.accounts import (
+    UNAVAILABLE_ERRORS,
+    AccountStopped,
+    StoredPass,
+    account_warning,
+    ask_account,
+    cap_flood_sleep,
+    flood_warning,
+    labels_accounts,
+    reaching_accounts,
+    recorded_reach,
+    through_accounts,
+    warm_peer_cache,
+)
 from grepogram.config import ConfigError
 from grepogram.dialogs import entity_username
 from grepogram.embed import Embedder
 from grepogram.models import (
+    DEFAULT_ACCOUNT,
+    AccountRow,
+    CachedPeer,
     ChatRow,
     Config,
+    LinkKind,
     MediaKind,
     MessageRow,
     PruneReport,
+    RecaptureReport,
     Source,
-    SyncCfg,
     SyncReport,
     UserRow,
+    chat_scope,
 )
 from grepogram.paths import FileLock, Paths
 from grepogram.sources import (
     IMPORT_PREFIX,
+    Resolution,
     discussion_source_id,
     imported_tag,
     parse_since,
@@ -190,9 +210,15 @@ def map_message(
 
     Service messages (joins, pins, topic edits) and ``MessageEmpty`` are skipped. The row is
     stored under ``chat.id`` whatever the message's own peer is, which is how channel comments
-    land in their discussion chat. Text is the message text or caption; a poll, venue or
-    contact — media that carries its content outside the text — contributes its own text when
-    the message has none.
+    land in their discussion chat; what Telegram says about the chat itself — the peer that sent
+    a channel post, the peer a quoted reply points into — is compared with ``chat.peer_id``, the
+    id Telegram knows, which a scoped row stored under a synthetic id does not share. Text is the
+    message text or caption; a poll, venue or contact — media that carries its content outside
+    the text — contributes its own text when the message has none.
+
+    A forward's origin is kept structured as well as named (:func:`forward_origin`), and every
+    Telegram destination the message names — in its text, its hyperlinks, its buttons, its link
+    preview — becomes a ``links`` pair (:func:`links_of`).
     """
     if isinstance(msg, types.MessageService) or not isinstance(msg, types.Message):
         return None
@@ -200,10 +226,11 @@ def map_message(
         log.debug("skipping message %s in chat %s: no date", msg.id, chat.id)
         return None
     from_id, from_name = sender_of(msg, names, me=me)
-    if from_id == chat.id and from_id not in names and chat.title:
+    if from_id == chat.peer_id and from_id not in names and chat.title:
         from_name = chat.title
-    reply_to_msg_id, topic_id = reply_of(msg.reply_to, chat.id)
+    reply_to_msg_id, topic_id = reply_of(msg.reply_to, chat.peer_id)
     media_kind, media_filename = media_of(msg.media)
+    fwd_peer_id, fwd_msg_id, fwd_date = forward_origin(msg.fwd_from)
     return MessageRow(
         chat_id=chat.id,
         msg_id=int(msg.id),
@@ -214,10 +241,14 @@ def map_message(
         reply_to_msg_id=reply_to_msg_id,
         topic_id=topic_id,
         fwd_from=forward_of(msg.fwd_from, names),
+        fwd_peer_id=fwd_peer_id,
+        fwd_msg_id=fwd_msg_id,
+        fwd_date=fwd_date,
         text=msg.message or media_text(msg.media),
         media_kind=media_kind,
         media_filename=media_filename,
         reactions_total=reactions_total(msg.reactions),
+        links=links_of(msg),
     )
 
 
@@ -228,14 +259,15 @@ def epoch(when: dt.datetime) -> int:
     return int(when.timestamp())
 
 
-def reply_of(reply_to: Any, chat_id: int) -> tuple[int | None, int | None]:
+def reply_of(reply_to: Any, peer_id: int) -> tuple[int | None, int | None]:
     """``(reply_to_msg_id, topic_id)`` from a message's ``reply_to`` header.
 
     In a forum the header always points at the topic: a message that merely sits in a topic has
     ``forum_topic`` set and ``reply_to_msg_id`` = the topic root with no ``reply_to_top_id`` and
     is not a reply; a real reply inside a topic carries its parent in ``reply_to_msg_id`` and the
     topic root in ``reply_to_top_id``. Story replies and quotes of a message from another chat
-    (``reply_to_peer_id`` set to a different peer) are not in-chat replies.
+    (``reply_to_peer_id`` set to a different peer than ``peer_id``, the chat's Telegram id)
+    are not in-chat replies.
     """
     if not isinstance(reply_to, types.MessageReplyHeader):
         return None, None
@@ -246,7 +278,7 @@ def reply_of(reply_to: Any, chat_id: int) -> tuple[int | None, int | None]:
         if not reply_to.reply_to_top_id:
             parent = None
     other = reply_to.reply_to_peer_id
-    if other is not None and int(utils.get_peer_id(other)) != chat_id:
+    if other is not None and int(utils.get_peer_id(other)) != peer_id:
         parent = None
     return parent, topic
 
@@ -334,6 +366,66 @@ def forward_of(fwd: Any, names: Mapping[int, str]) -> str | None:
     return fwd.from_name or fwd.post_author or UNKNOWN_SENDER
 
 
+def forward_origin(fwd: Any) -> tuple[int | None, int | None, int | None]:
+    """``(fwd_peer_id, fwd_msg_id, fwd_date)``: where a forwarded message came from.
+
+    The address of the original message when Telegram gives one — a channel post
+    (``from_id`` + ``channel_post``), else the chat and message it was saved from
+    (``saved_from_peer`` + ``saved_from_msg_id``) — so forwards of one post share one origin
+    wherever they land; else the author alone (``from_id``, no message), and nothing at all for
+    an account that hides itself behind ``from_name``. ``fwd_date`` is when the original was
+    sent. Ids are marked peer ids; nothing here asks whether this account can reach them.
+    """
+    if fwd is None:
+        return None, None, None
+    date = epoch(fwd.date) if fwd.date is not None else None
+    if fwd.from_id is not None and fwd.channel_post is not None:
+        return int(utils.get_peer_id(fwd.from_id)), int(fwd.channel_post), date
+    if fwd.saved_from_peer is not None and fwd.saved_from_msg_id is not None:
+        return int(utils.get_peer_id(fwd.saved_from_peer)), int(fwd.saved_from_msg_id), date
+    if fwd.from_id is not None:
+        return int(utils.get_peer_id(fwd.from_id)), None, date
+    return None, None, date
+
+
+def links_of(msg: Any) -> tuple[tuple[LinkKind, str], ...]:
+    """Every Telegram destination ``msg`` names, as sorted, distinct ``(kind, target)`` pairs.
+
+    Read from the raw attributes only: ``msg.entities`` (a visible URL → ``link``, a hidden
+    ``text_url`` hyperlink, an ``@mention`` or a mention by user id → ``mention``),
+    ``msg.reply_markup`` (URL buttons) and ``msg.media`` (the link preview's URL → ``webpage``).
+    Targets are normalized by :func:`grepogram.leads.normalize`, and a URL that names no
+    Telegram destination is dropped. Entity offsets count UTF-16 code units, hence the
+    surrogate round trip before slicing the text.
+    """
+    found: set[tuple[LinkKind, str]] = set()
+
+    def add(kind: LinkKind, value: Any) -> None:
+        if isinstance(value, str) and (lead := leads.normalize(value)) is not None:
+            found.add((kind, lead.target))
+
+    entities = list(msg.entities or ())
+    wide = helpers.add_surrogate(msg.message or "") if entities else ""
+    for entity in entities:
+        span = helpers.del_surrogate(wide[entity.offset : entity.offset + entity.length])
+        if isinstance(entity, types.MessageEntityUrl):
+            add("link", span)
+        elif isinstance(entity, types.MessageEntityTextUrl):
+            add("text_url", entity.url)
+        elif isinstance(entity, types.MessageEntityMention):
+            add("mention", span)
+        elif isinstance(entity, types.MessageEntityMentionName):
+            add("mention", leads.peer_identity(int(entity.user_id)))
+    markup = msg.reply_markup
+    if isinstance(markup, types.ReplyInlineMarkup):
+        for row in markup.rows:
+            for button in row.buttons:
+                add("button", getattr(button, "url", None))
+    if isinstance(msg.media, types.MessageMediaWebPage):
+        add("webpage", getattr(msg.media.webpage, "url", None))
+    return tuple(sorted(found))
+
+
 def reactions_total(reactions: Any) -> int:
     if reactions is None:
         return 0
@@ -361,16 +453,78 @@ class SyncInProgress(Exception):
 class SyncBudget:
     """Wall-clock allowance for one sync run; ``seconds=None`` never expires on its own.
 
+    ``messages`` is an optional allowance of newly stored messages (comments included), which a
+    research run sets from ``max_messages_per_run``: once :meth:`spend` has counted that many,
+    :attr:`exhausted` is true and the fetch stops at its next batch boundary exactly as it does
+    when the clock runs out — the batch it is on is committed and the chat resumes next time.
+    It stops *fetching* only: :attr:`expired` ignores it, so indexing, the re-cut and embedding,
+    which store no message, are paced by the clock alone.
+
     ``clock`` defaults to :func:`time.monotonic` and is injectable for tests.
     """
 
     def __init__(
-        self, seconds: float | None = None, *, clock: Callable[[], float] = time.monotonic
+        self,
+        seconds: float | None = None,
+        *,
+        messages: int | None = None,
+        clock: Callable[[], float] = time.monotonic,
     ) -> None:
+        if messages is not None and messages < 0:
+            raise ValueError(f"a message allowance cannot be negative: {messages}")
         self.seconds = seconds
+        self.messages = messages
+        self.spent = 0
+        self.held = 0
         self._clock = clock
         self.deadline: float | None = None if seconds is None else clock() + seconds
         self._cancelled = False
+
+    def spend(self, count: int) -> None:
+        """Count ``count`` newly stored messages against the allowance."""
+        self.spent += max(0, count)
+
+    def hold(self, wanted: int) -> int:
+        """Set aside up to ``wanted`` messages of the allowance for a batch about to be stored,
+        and return how many were set aside — ``wanted`` itself without an allowance.
+
+        Several accounts' queues fetch at once against the one budget, and each gathers a batch
+        before storing it: without this, two queues reading the same :attr:`messages_left` would
+        each store up to that many and overshoot the cap by a batch per queue. What a queue
+        holds is out of every other queue's :attr:`messages_left` until :meth:`release` — so it
+        stores no more rows than it holds (every stored row costs at most one message), spends
+        what was actually new, and then releases the hold.
+        """
+        if self.messages is None:
+            return wanted
+        granted = max(0, min(wanted, self.messages - self.spent - self.held))
+        self.held += granted
+        return granted
+
+    def release(self, held: int) -> None:
+        """Give back a :meth:`hold` once its batch is stored (and spent)."""
+        if self.messages is not None:
+            self.held -= held
+
+    @property
+    def messages_left(self) -> int | None:
+        """Messages the allowance still admits, ``None`` without one, never negative — what any
+        queue holds for a batch it is storing (:meth:`hold`) already taken off."""
+        if self.messages is None:
+            return None
+        return max(0, self.messages - self.spent - self.held)
+
+    @property
+    def exhausted(self) -> bool:
+        """Whether the message allowance is used up (or held by a batch being stored); never,
+        without one."""
+        return self.messages is not None and self.messages_left == 0
+
+    @property
+    def halted(self) -> bool:
+        """Whether fetching must stop: the clock ran out, the run was cancelled, or the message
+        allowance is used up. What the fetch loops check; :attr:`expired` is the clock alone."""
+        return self.expired or self.exhausted
 
     @property
     def expired(self) -> bool:
@@ -382,7 +536,7 @@ class SyncBudget:
         """Expire the budget now, whatever the clock says and whatever it was given.
 
         How a cancelled run stops the work a worker thread is pacing against this budget at its
-        next boundary instead of waiting the whole of it out (:func:`_joined_to_thread`).
+        next boundary instead of waiting the whole of it out (:func:`joined_to_thread`).
         """
         self._cancelled = True
 
@@ -427,14 +581,6 @@ class SyncLock(FileLock):
 # --- one chat --------------------------------------------------------------------------------
 
 
-UNAVAILABLE_ERRORS: tuple[type[Exception], ...] = (
-    errors.ChannelPrivateError,
-    errors.ChatAdminRequiredError,
-    errors.ChannelInvalidError,
-    errors.ChatForbiddenError,
-)
-
-
 class DiscussionUnavailable(Exception):
     """A channel's linked discussion group cannot be resolved, though the channel itself can."""
 
@@ -466,13 +612,50 @@ class SyncedChat:
     warnings: list[str] = field(default_factory=list)
 
 
-class _PeerBook:
-    """Users met during a fetch: display names for the mapper, pending rows for the upsert."""
+def forward_peers(messages: Iterable[Any]) -> list[CachedPeer]:
+    """The channels and supergroups ``messages`` were forwarded from, as Telegram handed them
+    along with the messages (``msg.forward.chat``, bound from the answer's ``chats`` at no
+    cost).
 
-    def __init__(self) -> None:
+    That is the only moment grepogram learns how to reach a forward's origin: the message
+    carries its id alone, and an id is no address — a channel is asked about with this
+    account's access hash, or found by its username. A ``min`` entity's access hash addresses
+    nothing and is left out; its username is kept. An origin that brings neither is dropped.
+    """
+    found: dict[int, CachedPeer] = {}
+    for msg in messages:
+        forward = getattr(msg, "forward", None)
+        chat = getattr(forward, "chat", None) if forward is not None else None
+        if not isinstance(chat, types.Channel):
+            continue
+        username = entity_username(chat)
+        access_hash = None if chat.min else chat.access_hash
+        if username or access_hash is not None:
+            marked = dialogs.peer_id(chat)
+            found[marked] = CachedPeer(marked, username, access_hash)
+    return list(found.values())
+
+
+def remember_forward_peers(
+    conn: sqlite3.Connection, account: str, messages: Iterable[Any], now: int | None = None
+) -> None:
+    """Record in ``peer_cache`` what ``account`` was handed about the origins of the forwards
+    among ``messages`` (:func:`forward_peers`), so research can probe and join them."""
+    peers = forward_peers(messages)
+    if peers:
+        db.remember_peers(conn, account, peers, int(time.time()) if now is None else now)
+
+
+class _PeerBook:
+    """Peers met during a fetch: display names for the mapper, pending user rows for the upsert,
+    and the forward origins ``account`` was handed (:func:`forward_peers`)."""
+
+    def __init__(self, account: str = DEFAULT_ACCOUNT) -> None:
+        self.account = account
         self.users: dict[int, UserRow] = {}
         self.names: dict[int, str] = {}
         self._pending: dict[int, UserRow] = {}
+        self._origins: dict[int, CachedPeer] = {}
 
     def add(self, msg: Any) -> None:
         for user_id, user in collect_users(peers_of(msg)).items():
@@ -482,11 +665,16 @@ class _PeerBook:
             self._pending[user_id] = user
             if user.display_name:
                 self.names[user_id] = user.display_name
+        for origin in forward_peers([msg]):
+            self._origins[origin.peer_id] = origin
 
     def flush(self, conn: sqlite3.Connection) -> None:
         if self._pending:
             db.upsert_users(conn, self._pending.values())
             self._pending = {}
+        if self._origins:
+            db.remember_peers(conn, self.account, self._origins.values(), int(time.time()))
+            self._origins = {}
 
 
 @dataclass(slots=True, kw_only=True)
@@ -514,6 +702,7 @@ class _Run:
     me: UserRow | None
     discussion: ChatRow | None = None
     peers: _PeerBook = field(default_factory=_PeerBook)
+    """Given the acting account by :func:`sync_chat`, whose forward origins it records."""
     changes: dict[int, None] = field(default_factory=dict)
     comment_ids: dict[int, None] = field(default_factory=dict)
     inserted: dict[int, int] = field(default_factory=dict)
@@ -546,7 +735,7 @@ class _Run:
         the one unit no ``json_each`` over ``units.msg_ids`` can reach.
 
         The whole write is one transaction, and it goes to a worker thread
-        (:func:`_joined_to_thread`) only when there is something to cut — a re-cut runs to the
+        (:func:`joined_to_thread`) only when there is something to cut — a re-cut runs to the
         end of the chat, which is what :func:`_drop_deleted` is pushed off the event loop for,
         while the ordinary batch is a plain upsert that has always run on it.
         """
@@ -562,10 +751,21 @@ class _Run:
             and db.attachment_replaced(was, row)
         ]
         write = functools.partial(self._write, chat_id, rows, stale)
-        ids = await _joined_to_thread(write, self.budget.cancel) if stale else write()
+        ids = await joined_to_thread(write, self.budget.cancel) if stale else write()
         fresh = sum(1 for row in rows if row.msg_id not in known)
         self.inserted[chat_id] = self.inserted.get(chat_id, 0) + fresh
+        self.budget.spend(fresh)
         return ids
+
+    async def store_new(self, rows: list[MessageRow]) -> tuple[list[int], int]:
+        """:meth:`store` as many of ``rows`` as the message allowance has room for, in order;
+        returns their row ids and how many of ``rows`` were stored. Fewer than all of them means
+        the allowance ran out: the caller stops fetching and the rest comes next run."""
+        held = self.budget.hold(len(rows))
+        try:
+            return await self.store(rows[:held]), held
+        finally:
+            self.budget.release(held)
 
     def _write(self, chat_id: int, rows: list[MessageRow], stale: Sequence[int]) -> list[int]:
         """The upsert and, for the rows whose extraction it just dropped, the re-cut."""
@@ -602,6 +802,24 @@ class _Run:
         self.discussion = None
 
 
+def foreign_scope(chat: ChatRow, source: Source, account: str | None = None) -> str | None:
+    """Why ``source`` may not fetch ``chat`` through ``account``, or ``None`` when it may.
+
+    ``account`` is the one whose client would do the fetch, ``source.account`` when omitted. A
+    private chat or legacy group is stored under the account whose history it is
+    (``chats.scope``), and only that account's client may read into it: another account's
+    conversation with the same peer has message ids of its own. A channel or supergroup is
+    shared and any account may fetch it.
+    """
+    acting = source.account if account is None else account
+    if not chat.scope or chat.scope == acting:
+        return None
+    return (
+        f"chat {chat.id} ({chat.title}) is {chat.scope}'s own {chat.type}, so source {source.id} "
+        f"cannot fetch it through account {acting}"
+    )
+
+
 def _track(seen: dict[int, None], ids: Iterable[int]) -> None:
     for row_id in ids:
         seen.setdefault(row_id, None)
@@ -628,6 +846,7 @@ async def sync_chat(
     *,
     cfg: Config | None = None,
     me: UserRow | None = None,
+    account: str | None = None,
 ) -> SyncedChat:
     """Fetch one chat incrementally and store what changed; the client must be connected.
 
@@ -653,10 +872,32 @@ async def sync_chat(
     result keeps pointing at the supergroup so :func:`sync_all` syncs that one.
     :class:`~telethon.errors.FloodWaitError` beyond the client's sleep threshold and
     authorization errors propagate after the current batch is committed.
+
+    ``client`` is ``account``'s — ``source.account``'s unless the run falls back to another
+    account that reaches a shared chat (:func:`_fetch_chat`) — and every chat stored on the way
+    (a migration's supergroup, a channel's discussion group) is filed under that account
+    (:func:`grepogram.db.upsert_chat`), while ``source`` still says how the chat is fetched
+    (``since``, ``comments``). Telegram is addressed by ``chat.peer_id`` throughout and the rows
+    by ``chat.id``. A private chat or legacy group is the account's own, so another account
+    asking for one is a ``ValueError`` rather than a fetch through the wrong session.
     """
+    acting = source.account if account is None else account
+    foreign = foreign_scope(chat, source, acting)
+    if foreign is not None:
+        raise ValueError(foreign)
     if chat.migrated_to is not None:
-        log.debug("chat %s migrated to %s; its history is frozen", chat.id, chat.migrated_to)
-        return SyncedChat(chat=chat, migrated_to=db.get_chat(conn, chat.migrated_to))
+        supergroup = db.get_chat(conn, chat.migrated_to)
+        if supergroup is not None:
+            log.debug("chat %s migrated to %s; its history is frozen", chat.id, chat.migrated_to)
+            return SyncedChat(chat=chat, migrated_to=supergroup)
+        # the supergroup's row was deleted since (its source removed): ask again, so it is
+        # stored anew rather than followed as a dangling id for good
+        log.info(
+            "chat %s (%s) migrated to %s, which the index no longer holds; checking again",
+            chat.id,
+            chat.title,
+            chat.migrated_to,
+        )
     run = _Run(
         client=client,
         conn=conn,
@@ -665,12 +906,15 @@ async def sync_chat(
         budget=budget,
         cfg=cfg or Config(),
         me=me,
+        peers=_PeerBook(acting),
     )
     try:
-        migrated = await _check_migration(client, conn, chat) if chat.type == "group" else None
+        migrated = (
+            await _check_migration(client, conn, chat, acting) if chat.type == "group" else None
+        )
         if source.comments and chat.type == "channel":
             try:
-                run.discussion = await link_discussion_chat(client, conn, chat)
+                run.discussion = await link_discussion_chat(client, conn, chat, acting)
             except DiscussionUnavailable as exc:
                 run.drop_comments(exc)
         fetched = await _fetch_new(run)
@@ -741,7 +985,7 @@ async def _fetch_new(run: _Run) -> _Fetched:
     seen_up_to = progress
     offset_date = since_of(run.source) if progress == 0 else None
     iterator = run.client.iter_messages(
-        chat.id, min_id=progress, reverse=True, offset_date=offset_date
+        chat.peer_id, min_id=progress, reverse=True, offset_date=offset_date
     )
     async for msg in iterator:
         seen_up_to = max(seen_up_to, int(msg.id))
@@ -750,17 +994,25 @@ async def _fetch_new(run: _Run) -> _Fetched:
             batch.append(row)
             if discussion is not None:
                 run.replies[row.msg_id] = replies_count(msg)
-        if len(batch) < BATCH_SIZE:
+        if len(batch) < _batch_size(run.budget):
             continue
         progress = await _store_batch(run, batch, progress, seen_up_to)
         batch = []
-        if run.budget.expired:
+        if run.budget.halted or progress < seen_up_to:
             complete = False
             break
     if complete and (batch or seen_up_to > progress):
         progress = await _store_batch(run, batch, progress, seen_up_to)
         complete = progress >= seen_up_to
     return _Fetched(progress=progress, complete=complete, discussion=discussion)
+
+
+def _batch_size(budget: SyncBudget) -> int:
+    """How many rows :func:`_fetch_new` gathers before storing them: :data:`BATCH_SIZE`, or
+    fewer when a message allowance has less left, so a run stops close to its cap rather than
+    up to a whole batch past it."""
+    left = budget.messages_left
+    return BATCH_SIZE if left is None else max(1, min(BATCH_SIZE, left))
 
 
 async def _store_batch(run: _Run, batch: list[MessageRow], progress: int, seen_up_to: int) -> int:
@@ -782,7 +1034,12 @@ async def _store_batch(run: _Run, batch: list[MessageRow], progress: int, seen_u
     channel Telegram is already rate-limiting.
     """
     chat = run.chat
-    _track(run.changes, await run.store(batch))
+    ids, kept = await run.store_new(batch)
+    _track(run.changes, ids)
+    if kept < len(batch):
+        # the message allowance ran out inside the batch: what was stored is the progress
+        batch = batch[:kept]
+        seen_up_to = batch[-1].msg_id if batch else progress
     if run.discussion is None:
         run.replies.clear()
         db.set_chat_progress(run.conn, chat.id, seen_up_to, chat.last_sync_at)
@@ -795,13 +1052,15 @@ async def _store_batch(run: _Run, batch: list[MessageRow], progress: int, seen_u
     )
     try:
         for row in batch:
-            if run.budget.expired:
+            if run.budget.halted:
                 break
             if run.discussion is None:
                 progress = seen_up_to
                 break
             if run.replies.pop(row.msg_id, 0) > stored.get(row.msg_id, 0):
                 _track(run.comment_ids, await _fetch_comments(run, row.msg_id))
+                if run.budget.exhausted:
+                    break  # the cap cut its thread short: the post comes again with it next run
             progress = row.msg_id
         else:
             progress = seen_up_to
@@ -826,13 +1085,19 @@ async def _fetch_comments(run: _Run, post_id: int) -> list[int]:
     wait partway through a long one, a cancellation — keeps the prefix it fetched instead of
     dropping everything on the floor and starting from the same place on every later run. The
     next run re-reads the thread from the top (an upsert, so nothing is stored twice) until as
-    many comments are stored as Telegram reports replies.
+    many comments are stored as Telegram reports replies. Comments are new messages like any
+    other: the read stops once the message allowance is :attr:`~SyncBudget.exhausted`, and every
+    batch is stored within it (:meth:`_Run.store_new`), so a research run's cap holds for a
+    channel's threads as it does for its posts. The clock does not cut a thread: it is checked
+    between posts (:func:`_store_batch`).
     """
     assert run.discussion is not None
     rows: list[MessageRow] = []
     stored: list[int] = []
     try:
-        async for msg in run.client.iter_messages(run.chat.id, reply_to=post_id):
+        async for msg in run.client.iter_messages(run.chat.peer_id, reply_to=post_id):
+            if run.budget.exhausted:
+                break
             row = run.map(msg, run.discussion)
             if row is not None:
                 rows.append(
@@ -840,15 +1105,18 @@ async def _fetch_comments(run: _Run, post_id: int) -> list[int]:
                         row, comment_of_chat_id=run.chat.id, comment_of_msg_id=post_id
                     )
                 )
-            if len(rows) >= BATCH_SIZE:
-                stored += await run.store(rows)
-                rows = []
+            if len(rows) >= _batch_size(run.budget):
+                ids, kept = await run.store_new(rows)
+                stored += ids
+                rows = rows[kept:]
+                if rows:
+                    break
     except errors.MsgIdInvalidError:
         log.debug("post %s in channel %s has no comment thread", post_id, run.chat.id)
     except UNAVAILABLE_ERRORS as exc:
         run.drop_comments(exc)
     finally:
-        stored += await run.store(rows)
+        stored += (await run.store_new(rows))[0]
     return stored
 
 
@@ -878,7 +1146,7 @@ async def _refetch_edits(run: _Run, cfg: Config) -> list[int]:
     fresh: list[MessageRow] = []
     replies: dict[int, int] = {}
     seen: set[int] = set()
-    async for msg in run.client.iter_messages(chat.id, limit=cfg.sync.edit_refetch):
+    async for msg in run.client.iter_messages(chat.peer_id, limit=cfg.sync.edit_refetch):
         seen.add(int(msg.id))
         row = run.map(msg, chat)
         if row is not None:
@@ -886,7 +1154,7 @@ async def _refetch_edits(run: _Run, cfg: Config) -> list[int]:
             replies[row.msg_id] = replies_count(msg)
     if not seen:
         return []
-    stored = {row.msg_id: row for row in db.get_messages(run.conn, chat.id, since_msg_id=min(seen))}
+    stored = _with_links(run.conn, db.get_messages(run.conn, chat.id, since_msg_id=min(seen)))
     changed = [row for row in fresh if row.msg_id in stored and _differs(stored[row.msg_id], row)]
     if changed:
         log.debug(
@@ -930,7 +1198,7 @@ async def _drop_deleted(
     left holding no messages is dropped instead of being rebuilt empty. Returns the ids removed.
 
     That transaction goes to a worker thread joined even under cancellation
-    (:func:`_joined_to_thread`), like every other write a sync makes:
+    (:func:`joined_to_thread`), like every other write a sync makes:
     :func:`grepogram.units.invalidate_units_for` re-cuts every window from the deleted message to
     the end of the chat, which is exactly the work :func:`on_chat_synced` is pushed off the event
     loop for — the client's keepalives run on while it happens.
@@ -944,7 +1212,7 @@ async def _drop_deleted(
     if not gone:
         return []
     msg_ids = [row.msg_id for row in gone]
-    await _joined_to_thread(
+    await joined_to_thread(
         functools.partial(_apply_drop, run, cfg, gone, msg_ids), run.budget.cancel
     )
     log.info(
@@ -961,6 +1229,17 @@ def _apply_drop(run: _Run, cfg: Config, gone: Sequence[MessageRow], msg_ids: Seq
     with db.transaction(run.conn):
         db.delete_messages(run.conn, run.chat.id, list(msg_ids))
         index.index_units(run.conn, units.invalidate_units_for(run.conn, run.chat, cfg, gone))
+
+
+def _with_links(conn: sqlite3.Connection, rows: Iterable[MessageRow]) -> dict[int, MessageRow]:
+    """``rows`` by ``msg_id``, each carrying its stored links — a row read back from the index
+    carries ``None`` there (not read), which :func:`_differs` would take for a change."""
+    by_msg_id = {row.msg_id: row for row in rows}
+    links = db.message_links(conn, [row.id for row in by_msg_id.values() if row.id is not None])
+    return {
+        msg_id: dataclasses.replace(row, links=links.get(row.id, ()) if row.id is not None else ())
+        for msg_id, row in by_msg_id.items()
+    }
 
 
 def _differs(stored: MessageRow, fresh: MessageRow) -> bool:
@@ -981,10 +1260,20 @@ def _differs(stored: MessageRow, fresh: MessageRow) -> bool:
     ``media_filename`` — the two columns that say so — are compared here in full, so a replaced
     attachment reaches ``store`` as an edit and is cleared there while a caption edit is not and
     keeps its text.
+
+    The forward origin and the ``links`` are compared in full (``stored`` carries its links,
+    :func:`_with_links`), so **changed links alone re-store a row**: a bot that swaps its URL
+    buttons with ``edit_hide`` set moves no ``edit_date``, and the upsert replaces the stored
+    links with exactly what the re-stored row carries — never with less than a comparison saw.
+    The first sync after schema step 8 therefore re-stores, once, the rows of each chat's
+    ``edit_refetch`` window that name a Telegram destination or were forwarded, which is how
+    those rows gain what step 8 captures; rows outside the window keep none — discovery reads
+    their text instead (``messages.links_read``) until ``grepogram recapture-links``
+    (:func:`recapture_links`) re-reads them.
     """
     kept = {
         field: getattr(stored, field) if getattr(fresh, field) is None else getattr(fresh, field)
-        for field in ("topic_id", "comment_of_chat_id", "comment_of_msg_id")
+        for field in ("topic_id", "comment_of_chat_id", "comment_of_msg_id", "links")
     }
     return _comparable(dataclasses.replace(stored, id=None)) != _comparable(
         dataclasses.replace(fresh, **kept)
@@ -1020,7 +1309,7 @@ async def _refresh_comments(
     touched: list[int] = []
     reread: list[int] = []
     for post_id in grown:
-        if run.budget.expired or run.discussion is None:
+        if run.budget.halted or run.discussion is None:
             break
         ids = await _fetch_comments(run, post_id)
         _track(run.comment_ids, ids)
@@ -1058,10 +1347,23 @@ def _refresh_comment_reactions(run: _Run, row_ids: Sequence[int]) -> None:
     db.refresh_unit_reactions(run.conn, run.discussion.id, [row.msg_id for row in rows])
 
 
-async def _check_migration(client: Any, conn: sqlite3.Connection, chat: ChatRow) -> ChatRow | None:
-    """Detect a legacy group upgraded to a supergroup; upsert and return the new chat row."""
+async def _check_migration(
+    client: Any, conn: sqlite3.Connection, chat: ChatRow, account: str
+) -> ChatRow | None:
+    """Detect a legacy group upgraded to a supergroup; upsert and return the new chat row.
+
+    The group is asked about by its peer id, which a group stored under a synthetic row id does
+    not share; the supergroup is a shared chat, found by its Telegram identity and stored through
+    ``account``, whose client is the one asking.
+
+    The supergroup inherits the group's coverage and reach (:func:`_inherit_coverage`): every
+    source that covered the group covers it in ``chat_sources``, and every account that reached
+    the group reaches it in ``chat_access`` — ``account`` with the access hash it resolved.
+    Without them ``sources rm`` of the primary would delete the supergroup while another
+    configured source still covers the group, and a fallback would not know who reaches it.
+    """
     try:
-        entity = await client.get_entity(chat.id)
+        entity = await client.get_entity(chat.peer_id)
     except ValueError as exc:
         log.warning("chat %s (%s): cannot check for migration: %s", chat.id, chat.title, exc)
         return None
@@ -1069,7 +1371,8 @@ async def _check_migration(client: Any, conn: sqlite3.Connection, chat: ChatRow)
     if target is None:
         return None
     new_id = dialogs.peer_id(types.PeerChannel(int(target.channel_id)))
-    new_chat = db.get_chat(conn, new_id)
+    new_chat = db.get_chat_by_peer(conn, new_id, chat_scope("supergroup", account))
+    resolved: int | None = None
     if new_chat is None:
         try:
             entity = await client.get_entity(new_id)
@@ -1082,16 +1385,48 @@ async def _check_migration(client: Any, conn: sqlite3.Connection, chat: ChatRow)
                 exc,
             )
             return None
-        new_chat = db.upsert_chat(conn, _chat_row_from_entity(entity, chat.source_id))
-    db.set_chat_migrated(conn, chat.id, new_id)
-    log.info("chat %s (%s) migrated to supergroup %s", chat.id, chat.title, new_id)
+        new_chat = db.upsert_chat(
+            conn, _chat_row_from_entity(entity, chat.source_id, account), account
+        )
+        found = getattr(entity, "access_hash", None)
+        resolved = None if found is None else int(found)
+    _inherit_coverage(conn, chat, new_chat, account, resolved)
+    db.set_chat_migrated(conn, chat.id, new_chat.id)
+    log.info("chat %s (%s) migrated to supergroup %s", chat.id, chat.title, new_chat.id)
     return new_chat
 
 
+def _inherit_coverage(
+    conn: sqlite3.Connection,
+    group: ChatRow,
+    supergroup: ChatRow,
+    account: str,
+    access_hash: int | None,
+) -> None:
+    """Give ``supergroup`` the coverage and reach of the legacy ``group`` it replaced, in one
+    transaction: its sources (``chat_sources``, the primary included) and its accounts
+    (``chat_access``), ``account`` — the one that found the migration — with ``access_hash``."""
+    covering = [*db.chat_source_ids(conn, group.id)]
+    if group.source_id and not group.source_id.startswith(IMPORT_PREFIX):
+        covering.append(group.source_id)
+    with db.transaction(conn):
+        db.add_chat_sources(conn, supergroup.id, covering)
+        for reaching in dict.fromkeys([*db.chat_accounts(conn, group.id), account]):
+            db.set_chat_access(
+                conn,
+                supergroup.id,
+                reaching,
+                access_hash=access_hash if reaching == account else None,
+            )
+
+
 async def link_discussion_chat(
-    client: Any, conn: sqlite3.Connection, channel: ChatRow
+    client: Any, conn: sqlite3.Connection, channel: ChatRow, account: str
 ) -> ChatRow | None:
     """Upsert the channel's linked discussion group as its own ``chats`` row.
+
+    ``client`` is ``account``'s, and the group is stored through that account
+    (:func:`grepogram.db.upsert_chat`); the channel is asked about by its peer id.
 
     The row carries ``discussion_of = channel.id`` and the ``source_id``
     :func:`~grepogram.sources.discussion_source_id` decides: a group a source covers on its own
@@ -1122,7 +1457,7 @@ async def link_discussion_chat(
     is useful: a group the account was kicked from still comes back inside ``full.chats``, so
     nothing else here would ever fail on it.
     """
-    full = await client(functions.channels.GetFullChannelRequest(channel.id))
+    full = await client(functions.channels.GetFullChannelRequest(channel.peer_id))
     linked = getattr(full.full_chat, "linked_chat_id", None)
     if not linked:
         _relink_discussion(conn, channel, None)
@@ -1149,7 +1484,7 @@ async def link_discussion_chat(
             ) from exc
     with db.transaction(conn):
         source_id = discussion_source_id(db.get_chat(conn, linked_id), channel)
-        stored = db.upsert_chat(conn, _chat_row_from_entity(entity, source_id))
+        stored = db.upsert_chat(conn, _chat_row_from_entity(entity, source_id, account), account)
         _relink_discussion(conn, channel, stored.id)
     return _refresh(conn, stored)
 
@@ -1227,10 +1562,18 @@ def _drop_comment_units(conn: sqlite3.Connection, channel_id: int | None, group_
     )
 
 
-def _chat_row_from_entity(entity: Any, source_id: str | None) -> ChatRow:
+def _chat_row_from_entity(entity: Any, source_id: str | None, account: str) -> ChatRow:
+    """The row of a Telegram entity reached through ``account``, for :func:`db.upsert_chat`.
+
+    The scope is spelled out rather than left to :class:`ChatRow`'s default, which is the
+    default account's: a user, bot or legacy group some other account reached must never be
+    filed under ``default``. ``id`` is the peer id only as a proposal — the upsert allocates.
+    """
     info = dialogs.dialog_info(entity)
     return ChatRow(
         id=info.id,
+        peer_id=info.id,
+        scope=chat_scope(info.type, account),
         type=info.type,
         title=info.title,
         username=info.username,
@@ -1273,7 +1616,7 @@ def on_chat_synced(
         db.mark_indexed(conn, new_msg_ids)
 
 
-async def _joined_to_thread[T](job: Callable[[], T], abort: Callable[[], None] | None = None) -> T:
+async def joined_to_thread[T](job: Callable[[], T], abort: Callable[[], None] | None = None) -> T:
     """Run ``job`` on a worker thread and never leave it writing on its own.
 
     ``await asyncio.to_thread(...)`` submits the job before it suspends, so a cancellation —
@@ -1293,6 +1636,10 @@ async def _joined_to_thread[T](job: Callable[[], T], abort: Callable[[], None] |
     only when the process is killed outright, and then the ``messages.indexed`` flags its
     transaction never cleared make the next run rebuild and repair what it left
     (:func:`index_pending`, :func:`grepogram.index.repair_unit_index`).
+
+    ``abort`` is for a cancellation and nothing else: a job that *raised* has already stopped,
+    and the budget ``abort`` expires is the whole run's, shared by every account's queue — one
+    chat's failed re-cut would otherwise end every other account's fetch at its next batch.
     """
     finished = threading.Event()
 
@@ -1306,6 +1653,8 @@ async def _joined_to_thread[T](job: Callable[[], T], abort: Callable[[], None] |
     try:
         return await asyncio.shield(future)
     except BaseException:
+        if finished.is_set():
+            raise
         if abort is not None:
             abort()
         while not finished.wait(JOIN_LOG_EVERY):
@@ -1325,7 +1674,7 @@ async def index_pending(conn: sqlite3.Connection, cfg: Config, chat: ChatRow) ->
     left behind get them on the next run. The chat rows are re-read, since a fetch may have
     changed them or linked the discussion group; a chat removed meanwhile has nothing to index.
     This is the step a cancelled sync runs on its way out, so the worker thread is joined rather
-    than abandoned (:func:`_joined_to_thread`). Rows flagged in a chat this run holds no handle on
+    than abandoned (:func:`joined_to_thread`). Rows flagged in a chat this run holds no handle on
     — a discussion group it was unlinked from meanwhile — are :func:`index_stranded`'s to repair
     at the end of the run.
     """
@@ -1334,7 +1683,7 @@ async def index_pending(conn: sqlite3.Connection, cfg: Config, chat: ChatRow) ->
             continue
         pending = db.unindexed_message_ids(conn, row.id)
         if pending:
-            await _joined_to_thread(functools.partial(on_chat_synced, conn, row, cfg, pending))
+            await joined_to_thread(functools.partial(on_chat_synced, conn, row, cfg, pending))
 
 
 async def index_stranded(
@@ -1366,7 +1715,7 @@ async def index_stranded(
             chat.title,
             len(pending),
         )
-        await _joined_to_thread(functools.partial(on_chat_synced, conn, chat, cfg, pending))
+        await joined_to_thread(functools.partial(on_chat_synced, conn, chat, cfg, pending))
 
 
 async def recut_pending_chats(
@@ -1381,8 +1730,9 @@ async def recut_pending_chats(
     just finished, and never hooked into :func:`on_chat_synced`: nothing is left flagged outside
     the transaction that rebuilds it, so no later run — least of all a 20-second auto-sync inside
     a ``search`` — inherits a whole-index backlog to drain. Who may start one is decided by the
-    caller, not by how many seconds are left: :func:`sync_all` takes ``recut``, and the automatic
-    sync inside an MCP ``search`` is the one caller that passes ``False``.
+    caller, not by how many seconds are left: :func:`sync_all` takes ``recut``, and two callers
+    pass ``False`` — the automatic sync inside an MCP ``search``
+    (:func:`grepogram.mcp._auto_sync`) and a research run (:func:`grepogram.research.running.run`).
 
     The procedure, in order:
 
@@ -1400,7 +1750,7 @@ async def recut_pending_chats(
        still ends it, and the marker makes the next run continue. A budget that was *cancelled*
        keeps nothing back: the caller is going away and the lock with it;
     #. each chat is one transaction on a worker thread joined even under cancellation
-       (:func:`_joined_to_thread`, with :meth:`SyncBudget.cancel` as the abort): re-read the chat
+       (:func:`joined_to_thread`, with :meth:`SyncBudget.cancel` as the abort): re-read the chat
        row and skip it when it is gone, :func:`grepogram.units.recut_chat`, index the delta,
        repair the unit index, write the marker. The indexing lives here rather than in
        :mod:`grepogram.units`, which cannot import :mod:`grepogram.index`, and **no message ids
@@ -1425,9 +1775,7 @@ async def recut_pending_chats(
                 len(pending) - position,
             )
             break
-        done = await _joined_to_thread(
-            functools.partial(_recut_one, conn, cfg, chat), budget.cancel
-        )
+        done = await joined_to_thread(functools.partial(_recut_one, conn, cfg, chat), budget.cancel)
         recut += int(done)
     if recut and embedder is None:
         log.warning(
@@ -1488,15 +1836,24 @@ ConfigSource = Config | Callable[[], Config]
 
 
 async def sync_all(
-    client: Any,
+    clients: Mapping[str, Any],
     conn: sqlite3.Connection,
     cfg: ConfigSource,
     paths: Paths,
     budget: SyncBudget,
     embedder: Embedder | None = None,
     recut: bool = True,
+    only: Collection[str] | None = None,
 ) -> SyncReport:
-    """Sync every configured source within ``budget``; the client must be connected.
+    """Sync every configured source within ``budget``; every client must be connected.
+
+    ``clients`` maps an account to its client, and every account's sources are resolved and
+    fetched through its own (:func:`_sync_chats`): one queue per account, run concurrently, each
+    chat fetched once — by the account of its primary source, falling back to another account
+    that reaches a shared chat when that one is refused. A source whose account has no client in
+    the mapping is skipped with a warning (:func:`~grepogram.sources.resolve_sources`). ``only``
+    narrows the fetch to the chats the named sources (``Source.id``) cover; every source is still
+    resolved, so a chat's primary source is the same whichever sources a run fetches.
 
     Takes the :class:`SyncLock` (:class:`SyncInProgress` when another process syncs), resolves
     the sources into chats, and processes them oldest-synced first (never-synced chats before
@@ -1508,13 +1865,13 @@ async def sync_all(
     a config they own (tests, a one-shot script) pass it as it is. Every stored row no rebuild
     has covered yet goes through :func:`on_chat_synced` (:func:`index_pending`) — after each
     chat's fetch, however it ended, and for the chats the run did not reach. A flood wait
-    Telegram will not let the client sleep through stops the run with a warning; a chat Telegram
-    refuses is reported in ``unavailable``; an
-    unauthorized session raises :class:`~telethon.errors.UnauthorizedError`, which the
-    :func:`~grepogram.tg.connected` block every caller runs in turns into
-    :class:`~grepogram.tg.AuthRequired`. The end of the run is stamped in ``meta.last_sync_run``
-    whether or not a chat completed, so a caller deciding whether the index is stale does not
-    retry a run that has nothing to finish.
+    Telegram will not let a client sleep through stops that account's queue with a warning and
+    leaves the other accounts' going; a chat Telegram refuses is reported in ``unavailable``; a
+    session Telegram rejects raises :class:`~grepogram.tg.AuthRequired` naming its account (any
+    other ``UnauthorizedError`` propagates as it is, for :func:`~grepogram.tg.connected` to turn
+    into one). The end of the run is stamped in ``meta.last_sync_run`` whether or not a chat
+    completed, so a caller deciding whether the index is stale does not retry a run that has
+    nothing to finish.
 
     ``recut`` says whether this run may start the one-time unit re-cut
     (:func:`recut_pending_chats`). It is a property of the caller, not of the budget: an
@@ -1527,11 +1884,12 @@ async def sync_all(
 
     With an ``embedder`` the run ends by embedding the dirty units under the same budget and
     lock (:func:`~grepogram.index.embed_dirty_units`); units the budget leaves unembedded and a
-    changed embedding model become ``warnings`` — the messages are synced either way.
+    changed embedding model become ``warnings`` — the messages are synced either way. The
+    re-cut and the embedding run once per run, after every account's queue is done.
     """
     with SyncLock(paths):
         current = cfg if isinstance(cfg, Config) else cfg()
-        report = await _sync_chats(client, conn, current, budget)
+        report = await _sync_chats(clients, conn, current, budget, only)
         if recut:
             await recut_pending_chats(conn, current, budget, embedder)
         db.set_last_sync_run(conn, int(time.time()))
@@ -1545,7 +1903,7 @@ async def _embed_after_sync(
 ) -> SyncReport:
     """Embed what the sync left dirty, off the event loop so the client's keepalives run on.
 
-    Joined like the indexing step (:func:`_joined_to_thread`): a cancelled run releases the
+    Joined like the indexing step (:func:`joined_to_thread`): a cancelled run releases the
     :class:`SyncLock` only once the worker thread has stopped writing vectors. This is the long
     job of the two, so the cancellation expires the budget it paces itself against
     (:meth:`SyncBudget.cancel`) and it stops after the batch it is on rather than after the
@@ -1553,7 +1911,7 @@ async def _embed_after_sync(
     """
     warnings = list(report.warnings)
     try:
-        embedded = await _joined_to_thread(
+        embedded = await joined_to_thread(
             functools.partial(index.embed_dirty_units, conn, embedder, budget=budget),
             budget.cancel,
         )
@@ -1573,18 +1931,30 @@ async def _embed_after_sync(
 
 @dataclass(slots=True)
 class _Tally:
-    """What the chat loop accumulates on its way to a :class:`SyncReport`."""
+    """What the chat loop accumulates on its way to a :class:`SyncReport`.
 
+    One tally for the whole run, whichever account's queue a chat went through. ``labelled``
+    is set when the run holds any account but the default one: each warning then starts with
+    ``account <name>:`` so a report of several accounts says whose fetch it is about, while a
+    single-account install reads exactly what it always did.
+    """
+
+    labelled: bool = False
     new: int = 0
     done: list[int] = field(default_factory=list)
     remaining: list[int] = field(default_factory=list)
     unavailable: list[int] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
 
-    def record(self, chat_id: int, synced: SyncedChat) -> None:
-        """Count one finished chat: its new messages, its warnings and where it ended up."""
+    def warn(self, account: str, warning: str) -> None:
+        self.warnings.append(account_warning(self.labelled, account, warning))
+
+    def record(self, chat_id: int, synced: SyncedChat, account: str) -> None:
+        """Count one finished chat: its new messages, its warnings — labelled with ``account``,
+        the one that fetched it — and where it ended up."""
         self.new += synced.new + (0 if synced.discussion is None else synced.discussion.new)
-        self.warnings.extend(synced.warnings)
+        for warning in synced.warnings:
+            self.warn(account, warning)
         if synced.unavailable:
             self.unavailable.append(chat_id)
         elif synced.complete:
@@ -1609,102 +1979,464 @@ class _Tally:
         )
 
 
-def _record_failure(tally: _Tally, chat: ChatRow, exc: Exception) -> bool:
-    """Turn one chat's failure into warnings; returns whether the whole run must stop.
+def _record_failure(tally: _Tally, chat: ChatRow, exc: Exception, account: str) -> None:
+    """Turn one chat's failure into a warning.
 
-    A flood wait is about the account rather than the chat, so the run ends and every chat left
-    is reported as remaining. An RPC error costs this chat its run, and a chat whose row
+    An RPC error — or a peer the account's client cannot address at all, the plain
+    ``ValueError`` Telethon raises for it — costs this chat its run, and a chat whose row
     disappeared under the sync — a removal that got past the lock, or a hand-edited database —
-    costs it silently: it is gone, so there is nothing left to resume. An unauthorized session
-    never reaches here; :func:`_sync_chats` re-raises it.
+    costs it silently: it is gone, so there is nothing left to resume. A flood wait never
+    reaches here (:func:`through_accounts` stops the account instead), nor does an unauthorized
+    session, which is re-raised naming its account.
     """
-    if isinstance(exc, errors.FloodWaitError):
-        log.warning("flood wait of %ss on chat %s; stopping this run", exc.seconds, chat.id)
-        tally.warnings.append(
-            f"flood wait: Telegram asks to wait {exc.seconds}s before more history "
-            "requests; run sync again later"
-        )
-        return True
-    if isinstance(exc, errors.RPCError):
+    if isinstance(exc, errors.RPCError | ValueError):
         log.warning("chat %s (%s): %s; skipped this run", chat.id, chat.title, exc)
-        tally.warnings.append(f"chat {chat.id} ({chat.title}): {exc}")
+        tally.warn(account, f"chat {chat.id} ({chat.title}): {exc}")
         tally.remaining.append(chat.id)
-        return False
+        return
     log.warning("chat %s (%s) was removed during the sync: %s", chat.id, chat.title, exc)
-    tally.warnings.append(f"chat {chat.id} ({chat.title}) was removed while it was being synced")
-    return False
+    tally.warn(account, f"chat {chat.id} ({chat.title}) was removed while it was being synced")
+
+
+def _flood_text(seconds: int) -> str:
+    return flood_warning(seconds, "more history requests", "run sync again later")
+
+
+@dataclass(slots=True, eq=False)
+class _Lane:
+    """One account's share of a run: its client, who it is, and the chats it fetches first.
+
+    Whether the account is stopped — a flood wait in its own queue, in a fallback another queue
+    made through it, or while its sources were resolved — is :attr:`_SyncPass.stopped`, which
+    ends the queue at its next chat.
+    """
+
+    account: str
+    client: Any
+    me: UserRow | None
+    queue: deque[tuple[ChatRow, Source]] = field(default_factory=deque)
+    """The chats to fetch, each with the source it is fetched for — checked once, when the chat
+    was queued (:func:`_enqueue`)."""
+    turn: asyncio.Lock = field(default_factory=asyncio.Lock)
+    """Held for every fetch through this account, its own queue's and every fallback another
+    queue makes through it (:func:`_fetch_chat`): one account never runs two fetches at once,
+    and one that waited for its turn sees a flood wait the other hit before it asks anything."""
+
+
+@dataclass(slots=True, eq=False)
+class _SyncPass:
+    """What every account's queue of one run shares: the index, the budget, the sources, the
+    lanes and the tally, the accounts a flood wait stopped, the chat ids already taken so no
+    chat is fetched twice, and the sources the report already says did not resolve."""
+
+    conn: sqlite3.Connection
+    cfg: Config
+    budget: SyncBudget
+    sources: dict[str, Source]
+    lanes: dict[str, _Lane]
+    tally: _Tally
+    stopped: set[str] = field(default_factory=set)
+    processed: set[int] = field(default_factory=set)
+    queued: set[int] = field(default_factory=set)
+    deferred: list[ChatRow] = field(default_factory=list)
+    unfetched: dict[str, int] = field(default_factory=dict)
+    unresolved: set[str] = field(default_factory=set)
+
+    @property
+    def clients(self) -> dict[str, Any]:
+        return {account: lane.client for account, lane in self.lanes.items()}
 
 
 async def _sync_chats(
-    client: Any, conn: sqlite3.Connection, cfg: Config, budget: SyncBudget
+    clients: Mapping[str, Any],
+    conn: sqlite3.Connection,
+    cfg: Config,
+    budget: SyncBudget,
+    only: Collection[str] | None = None,
 ) -> SyncReport:
-    """The chat loop of :func:`sync_all`.
+    """The chat loop of :func:`sync_all`, one queue per account.
 
-    The unit rebuild runs on a worker thread so the loop keeps serving the client's keepalives
+    Each account first signs its own ``me`` (the sender of its outgoing private messages,
+    recorded in ``accounts``), then the sources of every account are resolved once, each through
+    its own client (:func:`~grepogram.sources.resolve_sources`). Both steps are guarded per
+    account, with the client's flood-sleep threshold capped against the budget first: a flood
+    wait or a Telegram error on one account's ``get_me`` or resolve stops *that* account with a
+    warning — its sources keep what they covered and stay the primary of their chats — and a
+    rejected session is raised as :class:`~grepogram.tg.AuthRequired` naming the account it
+    belongs to. A source that does not resolve on its own (its chat or folder no longer names
+    anything its account reaches) is a warning in the report too, never only a log line: an
+    approved source that never syncs would otherwise look like one with nothing new. A run
+    limited by ``only`` warns about the sources it names alone, and the chat such a source
+    keeps, fetched through another account, carries no second warning for the same cause.
+
+    Every chat goes to the queue of the first account :func:`reaching_accounts` names that is in
+    the run and not stopped — its primary source's account when that one can — so a channel two
+    accounts' sources cover is one row fetched once, and a chat whose own account has no client
+    this run goes through another account that reaches it. When no account can take it
+    (:func:`_enqueue`), it is remaining only if a flood wait stopped an account that reaches it —
+    the next run fetches it; when no account of this run reaches it at all, it is counted in
+    :attr:`_SyncPass.unfetched` and the report carries one warning per account instead, since
+    running the sync again would not fetch it. The queues run concurrently: each account talks
+    to Telegram over its own connection and is rate-limited on its own, and the one database
+    connection serialises their writes (:class:`grepogram.db.Connection`), every transaction
+    being free of ``await``.
+    Everything the queues share is in :class:`_SyncPass`. A failure that ends the run (an
+    unauthorized session) cancels the other queues, which still index what they committed on
+    their way out, and is re-raised as itself; a second account failing at the same time is
+    logged and noted on the first.
+
+    The unit rebuild runs on a worker thread so the loop keeps serving the clients' keepalives
     while a big chat is cut into units; it runs for every chat once its fetch is over — after
     the last batch, or after the batch a flood wait, an RPC error or a cancellation interrupted,
     which stays committed and searchable either way — and at the end for the chats the budget
     or a flood wait kept the run from reaching, whose pending rows come from an earlier run. The
     run ends with :func:`index_stranded`, a bounded sweep of the chats no source and no link
-    leads to any more but that still hold flagged rows. Failures are :func:`_record_failure`'s to
-    describe; the tally becomes the report.
+    leads to any more but that still hold flagged rows — once, after every queue. Failures are
+    :func:`_record_failure`'s to describe; the tally becomes the report.
     """
-    me = _self_row(await client.get_me())
-    queue = deque(sorted(await resolve_sources(cfg, client, conn), key=_sync_order))
-    queued = {chat.id for chat in queue}
-    sources = {source.id: source for source in cfg.sources}
-    tally = _Tally()
-    processed: set[int] = set()
-    deferred: list[ChatRow] = []
-    while queue:
-        chat = queue.popleft()
-        queued.discard(chat.id)
-        processed.add(chat.id)
-        source = sources.get(chat.source_id or "")
-        if source is None:
-            log.debug("chat %s has no configured source; skipped", chat.id)
-            continue
-        if budget.expired:
-            tally.remaining.append(chat.id)
-            deferred.append(chat)
-            continue
-        _cap_flood_sleep(client, cfg.sync, budget)
-        try:
-            try:
-                synced = await sync_chat(client, conn, chat, source, budget, cfg=cfg, me=me)
-            finally:
-                await index_pending(conn, cfg, chat)
-        except errors.UnauthorizedError:
-            raise
-        except (errors.RPCError, sqlite3.IntegrityError) as exc:
-            if _record_failure(tally, chat, exc):
-                tally.remaining.extend([chat.id, *(c.id for c in queue)])
-                break
-            continue
-        tally.record(chat.id, synced)
-        migrated = synced.migrated_to
-        if migrated is not None and migrated.id not in processed and migrated.id not in queued:
-            queue.append(migrated)
-            queued.add(migrated.id)
-    for chat in [*deferred, *queue]:
+    tally = _Tally(labelled=labels_accounts(clients))
+    lanes, stopped = await _open_lanes(clients, conn, cfg, budget, tally)
+    usable = {account: lane.client for account, lane in lanes.items() if account not in stopped}
+    resolution = await resolve_sources(cfg, usable, conn)
+    stopped |= set(resolution.flooded)
+    unresolved = _report_resolution(resolution, only, tally)
+    run = _SyncPass(
+        conn=conn,
+        cfg=cfg,
+        budget=budget,
+        sources={source.id: source for source in cfg.sources},
+        lanes=lanes,
+        tally=tally,
+        stopped=stopped,
+        unresolved=unresolved,
+    )
+    for chat in sorted(_only(conn, resolution.chats, only, run.sources), key=_sync_order):
+        _enqueue(run, chat)
+    for account, count in run.unfetched.items():
+        tally.warn(
+            account,
+            f"{count} chats were not fetched: no account in this run reaches them, and "
+            f"account {account} itself is not signed in or not part of it",
+        )
+    failures: list[BaseException] = []
+    try:
+        async with asyncio.TaskGroup() as group:
+            for lane in lanes.values():
+                if lane.queue:
+                    group.create_task(_run_lane(run, lane))
+    except BaseExceptionGroup as grouped:
+        failures = _flattened(grouped)
+    if failures:
+        first = failures[0]
+        for other in failures[1:]:
+            log.warning("sync: another account failed in the same run: %s", other)
+            first.add_note(f"another account failed in the same run: {other}")
+        raise first
+    for chat in run.deferred:
         await index_pending(conn, cfg, chat)
     await index_stranded(conn, cfg)
-    return tally.report()
+    return run.tally.report()
 
 
-def _cap_flood_sleep(client: Any, sync_cfg: SyncCfg, budget: SyncBudget) -> None:
-    """Never let Telethon sleep through a flood wait longer than the budget has left.
+async def _open_lanes(
+    clients: Mapping[str, Any],
+    conn: sqlite3.Connection,
+    cfg: Config,
+    budget: SyncBudget,
+    tally: _Tally,
+) -> tuple[dict[str, _Lane], set[str]]:
+    """One lane per account of the run, and the accounts stopped before their first chat.
 
-    ``flood_sleep_threshold`` is what the client sleeps through on its own; a wait above it
-    raises :class:`~telethon.errors.FloodWaitError`, which :func:`_sync_chats` turns into a
-    warning. Inside a bounded run the threshold shrinks with the time left, so a 20-second
-    auto-sync never blocks a search for the two minutes the config allows an unattended sync.
+    Each client gets the flood-sleep cap first and is then asked who it is
+    (:func:`ask_account`, ``always``): one that is another Telegram user than the index recorded
+    gets no lane at all, one a Telegram error kept from answering gets a stopped lane — its
+    chats are the next run's — and every other records its first sign-in
+    (:func:`_record_account`). Every account left out is a warning in ``tally``."""
+    lanes: dict[str, _Lane] = {}
+    stopped: set[str] = set()
+    for account, client in clients.items():
+        cap_flood_sleep(client, cfg.sync, budget)
+        answer = await ask_account(conn, account, client, always=True)
+        if answer.left_out is not None:
+            tally.warn(account, answer.left_out)
+            if not answer.other_user:  # a Telegram error: its chats are the next run's
+                lanes[account] = _Lane(account=account, client=client, me=None)
+                stopped.add(account)
+            continue
+        me = None if answer.me is None else _self_row(answer.me)
+        lanes[account] = _Lane(account=account, client=client, me=me)
+        _record_account(conn, lanes[account])
+    return lanes, stopped
+
+
+def _report_resolution(
+    resolution: Resolution, only: Collection[str] | None, tally: _Tally
+) -> set[str]:
+    """Warn in ``tally`` about every account whose resolve Telegram stopped and every source
+    that did not resolve on its own — of those, only the ones ``only`` names when a run is
+    limited to some; every source is resolved whatever ``only`` says. Returns the ids of the
+    sources the report warned about."""
+    for account, seconds in resolution.flooded.items():
+        tally.warn(account, _flood_text(seconds))
+    for account, error in resolution.failed.items():
+        tally.warn(account, f"its sources could not be resolved ({error}); they keep what they had")
+    unresolved: set[str] = set()
+    for missed in resolution.unresolved:
+        if only is not None and missed.source_id not in only:
+            continue
+        unresolved.add(missed.source_id)
+        tally.warn(
+            missed.account,
+            f"source {missed.source_id} did not resolve ({missed.reason}); it keeps the chats it "
+            "already covered",
+        )
+    return unresolved
+
+
+def _record_account(conn: sqlite3.Connection, lane: _Lane) -> None:
+    """Remember who ``lane.account`` turned out to be — its first sign-in, or a display name
+    that changed. :func:`ask_account` has already refused a session of a Telegram user other
+    than the one recorded under that name: fetching with it would store another user's private
+    chats over the recorded user's, under the same scoped rows, and address peers with access
+    hashes that are not its own."""
+    if lane.me is None:
+        return
+    db.upsert_account(
+        conn,
+        AccountRow(
+            name=lane.account,
+            user_id=lane.me.id,
+            display_name=lane.me.display_name,
+        ),
+    )
+
+
+def _only(
+    conn: sqlite3.Connection,
+    resolved: Sequence[ChatRow],
+    only: Collection[str] | None,
+    sources: Mapping[str, Source],
+) -> list[ChatRow]:
+    """The resolved chats a run limited to the sources ``only`` names fetches: those any of them
+    covers (``chat_sources``), whichever source is their primary. ``None`` keeps every chat."""
+    if only is None:
+        return list(resolved)
+    wanted = set(only)
+    for source_id in sorted(wanted - set(sources)):
+        log.warning("sync: %s is not a configured source; nothing of it was fetched", source_id)
+    return [chat for chat in resolved if wanted & set(db.chat_source_ids(conn, chat.id))]
+
+
+def _enqueue(run: _SyncPass, chat: ChatRow) -> None:
+    """Put a resolved chat in the queue of the first account that may fetch it.
+
+    A chat with no configured source is skipped, and so is a private chat misfiled under another
+    account's source (reported). Otherwise it goes to the first account :func:`_route` names.
+    When it names none, the chat's pending rows are still indexed in the run's deferred pass, and
+    the report says why it was not fetched: a flood wait stopped every account that reaches it —
+    it is remaining, and the next run fetches it — or no account of this run reaches it at all,
+    its own having no client (not signed in, or left out), which :attr:`_SyncPass.unfetched`
+    counts per account for one warning each rather than listing it as remaining: running the
+    sync again would not fetch it.
     """
-    remaining = budget.remaining
-    threshold = sync_cfg.flood_sleep_threshold
-    if remaining is not None:
-        threshold = min(threshold, math.ceil(remaining))
-    client.flood_sleep_threshold = threshold
+    source = run.sources.get(chat.source_id or "")
+    if source is None:
+        log.debug("chat %s has no configured source; skipped", chat.id)
+        return
+    foreign = foreign_scope(chat, source)
+    if foreign is not None:
+        log.warning("%s; skipped", foreign)
+        run.tally.warn(source.account, foreign)
+        return
+    route = _route(run, chat)
+    if not route:
+        run.deferred.append(chat)
+        if any(account in run.stopped for account in reaching_accounts(run.conn, chat, run.lanes)):
+            run.tally.remaining.append(chat.id)
+            return
+        log.info(
+            "chat %s (%s): no account of this run reaches it (its own is %s); not fetched",
+            chat.id,
+            chat.title,
+            source.account,
+        )
+        run.unfetched[source.account] = run.unfetched.get(source.account, 0) + 1
+        return
+    run.lanes[route[0]].queue.append((chat, source))
+    run.queued.add(chat.id)
+
+
+def _route(run: _SyncPass, chat: ChatRow, first: str | None = None) -> list[str]:
+    """The accounts of this run to fetch ``chat`` through, in order: ``first`` when given, then
+    :func:`reaching_accounts` — the same order every pass over stored chats uses — leaving out
+    the accounts a flood wait stopped."""
+    order = reaching_accounts(run.conn, chat, run.lanes)
+    if first is not None:
+        order = [first, *(account for account in order if account != first)]
+    return [account for account in order if account not in run.stopped]
+
+
+def _flattened(grouped: BaseExceptionGroup[BaseException]) -> list[BaseException]:
+    """Every failure inside ``grouped``, unwrapped from every nested group, in order."""
+    found: list[BaseException] = []
+    for exc in grouped.exceptions:
+        found += _flattened(exc) if isinstance(exc, BaseExceptionGroup) else [exc]
+    return found
+
+
+async def _run_lane(run: _SyncPass, lane: _Lane) -> None:
+    """Fetch ``lane``'s queue, one chat after the other, until it is empty or the account stops.
+
+    A chat the budget or a flood wait keeps from its turn is reported as remaining and handed to
+    the run's deferred pass (:func:`index_pending` for what earlier runs left); a chat a fetch
+    went through is indexed right after it, however it ended. A legacy group that turns out to
+    have migrated has its supergroup appended to this queue, unless some queue has taken it.
+    """
+    tally = run.tally
+    while lane.queue:
+        chat, source = lane.queue.popleft()
+        run.queued.discard(chat.id)
+        run.processed.add(chat.id)
+        if lane.account in run.stopped or run.budget.halted:
+            tally.remaining.append(chat.id)
+            run.deferred.append(chat)
+            continue
+        try:
+            try:
+                fetched = await _fetch_chat(run, lane, chat, source)
+            finally:
+                await index_pending(run.conn, run.cfg, chat)
+        except sqlite3.IntegrityError as exc:
+            _record_failure(tally, chat, exc, lane.account)
+            continue
+        if fetched.error is not None:
+            _record_failure(tally, chat, fetched.error, fetched.account)
+        elif fetched.synced is None:
+            tally.remaining.append(chat.id)
+        else:
+            tally.record(chat.id, fetched.synced, fetched.account)
+            migrated = fetched.synced.migrated_to
+            if migrated is not None and migrated.id not in run.processed | run.queued:
+                _enqueue_migrated(run, lane, migrated)
+        if lane.account in run.stopped and lane.queue:
+            tally.remaining.extend(c.id for c, _ in lane.queue)
+            run.deferred.extend(c for c, _ in lane.queue)
+            lane.queue.clear()
+
+
+def _enqueue_migrated(run: _SyncPass, lane: _Lane, supergroup: ChatRow) -> None:
+    """Queue the supergroup a legacy group migrated to on ``lane``, for the source its row is
+    filed under. A supergroup is shared, so no account's scope stands in the way; one no
+    configured source covers is left alone."""
+    source = run.sources.get(supergroup.source_id or "")
+    if source is None:
+        log.debug("chat %s has no configured source; skipped", supergroup.id)
+        return
+    lane.queue.append((supergroup, source))
+    run.queued.add(supergroup.id)
+
+
+@dataclass(frozen=True, slots=True)
+class _Fetch:
+    """How one chat's fetch ended: through ``account`` with ``synced``, with ``error`` (the
+    account it came through named for the report), or with neither when no account was asked —
+    every one that reaches the chat stopped by a flood wait, or the budget spent."""
+
+    account: str
+    synced: SyncedChat | None = None
+    error: Exception | None = None
+
+
+async def _fetch_chat(run: _SyncPass, lane: _Lane, chat: ChatRow, source: Source) -> _Fetch:
+    """Fetch one chat through ``lane``'s account, and through another when that one is refused.
+
+    A private chat or legacy group belongs to one account and is fetched through it or not at all. A
+    channel or supergroup is one shared row that several accounts may reach, so when the first
+    account is refused — the chat went private for it, it was banned (:data:`UNAVAILABLE_ERRORS`,
+    which :func:`sync_chat` reports as ``unavailable``), or its client cannot address the peer at
+    all (``ValueError``, a chat its source no longer resolves through) — or stopped by a flood wait,
+    the other accounts of this run that reach it are tried in :func:`reaching_accounts`' order
+    (:func:`through_accounts`, the one retry rule every pass shares). Each is warmed first from what
+    the index stores for it (:func:`~grepogram.accounts.warm_peer_cache`): its client may never have
+    read a dialog this run. **Every fetch holds its account's turn** (:attr:`_Lane.turn`), the
+    lane's own and a fallback alike, warm-up included: that account's own queue runs beside this
+    one, and two fetches through one client at once would share its flood limit, and one could
+    go on asking after the other was flood-stopped. An account found stopped once its turn comes
+    is passed over (:class:`~grepogram.accounts.AccountStopped`). The first that fetches it
+    clears the ``unavailable`` flag the refusal set, the report says which account stood in, and
+    the chat's own warnings are labelled with the account that fetched it. A flood wait on any
+    account stops *that* account's queue. When every account is refused, the chat is reported as
+    the first refusal left it. The primary source never moves: it says how the chat is fetched
+    (``since``, ``comments``), not through whom.
+    """
+    route = _route(run, chat, lane.account) if chat.is_shared else [lane.account]
+    current = chat
+    # the primary's client learned the chat resolving its source, or from the stored access
+    # hashes seeded before it; any other account is warmed for it first
+    warmed = lane.account if lane.account == source.account else None
+
+    async def fetch(account: str, client: Any) -> SyncedChat:
+        nonlocal current
+        async with run.lanes[account].turn:
+            # waiting for the account's turn may have outlasted a flood wait that stopped it
+            if account in run.stopped:
+                raise AccountStopped(account)
+            cap_flood_sleep(client, run.cfg.sync, run.budget)
+            if account != warmed:
+                await warm_peer_cache(client, [chat], run.conn, account)
+            synced = await sync_chat(
+                client,
+                run.conn,
+                current,
+                source,
+                run.budget,
+                cfg=run.cfg,
+                me=run.lanes[account].me,
+                account=account,
+            )
+        current = synced.chat
+        return synced
+
+    outcome = await through_accounts(
+        run.conn,
+        run.clients,
+        chat,
+        route,
+        run.cfg.sync,
+        run.budget,
+        run.stopped,
+        fetch,
+        refused=lambda synced: synced.unavailable,
+        halted=lambda: run.budget.halted,
+        # fetch warms under the account's turn, so the warm-up is serialised with the fetch
+        warmed=run.lanes.keys(),
+    )
+    for flood in outcome.flooded:
+        log.warning(
+            "chat %s: flood wait of %ss through account %s", chat.id, flood.seconds, flood.account
+        )
+        run.tally.warn(flood.account, _flood_text(flood.seconds))
+    if outcome.account is not None:
+        assert outcome.result is not None
+        first = outcome.refusals[0] if outcome.refusals else None
+        # a source that did not resolve already has its warning: its own account failing to
+        # address the chat is that same fact, and the fetch that went through is the good news
+        if first is not None and not (
+            first.account == source.account and source.id in run.unresolved
+        ):
+            run.tally.warn(
+                first.account,
+                f"chat {chat.id} ({chat.title}): {first.reason} through account "
+                f"{first.account}; fetched through account {outcome.account} instead",
+            )
+        return _Fetch(outcome.account, outcome.result)
+    if outcome.failure is not None:
+        return _Fetch(outcome.failure.account, error=outcome.failure.error)
+    if outcome.refused is not None:
+        return _Fetch(outcome.refused.account, outcome.refused.result)
+    if outcome.refusals and outcome.refusals[0].error is not None:
+        return _Fetch(outcome.refusals[0].account, error=outcome.refusals[0].error)
+    return _Fetch(lane.account)
 
 
 def _sync_order(chat: ChatRow) -> tuple[int, int, int]:
@@ -1734,27 +2466,32 @@ class _PruneTally:
     checked: int = 0
     done: list[int] = field(default_factory=list)
     remaining: list[int] = field(default_factory=list)
+    held: list[int] = field(default_factory=list)
+    unreachable: list[int] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
 
     def report(self) -> PruneReport:
         log.info(
-            "prune-deleted: %d of %d checked messages were gone, %d chats swept, %d left",
+            "prune-deleted: %d of %d checked messages were gone, %d chats swept, %d left, %d held",
             self.removed,
             self.checked,
             len(self.done),
             len(self.remaining),
+            len(self.held),
         )
         return PruneReport(
             removed=self.removed,
             checked=self.checked,
             chats_done=self.done,
             chats_remaining=self.remaining,
+            chats_held=self.held,
+            chats_unreachable=self.unreachable,
             warnings=self.warnings,
         )
 
 
 async def prune_deleted(
-    client: Any,
+    clients: Mapping[str, Any],
     conn: sqlite3.Connection,
     cfg: Config,
     paths: Paths,
@@ -1776,17 +2513,39 @@ async def prune_deleted(
     plain exception rather than an ``RPCError`` and would otherwise end the whole sweep on the
     first chat that hit it.
 
+    ``clients`` maps an account to its connected client, and every chat is asked about through
+    the accounts that reach it (:class:`StoredPass`): a private chat through its own account
+    alone, a shared one through **every** account that reaches it, because one account's empty
+    slot is not proof of a deletion. An account that joined a group after it began — or one the
+    group hides its history from — sees older messages as empty while another account still
+    reads them, and the index holds whatever the account that fetched it could see. So a message
+    is removed only when every account the index records as reaching the chat
+    (:func:`recorded_reach`) answers it empty (:func:`_confirmed_gone`). Every one of them that
+    cannot answer is "cannot tell", and the chat keeps everything this run, with a warning: one
+    not in this run (no session, or left out as another Telegram user than recorded), one
+    stopped by a flood wait, one whose client cannot address the peer — and one Telegram refuses
+    the chat to outright (:data:`UNAVAILABLE_ERRORS`). That last one is not passed over, because
+    the rows the index holds may be exactly the history it fetched before it left or was banned,
+    while the account still in the group may be a late joiner that sees that history as empty:
+    taking its word alone would delete what neither can serve again. The price is deliberate: a
+    shared chat one recorded account can no longer reach is never pruned again, until ``grepogram
+    accounts rm`` forgets that account's reach (:func:`grepogram.db.forget_account` — removing a
+    source alone leaves ``chat_access`` as it is). Such a chat is reported in ``chats_held``
+    rather than ``chats_remaining``, with a warning naming the refused account and that remedy,
+    because running the sweep again would not finish it. A chat no connected account reaches is
+    left alone and reported in ``chats_unreachable`` — its cursor untouched, nothing removed.
+
     Addressing a chat by its stored id is only possible once the client knows that peer, and a
-    client grepogram builds knows none: :func:`warm_peer_cache` reads the dialog list first, for
-    the reasons written there. A sync gets that for free from
-    :func:`~grepogram.sources.resolve_sources`; this pass walks ``chats`` rows instead of a
-    source list, so it asks by hand.
+    client grepogram builds knows none: :func:`~grepogram.accounts.warm_peer_cache` seeds the stored
+    access hashes and reads the dialog list for the rest, for the reasons written there. A sync gets
+    that for free from :func:`~grepogram.sources.resolve_sources`; this pass walks ``chats`` rows
+    instead of a source list, so it asks by hand.
 
     It is a whole-index pass of about one request per hundred stored messages, so it is never
     automatic and never an MCP tool: like ``sources prune``, deleting indexed history stays a
     deliberate CLI action (``grepogram prune-deleted``). ``budget`` is in seconds like every
     other pass, the client's ``flood_sleep_threshold`` is capped against what is left of it
-    (:func:`_cap_flood_sleep`) **before the warm-up rather than after it** — the warm-up is a
+    (:func:`cap_flood_sleep`) **before the warm-up rather than after it** — the warm-up is a
     request like any other, and a client still carrying the default 120-second threshold would
     sleep through a sub-threshold flood wait far longer than the whole budget before the sweep
     had asked a single question — and the whole sweep runs under the :class:`SyncLock` — it deletes
@@ -1806,35 +2565,158 @@ async def prune_deleted(
     """
     with SyncLock(paths):
         targets = _sweep_targets(conn, chat_id)
-        tally = _PruneTally()
-        _cap_flood_sleep(client, cfg.sync, budget)
-        await warm_peer_cache(client, targets)
-        for position, chat in enumerate(targets):
+        route = await StoredPass.start(
+            conn, clients, targets, cfg.sync, budget, _prune_flood_warning, every=True
+        )
+        tally = _PruneTally(warnings=route.warnings)
+        tally.unreachable.extend(chat.id for chat in route.unreachable)
+        routed = [chat for chat in targets if chat.id in route.routes]
+        for position, chat in enumerate(routed):
             if budget.expired:
-                tally.remaining.extend(rest.id for rest in targets[position:])
+                tally.remaining.extend(rest.id for rest in routed[position:])
                 break
-            _cap_flood_sleep(client, cfg.sync, budget)
-            try:
-                complete = await _sweep_chat(client, conn, cfg, chat, budget, tally)
-            except errors.FloodWaitError as exc:
-                log.warning("flood wait of %ss on chat %s; stopping this run", exc.seconds, chat.id)
-                tally.warnings.append(
-                    f"flood wait: Telegram asks to wait {exc.seconds}s before more requests; "
-                    "run `grepogram prune-deleted` again later"
-                )
-                tally.remaining.extend(rest.id for rest in targets[position:])
-                break
-            except errors.UnauthorizedError:
-                raise
-            except (errors.RPCError, ValueError) as exc:
-                log.warning(
-                    "chat %s (%s): %s; nothing was removed from it", chat.id, chat.title, exc
-                )
-                tally.warnings.append(f"chat {chat.id} ({chat.title}): {exc}")
-                tally.remaining.append(chat.id)
-                continue
-            (tally.done if complete else tally.remaining).append(chat.id)
+            ended = {"done": tally.done, "remaining": tally.remaining, "held": tally.held}
+            ended[await _sweep_chat(route, conn, cfg, chat, budget, tally)].append(chat.id)
         return tally.report()
+
+
+# --- the link recapture pass -----------------------------------------------------------------
+
+
+@dataclass(slots=True)
+class _RecaptureTally:
+    """What the recapture pass accumulates on its way to a :class:`RecaptureReport`."""
+
+    checked: int = 0
+    captured: int = 0
+    done: list[int] = field(default_factory=list)
+    remaining: list[int] = field(default_factory=list)
+    unreachable: list[int] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
+
+
+async def recapture_links(
+    clients: Mapping[str, Any],
+    conn: sqlite3.Connection,
+    cfg: Config,
+    paths: Paths,
+    budget: SyncBudget,
+    *,
+    chat_id: int | None = None,
+) -> RecaptureReport:
+    """Re-read the stored messages whose links were never read and write down what they link to.
+
+    Rows stored before schema step 8 carry neither their links nor their forward origin, and a
+    sync only ever re-reads the newest ``edit_refetch`` messages of a chat — so an upgraded index
+    would keep the hidden hyperlinks, buttons and forward origins of its older history out of
+    research's reach for good, leaving only the visible text for discovery's fallback. This pass
+    asks Telegram about exactly those rows (``messages.links_read = 0``) by id, a hundred per
+    request (:data:`PRUNE_BATCH`), through an account that reaches each chat
+    (:class:`StoredPass`, which also warms each client first — a client grepogram builds knows
+    no peer), and writes onto them **only** the ``message_links``, the ``fwd_*`` columns and
+    ``links_read`` (:func:`grepogram.db.set_captured_links`): no text, no media, no ``indexed``
+    flag and no sync cursor moves — ``chats.last_msg_id`` stays where the sync left it — and no
+    unit changes, because a unit renders none of these. Each row it writes takes the next
+    lead-clock tick, so research's discovery reads it again. The forward origins the answers
+    carry are recorded for the answering account (:func:`remember_forward_peers`).
+
+    A message Telegram no longer has is passed over — telling deletions apart is
+    ``prune-deleted``'s — and a chat whose history never came from Telegram (an import) or that
+    Telegram refuses is not asked about (:func:`refetchable`). Progress is a ``meta`` cursor per
+    chat written with each page, so a run stopped by its budget or a flood wait resumes where it
+    stopped. It is a long, flood-exposed network pass over old history, so it runs under the
+    :class:`SyncLock` from ``grepogram recapture-links`` alone — never inside a sync and never as
+    an MCP tool. ``chat_id`` narrows it to one chat and the discussion group it links.
+    """
+    with SyncLock(paths):
+        targets = _recapture_targets(conn, chat_id)
+        route = await StoredPass.start(
+            conn, clients, targets, cfg.sync, budget, _recapture_flood_warning
+        )
+        tally = _RecaptureTally(warnings=route.warnings)
+        tally.unreachable.extend(chat.id for chat in route.unreachable)
+        routed = [chat for chat in targets if chat.id in route.routes]
+        for position, chat in enumerate(routed):
+            if budget.expired:
+                tally.remaining.extend(rest.id for rest in routed[position:])
+                break
+            complete = await _recapture_chat(route, conn, chat, budget, tally)
+            (tally.done if complete else tally.remaining).append(chat.id)
+        left = db.count_unread_links(conn, [chat.id for chat in targets])
+    log.info(
+        "recapture-links: %d of %d messages re-read, %d chats done, %d left",
+        tally.captured,
+        tally.checked,
+        len(tally.done),
+        len(tally.remaining),
+    )
+    return RecaptureReport(
+        checked=tally.checked,
+        captured=tally.captured,
+        remaining=left,
+        chats_done=tally.done,
+        chats_remaining=tally.remaining,
+        chats_unreachable=tally.unreachable,
+        warnings=tally.warnings,
+    )
+
+
+def _recapture_targets(conn: sqlite3.Connection, chat_id: int | None) -> list[ChatRow]:
+    """The chats holding rows whose links were never read that a pass may re-fetch, in id order;
+    ``chat_id`` narrows them to that chat and its discussion group."""
+    wanted = set(db.chats_with_unread_links(conn))
+    if chat_id is not None:
+        group = db.get_discussion_chat(conn, chat_id)
+        wanted &= {chat_id, *([group.id] if group is not None else [])}
+    chats = [db.get_chat(conn, found) for found in sorted(wanted)]
+    return [chat for chat in chats if chat is not None and refetchable(chat)]
+
+
+async def _recapture_chat(
+    route: StoredPass,
+    conn: sqlite3.Connection,
+    chat: ChatRow,
+    budget: SyncBudget,
+    tally: _RecaptureTally,
+) -> bool:
+    """One chat from its cursor on; ``True`` once no unread row is left above it."""
+    cursor = db.recapture_cursor(conn, chat.id)
+    while not budget.expired:
+        page = db.unread_link_ids(conn, chat.id, cursor, PRUNE_BATCH)
+        if not page:
+            return True
+
+        async def read(account: str, client: Any, page: list[int] = page) -> tuple[str, Any]:
+            return account, await client.get_messages(chat.peer_id, ids=page)
+
+        answered = await route.visit_as(chat, read)
+        if answered is None:
+            return False
+        account, answer = answered
+        if not isinstance(answer, list) or len(answer) != len(page):
+            route.warn(
+                account,
+                f"chat {chat.id} ({chat.title}): Telegram's answer did not line up with the "
+                f"{len(page)} ids asked about; nothing was written",
+            )
+            return False
+        found = [
+            msg for msg in answer if msg is not None and not isinstance(msg, types.MessageEmpty)
+        ]
+        rows = [row for msg in found if (row := map_message(msg, chat, {})) is not None]
+        remember_forward_peers(conn, account, found)
+        cursor = page[-1]
+        tally.checked += len(page)
+        tally.captured += db.set_captured_links(conn, chat.id, rows, cursor)
+    return False
+
+
+def _recapture_flood_warning(seconds: int) -> str:
+    return flood_warning(seconds, "more requests", "run `grepogram recapture-links` again later")
+
+
+def _prune_flood_warning(seconds: int) -> str:
+    return flood_warning(seconds, "more requests", "run `grepogram prune-deleted` again later")
 
 
 def _sweep_targets(conn: sqlite3.Connection, chat_id: int | None) -> list[ChatRow]:
@@ -1878,155 +2760,166 @@ def refetchable(chat: ChatRow) -> bool:
     return True
 
 
-async def warm_peer_cache(client: Any, chats: Sequence[ChatRow]) -> None:
-    """Teach ``client`` the peers of ``chats`` before anything addresses them by bare id.
+type _SweepEnd = Literal["done", "remaining", "held"]
+"""How one chat's turn of the sweep ended: the end of its history reached, stopped partway for
+a later run to carry on (a budget, a flood wait, an account that cannot answer this run), or
+held back by a recorded account Telegram refuses the chat to, which no rerun changes
+(:func:`_confirmed_gone`)."""
 
-    :func:`grepogram.tg.load_session` copies the data centre and the auth key out of the session
-    file and nothing else, so **the entity cache of every client grepogram builds starts empty**
-    — the docstring there states the rule and every Telegram-facing pass has to honour it. A
-    request that names a chat by its stored id and nothing else, which is what
-    ``client.get_messages(chat.id, ids=[…])`` is, has no access hash to build an ``InputPeer``
-    from: Telethon 1.44 asks the session, gets nothing, and its network fallback
-    (``channels.getChannels`` / ``users.getUsers`` with ``access_hash = 0``) is documented to
-    answer only for a bot's private chats or a contact. For a user session on a private
-    supergroup it ends in a plain ``ValueError: Could not find the input entity``, which is not
-    an ``RPCError`` and reaches a caller as a skipped chat or a traceback.
 
-    One ``get_dialogs()`` is the whole fix: Telethon writes the peers of every answer into the
-    session (``session.process_entities``), so the dialog list makes every chat the account has
-    a dialog with addressable for the rest of the client's life. It is the same warm-up a sync
-    gets for free from :func:`~grepogram.sources.resolve_sources` and the reason no path that
-    goes through a :class:`~grepogram.dialogs.DialogCatalog` ever had to think about this; the
-    two passes that walk stored rows instead of a source list — :func:`prune_deleted` and
-    :func:`grepogram.media.run` — are the ones that must ask for it by hand. The client's own
-    call rather than that catalog, because neither pass has any use for the folder list the
-    catalog reads beside it.
-
-    The dialog list is not the whole account, though, and the two chats it misses are exactly
-    the ones a source list reaches by a **stored handle** rather than by id:
-
-    * A public channel or group the account follows without joining has no dialog at all. A sync
-      never notices, because its source is a ``chat = "@name"`` and
-      :func:`~grepogram.sources.resolve_sources` resolves the handle — and that handle is stored
-      on the row as ``chats.username``, so this can walk the same route with
-      ``client.get_entity(chat.username)``. Skipping it left ``extract`` and ``prune-deleted``
-      failing every by-id request for precisely the chats the warm-up was added for.
-    * A channel's discussion group is indexed through the channel's link
-      (:func:`link_discussion_chat`) and may have neither a dialog nor a username of its own.
-      ``GetFullChannelRequest`` on the channel answers with the group among ``full.chats``,
-      which caches it exactly as the dialog list caches a dialog.
-
-    Both in that order, and the order matters: the *channel* a link-only group hangs off may
-    itself be outside the dialog list, and naming it by bare id in ``GetFullChannelRequest``
-    would fail for the same reason everything else here does. The username pass runs over the
-    whole list first, so a channel with a handle is resolved before its group is asked for.
-
-    ``resolved`` is what the session is known to hold, keyed by what actually came back
-    (``utils.get_peer_id``) rather than by what was asked for: a handle that has moved to another
-    peer resolves *that* one, and the chat it was stored on still needs its second route.
-
-    Nothing here is worth failing a pass for: a chat no route resolves is left to the caller's
-    per-chat handler, which costs that chat its turn and reports it, and a Telegram error during
-    the warm-up (a flood wait included) resurfaces on the very next request the pass makes, where
-    it is handled properly. An ``UnauthorizedError`` is the exception every handler makes, for
-    the reason :func:`_sync_chats` makes it: a session revoked mid-run is not a chat that would
-    not resolve, and only re-raising lets :func:`grepogram.tg.wrap_auth_errors` turn it into an
-    :class:`~grepogram.tg.AuthRequired` with the ``grepogram auth`` hint instead of a wall of
-    per-chat warnings and an exit code of zero.
-    """
-    if not chats:
-        return
-    try:
-        listed = {int(dialog.id) for dialog in await client.get_dialogs(ignore_migrated=True)}
-    except errors.UnauthorizedError:
-        raise
-    except (errors.RPCError, ValueError) as exc:
-        log.warning("could not read the dialog list to resolve %d chats: %s", len(chats), exc)
-        return
-    log.debug("warmed the entity cache with %d dialogs", len(listed))
-    resolved = set(listed)
-    for chat in chats:
-        if chat.id in resolved or not chat.username:
-            continue
-        try:
-            entity = await client.get_entity(chat.username)
-        except errors.UnauthorizedError:
-            raise
-        except (errors.RPCError, ValueError) as exc:
-            log.warning(
-                "chat %s (%s): @%s, the handle it is stored under, could not be resolved, "
-                "so the chat may not resolve: %s",
-                chat.id,
-                chat.title,
-                chat.username,
-                exc,
-            )
-            continue
-        resolved.add(int(utils.get_peer_id(entity)))
-    for chat in chats:
-        if chat.id in resolved or chat.discussion_of is None:
-            continue
-        try:
-            await client(functions.channels.GetFullChannelRequest(chat.discussion_of))
-        except errors.UnauthorizedError:
-            raise
-        except (errors.RPCError, ValueError) as exc:
-            log.warning(
-                "chat %s (%s): channel %s, which it holds the comments of, could not be read, "
-                "so the group may not resolve: %s",
-                chat.id,
-                chat.title,
-                chat.discussion_of,
-                exc,
-            )
+_HELD: Literal["held"] = "held"
+""":func:`_confirmed_gone`'s answer for a page a refused account holds back."""
 
 
 async def _sweep_chat(
-    client: Any,
+    route: StoredPass,
     conn: sqlite3.Connection,
     cfg: Config,
     chat: ChatRow,
     budget: SyncBudget,
     tally: _PruneTally,
-) -> bool:
-    """One chat from its cursor on; ``True`` once the sweep has reached the end of its history.
+) -> _SweepEnd:
+    """One chat from its cursor on; ``"done"`` once the sweep has reached the end of its
+    history, ``"held"`` when a refused account holds it back (:func:`_confirmed_gone`) and
+    ``"remaining"`` when anything else ended its turn.
 
-    A page of stored ids, one request, one transaction: the ids that came back empty are deleted,
-    the units holding them are cut again and the cursor moves to the last id of the page. The
-    write goes to a worker thread that is joined even under cancellation
-    (:func:`_joined_to_thread`), like every other write a sync makes.
+    A page of stored ids, one request per witness, one transaction: the ids every witness
+    answered empty (:func:`_confirmed_gone`) are deleted, the units holding them are cut again
+    and the cursor moves to the last id of the page. The write goes to a worker thread that is
+    joined even under cancellation (:func:`joined_to_thread`), like every other write a sync
+    makes.
 
     An answer that does not line up with the page is not an answer: the chat's turn ends with its
     cursor untouched, so the next run asks the same page again instead of taking the silence for
     a hundred deletions. ``checked`` counts the pages that *were* answered, for the same reason —
     a refused page has told the report nothing, and the next run asks about it again.
     """
+    absent = [account for account in recorded_reach(conn, chat) if account not in route.clients]
+    absent += [account for account in route.routes[chat.id] if account in route.stopped]
+    if absent:
+        who = ", ".join(sorted(set(absent)))
+        log.warning(
+            "chat %s (%s): account %s reaches it but cannot be asked this run; nothing removed",
+            chat.id,
+            chat.title,
+            who,
+        )
+        route.warn(
+            absent[0],
+            f"chat {chat.id} ({chat.title}): account {who} reaches it but is not signed in or "
+            "was stopped; nothing was removed, since only every account that reaches a chat "
+            "can tell a deletion from history one of them cannot see",
+        )
+        return "remaining"
+    witnesses = list(route.routes[chat.id])
     cursor = db.prune_cursor(conn, chat.id)
     while not budget.expired:
         page = db.message_ids_after(conn, chat.id, cursor, PRUNE_BATCH)
         if not page:
             db.clear_prune_cursor(conn, chat.id)
-            return True
-        gone = _empty_slots(page, await client.get_messages(chat.id, ids=page))
+            return "done"
+        gone = await _confirmed_gone(route, chat, page, witnesses)
         if gone is None:
-            log.warning(
-                "chat %s (%s): Telegram's answer did not line up with the %d ids asked about; "
-                "nothing was removed",
-                chat.id,
-                chat.title,
-                len(page),
-            )
-            tally.warnings.append(
-                f"chat {chat.id} ({chat.title}): Telegram's answer did not line up with the "
-                f"{len(page)} ids asked about; nothing was removed"
-            )
-            return False
+            return "remaining"
+        if isinstance(gone, str):  # _HELD
+            return "held"
         tally.checked += len(page)
         cursor = page[-1]
-        tally.removed += await _joined_to_thread(
+        tally.removed += await joined_to_thread(
             functools.partial(_prune_batch, conn, cfg, chat, gone, cursor), budget.cancel
         )
-    return False
+    return "remaining"
+
+
+async def _confirmed_gone(
+    route: StoredPass, chat: ChatRow, page: Sequence[int], witnesses: Sequence[str]
+) -> list[int] | Literal["held"] | None:
+    """The ids of ``page`` every account of ``witnesses`` answered empty, or ``None`` when that
+    cannot be told this run — the chat's turn then ends with nothing removed — or
+    :data:`_HELD` when a witness Telegram refuses the chat to holds it back for good.
+
+    The first witness is asked about the whole page, each next one only about what the ones
+    before it answered empty, so a chat one account reaches costs what it always did. **Every
+    witness has to answer**: anything else is "cannot tell". A flood wait stops the account
+    (:meth:`StoredPass.stop`); a Telegram refusal of the chat (:data:`UNAVAILABLE_ERRORS`: the
+    account left, was banned, the chat went private for it), any other Telegram error, and a peer
+    the account's client cannot address (``ValueError``: its cache was never warmed for it) are
+    reported — and all of them end the turn. A refused account is not passed over: the rows the
+    index holds may be exactly the history it fetched before it lost the chat, and its refusal
+    says nothing about whether they are gone, while the account still answering may be a late
+    joiner the group hides that history from.
+
+    That last case is told apart from the others, because no later run changes it: the refused
+    account stays a witness until ``grepogram accounts rm`` forgets its reach. The other
+    witnesses are still asked, and when one of them answers the chat is :data:`_HELD`, with a
+    warning that names the refused account, says nothing was removed and why, and names that
+    remedy — rather than Telegram's bare refusal, which a user would read as a chat to sweep
+    again. When none answers, the chat is out of every account's reach (a sync marks such a chat
+    unavailable, and the sweep leaves it alone from then on), so each refusal is reported as it
+    is and the turn ends like any other.
+    """
+    asked = list(page)
+    refused: list[tuple[str, Exception]] = []
+    answered = False
+    for account in witnesses:
+        client = route.clients[account]
+        cap_flood_sleep(client, route.sync_cfg, route.budget)
+        try:
+            answer = await client.get_messages(chat.peer_id, ids=asked)
+        except errors.FloodWaitError as exc:
+            log.warning(
+                "flood wait of %ss on chat %s through account %s", exc.seconds, chat.id, account
+            )
+            route.stop(account, int(exc.seconds))
+            return None
+        except errors.UnauthorizedError as exc:
+            tg.reraise_unauthorized(exc, account)
+        except UNAVAILABLE_ERRORS as refusal:
+            log.warning(
+                "chat %s (%s) through account %s: %s", chat.id, chat.title, account, refusal
+            )
+            refused.append((account, refusal))
+            continue
+        except (errors.RPCError, ValueError) as exc:
+            log.warning("chat %s (%s) through account %s: %s", chat.id, chat.title, account, exc)
+            route.warn(account, f"chat {chat.id} ({chat.title}): {exc}")
+            return None
+        answered = True
+        empty = _empty_slots(asked, answer)
+        if empty is None:
+            log.warning(
+                "chat %s (%s): Telegram's answer to account %s did not line up with the %d ids "
+                "asked about; nothing was removed",
+                chat.id,
+                chat.title,
+                account,
+                len(asked),
+            )
+            route.warn(
+                account,
+                f"chat {chat.id} ({chat.title}): Telegram's answer did not line up with the "
+                f"{len(asked)} ids asked about; nothing was removed",
+            )
+            return None
+        asked = empty
+        if not asked:
+            break
+    if not refused:
+        return asked
+    if not answered:
+        for account, reason in refused:
+            route.warn(account, f"chat {chat.id} ({chat.title}): {reason}")
+        return None
+    for account, reason in refused:
+        route.warn(
+            account,
+            f"chat {chat.id} ({chat.title}) is held back: Telegram refuses it to account "
+            f"{account} ({reason}), which may have fetched history the other accounts cannot "
+            "see, so nothing was removed from it and running prune-deleted again will not "
+            f"change that; `grepogram accounts rm {account}` forgets what that account reached "
+            "and lets the chat be pruned again",
+        )
+    return _HELD
 
 
 def _empty_slots(page: Sequence[int], answer: Any) -> list[int] | None:

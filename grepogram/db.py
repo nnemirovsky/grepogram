@@ -1,9 +1,12 @@
 """SQLite storage: connection setup, versioned schema migrations and typed row accessors.
 
-One file holds everything: ``chats``, ``users``, ``messages``, ``units``, the FTS5 tables and the
-sqlite-vec table. FTS and vec rows are keyed by the parent rowid (``messages.id`` / ``units.id``)
-so deletes are direct lookups; virtual tables cannot carry foreign keys, so :func:`delete_chat`
-removes their rows before the ``chats`` row cascades to ``messages`` and ``units``.
+``index.db`` holds everything derived from Telegram: ``chats``, ``users``, ``messages``,
+``units``, the FTS5 tables and the sqlite-vec table, and since the accounts steps ``accounts``,
+``chat_access``, ``chat_sources``, ``message_links`` and ``peer_cache``. Research decisions are
+not derived and live in ``research.db`` (:mod:`grepogram.research_db`), never here. FTS and
+vec rows are keyed by the parent rowid (``messages.id`` / ``units.id``) so deletes are direct
+lookups; virtual tables cannot carry foreign keys, so :func:`delete_chat` removes their rows
+before the ``chats`` row cascades to ``messages`` and ``units``.
 
 Every writing function is atomic on its own and commits when it finishes, unless a transaction is
 already open — wrap several calls in ``with transaction(conn):`` to commit them together.
@@ -35,7 +38,17 @@ from typing import Any
 
 import sqlite_vec
 
-from grepogram.models import ChatRow, MessageRow, UnitRow, UserRow
+from grepogram.models import (
+    DEFAULT_ACCOUNT,
+    AccountRow,
+    CachedPeer,
+    ChatRow,
+    LinkKind,
+    MessageRow,
+    UnitRow,
+    UserRow,
+    chat_scope,
+)
 from grepogram.paths import Paths
 
 BUSY_TIMEOUT_MS = 5000
@@ -54,6 +67,21 @@ META_RECUT_PREFIX = "unit_recut:"
 """Prefix of the per-chat marker a re-cut writes, ``unit_recut:<chat_id>``."""
 META_PRUNE_PREFIX = "prune_sweep:"
 """Prefix of the deletion sweep's cursor, ``prune_sweep:<chat_id>`` (:func:`prune_cursor`)."""
+META_LINKS_CAPTURED_FROM = "links_captured_from"
+"""The first ``messages.id`` stored with its links and forward origin captured (step 8); see
+:func:`links_captured_from`. Step 9 reads it once, to fill ``messages.links_read``."""
+META_LEAD_CLOCK = "lead_clock"
+"""The last value :func:`upsert_messages` stamped on ``messages.lead_seq`` (step 9); see
+:func:`lead_clock`."""
+META_INDEX_ID = "index_id"
+"""A random name this index got when step 9 ran on it, so a cursor kept outside it — research's
+scan cursors in ``research.db`` — can tell this index from one rebuilt under the same path."""
+META_SYNTHETIC_NEXT = "synthetic_next"
+"""The next synthetic ``chats.id`` :func:`upsert_chat` hands out; a high-water mark, never
+lowered, so the id of a deleted scoped row is never given to another conversation."""
+META_RECAPTURE_PREFIX = "links_recapture:"
+"""Prefix of the link recapture pass's cursor, ``links_recapture:<chat_id>``
+(:func:`recapture_cursor`)."""
 
 _V5: tuple[str, ...] = (
     "CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT)",
@@ -143,6 +171,106 @@ _V6: tuple[str, ...] = (
        WHERE media_state = 0 AND media_kind IS NOT NULL""",
 )
 
+_V7: tuple[str, ...] = (
+    # who each signed-in account turned out to be (grepogram auth --account records it)
+    """CREATE TABLE accounts(
+        name TEXT PRIMARY KEY,
+        user_id INTEGER,
+        display_name TEXT,
+        added_at INTEGER)""",
+    # a chat's Telegram identity is (scope, peer_id): scope '' for a channel or supergroup — one
+    # row whichever account reaches it, and its id stays its peer id — the account name for a
+    # user, bot or legacy group, whose message ids are that account's own (models.chat_scope)
+    "ALTER TABLE chats ADD COLUMN peer_id INTEGER",
+    "ALTER TABLE chats ADD COLUMN scope TEXT NOT NULL DEFAULT ''",
+    # the two fills below derive the new columns from existing ones and rewrite no value: every
+    # row stored so far was stored by the one account there was, under its own peer id
+    "UPDATE chats SET peer_id = id",
+    "UPDATE chats SET scope = 'default' WHERE type IN ('user', 'bot', 'group')",
+    "CREATE UNIQUE INDEX chats_scope_peer ON chats(scope, peer_id)",
+    # which accounts reach a chat, with the access hash each one addresses it by
+    """CREATE TABLE chat_access(
+        chat_id INTEGER NOT NULL REFERENCES chats(id) ON DELETE CASCADE,
+        account TEXT NOT NULL,
+        access_hash INTEGER,
+        via TEXT,
+        checked_at INTEGER,
+        PRIMARY KEY (chat_id, account))""",
+    # every source that covers a chat; chats.source_id stays the primary one
+    """CREATE TABLE chat_sources(
+        chat_id INTEGER NOT NULL REFERENCES chats(id) ON DELETE CASCADE,
+        source_id TEXT NOT NULL,
+        PRIMARY KEY (chat_id, source_id))""",
+    "INSERT INTO chat_sources(chat_id, source_id) SELECT id, source_id FROM chats "
+    "WHERE source_id IS NOT NULL",
+    # an import came from an export, not through any account, so no account is recorded for it
+    "INSERT INTO chat_access(chat_id, account, via) SELECT id, 'default', 'migrated' FROM chats "
+    "WHERE source_id IS NULL OR source_id NOT LIKE 'import:%'",
+)
+
+_V8: tuple[str, ...] = (
+    # a forward's structured origin beside the display name in fwd_from: the peer and message it
+    # came from and when that was sent (sync.forward_origin)
+    "ALTER TABLE messages ADD COLUMN fwd_peer_id INTEGER",
+    "ALTER TABLE messages ADD COLUMN fwd_msg_id INTEGER",
+    "ALTER TABLE messages ADD COLUMN fwd_date INTEGER",
+    """CREATE INDEX messages_fwd_origin ON messages(fwd_peer_id, fwd_msg_id)
+       WHERE fwd_peer_id IS NOT NULL""",
+    # every Telegram destination a message names, target normalized by leads.normalize
+    """CREATE TABLE message_links(
+        message_id INTEGER NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+        kind TEXT NOT NULL,
+        target TEXT NOT NULL,
+        PRIMARY KEY (message_id, kind, target))""",
+    "CREATE INDEX message_links_target ON message_links(target)",
+    # rows stored before this step carry no links and no forward origin; this fill records where
+    # capture starts, so discovery knows which rows only a scan of their text can speak for
+    "INSERT INTO meta(key, value) SELECT 'links_captured_from', COALESCE(MAX(id), 0) + 1 "
+    "FROM messages",
+)
+
+SYNTHETIC_BASE = 1 << 62
+"""The first ``chats.id`` a scoped row takes when another account's row already holds its peer id.
+
+Far above any id Telegram marks (user and bot ids fit in 52 bits, groups and channels are
+negative), so a synthetic id can never be mistaken for a peer; :func:`upsert_chat` hands them
+out upward, never twice (:data:`META_SYNTHETIC_NEXT`)."""
+
+_V9: tuple[str, ...] = (
+    # whether a row's links and forward origin were read off the message itself. A row that
+    # carries none was stored before step 8, or by an import whose export spelled no entities,
+    # or re-read by nothing since: only its visible text can speak for it (research's fallback),
+    # and the link recapture pass re-reads exactly those rows from Telegram
+    "ALTER TABLE messages ADD COLUMN links_read INTEGER NOT NULL DEFAULT 0",
+    # filled from what is stored: a row at or above step 8's mark was stored with its links
+    # unless an import stored it; a row with links or a forward origin was read either way
+    """UPDATE messages SET links_read = 1
+       WHERE fwd_peer_id IS NOT NULL
+          OR id IN (SELECT message_id FROM message_links)
+          OR (id >= CAST((SELECT value FROM meta WHERE key = 'links_captured_from') AS INTEGER)
+              AND chat_id NOT IN (SELECT id FROM chats WHERE source_id LIKE 'import:%'))""",
+    # when a row's leads last changed, on a clock of this index (meta lead_clock): stamped on
+    # every insert and on every re-store that read the links again, so a cursor over it sees a
+    # comment stored out of msg_id order, an edit that gained a link, and a recaptured row
+    "ALTER TABLE messages ADD COLUMN lead_seq INTEGER NOT NULL DEFAULT 1",
+    "CREATE INDEX messages_lead_seq ON messages(chat_id, lead_seq)",
+    "INSERT INTO meta(key, value) VALUES ('lead_clock', '1')",
+    # the peers an account met while fetching — a forward's origin channel above all — with the
+    # username and the (non-min) access hash Telegram gave that account for them, so a peer the
+    # index holds no chat row for can still be addressed or named
+    """CREATE TABLE peer_cache(
+        account TEXT NOT NULL,
+        peer_id INTEGER NOT NULL,
+        username TEXT,
+        access_hash INTEGER,
+        seen_at INTEGER,
+        PRIMARY KEY (account, peer_id))""",
+    "INSERT INTO meta(key, value) VALUES ('index_id', lower(hex(randomblob(8))))",
+    f"""INSERT INTO meta(key, value)
+        SELECT 'synthetic_next', COALESCE(MAX(id) + 1, {SYNTHETIC_BASE}) FROM chats
+        WHERE id >= {SYNTHETIC_BASE}""",
+)
+
 MEDIA_PENDING = 0
 """``messages.media_state``: media nothing has looked at yet — the extraction pass's queue."""
 MEDIA_EXTRACTED = 1
@@ -168,14 +296,29 @@ rest of the code querying columns that are not there. Every version below this o
 belongs to that chain and is refused outright; :func:`migrate` upgrades only from a version this
 build itself wrote."""
 
-MIGRATIONS: dict[int, tuple[str, ...]] = {BASE_VERSION: _V5, 6: _V6}
+MIGRATIONS: dict[int, tuple[str, ...]] = {
+    BASE_VERSION: _V5,
+    6: _V6,
+    7: _V7,
+    8: _V8,
+    9: _V9,
+}
 """The schema, keyed by the version each step brings a database to.
 
 :data:`BASE_VERSION` builds it from nothing and only an empty file gets that step;
 :data:`SCHEMA_VERSION` is the last of them, and a release that has to change the schema of a
 database in the field appends a step above the base rather than editing one. There is no step
 that transforms rows written by a development build — an index whose version this build did not
-write is rebuilt from Telegram, see :func:`migrate`."""
+write is rebuilt from Telegram, see :func:`migrate`.
+
+A step may **fill the columns and tables it adds**, deterministically from values already stored
+(step 7 derives ``chats.peer_id``, ``chats.scope``, ``chat_sources`` and ``chat_access`` that
+way; step 8 records in ``meta`` the first row id it captures links for; step 9 derives
+``messages.links_read`` from that mark and starts the lead clock — and gives the index the one
+value nothing stored determines, a random ``meta['index_id']`` naming this file rather than its
+data), and never rewrites a value that is already there. The index is derived, but an imported
+history is not — Telegram cannot serve it again — so "delete index.db and sync again" is not an
+upgrade path a released schema may ask for."""
 SCHEMA_VERSION = max(MIGRATIONS)
 _REBUILD_HINT = "delete index.db and run `grepogram sync` to build it again"
 
@@ -205,9 +348,10 @@ _ATTACHMENT_REPLACED = (
 
 _MESSAGE_UPSERT = f"""
     INSERT INTO messages(chat_id, msg_id, date, edit_date, from_id, from_name, reply_to_msg_id,
-                         topic_id, comment_of_chat_id, comment_of_msg_id, fwd_from, text,
-                         media_kind, media_filename, reactions_total)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                         topic_id, comment_of_chat_id, comment_of_msg_id, fwd_from, fwd_peer_id,
+                         fwd_msg_id, fwd_date, text, media_kind, media_filename, reactions_total,
+                         links_read, lead_seq)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(chat_id, msg_id) DO UPDATE SET
         date = excluded.date,
         edit_date = excluded.edit_date,
@@ -218,6 +362,9 @@ _MESSAGE_UPSERT = f"""
         comment_of_chat_id = COALESCE(excluded.comment_of_chat_id, messages.comment_of_chat_id),
         comment_of_msg_id = COALESCE(excluded.comment_of_msg_id, messages.comment_of_msg_id),
         fwd_from = excluded.fwd_from,
+        fwd_peer_id = excluded.fwd_peer_id,
+        fwd_msg_id = excluded.fwd_msg_id,
+        fwd_date = excluded.fwd_date,
         text = excluded.text,
         media_kind = excluded.media_kind,
         media_filename = excluded.media_filename,
@@ -226,6 +373,8 @@ _MESSAGE_UPSERT = f"""
             THEN NULL ELSE messages.extracted_text END,
         media_state = CASE WHEN {_ATTACHMENT_REPLACED}
             THEN {MEDIA_PENDING} ELSE messages.media_state END,
+        links_read = MAX(messages.links_read, excluded.links_read),
+        lead_seq = CASE WHEN excluded.links_read THEN excluded.lead_seq ELSE messages.lead_seq END,
         indexed = 0
     RETURNING id"""
 """Store a message, keeping what only the extraction pass knows — unless the attachment changed.
@@ -516,9 +665,13 @@ def migrate(conn: sqlite3.Connection) -> int:
       a version :func:`schema_version` cannot read at all.
 
     Rows are never transformed on a guess: the index is derived from Telegram and a rebuild costs
-    one sync. A gap in :data:`MIGRATIONS` itself is refused on both paths, the empty file's
-    included: a mis-keyed step is a bug here, and an empty database stamped at the head while
-    every existing one is turned away would hide it.
+    one sync. The one kind of row write a step makes is filling the columns and tables it adds
+    from values already stored (see :data:`MIGRATIONS`) — on an empty file those fills run over
+    no rows at all — and no step rewrites a value it did not add.
+
+    A gap in :data:`MIGRATIONS` itself is refused on both paths, the empty file's included: a
+    mis-keyed step is a bug here, and an empty database stamped at the head while every existing
+    one is turned away would hide it.
     """
     current = schema_version(conn)
     if current == SCHEMA_VERSION:
@@ -745,30 +898,64 @@ def clear_recut_markers(conn: sqlite3.Connection) -> None:
 # --- chats -----------------------------------------------------------------------------------
 
 
-def upsert_chat(conn: sqlite3.Connection, chat: ChatRow) -> ChatRow:
+def upsert_chat(conn: sqlite3.Connection, chat: ChatRow, account: str | None = None) -> ChatRow:
     """Insert ``chat`` or refresh the identity columns of the existing row; returns what is stored.
+
+    The row is found by its Telegram identity, ``(scope, peer_id)``, never by ``chat.id``: the
+    scope is :func:`grepogram.models.chat_scope` of the chat's type and ``account`` (``None``
+    keeps the account ``chat.scope`` names, :data:`DEFAULT_ACCOUNT`'s when it names none). A new
+    row takes ``id = peer_id`` when that id is free; a scoped row whose peer id another account's
+    row already holds — the same person's private chat seen from two accounts — takes the next
+    synthetic id from :data:`SYNTHETIC_BASE` up. A shared row (a channel or supergroup) always
+    keeps ``id == peer_id``: channel-space references (``discussion_of``, ``comment_of_chat_id``,
+    ``migrated_to``) name chats by that id, so a shared chat whose peer id is held by some other
+    row is refused with ``ValueError`` rather than stored under an id they would not find. The
+    caller reads the id back from the returned row.
 
     Identity columns are ``type``, ``title``, ``username``, ``is_forum``, ``source_id`` and
     ``discussion_of`` — the last one only when the new row carries it, so a discussion chat that
     is resolved again as an ordinary source chat keeps its channel. Sync state (``last_msg_id``,
     ``last_sync_at``, ``unavailable``, ``migrated_to``) is written on insert only, so re-resolving
     a source never rewinds a synced chat; change it with :func:`set_chat_progress`,
-    :func:`set_chat_unavailable` and :func:`set_chat_migrated`.
+    :func:`set_chat_unavailable` and :func:`set_chat_migrated`. Neither ``chat_access`` nor
+    ``chat_sources`` is written here: which account reaches a chat and which sources cover it are
+    the callers' to record (:func:`set_chat_access`, :func:`set_source_chats`).
     """
+    owner = account if account is not None else (chat.scope or DEFAULT_ACCOUNT)
+    scope = chat_scope(chat.type, owner)
     with transaction(conn):
+        stored = get_chat_by_peer(conn, chat.peer_id, scope)
+        if stored is not None:
+            conn.execute(
+                """UPDATE chats SET type = ?, title = ?, username = ?, is_forum = ?,
+                                    source_id = ?, discussion_of = COALESCE(?, discussion_of)
+                   WHERE id = ?""",
+                (
+                    chat.type,
+                    chat.title,
+                    chat.username,
+                    int(chat.is_forum),
+                    chat.source_id,
+                    chat.discussion_of,
+                    stored.id,
+                ),
+            )
+            return _require_chat(conn, stored.id)
+        row_id = chat.peer_id
+        if get_chat(conn, row_id) is not None:
+            if not scope:
+                raise ValueError(
+                    f"chat id {row_id} is held by another row, so {chat.type} {chat.peer_id} "
+                    "cannot be stored under its own peer id"
+                )
+            row_id = _next_synthetic_id(conn)
         conn.execute(
             """INSERT INTO chats(id, type, title, username, is_forum, source_id, discussion_of,
-                                 last_msg_id, last_sync_at, unavailable, migrated_to)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-               ON CONFLICT(id) DO UPDATE SET
-                   type = excluded.type,
-                   title = excluded.title,
-                   username = excluded.username,
-                   is_forum = excluded.is_forum,
-                   source_id = excluded.source_id,
-                   discussion_of = COALESCE(excluded.discussion_of, chats.discussion_of)""",
+                                 last_msg_id, last_sync_at, unavailable, migrated_to, peer_id,
+                                 scope)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
-                chat.id,
+                row_id,
                 chat.type,
                 chat.title,
                 chat.username,
@@ -779,14 +966,284 @@ def upsert_chat(conn: sqlite3.Connection, chat: ChatRow) -> ChatRow:
                 chat.last_sync_at,
                 int(chat.unavailable),
                 chat.migrated_to,
+                chat.peer_id,
+                scope,
             ),
         )
-        return _chat_row(conn.execute("SELECT * FROM chats WHERE id = ?", (chat.id,)).fetchone())
+        return _require_chat(conn, row_id)
+
+
+def _next_synthetic_id(conn: sqlite3.Connection) -> int:
+    """Hand out the next synthetic ``chats.id``: one above the highest ever handed out, not just
+    the highest still stored — so a scoped row deleted since (``sources rm``, ``accounts rm``)
+    never has its id given to another conversation, which anything kept outside the index
+    naming that id would then take for the old one (:data:`META_SYNTHETIC_NEXT`)."""
+    row = conn.execute(
+        "SELECT max(id) AS top FROM chats WHERE id >= ?", (SYNTHETIC_BASE,)
+    ).fetchone()
+    stored = SYNTHETIC_BASE if row["top"] is None else int(row["top"]) + 1
+    mark = get_meta(conn, META_SYNTHETIC_NEXT)
+    chosen = max(stored, int(mark) if mark else SYNTHETIC_BASE)
+    set_meta(conn, META_SYNTHETIC_NEXT, str(chosen + 1))
+    return chosen
+
+
+def _require_chat(conn: sqlite3.Connection, chat_id: int) -> ChatRow:
+    chat = get_chat(conn, chat_id)
+    if chat is None:  # pragma: no cover - read back inside the transaction that wrote it
+        raise LookupError(f"chat {chat_id} vanished inside its own transaction")
+    return chat
 
 
 def get_chat(conn: sqlite3.Connection, chat_id: int) -> ChatRow | None:
     row = conn.execute("SELECT * FROM chats WHERE id = ?", (chat_id,)).fetchone()
     return None if row is None else _chat_row(row)
+
+
+def get_chat_by_peer(conn: sqlite3.Connection, peer_id: int, scope: str) -> ChatRow | None:
+    """The row of Telegram peer ``peer_id`` under ``scope`` (``''`` for a channel or supergroup,
+    the account name otherwise — :func:`grepogram.models.chat_scope`), if stored."""
+    row = conn.execute(
+        "SELECT * FROM chats WHERE scope = ? AND peer_id = ?", (scope, peer_id)
+    ).fetchone()
+    return None if row is None else _chat_row(row)
+
+
+def chats_for_peer(conn: sqlite3.Connection, peer_id: int) -> list[ChatRow]:
+    """Every row of Telegram peer ``peer_id``, in any scope, ordered by id.
+
+    One row for a channel or supergroup; for a private chat or a legacy group, one per account
+    that has stored its own history with that peer.
+    """
+    rows = conn.execute("SELECT * FROM chats WHERE peer_id = ? ORDER BY id", (peer_id,))
+    return [_chat_row(row) for row in rows]
+
+
+# --- chat access, coverage and accounts ------------------------------------------------------
+
+
+def set_chat_access(
+    conn: sqlite3.Connection,
+    chat_id: int,
+    account: str,
+    *,
+    access_hash: int | None = None,
+) -> None:
+    """Record that ``account`` reaches chat ``chat_id``.
+
+    An ``access_hash`` left ``None`` keeps what is stored, so confirming access without an
+    entity at hand never drops the one an earlier resolve recorded. The table's ``via`` and
+    ``checked_at`` columns are no longer written: nothing reads them.
+    """
+    with transaction(conn):
+        conn.execute(
+            """INSERT INTO chat_access(chat_id, account, access_hash) VALUES (?, ?, ?)
+               ON CONFLICT(chat_id, account) DO UPDATE SET
+                   access_hash = COALESCE(excluded.access_hash, chat_access.access_hash)""",
+            (chat_id, account, access_hash),
+        )
+
+
+def chat_accounts(conn: sqlite3.Connection, chat_id: int) -> list[str]:
+    """The accounts that reach chat ``chat_id``, :data:`DEFAULT_ACCOUNT` first, then by name."""
+    rows = conn.execute(
+        "SELECT account FROM chat_access WHERE chat_id = ? ORDER BY account != ?, account",
+        (chat_id, DEFAULT_ACCOUNT),
+    )
+    return [str(row["account"]) for row in rows]
+
+
+def chat_reach(conn: sqlite3.Connection, chat_id: int) -> list[str]:
+    """The accounts what is stored of chat ``chat_id`` came through, :data:`DEFAULT_ACCOUNT`
+    first, then by name — the provenance a hit and a message view report.
+
+    Those ``chat_access`` records as reaching the chat and, for a discussion group, those
+    reaching the channel it holds the comments of: a sync reaches such a group through its
+    channel's link rather than a resolve of its own, so it may have no access row at all. Empty
+    for a chat no account reaches — a Telegram Desktop import, whose history came from a file.
+    """
+    rows = conn.execute(
+        "SELECT account FROM chat_access WHERE chat_id = ? "
+        "OR chat_id = (SELECT discussion_of FROM chats WHERE id = ?) "
+        "GROUP BY account ORDER BY account != ?, account",
+        (chat_id, chat_id, DEFAULT_ACCOUNT),
+    )
+    return [str(row["account"]) for row in rows]
+
+
+def chats_reached_by(conn: sqlite3.Connection, accounts: Iterable[str]) -> set[int]:
+    """Ids of the chats any of ``accounts`` reaches, by :func:`chat_reach`'s rule: every chat
+    ``chat_access`` records for one of them and the discussion groups of those chats."""
+    names = sorted(set(accounts))
+    if not names:
+        return set()
+    marks = ", ".join("?" * len(names))
+    rows = conn.execute(
+        f"WITH reached AS (SELECT chat_id FROM chat_access WHERE account IN ({marks})) "
+        "SELECT chat_id AS id FROM reached "
+        "UNION SELECT id FROM chats WHERE discussion_of IN (SELECT chat_id FROM reached)",
+        names,
+    )
+    return {int(row["id"]) for row in rows}
+
+
+def known_accounts(conn: sqlite3.Connection) -> set[str]:
+    """Every account name the index mentions: recorded in ``accounts``, reaching a chat in
+    ``chat_access``, or scoping a private chat's row."""
+    rows = conn.execute(
+        "SELECT name FROM accounts UNION SELECT account FROM chat_access "
+        "UNION SELECT scope FROM chats WHERE scope != ''"
+    )
+    return {str(row[0]) for row in rows}
+
+
+def access_hash(conn: sqlite3.Connection, chat_id: int, account: str) -> int | None:
+    """The access hash ``account`` addresses chat ``chat_id`` by, ``None`` when none is stored."""
+    row = conn.execute(
+        "SELECT access_hash FROM chat_access WHERE chat_id = ? AND account = ?",
+        (chat_id, account),
+    ).fetchone()
+    return None if row is None or row["access_hash"] is None else int(row["access_hash"])
+
+
+def stored_peers(conn: sqlite3.Connection, account: str) -> list[tuple[int, int]]:
+    """``(peer_id, access_hash)`` of every chat ``account`` has an access hash stored for — what
+    its client can address with no request at all once the session is handed them."""
+    rows = conn.execute(
+        "SELECT c.peer_id, a.access_hash FROM chat_access a JOIN chats c ON c.id = a.chat_id "
+        "WHERE a.account = ? AND a.access_hash IS NOT NULL ORDER BY c.id",
+        (account,),
+    )
+    return [(int(row["peer_id"]), int(row["access_hash"])) for row in rows]
+
+
+def chat_source_ids(conn: sqlite3.Connection, chat_id: int) -> list[str]:
+    """Every source recorded as covering chat ``chat_id``, ordered by id."""
+    rows = conn.execute(
+        "SELECT source_id FROM chat_sources WHERE chat_id = ? ORDER BY source_id", (chat_id,)
+    )
+    return [str(row["source_id"]) for row in rows]
+
+
+def set_source_chats(conn: sqlite3.Connection, source_id: str, chat_ids: Iterable[int]) -> None:
+    """Make ``chat_ids`` the whole set of chats source ``source_id`` covers, for a resolve that
+    has just read what one source lists. An empty set drops the source from every chat's
+    coverage; ``chats.source_id``, the primary owner, is not touched."""
+    with transaction(conn):
+        conn.execute("DELETE FROM chat_sources WHERE source_id = ?", (source_id,))
+        conn.executemany(
+            "INSERT INTO chat_sources(chat_id, source_id) VALUES (?, ?)",
+            [(chat_id, source_id) for chat_id in dict.fromkeys(chat_ids)],
+        )
+
+
+def add_chat_sources(conn: sqlite3.Connection, chat_id: int, source_ids: Iterable[str]) -> None:
+    """Record that every source of ``source_ids`` covers chat ``chat_id`` too, keeping what
+    each already covers — for a chat a sync learns of outside any source's listing (the
+    supergroup a legacy group migrated to)."""
+    with transaction(conn):
+        conn.executemany(
+            "INSERT OR IGNORE INTO chat_sources(chat_id, source_id) VALUES (?, ?)",
+            [(chat_id, source_id) for source_id in dict.fromkeys(source_ids)],
+        )
+
+
+def source_chat_ids(conn: sqlite3.Connection, source_id: str) -> list[int]:
+    """Every chat recorded as covered by ``source_id``, ordered by id."""
+    rows = conn.execute(
+        "SELECT chat_id FROM chat_sources WHERE source_id = ? ORDER BY chat_id", (source_id,)
+    )
+    return [int(row["chat_id"]) for row in rows]
+
+
+def chat_sources_map(conn: sqlite3.Connection) -> dict[int, list[str]]:
+    """Chat id → every source recorded as covering it, for the readers that walk all chats."""
+    covering: dict[int, list[str]] = {}
+    for row in conn.execute(
+        "SELECT chat_id, source_id FROM chat_sources ORDER BY chat_id, source_id"
+    ):
+        covering.setdefault(int(row["chat_id"]), []).append(str(row["source_id"]))
+    return covering
+
+
+def chat_accounts_map(conn: sqlite3.Connection) -> dict[int, list[str]]:
+    """Chat id → every account ``chat_access`` records as reaching it, in
+    :func:`chat_accounts` order, for the readers that walk all chats."""
+    reaching: dict[int, list[str]] = {}
+    for row in conn.execute(
+        "SELECT chat_id, account FROM chat_access ORDER BY chat_id, account != ?, account",
+        (DEFAULT_ACCOUNT,),
+    ):
+        reaching.setdefault(int(row["chat_id"]), []).append(str(row["account"]))
+    return reaching
+
+
+def set_primary_source(conn: sqlite3.Connection, chat_id: int, source_id: str) -> None:
+    """Move chat ``chat_id``'s primary owner (``chats.source_id``) to ``source_id``.
+
+    The caller has asked :func:`grepogram.sources.imported_tag` first, like every writer of the
+    column; nothing else of the row changes.
+    """
+    with transaction(conn):
+        conn.execute("UPDATE chats SET source_id = ? WHERE id = ?", (source_id, chat_id))
+
+
+def upsert_account(conn: sqlite3.Connection, account: AccountRow) -> AccountRow:
+    """Record who ``account.name`` is. ``accounts.added_at`` is no longer written: nothing
+    reads it."""
+    with transaction(conn):
+        conn.execute(
+            """INSERT INTO accounts(name, user_id, display_name) VALUES (?, ?, ?)
+               ON CONFLICT(name) DO UPDATE SET
+                   user_id = excluded.user_id,
+                   display_name = excluded.display_name""",
+            (account.name, account.user_id, account.display_name),
+        )
+        row = conn.execute("SELECT * FROM accounts WHERE name = ?", (account.name,)).fetchone()
+        return _account_row(row)
+
+
+def get_account(conn: sqlite3.Connection, name: str) -> AccountRow | None:
+    """Who ``name`` was recorded as, if it ever was."""
+    row = conn.execute("SELECT * FROM accounts WHERE name = ?", (name,)).fetchone()
+    return None if row is None else _account_row(row)
+
+
+def conflicting_account(conn: sqlite3.Connection, name: str, user_id: int) -> AccountRow | None:
+    """The row recording ``name`` as a Telegram user other than ``user_id``, or ``None`` — none
+    recorded, or one with no user yet (a ``default`` account from before accounts existed)."""
+    found = get_account(conn, name)
+    if found is None or found.user_id is None or found.user_id == user_id:
+        return None
+    return found
+
+
+def list_accounts(conn: sqlite3.Connection) -> list[AccountRow]:
+    """Every recorded account, :data:`DEFAULT_ACCOUNT` first, then by name."""
+    rows = conn.execute("SELECT * FROM accounts ORDER BY name != ?, name", (DEFAULT_ACCOUNT,))
+    return [_account_row(row) for row in rows]
+
+
+def account_chat_counts(conn: sqlite3.Connection) -> dict[str, int]:
+    """Account name → how many stored chats ``chat_access`` records it as reaching."""
+    rows = conn.execute("SELECT account, COUNT(*) AS n FROM chat_access GROUP BY account")
+    return {str(row["account"]): int(row["n"]) for row in rows}
+
+
+def forget_account(conn: sqlite3.Connection, account: str) -> int:
+    """Drop every ``chat_access`` row of ``account``, the peers its syncs cached
+    (``peer_cache`` — access hashes only that Telegram user can address anything with) and its
+    ``accounts`` row; returns how many chats it was recorded as reaching.
+
+    Nothing else goes: which chats stay indexed is decided by the sources that cover them
+    (:func:`grepogram.sources.remove_source`), and a chat another account reaches keeps that
+    account's access.
+    """
+    with transaction(conn):
+        dropped = conn.execute("DELETE FROM chat_access WHERE account = ?", (account,)).rowcount
+        conn.execute("DELETE FROM peer_cache WHERE account = ?", (account,))
+        conn.execute("DELETE FROM accounts WHERE name = ?", (account,))
+    return int(dropped)
 
 
 def get_discussion_chat(conn: sqlite3.Connection, channel_id: int) -> ChatRow | None:
@@ -895,12 +1352,13 @@ def delete_chat(conn: sqlite3.Connection, chat_id: int) -> None:
     every message it holds, and only the link goes — with the comment mapping under it, which
     :func:`drop_comment_units` clears for the groups the delete unlinks.
 
-    The chat's two per-chat ``meta`` markers go too, because nothing else would ever remove them
+    The chat's per-chat ``meta`` markers go too, because nothing else would ever remove them
     and a chat id can come back — re-added after a ``sources rm``, or re-listed by a folder after
     a ``sources prune``. A surviving ``prune_sweep:`` cursor would make
     :func:`grepogram.sync.prune_deleted` resume the fresh history from the old chat's high-water
     mark, report the chat done and never ask about anything below it; a surviving ``unit_recut:``
-    marker would make the next recipe bump skip the chat outright.
+    marker would make the next recipe bump skip the chat outright, and a ``links_recapture:``
+    cursor would skip the fresh history's unread rows the same way.
     """
     with transaction(conn):
         chat = get_chat(conn, chat_id)
@@ -923,8 +1381,12 @@ def delete_chat(conn: sqlite3.Connection, chat_id: int) -> None:
                 (chat_id,),
             )
         conn.execute(
-            "DELETE FROM meta WHERE key IN (?, ?)",
-            (f"{META_PRUNE_PREFIX}{chat_id}", f"{META_RECUT_PREFIX}{chat_id}"),
+            "DELETE FROM meta WHERE key IN (?, ?, ?)",
+            (
+                f"{META_PRUNE_PREFIX}{chat_id}",
+                f"{META_RECUT_PREFIX}{chat_id}",
+                f"{META_RECAPTURE_PREFIX}{chat_id}",
+            ),
         )
         conn.execute("DELETE FROM chats WHERE id = ?", (chat_id,))
 
@@ -1031,9 +1493,23 @@ def upsert_messages(conn: sqlite3.Connection, batch: Iterable[MessageRow]) -> li
     all (see :data:`_MESSAGE_UPSERT`): they belong to the extraction pass, which owns them through
     its own writers. Every row written, new or updated, is flagged ``indexed = 0`` until a rebuild
     covers it (:func:`mark_indexed`). The chat row must exist (foreign key).
+
+    A row's ``links`` **replace** the message's stored ``message_links`` when they are a tuple —
+    an empty one included, a message whose last link was edited away — and leave them alone when
+    they are ``None``, what a row carries that was read back from the index or built by an
+    import that knows no links; the same "not supplied" idiom the ``COALESCE`` columns use. A
+    tuple also marks the row ``links_read`` for good, which is what tells research's text
+    fallback and the link recapture pass which rows were never read (:func:`lead_messages`,
+    :func:`unread_link_ids`).
+
+    Every row inserted, and every row re-stored with its links read again, is stamped with the
+    next tick of the lead clock (:func:`lead_clock`) — one tick per call, taken inside the
+    transaction that writes the rows, so a reader that saw a clock value has seen every row
+    stamped at or below it.
     """
     ids: list[int] = []
     with transaction(conn):
+        tick = _tick_lead_clock(conn)
         for message in batch:
             row = conn.execute(
                 _MESSAGE_UPSERT,
@@ -1049,14 +1525,292 @@ def upsert_messages(conn: sqlite3.Connection, batch: Iterable[MessageRow]) -> li
                     message.comment_of_chat_id,
                     message.comment_of_msg_id,
                     message.fwd_from,
+                    message.fwd_peer_id,
+                    message.fwd_msg_id,
+                    message.fwd_date,
                     message.text,
                     message.media_kind,
                     message.media_filename,
                     message.reactions_total,
+                    int(message.links is not None),
+                    tick,
                 ),
             ).fetchone()
-            ids.append(int(row["id"]))
+            message_id = int(row["id"])
+            if message.links is not None:
+                _replace_links(conn, message_id, message.links)
+            ids.append(message_id)
     return ids
+
+
+def _replace_links(
+    conn: sqlite3.Connection, message_id: int, links: Iterable[tuple[LinkKind, str]]
+) -> None:
+    conn.execute("DELETE FROM message_links WHERE message_id = ?", (message_id,))
+    conn.executemany(
+        "INSERT OR IGNORE INTO message_links(message_id, kind, target) VALUES (?, ?, ?)",
+        [(message_id, kind, target) for kind, target in links],
+    )
+
+
+def message_links(
+    conn: sqlite3.Connection, ids: Iterable[int]
+) -> dict[int, tuple[tuple[LinkKind, str], ...]]:
+    """The stored links of the messages ``ids`` (``messages.id``), sorted like
+    ``MessageRow.links``; a message with none is absent."""
+    found: dict[int, list[tuple[LinkKind, str]]] = {}
+    for chunk in _chunks(ids):
+        rows = conn.execute(
+            f"SELECT message_id, kind, target FROM message_links "
+            f"WHERE message_id IN ({_marks(chunk)}) ORDER BY message_id, kind, target",
+            chunk,
+        )
+        for row in rows:
+            found.setdefault(int(row["message_id"]), []).append((row["kind"], row["target"]))
+    return {message_id: tuple(links) for message_id, links in found.items()}
+
+
+def links_captured_from(conn: sqlite3.Connection) -> int:
+    """The first ``messages.id`` whose links and forward origin were captured when stored.
+
+    Rows below it were stored before schema step 8 and carry neither — unless a later edit
+    re-stored them. Step 9 turned this mark into ``messages.links_read``, the per-row answer
+    everything reads now; an index built at step 8 or later has ``1`` here.
+    """
+    value = get_meta(conn, META_LINKS_CAPTURED_FROM)
+    return int(value) if value else 1
+
+
+def _tick_lead_clock(conn: sqlite3.Connection) -> int:
+    """Advance the lead clock by one and return the new value; the caller's transaction holds
+    the write lock, so no other writer can stamp the same value."""
+    row = conn.execute(
+        "INSERT INTO meta(key, value) VALUES (?, '2') "
+        "ON CONFLICT(key) DO UPDATE SET value = CAST(value AS INTEGER) + 1 RETURNING value",
+        (META_LEAD_CLOCK,),
+    ).fetchone()
+    return int(row["value"])
+
+
+def lead_clock(conn: sqlite3.Connection) -> int:
+    """The last tick :func:`upsert_messages` (or :func:`set_captured_links`) stamped a row with.
+
+    ``messages.lead_seq`` is when a row's leads — its links and forward origin — last changed on
+    this clock, so ``lead_seq > cursor`` is every row stored or re-read since a reader took that
+    cursor, whatever its ``msg_id``: a discussion group's comments arrive out of ``msg_id``
+    order, and an edit or a recapture gives an old row links it did not have. The clock is the
+    index's own, so a cursor on it only means something together with :func:`index_id`.
+    """
+    value = get_meta(conn, META_LEAD_CLOCK)
+    return int(value) if value else 1
+
+
+def index_id(conn: sqlite3.Connection) -> str:
+    """The random name this index was given (:data:`META_INDEX_ID`); one rebuilt from scratch
+    under the same path gets another, which is how a cursor kept elsewhere notices it."""
+    value = get_meta(conn, META_INDEX_ID)
+    return value or ""
+
+
+_TEXT_MAY_LINK = (
+    "(text LIKE '%@%' OR text LIKE '%t.me%' OR text LIKE '%telegram.me%' "
+    "OR text LIKE '%telegram.dog%' OR text LIKE '%tg:%')"
+)
+"""What the text of a row whose links were never read must hold for
+:func:`grepogram.leads.text_leads` to find anything in it; ``LIKE`` ignores ASCII case."""
+
+
+def lead_messages(
+    conn: sqlite3.Connection, chat_id: int, after_seq: int, upto_seq: int
+) -> list[tuple[MessageRow, bool]]:
+    """The messages of ``chat_id`` whose leads changed after lead clock ``after_seq`` and no
+    later than ``upto_seq`` (:func:`lead_clock`) that may name another chat, ascending by
+    ``msg_id``, each with whether its links were read — research's offline discovery reads these.
+
+    A row carries a lead when it has stored links or a forward origin; a row whose links were
+    never read (``links_read = 0``: stored before step 8, or by an import that spelled no
+    entities) may still show one in its text, and is included when that text could hold a URL or
+    a mention at all.
+    """
+    rows = conn.execute(
+        f"""SELECT * FROM messages AS m WHERE chat_id = ? AND lead_seq > ? AND lead_seq <= ?
+            AND (fwd_peer_id IS NOT NULL
+                 OR EXISTS (SELECT 1 FROM message_links WHERE message_id = m.id)
+                 OR (links_read = 0 AND {_TEXT_MAY_LINK}))
+            ORDER BY msg_id""",
+        (chat_id, after_seq, upto_seq),
+    )
+    return [(_message_row(row), bool(row["links_read"])) for row in rows]
+
+
+def newest_lead_seq(conn: sqlite3.Connection, chat_id: int) -> int:
+    """The highest ``lead_seq`` stored for ``chat_id``; ``0`` for a chat holding none."""
+    row = conn.execute(
+        "SELECT MAX(lead_seq) AS newest FROM messages WHERE chat_id = ?", (chat_id,)
+    ).fetchone()
+    return int(row["newest"] or 0)
+
+
+def chat_link_targets(conn: sqlite3.Connection, chat_id: int) -> set[str]:
+    """Every distinct ``message_links`` target and forward origin (as ``peer:<id>``) the stored
+    messages of ``chat_id`` name — what telling a directory chat apart is counted over."""
+    rows = conn.execute(
+        """SELECT DISTINCT l.target AS target FROM message_links AS l
+           JOIN messages AS m ON m.id = l.message_id WHERE m.chat_id = ?
+           UNION SELECT DISTINCT 'peer:' || fwd_peer_id FROM messages
+           WHERE chat_id = ? AND fwd_peer_id IS NOT NULL""",
+        (chat_id, chat_id),
+    )
+    return {str(row["target"]) for row in rows}
+
+
+# --- the link recapture pass -----------------------------------------------------------------
+
+
+def unread_link_ids(
+    conn: sqlite3.Connection, chat_id: int, after_msg_id: int, limit: int
+) -> list[int]:
+    """Up to ``limit`` Telegram ``msg_id`` values above ``after_msg_id``, ascending, of the rows
+    of ``chat_id`` whose links were never read (``links_read = 0``)."""
+    rows = conn.execute(
+        "SELECT msg_id FROM messages WHERE chat_id = ? AND links_read = 0 AND msg_id > ? "
+        "ORDER BY msg_id LIMIT ?",
+        (chat_id, after_msg_id, limit),
+    )
+    return [int(row["msg_id"]) for row in rows]
+
+
+def chats_with_unread_links(conn: sqlite3.Connection) -> list[int]:
+    """Ids of the chats holding a row whose links were never read, ascending."""
+    rows = conn.execute("SELECT DISTINCT chat_id FROM messages WHERE links_read = 0 ORDER BY 1")
+    return [int(row["chat_id"]) for row in rows]
+
+
+def count_unread_links(conn: sqlite3.Connection, chat_ids: Collection[int] | None = None) -> int:
+    """How many rows — of ``chat_ids``, or of every chat — have links nothing ever read."""
+    if chat_ids is None:
+        row = conn.execute("SELECT COUNT(*) AS n FROM messages WHERE links_read = 0").fetchone()
+        return int(row["n"])
+    total = 0
+    for chunk in _chunks(chat_ids):
+        row = conn.execute(
+            f"SELECT COUNT(*) AS n FROM messages WHERE links_read = 0 "
+            f"AND chat_id IN ({_marks(chunk)})",
+            chunk,
+        ).fetchone()
+        total += int(row["n"])
+    return total
+
+
+def recapture_cursor(conn: sqlite3.Connection, chat_id: int) -> int:
+    """The highest ``msg_id`` the link recapture pass has asked Telegram about in ``chat_id``."""
+    value = get_meta(conn, f"{META_RECAPTURE_PREFIX}{chat_id}")
+    return int(value) if value else 0
+
+
+def set_captured_links(
+    conn: sqlite3.Connection, chat_id: int, rows: Iterable[MessageRow], cursor: int
+) -> int:
+    """Write the links and forward origin of re-read ``rows`` onto the stored rows of ``chat_id``
+    and move the recapture cursor to ``cursor`` — one transaction; returns how many rows changed.
+
+    Nothing else of a row is touched: its text, media, reactions, ``indexed`` flag and units stay
+    exactly as they are — a unit renders none of these columns, so there is nothing to re-cut —
+    and a row the index does not hold is not created. Each row becomes ``links_read`` and takes
+    the next lead-clock tick, so discovery reads it again.
+    """
+    changed = 0
+    with transaction(conn):
+        tick = _tick_lead_clock(conn)
+        for message in rows:
+            row = conn.execute(
+                """UPDATE messages SET fwd_peer_id = ?, fwd_msg_id = ?, fwd_date = ?,
+                                       links_read = 1, lead_seq = ?
+                   WHERE chat_id = ? AND msg_id = ? RETURNING id""",
+                (
+                    message.fwd_peer_id,
+                    message.fwd_msg_id,
+                    message.fwd_date,
+                    tick,
+                    chat_id,
+                    message.msg_id,
+                ),
+            ).fetchone()
+            if row is None:
+                continue
+            _replace_links(conn, int(row["id"]), message.links or ())
+            changed += 1
+        set_meta(conn, f"{META_RECAPTURE_PREFIX}{chat_id}", str(cursor))
+    return changed
+
+
+# --- peers met while fetching ----------------------------------------------------------------
+
+
+def remember_peers(
+    conn: sqlite3.Connection,
+    account: str,
+    peers: Iterable[CachedPeer],
+    now: int | None = None,
+) -> None:
+    """Record the peers ``account`` was handed while fetching (:class:`CachedPeer`) — a
+    forward's origin channel, typically, which no source covers. A value left ``None`` keeps
+    what is stored; a username is stored lowercased."""
+    with transaction(conn):
+        conn.executemany(
+            """INSERT INTO peer_cache(account, peer_id, username, access_hash, seen_at)
+               VALUES (?, ?, ?, ?, ?)
+               ON CONFLICT(account, peer_id) DO UPDATE SET
+                   username = COALESCE(excluded.username, peer_cache.username),
+                   access_hash = COALESCE(excluded.access_hash, peer_cache.access_hash),
+                   seen_at = COALESCE(excluded.seen_at, peer_cache.seen_at)""",
+            [
+                (account, p.peer_id, p.username.lower() if p.username else None, p.access_hash, now)
+                for p in peers
+            ],
+        )
+
+
+def cached_peer_hash(conn: sqlite3.Connection, peer_id: int, account: str) -> int | None:
+    """The access hash ``account`` was handed for ``peer_id`` while fetching, if any."""
+    row = conn.execute(
+        "SELECT access_hash FROM peer_cache WHERE account = ? AND peer_id = ?", (account, peer_id)
+    ).fetchone()
+    return None if row is None or row["access_hash"] is None else int(row["access_hash"])
+
+
+def cached_peers(conn: sqlite3.Connection, account: str) -> list[tuple[int, int]]:
+    """``(peer_id, access_hash)`` of every peer ``account`` was handed an access hash for and
+    ``peer_cache`` keeps — a forward's origin, or a public chat a research run added as a source
+    without the account joining it
+    (:func:`grepogram.research.running._remember_read_without_joining`), which no ``chat_access``
+    row holds until a sync first reaches it."""
+    rows = conn.execute(
+        "SELECT peer_id, access_hash FROM peer_cache "
+        "WHERE account = ? AND access_hash IS NOT NULL ORDER BY peer_id",
+        (account,),
+    )
+    return [(int(row["peer_id"]), int(row["access_hash"])) for row in rows]
+
+
+def cached_peer_username(conn: sqlite3.Connection, peer_id: int) -> str | None:
+    """The username any account saw ``peer_id`` under while fetching, the most recent first — a
+    username is public, whoever read it."""
+    row = conn.execute(
+        "SELECT username FROM peer_cache WHERE peer_id = ? AND username IS NOT NULL "
+        "ORDER BY seen_at DESC, account LIMIT 1",
+        (peer_id,),
+    ).fetchone()
+    return None if row is None else str(row["username"])
+
+
+def chats_for_username(conn: sqlite3.Connection, username: str) -> list[ChatRow]:
+    """Every stored chat whose ``@username`` is ``username``, ignoring case, ordered by id."""
+    rows = conn.execute(
+        "SELECT * FROM chats WHERE lower(username) = ? ORDER BY id",
+        (username.lstrip("@").lower(),),
+    )
+    return [_chat_row(row) for row in rows]
 
 
 def attachment_replaced(stored: MessageRow, fresh: MessageRow) -> bool:
@@ -1200,7 +1954,7 @@ def count_pending_media(conn: sqlite3.Connection, chat_ids: Sequence[int] | None
     """How many rows are left in the extraction queue; ``chat_ids`` scopes it to those chats.
 
     The scoped figure is what ``grepogram extract`` reports as ``remaining``, over the chats the
-    pass can actually re-fetch (:func:`grepogram.media._fetchable_chats`). A row in an imported
+    pass can actually re-fetch (:func:`grepogram.media._queue_left`). A row in an imported
     or unavailable chat never leaves :data:`MEDIA_PENDING`, so the index-wide count would tell
     the user to "run extract again" for work no run can ever do, and a script looping until it
     reaches zero would never stop. An empty ``chat_ids`` is an empty scope, not the whole index.
@@ -1813,6 +2567,16 @@ def _chat_row(row: sqlite3.Row) -> ChatRow:
         last_sync_at=row["last_sync_at"],
         unavailable=bool(row["unavailable"]),
         migrated_to=row["migrated_to"],
+        peer_id=row["peer_id"],
+        scope=row["scope"],
+    )
+
+
+def _account_row(row: sqlite3.Row) -> AccountRow:
+    return AccountRow(
+        name=row["name"],
+        user_id=row["user_id"],
+        display_name=row["display_name"],
     )
 
 
@@ -1830,6 +2594,9 @@ def _message_row(row: sqlite3.Row) -> MessageRow:
         comment_of_chat_id=row["comment_of_chat_id"],
         comment_of_msg_id=row["comment_of_msg_id"],
         fwd_from=row["fwd_from"],
+        fwd_peer_id=row["fwd_peer_id"],
+        fwd_msg_id=row["fwd_msg_id"],
+        fwd_date=row["fwd_date"],
         text=row["text"],
         media_kind=row["media_kind"],
         media_filename=row["media_filename"],

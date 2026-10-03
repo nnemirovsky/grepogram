@@ -6,7 +6,16 @@ import pytest
 import sqlite_vec
 
 from grepogram import db, index, stem, sync, tg, units
-from grepogram.models import ChatRow, Config, MessageRow, Source, SyncReport, UnitRow, UnitsCfg
+from grepogram.models import (
+    DEFAULT_ACCOUNT,
+    ChatRow,
+    Config,
+    MessageRow,
+    Source,
+    SyncReport,
+    UnitRow,
+    UnitsCfg,
+)
 from grepogram.paths import Paths
 from grepogram.sync import SyncBudget
 from grepogram.units import UnitDelta
@@ -574,7 +583,7 @@ def _client(messages: list[object]) -> FakeClient:
 
 async def _run(client: FakeClient, conn: sqlite3.Connection, paths: Paths) -> SyncReport:
     async with tg.connected(client):
-        return await sync.sync_all(client, conn, CFG, paths, SyncBudget())
+        return await sync.sync_all({DEFAULT_ACCOUNT: client}, conn, CFG, paths, SyncBudget())
 
 
 async def test_sync_all_maintains_the_lexical_index(conn: sqlite3.Connection, paths: Paths) -> None:

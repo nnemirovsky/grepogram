@@ -14,7 +14,19 @@ import pytest
 from grepogram import config
 from grepogram.config import TEMPLATE, ConfigError
 from grepogram.log import redact, setup_logging, shutdown_logging
-from grepogram.models import Config, MediaCfg, ModelsCfg, SearchCfg, Source, TelegramCfg
+from grepogram.models import (
+    DEFAULT_ACCOUNT,
+    RESEARCH_LIMIT_MAX,
+    AccountCfg,
+    Config,
+    MediaCfg,
+    ModelsCfg,
+    ResearchCfg,
+    ResearchLimits,
+    SearchCfg,
+    Source,
+    TelegramCfg,
+)
 from grepogram.paths import Paths, env_flag
 from tests.conftest import file_mode
 
@@ -30,7 +42,9 @@ def paths(tmp_home: Path) -> Paths:
 def test_paths_follow_grepogram_home(tmp_home: Path, paths: Paths) -> None:
     assert paths.config_file == tmp_home / "config.toml"
     assert paths.session_file == tmp_home / "session.session"
+    assert paths.sessions_dir == tmp_home / "sessions"
     assert paths.db_file == tmp_home / "index.db"
+    assert paths.research_db_file == tmp_home / "research.db"
     assert paths.lock_file == tmp_home / "sync.lock"
     assert paths.config_lock_file == tmp_home / "config.lock"
     assert paths.log_dir == tmp_home / "logs"
@@ -49,8 +63,10 @@ def test_paths_macos_defaults_without_override(monkeypatch: pytest.MonkeyPatch) 
     home = Path.home()
     assert paths.config_file == home / ".config" / "grepogram" / "config.toml"
     assert paths.session_file == home / ".config" / "grepogram" / "session.session"
+    assert paths.sessions_dir == home / ".config" / "grepogram" / "sessions"
     assert paths.db_file == home / "Library" / "Application Support" / "grepogram" / "index.db"
     assert paths.lock_file == home / "Library" / "Application Support" / "grepogram" / "sync.lock"
+    assert paths.research_db_file == paths.db_file.with_name("research.db")
     assert paths.config_lock_file == home / ".config" / "grepogram" / "config.lock"
     assert paths.log_dir == home / "Library" / "Logs" / "grepogram"
     assert Paths.from_env({"GREPOGRAM_HOME": "  "}) == paths
@@ -88,7 +104,29 @@ def test_ensure_dirs_creates_private_directories(tmp_path: Path) -> None:
     for directory in paths.directories:
         assert directory.is_dir()
         assert file_mode(directory) == 0o700
-    assert len(paths.directories) == 3
+    assert len(paths.directories) == 4
+    assert paths.sessions_dir in paths.directories
+
+
+def test_the_default_account_keeps_the_existing_session_file(tmp_home: Path, paths: Paths) -> None:
+    assert paths.session_file_for(DEFAULT_ACCOUNT) == paths.session_file
+    assert paths.session_file_for("work") == tmp_home / "sessions" / "work.session"
+
+
+def test_named_account_sessions_live_next_to_the_macos_config(tmp_path: Path) -> None:
+    paths = Paths.macos_default(tmp_path)
+    config_dir = tmp_path / ".config" / "grepogram"
+    assert paths.session_file_for(DEFAULT_ACCOUNT) == config_dir / "session.session"
+    assert paths.session_file_for("work") == config_dir / "sessions" / "work.session"
+    assert paths.session_file_for("work").suffix == ".session"
+
+
+@pytest.mark.parametrize("name", ["", "../evil", "a/b", "Work", "x" * 33, "wörk"])
+def test_session_file_for_refuses_a_name_that_is_not_an_account_name(
+    paths: Paths, name: str
+) -> None:
+    with pytest.raises(ValueError, match="invalid account name"):
+        paths.session_file_for(name)
 
 
 # --- config ----------------------------------------------------------------------------------
@@ -121,12 +159,125 @@ def test_save_load_round_trip(paths: Paths) -> None:
     assert config.load(paths) == cfg
 
 
+def test_accounts_round_trip_and_a_default_account_is_not_written(paths: Paths) -> None:
+    cfg = Config(
+        accounts=[AccountCfg(name="work", label="work phone"), AccountCfg(name="spare")],
+        sources=[
+            Source(chat=12345),
+            Source(chat=12345, account="work", since="2025-01-01"),
+            Source(folder="News", account="spare", comments=True),
+            Source(chat="@explicit", account=DEFAULT_ACCOUNT),
+        ],
+    )
+    config.save(cfg, paths)
+    assert config.load(paths) == cfg
+    stored = paths.config_file.read_text()
+    assert stored.count("account = ") == 2
+    assert '{ name = "spare" }' in stored
+    assert config.to_dict(cfg)["sources"][3] == {"chat": "@explicit"}
+
+
+def test_a_config_without_accounts_is_the_default_account_alone() -> None:
+    cfg = config.loads("[[sources]]\nchat = 1\n")
+    assert cfg.accounts == []
+    assert cfg.account_names() == (DEFAULT_ACCOUNT,)
+    assert cfg.sources[0].account == DEFAULT_ACCOUNT
+    assert "accounts" not in config.to_dict(cfg)
+
+
+def test_account_names_list_the_default_account_first() -> None:
+    cfg = config.loads("[[accounts]]\nname = 'work'\n[[accounts]]\nname = 'alt'\n")
+    assert cfg.account_names() == (DEFAULT_ACCOUNT, "work", "alt")
+    assert cfg.accounts[0] == AccountCfg(name="work", label=None)
+
+
+def test_a_source_must_name_a_known_account() -> None:
+    with pytest.raises(ConfigError, match=r"sources\[0\]\.account: unknown account 'work'") as info:
+        config.loads("[[sources]]\nchat = 1\naccount = 'work'\n")
+    assert info.value.hint is not None and "[[accounts]]" in info.value.hint
+    cfg = config.loads("[[accounts]]\nname = 'work'\n[[sources]]\nchat = 1\naccount = 'work'\n")
+    assert cfg.sources[0].account == "work"
+
+
+@pytest.mark.parametrize("name", ["", "Work", "x" * 33, "a/b", "../x", "wörk", "a b"])
+def test_an_invalid_account_name_is_refused(name: str) -> None:
+    with pytest.raises(ConfigError, match=r"accounts\[0\]: invalid account name") as info:
+        config.loads(f"[[accounts]]\nname = {name!r}\n")
+    assert info.value.hint is not None
+
+
+@pytest.mark.parametrize("name", ["a", "work_2", "x" * 32, "my-phone", "0"])
+def test_a_valid_account_name_is_accepted(name: str) -> None:
+    assert config.check_account_name(name) == name
+    assert config.loads(f"[[accounts]]\nname = {name!r}\n").accounts[0].name == name
+
+
+def test_the_default_account_name_is_reserved() -> None:
+    with pytest.raises(ConfigError, match=r"accounts\[0\]: .*'default' is reserved") as info:
+        config.loads("[[accounts]]\nname = 'default'\n")
+    assert info.value.hint == config.RESERVED_ACCOUNT_HINT
+
+
+def test_duplicate_accounts_rejected() -> None:
+    with pytest.raises(ConfigError, match=r"accounts\[1\]: duplicate account 'work'"):
+        config.loads("[[accounts]]\nname = 'work'\n[[accounts]]\nname = 'work'\n")
+
+
+@pytest.mark.parametrize(
+    ("text", "match"),
+    [
+        ("accounts = 1\n", r"invalid value for accounts: expected an array"),
+        ("accounts = [1]\n", r"invalid value for accounts\[0\]: expected a table"),
+        ("[[accounts]]\nlabel = 'x'\n", r"accounts\[0\]: an account needs a 'name'"),
+        ("[[accounts]]\nname = 1\n", r"invalid value for accounts\[0\]\.name: expected str"),
+        ("[[accounts]]\nname = 'a'\nlabel = 2\n", r"accounts\[0\]\.label: expected str"),
+        ("[[sources]]\nchat = 1\naccount = 2\n", r"sources\[0\]\.account: expected str"),
+    ],
+)
+def test_malformed_accounts_name_the_key(text: str, match: str) -> None:
+    with pytest.raises(ConfigError, match=match):
+        config.loads(text)
+
+
+def test_an_unknown_account_key_names_the_keys_an_account_takes() -> None:
+    with pytest.raises(ConfigError, match=r"unknown key: accounts\[0\]\.session") as info:
+        config.loads("[[accounts]]\nname = 'a'\nsession = 'x'\n")
+    assert info.value.hint is not None and "name" in info.value.hint and "label" in info.value.hint
+    assert "[[accounts]]" in config.UNKNOWN_SECTION_HINT
+
+
+def test_one_chat_value_may_be_a_source_of_two_accounts_but_not_twice_of_one() -> None:
+    both = "[[accounts]]\nname = 'work'\n[[sources]]\nchat = 1\n[[sources]]\nchat = 1\n"
+    with pytest.raises(ConfigError, match=r"sources\[1\]: duplicate source 'chat:1'"):
+        config.loads(both)
+    cfg = config.loads(both + "account = 'work'\n")
+    assert [source.id for source in cfg.sources] == ["chat:1", "work/chat:1"]
+    with pytest.raises(ConfigError, match=r"duplicate source 'work/chat:1'"):
+        config.loads(both.replace("chat = 1\n", "chat = 1\naccount = 'work'\n"))
+
+
 def test_save_writes_mode_0600_even_over_a_permissive_file(paths: Paths) -> None:
     paths.config_file.write_text("")
     paths.config_file.chmod(0o644)
     config.save(Config(), paths)
     assert file_mode(paths.config_file) == 0o600
     assert not paths.config_file.with_name(".config.toml.tmp").exists()
+
+
+def test_save_refuses_a_config_load_would_refuse_and_keeps_the_file(paths: Paths) -> None:
+    """No writer can leave a ``config.toml`` every later command fails on: a source of an
+    account the config does not list is refused before anything is written."""
+    kept = Config(sources=[Source(chat="@news")])
+    config.save(kept, paths)
+    orphan = dataclasses.replace(kept, sources=[*kept.sources, Source(chat=1, account="gone")])
+    with pytest.raises(ConfigError, match="refusing to save a config that would not load") as err:
+        config.save(orphan, paths)
+    assert "unknown account 'gone'" in str(err.value)
+    assert err.value.hint is not None and "[[accounts]]" in err.value.hint
+    assert config.load(paths) == kept
+    with pytest.raises(ConfigError, match="unknown account 'gone'"):
+        config.update(paths, lambda current: orphan)
+    assert config.load(paths) == kept
 
 
 def test_save_is_comment_lossy(paths: Paths) -> None:
@@ -241,6 +392,10 @@ def test_source_ids_are_stable() -> None:
     assert Source(folder="Argentina").id == "folder:Argentina"
     assert Source(chat="@ru_georgia").id == "chat:@ru_georgia"
     assert Source(chat=123456789).id == "chat:123456789"
+    assert Source(chat=123456789, account=DEFAULT_ACCOUNT).id == "chat:123456789"
+    assert Source(chat=123456789, account="work").id == "work/chat:123456789"
+    assert Source(chat="https://t.me/x", account="work").id == "work/chat:https://t.me/x"
+    assert Source(folder="Argentina", account="work").id == "work/folder:Argentina"
     with pytest.raises(ValueError):
         Source()
 
@@ -248,6 +403,20 @@ def test_source_ids_are_stable() -> None:
 def test_template_parses_to_defaults() -> None:
     assert config.loads(TEMPLATE) == Config()
     assert "[[sources]]" in TEMPLATE
+
+
+def test_template_documents_accounts_and_the_account_of_a_source() -> None:
+    """The commented examples are valid config once uncommented, accounts and all."""
+    examples = [
+        line.removeprefix("# ")
+        for line in TEMPLATE.splitlines()
+        if re.match(r"# (\[\[\w+\]\]$|\w+ = )", line)
+    ]
+    cfg = config.loads("\n".join(examples))
+    assert cfg.accounts == [AccountCfg(name="work", label="work phone")]
+    assert cfg.sources[1] == Source(
+        chat="@ru_georgia", account="work", since="2024-01-01", comments=False
+    )
 
 
 # --- models.max_seq_length -------------------------------------------------------------------
@@ -356,6 +525,96 @@ def test_media_is_a_known_section_with_its_own_unknown_key_hint() -> None:
     with pytest.raises(ConfigError, match=r"unknown key: media\.nope") as caught:
         config.loads("[media]\nnope = 1\n")
     assert caught.value.hint is not None and "[media]" in caught.value.hint
+
+
+# --- [research] ------------------------------------------------------------------------------
+
+
+def test_research_defaults_keep_research_off() -> None:
+    assert ResearchCfg() == ResearchCfg(
+        enabled=False,
+        chat_search=False,
+        post_search=False,
+        paid_stars_max=0,
+        max_depth=2,
+        max_candidates=50,
+        probe_limit=20,
+        since_days=365,
+        max_messages_per_run=5000,
+        run_budget_s=300,
+    )
+    assert config.loads("").research == ResearchCfg()
+    assert config.loads(TEMPLATE).research == ResearchCfg()
+    assert Config().research == ResearchCfg()
+
+
+def test_research_round_trips_through_save_and_load(paths: Paths) -> None:
+    cfg = Config(research=ResearchCfg(enabled=True, post_search=True, paid_stars_max=10))
+    config.save(cfg, paths)
+    text = paths.config_file.read_text()
+    assert "[research]" in text and "paid_stars_max = 10" in text
+    assert config.load(paths) == cfg
+
+
+def test_research_limits_copy_the_configured_bounds() -> None:
+    cfg = ResearchCfg(
+        max_depth=3,
+        max_candidates=7,
+        probe_limit=4,
+        since_days=30,
+        max_messages_per_run=100,
+        run_budget_s=60,
+    )
+    assert cfg.limits() == ResearchLimits(
+        max_depth=3,
+        max_candidates=7,
+        probe_limit=4,
+        since_days=30,
+        max_messages_per_run=100,
+        run_budget_s=60,
+    )
+    assert ResearchCfg().limits() == ResearchLimits()
+
+
+@pytest.mark.parametrize("key", sorted(RESEARCH_LIMIT_MAX))
+def test_research_bounds_reject_a_value_outside_one_to_the_ceiling(key: str) -> None:
+    """A huge ``since_days`` once reached date arithmetic and crashed every later call of the
+    session it started; every limit is a whole number from 1 to its ceiling."""
+    high = RESEARCH_LIMIT_MAX[key]
+    for value in (0, -1, high + 1, 10**30):
+        with pytest.raises(
+            ConfigError,
+            match=rf"invalid value for research\.{key}: must be a whole number from 1 to",
+        ):
+            config.loads(f"[research]\n{key} = {value}\n")
+    assert getattr(config.loads(f"[research]\n{key} = {high}\n").research, key) == high
+
+
+def test_paid_stars_max_takes_zero_and_refuses_a_negative() -> None:
+    assert config.loads("[research]\npaid_stars_max = 0\n").research.paid_stars_max == 0
+    with pytest.raises(ConfigError, match=r"research\.paid_stars_max: expected a non-negative"):
+        config.loads("[research]\npaid_stars_max = -5\n")
+
+
+@pytest.mark.parametrize(
+    ("text", "key", "expected"),
+    [
+        ("[research]\nenabled = 1\n", "research.enabled", "bool"),
+        ("[research]\npost_search = 'no'\n", "research.post_search", "bool"),
+        ("[research]\nmax_depth = 2.0\n", "research.max_depth", "int"),
+    ],
+)
+def test_research_rejects_wrong_types(text: str, key: str, expected: str) -> None:
+    with pytest.raises(
+        ConfigError, match=rf"invalid value for {re.escape(key)}: expected {expected}"
+    ):
+        config.loads(text)
+
+
+def test_research_is_a_known_section() -> None:
+    assert "[research]" in config.UNKNOWN_SECTION_HINT
+    with pytest.raises(ConfigError, match=r"unknown key: research\.nope"):
+        config.loads("[research]\nnope = 1\n")
 
 
 # --- README ----------------------------------------------------------------------------------

@@ -9,7 +9,16 @@ from telethon.tl import functions, types
 from telethon.tl.types import messages as tl_messages
 
 from grepogram import db, sync, tg, units
-from grepogram.models import ChatRow, Config, MessageRow, Source, SyncReport, UnitRow, UnitsCfg
+from grepogram.models import (
+    DEFAULT_ACCOUNT,
+    ChatRow,
+    Config,
+    MessageRow,
+    Source,
+    SyncReport,
+    UnitRow,
+    UnitsCfg,
+)
 from grepogram.paths import Paths
 from grepogram.sync import SyncBudget
 from grepogram.units import UnitDelta
@@ -961,7 +970,7 @@ async def _run(
     client: FakeClient, conn: sqlite3.Connection, paths: Paths, cfg: Config
 ) -> SyncReport:
     async with tg.connected(client):
-        return await sync.sync_all(client, conn, cfg, paths, SyncBudget())
+        return await sync.sync_all({DEFAULT_ACCOUNT: client}, conn, cfg, paths, SyncBudget())
 
 
 def test_on_chat_synced_rebuilds_units(conn: sqlite3.Connection, chat: ChatRow) -> None:

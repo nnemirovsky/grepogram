@@ -13,6 +13,7 @@ from grepogram import cli, db, embed, filters, index, sync, tg, units
 from grepogram.embed import FAKE_DIM, FakeEmbedder, ModelUnavailable
 from grepogram.index import EmbeddingSpaceMismatch
 from grepogram.models import (
+    DEFAULT_ACCOUNT,
     ChatRow,
     Config,
     Filters,
@@ -558,7 +559,9 @@ async def _run(
     budget: SyncBudget | None = None,
 ) -> SyncReport:
     async with tg.connected(client):
-        return await sync.sync_all(client, conn, SYNC_CFG, paths, budget or SyncBudget(), embedder)
+        return await sync.sync_all(
+            {DEFAULT_ACCOUNT: client}, conn, SYNC_CFG, paths, budget or SyncBudget(), embedder
+        )
 
 
 async def test_sync_all_embeds_the_units_it_built(
@@ -776,7 +779,7 @@ def test_cli_sync_embeds_and_only_warns_without_the_model(
     paths.config_file.write_text(CONFIG)
     paths.session_file.touch()
     client = _client([tl.message(CHAT, 1, "hello", sender=1)])
-    monkeypatch.setattr(tg, "make_client", lambda cfg, paths: client)
+    monkeypatch.setattr(tg, "make_client", lambda *_: client)
     result = runner.invoke(cli.app, ["sync"])
     assert result.exit_code == 0, result.output
     assert "new messages: 1" in result.stdout

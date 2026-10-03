@@ -7,7 +7,7 @@ import pytest
 from grepogram import db, search
 from grepogram.models import ChatRow, MessageRow, MessageView
 from grepogram.search import UnknownMessage
-from tests.fixtures import chat_ru
+from tests.fixtures import chat_ru, two_accounts
 
 ARG = chat_ru.ARG_ID
 GEO = chat_ru.GEO_ID
@@ -326,6 +326,7 @@ def test_views_serialise_to_json(conn: sqlite3.Connection, loaded: chat_ru.Loade
     assert len(parsed) == 8
     assert set(parsed[0]) == {
         "chat_id",
+        "peer_id",
         "msg_id",
         "date",
         "from_name",
@@ -333,7 +334,50 @@ def test_views_serialise_to_json(conn: sqlite3.Connection, loaded: chat_ru.Loade
         "url",
         "fallback_url",
         "reply_to_msg_id",
+        "accounts",
     }
+
+
+def test_readers_on_a_synthetic_row_address_it_by_row_id_and_name_its_peer(
+    conn: sqlite3.Connection,
+) -> None:
+    """The work account's chat with Bob lives under a synthetic id, and its message 7 is not the
+    default account's message 7: the readers take the row id, stay in that row, and report the
+    Telegram peer and the account every view came through."""
+    two = two_accounts.load(conn)
+    bob = two_accounts.BOB
+    (work_view,) = search.thread(conn, two.work_bob.id, 7)
+    assert work_view.chat_id == two.work_bob.id >= db.SYNTHETIC_BASE
+    assert work_view.peer_id == bob and work_view.accounts == ["work"]
+    assert work_view.text == "Brubank payroll moves to Friday"
+    assert work_view.url == f"tg://openmessage?user_id={bob}&message_id=7"
+    assert [(v.chat_id, v.msg_id) for v in search.context(conn, two.work_bob.id, 7)] == [
+        (two.work_bob.id, 7)
+    ]
+    default_views = search.context(conn, bob, 7)
+    assert [v.msg_id for v in default_views] == [7, 8]
+    assert {(v.chat_id, v.peer_id) for v in default_views} == {(bob, bob)}
+    assert all(v.accounts == ["default"] for v in default_views)
+    assert _ids(search.thread(conn, bob, 8)) == [7, 8]
+    with pytest.raises(UnknownMessage):
+        search.thread(conn, two.work_bob.id, 8)
+
+
+def test_views_of_a_discussion_group_name_the_accounts_reaching_its_channel(
+    conn: sqlite3.Connection,
+) -> None:
+    """A group reached only through its channel's link has no access row of its own; what
+    reaches it is what reaches the channel. An import is reached by no account at all."""
+    two = two_accounts.load(conn)
+    (view,) = search.context(conn, two.hall_chat.id, 3)
+    assert view.accounts == ["default", "work"] and view.peer_id == two.hall_chat.id
+    assert db.chat_reach(conn, two.hall.id) == ["default", "work"]
+    assert db.chats_reached_by(conn, ["work"]) == {two.hall.id, two.hall_chat.id, two.work_bob.id}
+    assert db.chats_reached_by(conn, []) == set()
+    _store(conn, _chat(PLAIN, source_id="import:plain"), [_msg(PLAIN, 1)])
+    (imported,) = search.context(conn, PLAIN, 1)
+    assert imported.accounts == []
+    assert db.known_accounts(conn) == {"default", "work"}
 
 
 # --- context ---------------------------------------------------------------------------------

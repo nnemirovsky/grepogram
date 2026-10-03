@@ -12,16 +12,20 @@ import threading
 import time
 from collections.abc import Callable, Iterator
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
+from mcp import types as mcp_types
+from mcp.server.elicitation import AcceptedElicitation, CancelledElicitation, DeclinedElicitation
 from mcp.server.fastmcp import FastMCP
+from mcp.shared.exceptions import McpError
 from mcp.shared.memory import create_connected_server_and_client_session
 from telethon import errors
 from telethon.tl import functions, types
 from telethon.tl.types import messages as tl_messages
 
-from grepogram import config, db, embed, filters, index, units
+from grepogram import config, db, embed, filters, index, research, research_db, units
 from grepogram import mcp as tools
 from grepogram import rerank as reranking
 from grepogram import search as retrieval
@@ -30,9 +34,13 @@ from grepogram import sync as syncing
 from grepogram.embed import FakeEmbedder, ModelUnavailable
 from grepogram.filters import InvalidDate, UnknownChat
 from grepogram.models import (
+    DEFAULT_ACCOUNT,
+    AccountCfg,
+    ApprovalItem,
     ChatRow,
     Config,
     MessageRow,
+    ResearchCfg,
     Source,
     SyncReport,
     TelegramCfg,
@@ -43,8 +51,16 @@ from grepogram.search import UnknownMessage
 from grepogram.sources import AmbiguousTarget
 from grepogram.sync import SyncInProgress, SyncLock
 from grepogram.tg import AuthRequired, SessionError, SessionMissing
-from tests.fakes import FakeClient, make_channel, make_dialog, make_folder, make_user
-from tests.fixtures import chat_ru, tl
+from tests.fakes import (
+    FakeClient,
+    FakeWorld,
+    make_channel,
+    make_dialog,
+    make_folder,
+    make_user,
+    no_discussion,
+)
+from tests.fixtures import chat_ru, tl, two_accounts
 
 ARG = chat_ru.ARG_ID
 GEO = chat_ru.GEO_ID
@@ -92,7 +108,7 @@ def bind(
 
     def make(cfg: Config = CFG, client: FakeClient | None = None) -> tools.AppState:
         chosen = fake if client is None else client
-        state = tools.AppState(paths, cfg, conn, client_factory=lambda cfg, paths: chosen)
+        state = tools.AppState(paths, cfg, conn, client_factory=lambda cfg, paths, account: chosen)
         tools.bind(state)
         return state
 
@@ -289,7 +305,8 @@ async def test_auto_sync_under_a_held_lock_is_a_warning(
     assert result["synced"] is False
     assert result["warnings"] == ["auto-sync skipped: another sync is running (lock held)"]
     assert len(calls) == 1
-    assert calls[0][0] is fake and calls[0][1] is stale.conn and calls[0][3] is paths
+    assert calls[0][0] == {DEFAULT_ACCOUNT: fake}
+    assert calls[0][1] is stale.conn and calls[0][3] is paths
     budget = calls[0][4]
     assert isinstance(budget, syncing.SyncBudget)
     assert budget.seconds == CFG.search.auto_sync_budget_s
@@ -344,7 +361,9 @@ async def test_auto_sync_without_a_session_is_a_warning(
     ]
     built: list[Config] = []
     tools.bind(
-        tools.AppState(paths, CFG, stale.conn, client_factory=lambda cfg, p: built.append(cfg))
+        tools.AppState(
+            paths, CFG, stale.conn, client_factory=lambda cfg, p, account: built.append(cfg)
+        )
     )
     paths.session_file.unlink()
     result = await tools.search("DNI", mode="lexical")
@@ -386,7 +405,7 @@ async def test_each_telegram_call_builds_a_fresh_client(
     clients = [_client(authorized=False), _client()]
     built: list[FakeClient] = []
 
-    def factory(cfg: Config, p: Paths) -> FakeClient:
+    def factory(cfg: Config, p: Paths, account: str) -> FakeClient:
         built.append(clients[len(built)])
         return built[-1]
 
@@ -459,7 +478,7 @@ async def test_auto_sync_waits_no_longer_than_its_budget_for_a_running_sync(
 async def test_an_unreadable_session_file_is_an_error_with_a_hint(
     stale: tools.AppState, paths: Paths, conn: sqlite3.Connection
 ) -> None:
-    def locked(cfg: Config, p: Paths) -> FakeClient:
+    def locked(cfg: Config, p: Paths, account: str) -> FakeClient:
         raise SessionError(p.session_file, sqlite3.OperationalError("database is locked"))
 
     tools.bind(tools.AppState(paths, CFG, conn, client_factory=locked))
@@ -691,7 +710,6 @@ UNSET = Config(search=CFG.search, units=CFG.units, sources=CFG.sources)
             tools.AUTH_HINT,
             id="unauthorized",
         ),
-        pytest.param(CFG, _flooded, "telegram error: ", None, id="flood-wait"),
         pytest.param(CFG, _offline, "connection error: offline", None, id="offline"),
         pytest.param(UNSET, _client, "[telegram] api_id and api_hash", tools.SETUP_HINT, id="keys"),
         pytest.param(
@@ -716,6 +734,19 @@ async def test_sync_errors_carry_hints(
     assert result["error"].startswith(error)
     assert result["hint"] == hint
     assert "new" not in result
+
+
+async def test_a_flood_wait_while_resolving_is_a_warning_not_an_error(
+    state: tools.AppState, bind: Callable[..., tools.AppState]
+) -> None:
+    """A flood wait on one account's resolve stops that account for the run; the sync itself
+    answers, and says so, instead of failing every account's run with a Telegram error."""
+    bind(CFG, _flooded())
+    result = await tools.sync()
+    assert "error" not in result
+    assert result["warnings"] == [
+        "flood wait: Telegram asks to wait 30s before more history requests; run sync again later"
+    ]
 
 
 async def test_sync_without_a_session_file_carries_the_auth_hint(
@@ -819,6 +850,7 @@ async def test_sources_add_fuzzy_writes_config_and_reads_dialogs_afresh(
         "chat": GEO,
         "since": None,
         "comments": False,
+        "account": "default",
     }
     assert added["kind"] == "chat" and added["title"] == "Грузия | Georgia chat"
     assert [c["id"] for c in added["chats"]] == [GEO]
@@ -843,6 +875,20 @@ async def test_sources_add_fuzzy_writes_config_and_reads_dialogs_afresh(
     assert "channels only" in (await tools.sources_add("@arg_chat", comments=True))["error"]
     assert "ISO date" in (await tools.sources_add("@news", since="jan"))["error"]
     assert config.load(paths).sources == expected
+
+
+async def test_a_refused_join_link_reaches_the_caller_and_not_the_log(
+    bind: Callable[..., tools.AppState], caplog: pytest.LogCaptureFixture
+) -> None:
+    """An invite or folder link a tool refuses can be a private way in someone wrote in a
+    message: the result quotes it for the caller, the log says only what kind of refusal it was
+    unless it runs at DEBUG."""
+    bind(Config(telegram=KEYS))
+    with caplog.at_level(logging.INFO, logger="grepogram"):
+        refused = await tools.sources_add("https://t.me/+SecretDoor")
+    assert "SecretDoor" in refused["error"]
+    assert "sources_add failed: InvalidTarget" in caplog.text
+    assert "SecretDoor" not in caplog.text
 
 
 async def test_sources_add_refuses_a_chat_already_held_as_an_import(
@@ -871,6 +917,8 @@ async def test_sources_remove_deletes_data_and_saves_the_config(
     assert removed == {
         "source_id": "folder:Argentina",
         "removed_chat_ids": [ARG],
+        "kept_chat_ids": [],
+        "undecided_chat_ids": [],
         "config_updated": True,
     }
     assert db.get_chat(conn, ARG) is None and db.get_chat(conn, GEO) is not None
@@ -882,6 +930,33 @@ async def test_sources_remove_deletes_data_and_saves_the_config(
     unknown = tools.sources_remove("folder:Nowhere")
     assert unknown["error"].startswith("no folder source named 'Nowhere'")
     assert unknown["hint"] is None
+
+
+def test_sources_remove_of_a_stray_chat_keeps_its_source_and_says_so(
+    state: tools.AppState, conn: sqlite3.Connection, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A chat held under a ``chat:`` source that resolved to another chat goes alone: the
+    source stays configured, and the log says the chat went, not the source."""
+    geo_source = f"chat:{GEO}"
+    db.set_source_chats(conn, geo_source, [GEO])
+    left = -1000000000777
+    db.upsert_chat(conn, ChatRow(id=left, type="supergroup", title="Left", source_id=geo_source))
+
+    with caplog.at_level(logging.INFO, logger="grepogram"):
+        removed = tools.sources_remove(str(left))
+
+    assert removed == {
+        "source_id": geo_source,
+        "removed_chat_ids": [left],
+        "kept_chat_ids": [],
+        "undecided_chat_ids": [],
+        "config_updated": False,
+    }
+    assert db.get_chat(conn, left) is None and db.get_chat(conn, GEO) is not None
+    assert state.config().sources == CFG.sources
+    assert f"removed chat {left}, held under {geo_source} which does not cover it" in caplog.text
+    assert "that source stays" in caplog.text
+    assert f"source {geo_source} removed" not in caplog.text
 
 
 def test_config_is_reread_when_the_file_changes(state: tools.AppState, paths: Paths) -> None:
@@ -921,6 +996,7 @@ def test_thread_and_context_read_messages(state: tools.AppState) -> None:
     assert result["messages"][0]["url"] == "https://t.me/arg_chat/1"
     assert set(result["messages"][0]) == {
         "chat_id",
+        "peer_id",
         "msg_id",
         "date",
         "from_name",
@@ -928,6 +1004,7 @@ def test_thread_and_context_read_messages(state: tools.AppState) -> None:
         "url",
         "fallback_url",
         "reply_to_msg_id",
+        "accounts",
     }
     around = tools.context(ARG, 5, before=1, after=1)
     assert [m["msg_id"] for m in around["messages"]] == [4, 5, 6]
@@ -1150,6 +1227,316 @@ def test_stdout_guard_holds_until_the_last_block_exits(
     assert sys.stdout is before
 
 
+# --- accounts --------------------------------------------------------------------------------
+
+WORK = "work"
+BOB = make_user(2, "Bob")
+WORK_ME = make_user(43, "Worker")
+TWO_ACCOUNTS = Config(
+    telegram=KEYS,
+    search=CFG.search,
+    units=CFG.units,
+    accounts=[AccountCfg(name=WORK, label="work phone")],
+    sources=[
+        Source(chat="@news"),
+        Source(chat="@news", account=WORK),
+        Source(chat=2, account=WORK),
+    ],
+)
+
+
+class Accounts:
+    """The default account and ``work`` over one world: both see the public channel ``@news``,
+    ``work`` alone has a private chat with Bob. Every block gets fresh clients, as the server's
+    factory builds them; ``built`` records each one per account."""
+
+    def __init__(self, paths: Paths) -> None:
+        self.paths = paths
+        self.world = FakeWorld(
+            entities=[NEWS, BOB],
+            messages={NEWS_ID: [tl.channel_post(NEWS_ID, i, f"news {i}") for i in (1, 2)]},
+        )
+        self.options: dict[str, dict[str, Any]] = {DEFAULT_ACCOUNT: {}, WORK: {}}
+        self.built: dict[str, list[FakeClient]] = {DEFAULT_ACCOUNT: [], WORK: []}
+        paths.session_file_for(WORK).parent.mkdir(parents=True, exist_ok=True)
+        paths.session_file_for(WORK).touch()
+
+    def factory(self, cfg: Config, paths: Paths, account: str) -> FakeClient:
+        if account == WORK:
+            client = self.world.client(
+                WORK,
+                members=[NEWS, BOB],
+                me=WORK_ME,
+                messages={2: [tl.message(2, 5, "bob at work", sender=2)]},
+                **self.options[WORK],
+            )
+        else:
+            client = self.world.client(members=[NEWS], me=ME, **self.options[DEFAULT_ACCOUNT])
+        self.built[account].append(client)
+        return client
+
+
+@pytest.fixture
+def accounts(paths: Paths, conn: sqlite3.Connection) -> Iterator[Accounts]:
+    two = Accounts(paths)
+    tools.bind(tools.AppState(paths, TWO_ACCOUNTS, conn, client_factory=two.factory))
+    yield two
+    tools.unbind()
+
+
+def _skipped(account: str, error: str) -> dict[str, object]:
+    return {"account": account, "error": error, "hint": tools.auth_hint(account)}
+
+
+async def test_sync_fetches_through_every_signed_in_account(
+    accounts: Accounts, conn: sqlite3.Connection
+) -> None:
+    report = await tools.sync(budget_s=10)
+    assert "error" not in report, report
+    assert report["new"] == 3 and report["accounts_skipped"] == [] and report["warnings"] == []
+    bob = db.get_chat_by_peer(conn, 2, WORK)
+    assert bob is not None
+    assert db.message_counts(conn) == {NEWS_ID: 2, bob.id: 1}
+    assert db.chat_accounts(conn, NEWS_ID) == [DEFAULT_ACCOUNT, WORK]
+    assert {name: len(built) for name, built in accounts.built.items()} == {
+        DEFAULT_ACCOUNT: 1,
+        WORK: 1,
+    }
+    assert all(not c.is_connected() for built in accounts.built.values() for c in built)
+    again = await tools.sync(budget_s=10)
+    assert again["new"] == 0
+    assert {name: len(built) for name, built in accounts.built.items()} == {
+        DEFAULT_ACCOUNT: 2,
+        WORK: 2,
+    }
+
+
+async def test_sync_goes_on_without_a_signed_out_account_and_names_its_sign_in(
+    accounts: Accounts, conn: sqlite3.Connection, capfd: pytest.CaptureFixture[str]
+) -> None:
+    accounts.options[WORK] = {"authorized": False}
+    report = await tools.sync(budget_s=10)
+    assert "error" not in report, report
+    assert report["new"] == 2 and db.message_counts(conn) == {NEWS_ID: 2}
+    assert report["accounts_skipped"] == [_skipped(WORK, "Telegram session is not authorized")]
+    assert tools.auth_hint(WORK) == (
+        "sign in from a terminal with `grepogram auth --account work`, then retry"
+    )
+    assert report["warnings"] == [
+        f"account work skipped: Telegram session is not authorized; {tools.auth_hint(WORK)}"
+    ]
+    assert db.chat_accounts(conn, NEWS_ID) == [DEFAULT_ACCOUNT]
+
+    accounts.options[WORK] = {}
+    accounts.paths.session_file_for(WORK).unlink()
+    missing = await tools.sync(budget_s=10)
+    work_session = accounts.paths.session_file_for(WORK)
+    assert missing["accounts_skipped"] == [_skipped(WORK, f"no Telegram session at {work_session}")]
+    assert len(accounts.built[WORK]) == 1  # no client is built for a missing session
+    assert capfd.readouterr().out == ""
+
+
+async def test_sync_with_no_account_signed_in_is_an_error_naming_the_source_owner(
+    accounts: Accounts, paths: Paths
+) -> None:
+    paths.session_file.unlink()
+    accounts.options[WORK] = {"authorized": False}
+    refused = await tools.sync(budget_s=10)
+    assert refused["error"] == "account work: Telegram session is not authorized"
+    assert refused["hint"] == tools.auth_hint(WORK)
+    paths.session_file_for(WORK).unlink()
+    missing = await tools.sync(budget_s=10)
+    assert missing["error"] == f"no Telegram session at {paths.session_file}"
+    assert missing["hint"] == tools.AUTH_HINT  # the default account owns a source too
+
+
+async def test_a_session_file_only_named_accounts_need_is_not_missed(
+    paths: Paths, conn: sqlite3.Connection
+) -> None:
+    """An install whose sources all belong to ``work`` never had a default session to miss."""
+    two = Accounts(paths)
+    paths.session_file.unlink()
+    cfg = dataclasses.replace(TWO_ACCOUNTS, sources=[Source(chat=2, account=WORK)])
+    tools.bind(tools.AppState(paths, cfg, conn, client_factory=two.factory))
+    try:
+        report = await tools.sync(budget_s=10)
+    finally:
+        tools.unbind()
+    assert "error" not in report, report
+    assert report["new"] == 1 and report["accounts_skipped"] == [] and report["warnings"] == []
+
+
+async def test_auto_sync_refreshes_every_account_and_warns_about_a_refused_one(
+    accounts: Accounts, conn: sqlite3.Connection
+) -> None:
+    await tools.sync(budget_s=10)
+    conn.execute("UPDATE chats SET last_sync_at = 1")
+    conn.execute("DELETE FROM meta WHERE key LIKE 'last_sync%'")
+    assert tools._stale(tools._app(), TWO_ACCOUNTS)
+    accounts.world.messages[NEWS_ID].append(tl.channel_post(NEWS_ID, 3, "news 3 Brubank"))
+    accounts.options[WORK] = {"authorized": False}
+    result = await tools.search("Brubank", mode="lexical")
+    assert result["synced"] is True and _has(result, NEWS_ID, 3)
+    assert result["warnings"] == [
+        "auto-sync: account work skipped: Telegram session is not authorized; "
+        f"{tools.auth_hint(WORK)}",
+        "auto-sync: 1 chats were not fetched: no account in this run reaches them, and account "
+        "work itself is not signed in or not part of it",
+    ], "its chat with Bob is not reported as behind: syncing again would not fetch it"
+
+
+async def test_dialogs_reads_the_account_it_is_given(accounts: Accounts) -> None:
+    home = await tools.dialogs("news")
+    assert home["account"] == DEFAULT_ACCOUNT
+    assert [m["target"] for m in home["matches"]] == ["@news"]
+    work = await tools.dialogs("bob", account=WORK)
+    assert "error" not in work, work
+    assert work["account"] == WORK
+    assert [(m["id"], m["target"]) for m in work["matches"]] == [(2, "work/chat:2")]
+    assert [m["target"] for m in (await tools.dialogs("news", WORK))["matches"]] == [
+        "work/chat:@news"
+    ]
+    assert len(accounts.built[DEFAULT_ACCOUNT]) == 1 and len(accounts.built[WORK]) == 2
+    assert not any(c.is_connected() for built in accounts.built.values() for c in built)
+    unknown = await tools.dialogs("bob", account="nobody")
+    assert unknown["error"] == f"unknown account 'nobody'; known: {DEFAULT_ACCOUNT}, {WORK}"
+    assert unknown["hint"] == tools.auth_hint("nobody")
+    accounts.options[WORK] = {"authorized": False}
+    refused = await tools.dialogs("bob", account=WORK)
+    assert refused == {
+        "error": "account work: Telegram session is not authorized",
+        "hint": tools.auth_hint(WORK),
+    }
+
+
+async def test_sources_add_for_another_account(paths: Paths, conn: sqlite3.Connection) -> None:
+    two = Accounts(paths)
+    cfg = dataclasses.replace(TWO_ACCOUNTS, sources=[])
+    state = tools.AppState(paths, cfg, conn, client_factory=two.factory)
+    tools.bind(state)
+    try:
+        prefixed = await tools.sources_add("work/chat:2")
+        named = await tools.sources_add("@news", account=WORK)
+        home = await tools.sources_add("@news")
+        clash = await tools.sources_add("work/chat:@news", account=DEFAULT_ACCOUNT)
+        unknown = await tools.sources_add("@news", account="nobody")
+    finally:
+        tools.unbind()
+    assert prefixed["source"]["id"] == "work/chat:2" and prefixed["source"]["account"] == WORK
+    assert named["source"]["id"] == "work/chat:@news"
+    assert home["source"]["id"] == "chat:@news" and home["source"]["account"] == DEFAULT_ACCOUNT
+    assert "account default" in clash["error"]
+    assert unknown["hint"] == tools.auth_hint("nobody")
+    assert [s.id for s in state.config().sources] == [
+        "work/chat:2",
+        "work/chat:@news",
+        "chat:@news",
+    ]
+    assert len(two.built[WORK]) == 2 and len(two.built[DEFAULT_ACCOUNT]) == 2
+
+
+async def test_sources_add_for_an_account_removed_meanwhile_saves_nothing(
+    paths: Paths, conn: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``grepogram accounts rm work`` saves while the target resolves: the tool answers with an
+    error, and the server — and every later command — still loads the config."""
+    two = Accounts(paths)
+    cfg = dataclasses.replace(TWO_ACCOUNTS, sources=[])
+    state = tools.AppState(paths, cfg, conn, client_factory=two.factory)
+    state.save_config(state.cfg)
+    real_add = sourcing.add_source
+
+    async def add_then_lose_the_account(*args: Any, **kwargs: Any) -> sourcing.Added:
+        added = await real_add(*args, **kwargs)
+        config.update(paths, lambda current: dataclasses.replace(current, accounts=[]))
+        return added
+
+    monkeypatch.setattr(sourcing, "add_source", add_then_lose_the_account)
+    tools.bind(state)
+    try:
+        result = await tools.sources_add("@news", account=WORK)
+    finally:
+        tools.unbind()
+    assert "account 'work' was removed while the source was being added" in result["error"]
+    loaded = config.load(paths)
+    assert loaded.sources == [] and loaded.accounts == []
+    assert state.config() == loaded
+
+
+async def test_sources_carry_accounts_and_remove_keeps_a_shared_chat(
+    accounts: Accounts, conn: sqlite3.Connection
+) -> None:
+    await tools.sync(budget_s=10)
+    bob = db.get_chat_by_peer(conn, 2, WORK)
+    assert bob is not None
+    listed = {s["source_id"]: s for s in tools.sources()["sources"]}
+    assert [(s, listed[s]["account"]) for s in listed] == [
+        ("chat:@news", DEFAULT_ACCOUNT),
+        ("work/chat:@news", WORK),
+        ("work/chat:2", WORK),
+    ]
+    assert listed["chat:@news"]["chats"][0]["accounts"] == [DEFAULT_ACCOUNT, WORK]
+    assert listed["work/chat:2"]["chats"][0]["accounts"] == [WORK]
+    removed = tools.sources_remove("chat:@news")
+    assert removed["source_id"] == "chat:@news"
+    assert removed["removed_chat_ids"] == [] and removed["kept_chat_ids"] == [NEWS_ID]
+    dm = tools.sources_remove("work/chat:2")
+    assert dm["source_id"] == "work/chat:2" and dm["removed_chat_ids"] == [bob.id]
+    assert [s.id for s in tools._app().config().sources] == ["work/chat:@news"]
+    assert db.message_counts(conn) == {NEWS_ID: 2}
+    (left,) = tools.sources()["sources"]
+    assert left["source_id"] == "work/chat:@news" and left["chats"][0]["id"] == NEWS_ID
+
+
+async def test_accounts_lists_every_account_offline(
+    accounts: Accounts, conn: sqlite3.Connection, paths: Paths
+) -> None:
+    before = tools.accounts()
+    assert [(a["name"], a["label"], a["session"]) for a in before["accounts"]] == [
+        (DEFAULT_ACCOUNT, None, "present"),
+        (WORK, "work phone", "present"),
+    ]
+    assert before["hint"] == tools.ACCOUNTS_HINT
+    await tools.sync(budget_s=10)
+    paths.session_file.unlink()
+    home, work = tools.accounts()["accounts"]
+    assert home == {
+        "name": DEFAULT_ACCOUNT,
+        "label": None,
+        "session": "missing",
+        "user_id": 42,
+        "display_name": "Me Myself",
+        "sources": ["chat:@news"],
+        "chats": 1,
+        "hint": tools.AUTH_HINT,
+    }
+    assert work == {
+        "name": WORK,
+        "label": "work phone",
+        "session": "authorized",
+        "user_id": 43,
+        "display_name": "Worker",
+        "sources": ["work/chat:@news", "work/chat:2"],
+        "chats": 2,
+        "hint": None,
+    }
+    assert all(not c.is_connected() for built in accounts.built.values() for c in built)
+
+
+def test_session_hints_name_the_account() -> None:
+    assert tools.session_hint() == tools.SESSION_HINT
+    assert "`grepogram auth --account work`" in tools.session_hint(WORK)
+    work = AuthRequired(account=WORK)
+    assert tools.failure(work) == {
+        "error": "account work: Telegram session is not authorized",
+        "hint": tools.auth_hint(WORK),
+    }
+    unreadable = SessionError(
+        Path("/x/sessions/work.session"), sqlite3.OperationalError("database is locked"), WORK
+    )
+    assert tools.hint_for(unreadable) == tools.session_hint(WORK), "not the default's hint"
+
+
 # --- server ----------------------------------------------------------------------------------
 
 
@@ -1161,15 +1548,22 @@ def test_instructions_carry_the_playbook() -> None:
     assert "`url`" in text
     assert "say so rather than guess" in text
     assert "`sources`" in text and "`dialogs`" in text and "`sources_add`" in text
+    assert "`accounts`" in text and "signs it in" in text
+    assert "`research_start`" in text and "`research_approve`" in text
+    assert "show the user that summary verbatim" in text
+    assert "never confirm on your own judgement" in text
+    assert "forwards and copies of one post are one source" in text
+    assert "not independent confirmation" in text
+    assert "Name the account a claim came through" in text
 
 
-async def test_server_lists_the_eight_tools_over_a_session(state: tools.AppState) -> None:
+async def test_server_lists_the_eighteen_tools_over_a_session(state: tools.AppState) -> None:
     server = tools.build_server()
     assert server.name == "grepogram" and server.instructions == tools.INSTRUCTIONS
     async with create_connected_server_and_client_session(server) as session:
         listed = await session.list_tools()
         by_name = {tool.name: tool for tool in listed.tools}
-        assert len(by_name) == 8
+        assert len(by_name) == 18
         assert sorted(by_name) == sorted(tool.__name__ for tool in tools.TOOLS)
         search_tool = by_name["search"]
         assert search_tool.description is not None
@@ -1182,6 +1576,10 @@ async def test_server_lists_the_eight_tools_over_a_session(state: tools.AppState
         assert by_name["sync"].inputSchema["properties"]["budget_s"]["default"] == 45
         assert by_name["context"].inputSchema["properties"]["before"]["default"] == 15
         assert by_name["sources"].inputSchema["properties"] == {}
+        assert by_name["accounts"].inputSchema["properties"] == {}
+        assert by_name["dialogs"].inputSchema["required"] == ["query"]
+        assert "account" in by_name["dialogs"].inputSchema["properties"]
+        assert "account" in by_name["sources_add"].inputSchema["properties"]
         for tool in listed.tools:
             assert tool.description
         result = await session.call_tool("search", {"query": "DNI", "mode": "lexical", "k": 2})
@@ -1291,3 +1689,679 @@ def test_server_speaks_json_rpc_over_real_stdio(tmp_home: Path) -> None:
     listed = by_id[2]["result"]["tools"]
     assert sorted(tool["name"] for tool in listed) == sorted(tool.__name__ for tool in tools.TOOLS)
     assert "grepogram-mcp serving" in completed.stderr
+
+
+# --- account scopes and provenance -----------------------------------------------------------
+
+
+@pytest.fixture
+def two(bind: Callable[..., tools.AppState], conn: sqlite3.Connection) -> two_accounts.TwoAccounts:
+    """Two accounts' chats, synced just now (no auto-sync on search)."""
+    loaded = two_accounts.load(conn, synced_at=int(time.time()))
+    bind(two_accounts.CFG)
+    return loaded
+
+
+async def test_search_scopes_by_account_and_names_the_accounts_of_every_hit(
+    two: two_accounts.TwoAccounts, capsys: pytest.CaptureFixture[str]
+) -> None:
+    everything = await tools.search("Brubank", mode="lexical")
+    reach = {h["chat"]["id"]: (h["peer_id"], h["accounts"]) for h in everything["hits"]}
+    assert reach == {
+        two.hall.id: (two.hall.id, ["default", "work"]),
+        two.hall_chat.id: (two.hall_chat.id, ["default", "work"]),
+        two.default_bob.id: (two_accounts.BOB, ["default"]),
+        two.work_bob.id: (two_accounts.BOB, ["work"]),
+    }
+    work = await tools.search("Brubank", mode="lexical", accounts=["work"])
+    assert {h["chat"]["id"] for h in work["hits"]} == {
+        two.hall.id,
+        two.hall_chat.id,
+        two.work_bob.id,
+    }
+    by_spec = await tools.search("Brubank", chats=["account:default"], mode="lexical")
+    assert {h["chat"]["id"] for h in by_spec["hits"]} == {
+        two.hall.id,
+        two.hall_chat.id,
+        two.default_bob.id,
+    }
+    by_peer = await tools.search("Brubank", chats=[f"work/{two_accounts.BOB}"], mode="lexical")
+    assert {h["chat"]["id"] for h in by_peer["hits"]} == {two.work_bob.id}
+    refused = await tools.search("Brubank", accounts=["home"])
+    assert refused["error"].startswith("no indexed chat matches 'account:home'")
+    assert refused["hint"] == "no account is named 'home'; known accounts: default, work"
+    assert refused["candidates"] == ["account:default", "account:work"]
+    assert capsys.readouterr().out == ""
+
+
+def test_readers_follow_a_synthetic_row_and_report_its_peer(
+    two: two_accounts.TwoAccounts, capsys: pytest.CaptureFixture[str]
+) -> None:
+    result = tools.thread(two.work_bob.id, 7)
+    assert result["chat_id"] == two.work_bob.id
+    (message,) = result["messages"]
+    assert message["chat_id"] == two.work_bob.id and message["peer_id"] == two_accounts.BOB
+    assert message["accounts"] == ["work"] and message["text"] == "Brubank payroll moves to Friday"
+    around = tools.context(two_accounts.BOB, 7)
+    assert [(m["chat_id"], m["msg_id"], m["accounts"]) for m in around["messages"]] == [
+        (two_accounts.BOB, 7, ["default"]),
+        (two_accounts.BOB, 8, ["default"]),
+    ]
+    assert capsys.readouterr().out == ""
+
+
+# --- research --------------------------------------------------------------------------------
+
+RESEARCH_CFG = Config(telegram=KEYS, research=ResearchCfg(enabled=True))
+RENT_PEER = -1000000000100
+FLATS = make_channel(3001, "Tbilisi flats", username="tb_flats")
+FLATS_PEER = -1000000003001
+FORM = mcp_types.ClientCapabilities(elicitation=mcp_types.ElicitationCapability())
+TERMINAL = "grepogram research approve 1 1:join,fetch,add_source"
+RESEARCH_TOOLS = [tool for tool in tools.TOOLS if tool.__name__.startswith("research_")]
+
+
+@dataclasses.dataclass
+class FakeContext:
+    """The part of FastMCP's ``Context`` ``research_approve`` uses: the client's declared
+    capabilities and ``elicit``, which records what the user was asked and answers ``answer``
+    (raised when it is an exception)."""
+
+    capabilities: mcp_types.ClientCapabilities | None = dataclasses.field(
+        default_factory=lambda: FORM
+    )
+    answer: object = dataclasses.field(default_factory=DeclinedElicitation)
+    asked: list[tuple[str, type]] = dataclasses.field(default_factory=list)
+
+    @property
+    def session(self) -> SimpleNamespace:
+        params = (
+            None if self.capabilities is None else SimpleNamespace(capabilities=self.capabilities)
+        )
+        return SimpleNamespace(client_params=params)
+
+    async def elicit(self, message: str, schema: type) -> object:
+        self.asked.append((message, schema))
+        if isinstance(self.answer, BaseException):
+            raise self.answer
+        return self.answer
+
+
+async def _approve(
+    ctx: FakeContext, items: list[str], confirm: str | None = None
+) -> tools.ToolResult:
+    """``research_approve`` of session 1 through ``ctx``, with ``confirm`` when given."""
+    return await tools.research_approve(1, items, ctx, confirm=confirm)  # type: ignore[arg-type]
+
+
+def _accept(approve: bool = True) -> AcceptedElicitation[tools.Confirm]:
+    return AcceptedElicitation(data=tools.Confirm(approve=approve))
+
+
+@pytest.fixture
+def researching(
+    bind: Callable[..., tools.AppState], paths: Paths, conn: sqlite3.Connection
+) -> FakeClient:
+    """Research switched on over one indexed channel, ``@tbrent``, whose only message mentions
+    ``@tb_flats`` — a public channel of two posts the default account is not in."""
+    config.save(RESEARCH_CFG, paths)
+    db.upsert_chat(
+        conn, ChatRow(id=RENT_PEER, type="channel", title="Tbilisi rent", username="tbrent")
+    )
+    db.upsert_messages(
+        conn,
+        [
+            MessageRow(
+                chat_id=RENT_PEER,
+                msg_id=1,
+                date=1_735_689_600,
+                text="flats at @tb_flats",
+                links=(("mention", "@tb_flats"),),
+            )
+        ],
+    )
+    world = FakeWorld(
+        entities=[FLATS],
+        messages={FLATS_PEER: [tl.message(FLATS_PEER, i, f"flat {i}") for i in (1, 2)]},
+    )
+    client = world.client(
+        me=make_user(9, "Me"), responses={functions.channels.GetFullChannelRequest: no_discussion}
+    )
+    bind(RESEARCH_CFG, client)
+    return client
+
+
+async def _discovered() -> None:
+    """Session 1 from ``@tbrent``, discovered and probed: candidate 1 is ``@tb_flats``."""
+    started = tools.research_start("who rents flats", ["@tbrent"], since_days=3650)
+    assert "error" not in started, started
+    discovered = await tools.research_discover(started["id"])
+    assert "error" not in discovered, discovered
+    assert discovered["new_candidates"] == [1]
+
+
+def _grants(paths: Paths) -> list[Any]:
+    rdb = research_db.open_store(paths)
+    try:
+        return research_db.list_grants(rdb, 1)
+    finally:
+        rdb.close()
+
+
+async def test_research_tools_refuse_while_research_is_disabled(
+    bind: Callable[..., tools.AppState], paths: Paths
+) -> None:
+    bind()
+    ctx = FakeContext(answer=_accept())
+    results = [
+        tools.research_start("who rents flats", ["@tbrent"]),
+        await tools.research_discover(1),
+        tools.research_candidates(1),
+        await tools.research_approve(1, ["1"], ctx),  # type: ignore[arg-type]
+        tools.research_skip(1, [1]),
+        tools.research_exclude(["@tb_flats"]),
+        await tools.research_run(1),
+        tools.research_status(),
+        tools.research_stop(1),
+    ]
+    assert len(results) == len(RESEARCH_TOOLS)
+    for result in results:
+        assert result == {"error": "research is disabled", "hint": research.ENABLE_HINT}
+    assert ctx.asked == [], "a refusal asks the user nothing"
+    assert not paths.research_db_file.exists(), "a refusal opens no research store"
+
+
+async def test_research_loop_through_the_tools(
+    researching: FakeClient, paths: Paths, conn: sqlite3.Connection
+) -> None:
+    started = tools.research_start("who rents flats", ["@tbrent"], since_days=3650)
+    assert (started["id"], started["account"], list(started["seeds"])) == (
+        1,
+        "default",
+        [{"scope": "", "peer_id": RENT_PEER}],
+    )
+    assert started["limits"]["since_days"] == 3650 and started["horizon"]
+    discovered = await tools.research_discover(1)
+    assert discovered["new_candidates"] == [1] and discovered["probe"]["probed"] == [1]
+    history = [kw for n, kw in researching.calls if n in ("iter_messages", "get_messages")]
+    assert [kw for kw in history if kw["filter"] is not types.InputMessagesFilterPinned] == [], (
+        "at most a seed's pinned posts are read, and nothing of any candidate"
+    )
+    listed = tools.research_candidates(1)
+    (candidate,) = listed["candidates"]
+    assert (candidate["identity"], candidate["title"], candidate["status"]) == (
+        "@tb_flats",
+        "Tbilisi flats",
+        "proposed",
+    )
+    assert (candidate["member"], candidate["cached"], candidate["authorized"]) == (False, False, [])
+    assert "access_hash" not in candidate
+    (evidence,) = candidate["evidence"]
+    assert evidence["snippet"] == "flats at @tb_flats"
+    assert (evidence["scope"], evidence["peer_id"], evidence["chat_id"]) == (
+        "",
+        RENT_PEER,
+        RENT_PEER,
+    )
+
+    rdb = research_db.open_store(paths)
+    try:
+        item = ApprovalItem(candidate_id=1, actions=("join", "fetch", "add_source"))
+        summary = research.approval_summary(rdb, conn, RESEARCH_CFG, 1, [item])
+    finally:
+        rdb.close()
+    ctx = FakeContext(answer=_accept())
+    approved = await tools.research_approve(1, ["1"], ctx)  # type: ignore[arg-type]
+    assert ctx.asked == [(summary, tools.Confirm)], "the user is asked with exactly the summary"
+    assert approved["approved"] is True and approved["summary"] == summary
+    assert approved["items"] == ["1:join,fetch,add_source"], "a bare id joins, public or not"
+    (grant,) = _grants(paths)
+    assert (grant.via, grant.summary) == ("elicitation", summary)
+    assert approved["grants"] == [
+        {
+            "id": 1,
+            "candidate_id": 1,
+            "identity": approved["grants"][0]["identity"],
+            "title": approved["grants"][0]["title"],
+            "account": "default",
+            "actions": ["join", "fetch", "add_source"],
+            "via": "elicitation",
+            "granted_at": grant.granted_at,
+        }
+    ]
+    assert approved["grants"][0]["identity"] is not None
+
+    status = tools.research_status(1)
+    assert status["pending_grants"] == approved["grants"], "one shape of a grant, both tools"
+    assert tools.research_status()["sessions"][0]["state"] == "active"
+
+    ran = await tools.research_run(1)
+    assert (ran["joined"], ran["sources_added"], ran["fetched"], ran["messages"]) == (
+        [1],
+        [1],
+        [1],
+        2,
+    )
+    assert ran["accounts_skipped"] == []
+    assert [source.id for source in config.load(paths).sources] == [f"chat:{FLATS_PEER}"]
+    after = tools.research_candidates(1, status=["fetched"])["candidates"]
+    assert [(c["status"], c["cached"]) for c in after] == [("fetched", True)]
+
+    stopped = tools.research_stop(1)
+    assert stopped == {
+        "session_id": 1,
+        "stopped": True,
+        "grants_voided": 0,
+        "hint": tools.STOP_HINT,
+    }
+    assert [source.id for source in config.load(paths).sources] == [f"chat:{FLATS_PEER}"]
+    again = await tools.research_run(1)
+    assert again["error"] == "research session 1 is stopped"
+
+
+@pytest.mark.parametrize(
+    ("answer", "said"),
+    [
+        (DeclinedElicitation(), "decline"),
+        (CancelledElicitation(), "cancel"),
+        (_accept(approve=False), "accept"),
+    ],
+)
+async def test_research_approve_grants_nothing_unless_the_user_approves(
+    researching: FakeClient, paths: Paths, answer: object, said: str
+) -> None:
+    await _discovered()
+    ctx = FakeContext(answer=answer)
+
+    result = await tools.research_approve(1, ["1:fetch,add_source"], ctx)  # type: ignore[arg-type]
+
+    assert len(ctx.asked) == 1
+    assert result["approved"] is False and result["answer"] == said
+    assert result["hint"] == tools.DECLINED_HINT and "grants" not in result
+    assert _grants(paths) == []
+    listed = tools.research_candidates(1)["candidates"]
+    assert [(c["status"], c["authorized"]) for c in listed] == [("proposed", [])]
+
+
+@pytest.mark.parametrize(
+    ("meanwhile", "error"),
+    [
+        (lambda: tools.research_stop(1), "research session 1 is stopped"),
+        (lambda: tools.research_exclude(["@tb_flats"]), "candidate 1 (@tb_flats): it is excluded"),
+    ],
+)
+async def test_research_approve_grants_nothing_once_the_session_changed_under_the_question(
+    researching: FakeClient,
+    paths: Paths,
+    meanwhile: Callable[[], tools.ToolResult],
+    error: str,
+) -> None:
+    """The user answers yes while another call stopped the session or excluded the chat: the
+    grant is refused as a tool error, with nothing written and no traceback."""
+    await _discovered()
+
+    class ChangingContext(FakeContext):
+        async def elicit(self, message: str, schema: type) -> object:
+            assert "error" not in meanwhile()
+            return await super().elicit(message, schema)
+
+    ctx = ChangingContext(answer=_accept())
+    result = await tools.research_approve(1, ["1:fetch,add_source"], ctx)  # type: ignore[arg-type]
+
+    assert len(ctx.asked) == 1
+    assert result["error"].startswith(error), result
+    assert "grants" not in result
+    assert _grants(paths) == []
+
+
+@pytest.mark.parametrize(
+    "failure", [TimeoutError("no answer"), McpError(mcp_types.ErrorData(code=-1, message="gone"))]
+)
+async def test_research_approve_that_cannot_ask_grants_nothing(
+    researching: FakeClient, paths: Paths, failure: Exception
+) -> None:
+    """A dialog that cannot be shown grants nothing; the token and the shell command that
+    confirms it come back instead, since this client refuses ``confirm`` itself."""
+    await _discovered()
+    ctx = FakeContext(answer=failure)
+
+    result = await tools.research_approve(1, ["1"], ctx)  # type: ignore[arg-type]
+
+    assert result["approved"] is False
+    assert result["error"].startswith("the confirmation could not be asked")
+    assert result["hint"] == tools.DIALOG_FAILED_HINT
+    assert result["command"] == f"{TERMINAL} --confirm {result['confirm']}"
+    assert _grants(paths) == []
+
+
+@pytest.mark.parametrize(
+    "capabilities",
+    [
+        None,
+        mcp_types.ClientCapabilities(),
+        mcp_types.ClientCapabilities(
+            elicitation=mcp_types.ElicitationCapability(url=mcp_types.UrlElicitationCapability())
+        ),
+    ],
+)
+async def test_research_approve_without_elicitation_answers_the_summary_and_a_token(
+    researching: FakeClient,
+    paths: Paths,
+    capabilities: mcp_types.ClientCapabilities | None,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The ask step: the exact summary, the token bound to it and the CLI command that takes
+    the same token — and nothing granted until the call comes back with it."""
+    await _discovered()
+    ctx = FakeContext(capabilities=capabilities, answer=_accept())
+
+    asked = await tools.research_approve(1, ["1"], ctx)  # type: ignore[arg-type]
+
+    assert ctx.asked == [], "a client that cannot ask the user is never asked"
+    assert asked["approved"] is False and asked["needs_confirmation"] is True
+    assert "error" not in asked and asked["hint"] == tools.CONFIRM_HINT
+    assert asked["summary"].startswith("Research session 1")
+    assert asked["command"] == f"{TERMINAL} --confirm {asked['confirm']}"
+    assert _grants(paths) == []
+
+    confirmed = await _approve(ctx, ["1"], confirm=asked["confirm"])
+
+    assert ctx.asked == []
+    assert confirmed["approved"] is True and confirmed["hint"] == tools.RUN_NEXT_HINT
+    [document] = confirmed["grants"]
+    assert (document["via"], document["actions"]) == ("confirm", ["join", "fetch", "add_source"])
+    (grant,) = _grants(paths)
+    assert (grant.via, grant.summary) == ("confirm", asked["summary"])
+    assert capsys.readouterr().out == ""
+
+
+async def test_research_approve_refuses_a_wrong_malformed_or_stale_token(
+    researching: FakeClient, paths: Paths
+) -> None:
+    await _discovered()
+    ctx = FakeContext(capabilities=None)
+    token = (await _approve(ctx, ["1"]))["confirm"]
+
+    wrong = await _approve(ctx, ["1"], confirm="0" * 12)
+    malformed = await _approve(ctx, ["1"], confirm="yes")
+    other = await _approve(ctx, ["1:fetch,add_source"], confirm=token)
+    rdb = research_db.open_store(paths)
+    try:
+        research_db.update_candidate(rdb, 1, title="Tbilisi flats, renamed")
+    finally:
+        rdb.close()
+    stale = await _approve(ctx, ["1"], confirm=token)
+
+    for refused in (wrong, other, stale):
+        assert refused["approved"] is False and "does not match" in refused["error"]
+    assert "is not a confirmation token" in malformed["error"]
+    assert other["confirm"] != token and stale["confirm"] != token
+    assert "renamed" in stale["summary"] and stale["hint"] == tools.CONFIRM_HINT
+    assert _grants(paths) == []
+
+
+async def test_research_approve_takes_no_token_where_the_user_answers_a_dialog(
+    researching: FakeClient, paths: Paths
+) -> None:
+    """A client that can show the dialog is asked through it; a token passed there approves
+    nothing and asks nobody."""
+    await _discovered()
+    token = (await _approve(FakeContext(capabilities=None), ["1"]))["confirm"]
+    ctx = FakeContext(answer=_accept())
+
+    result = await _approve(ctx, ["1"], confirm=token)
+
+    assert result["approved"] is False
+    assert (result["error"], result["hint"]) == (tools.ELICIT_INSTEAD, tools.ELICIT_INSTEAD_HINT)
+    assert "confirm" not in result
+    assert ctx.asked == [] and _grants(paths) == []
+
+
+async def test_research_approve_refuses_an_invalid_approval_before_asking(
+    researching: FakeClient, paths: Paths
+) -> None:
+    await _discovered()
+    ctx = FakeContext(answer=_accept())
+
+    fetch_only = await tools.research_approve(1, ["1:fetch"], ctx)  # type: ignore[arg-type]
+    malformed = await tools.research_approve(1, ["flats"], ctx)  # type: ignore[arg-type]
+
+    assert "approve `add_source` together with `fetch`" in fetch_only["error"]
+    assert "'flats' is not an approval item" in malformed["error"]
+    assert ctx.asked == [] and _grants(paths) == []
+
+
+async def test_research_approve_elicits_over_a_real_session(
+    researching: FakeClient, paths: Paths
+) -> None:
+    await _discovered()
+    answers = [
+        mcp_types.ElicitResult(action="accept", content={"approve": "true"}),
+        mcp_types.ElicitResult(action="decline"),
+        mcp_types.ElicitResult(action="accept", content={"approve": True}),
+    ]
+    asked: list[str] = []
+
+    async def elicitation(context: object, params: Any) -> mcp_types.ElicitResult:
+        asked.append(params.message)
+        assert params.requestedSchema["properties"]["approve"]["type"] == "boolean"
+        return answers.pop(0)
+
+    server = tools.build_server()
+    async with create_connected_server_and_client_session(
+        server, elicitation_callback=elicitation
+    ) as session:
+        coerced = await session.call_tool("research_approve", {"session_id": 1, "items": ["1"]})
+        declined = await session.call_tool("research_approve", {"session_id": 1, "items": ["1"]})
+        assert _grants(paths) == [], "only a JSON true approves"
+        accepted = await session.call_tool("research_approve", {"session_id": 1, "items": ["1"]})
+    for result in (coerced, declined, accepted):
+        assert not result.isError and result.structuredContent is not None
+    assert coerced.structuredContent is not None and declined.structuredContent is not None
+    assert coerced.structuredContent["approved"] is False
+    assert declined.structuredContent["answer"] == "decline"
+    assert accepted.structuredContent is not None
+    assert accepted.structuredContent["approved"] is True
+    (grant,) = _grants(paths)
+    assert grant.via == "elicitation" and asked == [grant.summary] * 3
+
+
+async def test_research_approve_over_a_session_without_elicitation_confirms_by_token(
+    researching: FakeClient, paths: Paths
+) -> None:
+    await _discovered()
+    async with create_connected_server_and_client_session(tools.build_server()) as session:
+        asked = await session.call_tool("research_approve", {"session_id": 1, "items": ["1"]})
+        assert asked.structuredContent is not None
+        assert asked.structuredContent["needs_confirmation"] is True
+        assert _grants(paths) == [], "asking grants nothing"
+        token = asked.structuredContent["confirm"]
+        confirmed = await session.call_tool(
+            "research_approve", {"session_id": 1, "items": ["1"], "confirm": token}
+        )
+    assert confirmed.structuredContent is not None
+    assert confirmed.structuredContent["approved"] is True
+    (grant,) = _grants(paths)
+    assert (grant.via, grant.summary) == ("confirm", asked.structuredContent["summary"])
+
+
+async def test_only_a_summary_bound_token_stands_in_for_a_dialog(state: tools.AppState) -> None:
+    """``research_approve`` takes ``confirm`` — a string, the token bound to the summary it
+    answered with, never required — and no research tool takes a bare yes of any shape."""
+    async with create_connected_server_and_client_session(tools.build_server()) as session:
+        listed = {tool.name: tool for tool in (await session.list_tools()).tools}
+    approve = listed["research_approve"].inputSchema
+    assert set(approve["properties"]) == {"session_id", "items", "confirm"}
+    assert approve["required"] == ["session_id", "items"]
+    kinds = {branch.get("type") for branch in approve["properties"]["confirm"]["anyOf"]}
+    assert kinds == {"string", "null"}, "a token, never a boolean"
+    bare = {"approve", "approved", "confirmed", "yes", "force", "consent"}
+    for tool in RESEARCH_TOOLS:
+        properties = set(listed[tool.__name__].inputSchema["properties"])
+        assert not bare & properties, tool.__name__
+        assert tool is tools.research_approve or "confirm" not in properties, tool.__name__
+
+
+async def test_research_skip_and_exclude_need_no_approval(researching: FakeClient) -> None:
+    await _discovered()
+
+    skipped = tools.research_skip(1, [1])
+    excluded = tools.research_exclude(["@tb_flats"], reason="spam")
+    unknown = tools.research_skip(1, [9])
+
+    assert skipped == {"session_id": 1, "skipped": [1]}
+    assert excluded == {
+        "excluded": [{"identity": "@tb_flats", "candidates_set_aside": 1}],
+        "hint": tools.UNEXCLUDE_HINT,
+    }
+    assert unknown["error"] == "no candidate 9 in research session 1"
+    assert tools.research_candidates(1)["candidates"][0]["status"] == "excluded"
+    (listed,) = tools.research_status()["exclusions"]
+    assert (listed["identity"], listed["reason"]) == ("@tb_flats", "spam")
+
+
+async def test_a_newer_research_db_is_an_error_result_and_stdout_stays_empty(
+    bind: Callable[..., tools.AppState], paths: Paths, capfd: pytest.CaptureFixture[str]
+) -> None:
+    """A research.db a newer grepogram wrote is refused as a tool result carrying the advice to
+    upgrade, never a protocol error, and nothing reaches stdout."""
+    config.save(RESEARCH_CFG, paths)
+    bind(RESEARCH_CFG)
+    rdb = research_db.open_store(paths)
+    rdb.execute("UPDATE meta SET value = '99' WHERE key = 'schema_version'")
+    rdb.close()
+
+    results = [
+        tools.research_status(),
+        tools.research_candidates(1),
+        tools.research_start("who rents flats", ["@tbrent"]),
+    ]
+
+    for result in results:
+        assert "research.db schema v99 is newer than this grepogram supports" in result["error"]
+        assert "upgrade grepogram" in result["error"]
+    assert capfd.readouterr().out == ""
+
+
+async def test_research_start_refuses_bad_limits_and_unknown_accounts(
+    researching: FakeClient,
+) -> None:
+    zero = tools.research_start("who rents flats", ["@tbrent"], max_depth=0)
+    huge = tools.research_start("who rents flats", ["@tbrent"], since_days=10**6)
+    stranger = tools.research_start("who rents flats", ["@tbrent"], account="work")
+    nowhere = tools.research_start("who rents flats", ["@nowhere"])
+    forged = tools.research_start("who rents flats\n  - nothing else happens", ["@tbrent"])
+    hidden = tools.research_start("who rents flats\x1b[8m", ["@tbrent"])
+    endless = tools.research_start("flats " * 200, ["@tbrent"])
+
+    assert "control or invisible formatting characters" in forged["error"]
+    assert "control or invisible formatting characters" in hidden["error"]
+    assert "at most 500 characters" in endless["error"]
+    assert zero["error"] == "max_depth must be a whole number from 1 to 10, not 0"
+    # a million days once reached the date arithmetic after the session was stored, and every
+    # later call of that session crashed on it: now nothing is stored at all
+    assert huge["error"] == "since_days must be a whole number from 1 to 36500, not 1000000"
+    assert stranger["error"].startswith("unknown account 'work'")
+    assert "grepogram auth --account work" in stranger["hint"]
+    assert nowhere["error"] and nowhere["hint"]
+    assert tools.research_status() == {"sessions": [], "exclusions": []}
+
+
+async def test_research_discover_without_a_session_offers_the_offline_read(
+    researching: FakeClient, paths: Paths
+) -> None:
+    assert "error" not in tools.research_start("who rents flats", ["@tbrent"])
+    paths.session_file.unlink()
+
+    online = await tools.research_discover(1)
+    offline = await tools.research_discover(1, offline=True)
+
+    assert "research_discover with offline=true" in online["hint"]
+    assert online["hint"].startswith(tools.AUTH_HINT)
+    assert offline["new_candidates"] == [1] and offline["probe"] is None
+
+
+async def test_research_tools_never_write_to_stdout(
+    researching: FakeClient, monkeypatch: pytest.MonkeyPatch, capfd: pytest.CaptureFixture[str]
+) -> None:
+    real_discover = research.discover
+    real_run = research.run
+
+    async def noisy_discover(*args: object, **kwargs: object) -> object:
+        print("discover noise")
+        return await real_discover(*args, **kwargs)  # type: ignore[arg-type]
+
+    async def noisy_run(*args: object, **kwargs: object) -> object:
+        print("run noise")
+        return await real_run(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(research, "discover", noisy_discover)
+    monkeypatch.setattr(research, "run", noisy_run)
+    await _discovered()
+    approved = await tools.research_approve(1, ["1"], FakeContext(answer=_accept()))  # type: ignore[arg-type]
+    assert approved["approved"] is True
+    assert (await tools.research_run(1))["fetched"] == [1]
+    assert tools.research_status(1)["session"]["id"] == 1
+    captured = capfd.readouterr()
+    assert captured.out == ""
+    assert [line for line in captured.err.splitlines() if line.endswith("noise")] == [
+        "discover noise",
+        "run noise",
+    ]
+
+
+async def test_ordinary_search_never_widens_what_research_found(
+    researching: FakeClient, paths: Paths, conn: sqlite3.Connection
+) -> None:
+    """A candidate approved but not yet run stays outside `search`: only `research_run` acts on
+    a grant, so a search neither fetches it, nor asks Telegram anything about it, nor spends
+    the grant."""
+    await _discovered()
+    approved = await tools.research_approve(1, ["1"], FakeContext(answer=_accept()))  # type: ignore[arg-type]
+    assert approved["approved"] is True
+    rent = db.get_chat(conn, RENT_PEER)
+    assert rent is not None
+    ids = [
+        row["id"] for row in conn.execute("SELECT id FROM messages WHERE chat_id = ?", (RENT_PEER,))
+    ]
+    index.index_chat(conn, rent, ids, units.rebuild_for_chat(conn, rent, RESEARCH_CFG, ids))
+    db.set_chat_progress(conn, RENT_PEER, 1, int(time.time()))
+    requests, calls = len(researching.requests), len(researching.calls)
+
+    result = await tools.search("flat", mode="lexical")
+
+    assert {hit["chat"]["id"] for hit in result["hits"]} == {RENT_PEER}
+    assert researching.requests[requests:] == [] and researching.calls[calls:] == []
+    assert db.message_counts(conn) == {RENT_PEER: 1}
+    assert config.load(paths).sources == []
+    (candidate,) = tools.research_candidates(1)["candidates"]
+    assert (candidate["status"], candidate["authorized"]) == (
+        "approved",
+        ["join", "fetch", "add_source"],
+    )
+
+
+async def test_removing_a_source_research_added_leaves_the_chat_joined(
+    researching: FakeClient, paths: Paths, conn: sqlite3.Connection
+) -> None:
+    """Stopping a session keeps the source its run added; removing that source afterwards
+    deletes the config entry and the indexed history and never the membership — leaving a chat
+    is `grepogram leave`, a command of its own."""
+    await _discovered()
+    ctx = FakeContext(answer=_accept())
+    approved = await tools.research_approve(1, ["1:join,fetch,add_source"], ctx)  # type: ignore[arg-type]
+    assert approved["approved"] is True
+    ran = await tools.research_run(1)
+    assert (ran["joined"], ran["fetched"]) == ([1], [1])
+    assert FLATS_PEER in researching.members
+    assert tools.research_stop(1)["stopped"] is True
+    assert [source.id for source in config.load(paths).sources] == [f"chat:{FLATS_PEER}"]
+
+    removed = tools.sources_remove(f"chat:{FLATS_PEER}")
+
+    assert removed["removed_chat_ids"] == [FLATS_PEER]
+    assert config.load(paths).sources == []
+    assert db.get_chat(conn, FLATS_PEER) is None
+    leaving = (functions.channels.LeaveChannelRequest, functions.messages.DeleteChatUserRequest)
+    assert [r for r in researching.requests if isinstance(r, leaving)] == []
+    assert FLATS_PEER in researching.members, "the account is still in the chat"

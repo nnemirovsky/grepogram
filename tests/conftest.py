@@ -5,8 +5,9 @@ from pathlib import Path
 
 import pytest
 
-from grepogram import db
+from grepogram import db, research_db
 from grepogram.log import shutdown_logging
+from grepogram.models import ChatKey, ScanCursor
 
 
 @pytest.fixture(autouse=True)
@@ -27,6 +28,18 @@ def plain_cli_output(monkeypatch: pytest.MonkeyPatch) -> None:
     there. ``TERM=dumb`` is what rich reads as "no terminal".
     """
     monkeypatch.setenv("TERM", "dumb")
+
+
+@pytest.fixture(autouse=True)
+def no_terminal(monkeypatch: pytest.MonkeyPatch) -> None:
+    """No test ever asks the developer's real terminal.
+
+    ``accounts rm``, ``leave`` and ``research approve`` confirm on the controlling terminal
+    (``cli.TERMINAL``), which a local ``pytest`` run has; the suite points it at a path nothing
+    can open, so the real opener runs and refuses as it does without a terminal. A test that
+    answers a confirmation installs its own terminal (``cli._open_terminal``) over this one.
+    """
+    monkeypatch.setattr("grepogram.cli.TERMINAL", "/dev/null/no-terminal-in-the-test-suite")
 
 
 @pytest.fixture(autouse=True)
@@ -59,6 +72,25 @@ def conn() -> Iterator[sqlite3.Connection]:
     connection.close()
 
 
+@pytest.fixture
+def v6_conn() -> Iterator[sqlite3.Connection]:
+    """An empty index in memory at schema 6 — what v0.2.0 left in the field — built from the
+    released steps and not migrated further, for the upgrade tests to populate and walk up."""
+    connection = db.connect(":memory:")
+    for version in (db.BASE_VERSION, 6):
+        for statement in db.MIGRATIONS[version]:
+            connection.execute(statement)
+    db.set_meta(connection, db.META_SCHEMA_VERSION, "6")
+    yield connection
+    connection.close()
+
+
 def file_mode(path: Path) -> int:
     """The permission bits of ``path``, for the 0600 / 0700 assertions."""
     return stat.S_IMODE(path.stat().st_mode)
+
+
+def scan_cursor(rdb: sqlite3.Connection, session_id: int, chat: ChatKey) -> ScanCursor | None:
+    """The cursor a research session keeps for ``chat``, if any (``research.db``'s one reader of
+    them, ``list_scan_cursors``, narrowed to it)."""
+    return next((c for c in research_db.list_scan_cursors(rdb, session_id) if c.chat == chat), None)

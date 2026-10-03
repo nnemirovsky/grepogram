@@ -4,7 +4,7 @@ import logging
 import pytest
 from telethon.tl import types
 
-from grepogram import sync
+from grepogram import db, sync
 from grepogram.models import ChatRow, MessageRow, UserRow
 from tests.fakes import make_channel, make_group, make_message, make_user
 from tests.fixtures import tl
@@ -24,6 +24,7 @@ ME = UserRow(id=42, display_name="Me Myself", username="me")
 
 USERS = sync.collect_users([ALICE, BOB, DELETED, HELPER, OLD_GROUP, ARG_ENTITY, NEWS_ENTITY])
 NAMES = {user_id: user.display_name for user_id, user in USERS.items() if user.display_name}
+EPOCH_S = int(tl.EPOCH.timestamp())
 
 
 def _map(msg: object, chat: ChatRow = ARG, names: dict[int, str] | None = None) -> MessageRow:
@@ -134,6 +135,7 @@ def test_text_message() -> None:
         from_id=1,
         from_name="Alice Liddell",
         text="hello",
+        links=(),
     )
 
 
@@ -235,6 +237,21 @@ def test_chat_title_names_the_chat_itself_when_absent_from_names() -> None:
     untitled = ChatRow(id=ARG.id, type="supergroup")
     row = _map(tl.message(ARG.id, 1, "x", sender=ARG_ENTITY), untitled, {})
     assert row.from_name == f"id{ARG.id}"
+
+
+def test_a_row_under_a_synthetic_id_is_read_against_its_peer_id() -> None:
+    """A second account's private chat with Alice is stored under a synthetic id, and Telegram
+    still names the chat by peer 1: the sender check and the quoted-reply check compare with the
+    peer id, while the row keeps the row id."""
+    work_dm = ChatRow(
+        id=db.SYNTHETIC_BASE, peer_id=1, type="user", title="Alice at work", scope="work"
+    )
+    row = _map(tl.message(1, 1, "hi"), work_dm, {})
+    assert (row.chat_id, row.from_id, row.from_name) == (db.SYNTHETIC_BASE, 1, "Alice at work")
+    reply = _map(tl.message(1, 2, "yes", reply_to=tl.reply_header(1, reply_to_peer=1)), work_dm)
+    assert reply.reply_to_msg_id == 1
+    elsewhere = tl.reply_header(1, reply_to_peer=db.SYNTHETIC_BASE)
+    assert _map(tl.message(1, 3, "no", reply_to=elsewhere), work_dm).reply_to_msg_id is None
 
 
 def test_row_is_stored_under_the_given_chat() -> None:
@@ -378,6 +395,120 @@ def test_story_reply_is_not_a_reply() -> None:
 )
 def test_forward_of(header: object, expected: str | None) -> None:
     assert sync.forward_of(header, NAMES) == expected
+
+
+@pytest.mark.parametrize(
+    ("header", "expected"),
+    [
+        (None, (None, None, None)),
+        # a channel post: the address every repost of it shares
+        (tl.forward_header(NEWS_ENTITY, channel_post=7), (NEWS.id, 7, EPOCH_S)),
+        # saved from a chat: that chat and its message, whoever wrote it
+        (
+            tl.forward_header(1, saved_from=ARG_ENTITY, saved_from_msg_id=40),
+            (ARG.id, 40, EPOCH_S),
+        ),
+        # a user's message: the author, with no message to point at
+        (tl.forward_header(1), (1, None, EPOCH_S)),
+        # a hidden account: Telegram names no peer, and none is invented
+        (tl.forward_header(origin_name="Hidden User"), (None, None, EPOCH_S)),
+    ],
+)
+def test_forward_origin(header: object, expected: tuple[int | None, ...]) -> None:
+    assert sync.forward_origin(header) == expected
+
+
+def test_channel_forward_through_map_message() -> None:
+    posted = tl.at(-60)
+    msg = tl.channel_forward(ARG.id, 30, "repost", channel=NEWS_ENTITY, post=7, posted=posted)
+    row = _map(msg)
+    assert (row.fwd_from, row.fwd_peer_id, row.fwd_msg_id, row.fwd_date) == (
+        "News",
+        NEWS.id,
+        7,
+        int(posted.timestamp()),
+    )
+    plain = _map(tl.text_message(ARG.id, 31, "own words", sender=1))
+    assert (plain.fwd_peer_id, plain.fwd_msg_id, plain.fwd_date) == (None, None, None)
+
+
+# --- map_message: links ----------------------------------------------------------------------
+
+
+def test_links_from_a_hidden_hyperlink() -> None:
+    msg = tl.hyperlink_message(
+        ARG.id, 50, "the list is here", anchor="here", url="https://t.me/addlist/Slug1"
+    )
+    assert _map(msg).links == (("text_url", "addlist/Slug1"),)
+
+
+def test_links_from_mentions_by_username_and_by_id() -> None:
+    assert _map(tl.mention_message(ARG.id, 51, "ask @Helper_Bot or @news.")).links == (
+        ("mention", "@helper_bot"),
+        ("mention", "@news"),
+    )
+    text = "thanks Bob"
+    by_id = tl.message(ARG.id, 52, text, entities=[tl.mention_name_entity(text, "Bob", 2)])
+    assert _map(by_id).links == (("mention", "peer:2"),)
+
+
+def test_links_from_visible_urls_count_utf16_offsets() -> None:
+    """An emoji before the URL is two code units in Telegram's offsets and one character in
+    Python: slicing without the surrogate round trip would cut the URL short."""
+    text = "🇦🇷 chat: https://t.me/arg_chat/12 and https://example.com"
+    msg = tl.message(
+        ARG.id,
+        53,
+        text,
+        entities=[
+            tl.url_entity(text, "https://t.me/arg_chat/12"),
+            tl.url_entity(text, "https://example.com"),
+        ],
+    )
+    assert _map(msg).links == (("link", "@arg_chat/12"),)
+
+
+def test_links_from_buttons_and_the_link_preview() -> None:
+    buttons = {"Join": "https://t.me/+Invite_1", "Site": "https://example.com", "Folder": "x"}
+    assert _map(tl.button_message(NEWS.id, 54, "post", buttons), NEWS, {}).links == (
+        ("button", "+Invite_1"),
+    )
+    preview = tl.webpage_message(ARG.id, 55, "look", url="https://t.me/news/5")
+    assert _map(preview).links == (("webpage", "@news/5"),)
+    elsewhere = tl.webpage_message(ARG.id, 56, "look", url="https://example.com")
+    assert _map(elsewhere).links == ()
+
+
+def test_links_are_distinct_and_sorted_across_sources() -> None:
+    text = "see t.me/news and @news"
+    msg = tl.message(
+        ARG.id,
+        57,
+        text,
+        entities=[
+            tl.url_entity(text, "t.me/news"),
+            tl.mention_entity(text, "@news"),
+            tl.text_url_entity(text, "see", "https://t.me/news"),
+        ],
+        reply_markup=tl.url_buttons({"a": "https://t.me/news", "b": "https://t.me/News"}),
+    )
+    assert _map(msg).links == (
+        ("button", "@news"),
+        ("link", "@news"),
+        ("mention", "@news"),
+        ("text_url", "@news"),
+    )
+
+
+def test_links_ignore_keyboards_without_urls() -> None:
+    keyboard = types.ReplyKeyboardMarkup(
+        rows=[types.KeyboardButtonRow(buttons=[types.KeyboardButton(text="t.me/news")])]
+    )
+    callback = types.ReplyInlineMarkup(
+        rows=[types.KeyboardButtonRow(buttons=[types.KeyboardButtonCallback("go", b"x")])]
+    )
+    assert _map(tl.message(ARG.id, 58, "x", reply_markup=keyboard)).links == ()
+    assert _map(tl.message(ARG.id, 59, "x", reply_markup=callback)).links == ()
 
 
 # --- dates and skips -------------------------------------------------------------------------

@@ -125,6 +125,7 @@ def _hit(score: float, msg_ids: list[int], chat: ChatRow = chat_ru.ARG) -> Hit:
     return Hit(
         score=score,
         chat=chat,
+        peer_id=chat.peer_id,
         kind="window",
         date_start=0,
         date_end=0,

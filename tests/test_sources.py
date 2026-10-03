@@ -4,17 +4,25 @@ import logging
 import os
 import sqlite3
 import stat
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
 import pytest
-from telethon import TelegramClient, errors
+from telethon import errors
 from typer.testing import CliRunner
 
 from grepogram import cli, config, db, sources, sync, tg
-from grepogram.dialogs import DialogCatalog, DialogInfo
-from grepogram.models import ChatRow, Config, MessageRow, Source
+from grepogram.dialogs import DialogCatalog, DialogInfo, dialog_info
+from grepogram.models import (
+    AccountCfg,
+    AccountRow,
+    AccountStatus,
+    ChatRow,
+    Config,
+    MessageRow,
+    Source,
+)
 from grepogram.paths import Paths
 from grepogram.sources import (
     AmbiguousTarget,
@@ -119,7 +127,8 @@ def _store(conn: sqlite3.Connection, chat: ChatRow, messages: int = 0) -> None:
         ("t.me/arg_chat", "username", "arg_chat"),
         ("https://t.me/arg_chat/123", "username", "arg_chat"),
         ("https://t.me/arg_chat?start=x", "username", "arg_chat"),
-        ("https://www.telegram.me/Arg_Chat", "username", "Arg_Chat"),
+        ("https://www.telegram.me/Arg_Chat", "username", "arg_chat"),  # Telegram ignores case
+        ("https://t.me/S/arg_chat", "username", "arg_chat"),
         ("https://t.me/s/arg_chat", "username", "arg_chat"),
         ("https://t.me/c/1234567890/42", "id", -1001234567890),
         ("t.me/c/100", "id", -1000000000100),
@@ -150,9 +159,16 @@ def test_parse_target(raw: str, kind: str, value: str | int) -> None:
         ("@1starts_with_digit", "invalid username"),
         ("https://t.me/+AbCdEf", "invite"),
         ("https://t.me/joinchat/AbCdEf", "invite"),
+        ("https://t.me/JoinChat/AbCdEf", "invite"),
+        ("https://t.me/addlist/AbCdEf", "shared-folder links"),
+        ("https://t.me/share", "no chat"),
         ("https://t.me/", "no chat"),
         ("https://t.me/c/", "t.me/c/<id>"),
         ("https://t.me/c/abc", "t.me/c/<id>"),
+        ("https://t.me/c/99999999999999999999/5", "t.me/c/<id>"),
+        ("99999999999999999999", "not a Telegram chat id"),
+        ("-99999999999999999999", "not a Telegram chat id"),
+        pytest.param("chat:" + "9" * 5000, "not a Telegram chat id", id="5000-digits"),
         ("folder:", "folder name missing"),
         ("folder:   ", "folder name missing"),
     ],
@@ -633,9 +649,16 @@ def test_with_source_appends_and_rejects_duplicates() -> None:
 # --- resolve_sources -------------------------------------------------------------------------
 
 
+async def _resolve(
+    cfg: Config, clients: Mapping[str, FakeClient], conn: sqlite3.Connection
+) -> list[ChatRow]:
+    """The chats :func:`sources.resolve_sources` hands a sync."""
+    return (await sources.resolve_sources(cfg, clients, conn)).chats
+
+
 async def test_resolve_sources_folder_and_dm(conn: sqlite3.Connection) -> None:
     cfg = _cfg(Source(folder="Argentina"), Source(chat="@alice"))
-    rows = await sources.resolve_sources(cfg, _client(), conn)
+    rows = await _resolve(cfg, {"default": _client()}, conn)
     assert [(r.id, r.source_id) for r in rows] == [
         (ARG_ID, "folder:Argentina"),
         (NEWS_ID, "folder:Argentina"),
@@ -662,7 +685,7 @@ async def test_resolve_sources_category_folder_and_int_and_link_chats(
     conn: sqlite3.Connection,
 ) -> None:
     cfg = _cfg(Source(folder="People"), Source(chat=GEORGIA_ID), Source(chat="https://t.me/news"))
-    rows = await sources.resolve_sources(cfg, _client(), conn)
+    rows = await _resolve(cfg, {"default": _client()}, conn)
     assert [(r.id, r.source_id) for r in rows] == [
         (1, "folder:People"),
         (GEORGIA_ID, f"chat:{GEORGIA_ID}"),
@@ -674,14 +697,14 @@ async def test_resolve_sources_keeps_sync_state_and_first_source(
     conn: sqlite3.Connection,
 ) -> None:
     cfg = _cfg(Source(chat="@arg_chat"), Source(folder="Argentina"))
-    first = await sources.resolve_sources(cfg, _client(), conn)
+    first = await _resolve(cfg, {"default": _client()}, conn)
     assert [(r.id, r.source_id) for r in first][:2] == [
         (ARG_ID, "chat:@arg_chat"),
         (NEWS_ID, "folder:Argentina"),
     ]
     db.set_chat_progress(conn, ARG_ID, last_msg_id=77, last_sync_at=1_700_000_000)
     db.set_chat_unavailable(conn, NEWS_ID)
-    again = await sources.resolve_sources(cfg, _client(), conn)
+    again = await _resolve(cfg, {"default": _client()}, conn)
     assert len(again) == len(first) == 3
     arg = db.get_chat(conn, ARG_ID)
     assert arg is not None and (arg.last_msg_id, arg.last_sync_at) == (77, 1_700_000_000)
@@ -701,7 +724,7 @@ async def test_resolve_sources_warns_and_skips_unresolvable_sources(
         Source(chat="@alice"),
     )
     with caplog.at_level(logging.WARNING, logger="grepogram.sources"):
-        rows = await sources.resolve_sources(cfg, _client(), conn)
+        rows = await _resolve(cfg, {"default": _client()}, conn)
     assert [r.id for r in rows] == [1]
     messages = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
     assert any("skipping source folder:Xyz" in m and "no folder named" in m for m in messages)
@@ -715,7 +738,7 @@ async def test_resolve_sources_warns_for_unresolvable_folder_peers(
     conn: sqlite3.Connection, caplog: pytest.LogCaptureFixture
 ) -> None:
     with caplog.at_level(logging.WARNING, logger="grepogram.sources"):
-        rows = await sources.resolve_sources(_cfg(Source(folder="Argentina")), _client(), conn)
+        rows = await _resolve(_cfg(Source(folder="Argentina")), {"default": _client()}, conn)
     assert GHOST_ID not in {r.id for r in rows}
     assert OUTSIDE_ID in {r.id for r in rows}
     assert any(
@@ -726,7 +749,7 @@ async def test_resolve_sources_warns_for_unresolvable_folder_peers(
 
 async def test_resolve_sources_with_no_sources(conn: sqlite3.Connection) -> None:
     client = _client()
-    assert await sources.resolve_sources(_cfg(), client, conn) == []
+    assert await _resolve(_cfg(), {"default": client}, conn) == []
     assert db.list_chats(conn) == []
     assert ("get_dialogs", {}) not in client.calls
 
@@ -783,7 +806,7 @@ def test_cli_sources_help_lists_commands() -> None:
 def test_cli_sources_add_writes_config(tmp_home: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     config_file = _signed_in(tmp_home)
     fake = _client()
-    monkeypatch.setattr(tg, "make_client", lambda cfg, paths: fake)
+    monkeypatch.setattr(tg, "make_client", lambda *_: fake)
     result = runner.invoke(cli.app, ["sources", "add", "@arg_chat"])
     assert result.exit_code == 0, result.output
     assert result.stdout.splitlines() == [
@@ -828,13 +851,18 @@ def test_cli_sources_add_keeps_a_change_saved_while_the_target_resolved(
     is applied to the file as it is by then, under the config lock, so the removal survives."""
     _signed_in(tmp_home, '[[sources]]\nchat = "@alice"\n')
     paths = Paths.from_env()
-    monkeypatch.setattr(tg, "make_client", lambda cfg, paths: _client())
+    monkeypatch.setattr(tg, "make_client", lambda *_: _client())
     real_add = cli._add_source
 
     async def add_after_the_removal(
-        client: Any, cfg: Config, target: sources.Target, since: str | None, comments: bool
+        client: Any,
+        cfg: Config,
+        target: sources.Target,
+        since: str | None,
+        comments: bool,
+        account: str,
     ) -> sources.Added:
-        added = await real_add(client, cfg, target, since, comments)
+        added = await real_add(client, cfg, target, since, comments, account)
         config.update(paths, lambda current: dataclasses.replace(current, sources=[]))
         return added
 
@@ -851,13 +879,18 @@ def test_cli_sources_add_refuses_a_source_another_process_added_meanwhile(
 ) -> None:
     _signed_in(tmp_home)
     paths = Paths.from_env()
-    monkeypatch.setattr(tg, "make_client", lambda cfg, paths: _client())
+    monkeypatch.setattr(tg, "make_client", lambda *_: _client())
     real_add = cli._add_source
 
     async def add_after_the_other_add(
-        client: Any, cfg: Config, target: sources.Target, since: str | None, comments: bool
+        client: Any,
+        cfg: Config,
+        target: sources.Target,
+        since: str | None,
+        comments: bool,
+        account: str,
     ) -> sources.Added:
-        added = await real_add(client, cfg, target, since, comments)
+        added = await real_add(client, cfg, target, since, comments, account)
         config.update(paths, lambda current: sources.with_source(current, added.source, None))
         return added
 
@@ -872,7 +905,7 @@ def test_cli_sources_add_reports_source_errors(
     tmp_home: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     config_file = _signed_in(tmp_home)
-    monkeypatch.setattr(tg, "make_client", lambda cfg, paths: _client())
+    monkeypatch.setattr(tg, "make_client", lambda *_: _client())
     ambiguous = runner.invoke(cli.app, ["sources", "add", "arg"])
     assert ambiguous.exit_code == 1
     assert "be more specific" in ambiguous.stderr
@@ -908,7 +941,7 @@ def test_cli_sources_add_maps_network_errors(
         raise ConnectionError("offline")
 
     monkeypatch.setattr(broken, "connect", failing_connect)
-    monkeypatch.setattr(tg, "make_client", lambda cfg, paths: broken)
+    monkeypatch.setattr(tg, "make_client", lambda *_: broken)
     result = runner.invoke(cli.app, ["sources", "add", "@arg_chat"])
     assert result.exit_code == 1
     assert "telegram error: offline" in result.stderr
@@ -932,6 +965,7 @@ def test_cli_sources_ls_prints_table_and_empty_message(tmp_home: Path) -> None:
     assert result.exit_code == 0, result.output
     lines = result.stdout.splitlines()
     assert lines[0].split() == [
+        "account",
         "source",
         "id",
         "type",
@@ -942,11 +976,13 @@ def test_cli_sources_ls_prints_table_and_empty_message(tmp_home: Path) -> None:
         "sync",
         "status",
     ]
-    assert lines[1].startswith(f"folder:Argentina  {NEWS_ID}  channel     News")
+    assert lines[1].startswith(f"default  folder:Argentina  {NEWS_ID}  channel     News")
     assert lines[1].endswith("0         never             unavailable")
-    assert lines[2].startswith(f"folder:Argentina  {ARG_ID}  supergroup  Argentina chat  @arg_chat")
+    assert lines[2].startswith(
+        f"default  folder:Argentina  {ARG_ID}  supergroup  Argentina chat  @arg_chat"
+    )
     assert "  3  " in lines[2] and lines[2].endswith("ok")
-    assert lines[3].startswith("chat:@alice")
+    assert lines[3].startswith("default  chat:@alice")
     assert lines[3].endswith("not synced yet")
     assert not any(line.endswith(" ") for line in lines)
 
@@ -1043,13 +1079,13 @@ def test_cli_sources_rm_applies_to_the_config_as_stored_under_the_config_lock(
         return loaded
 
     def remove_under_the_locks(
-        cfg: Config, conn: sqlite3.Connection, target: sources.Target
+        cfg: Config, conn: sqlite3.Connection, target: sources.Target, **kwargs: Any
     ) -> sources.Removed:
         assert [s.id for s in cfg.sources] == ["chat:@alice", "folder:Argentina"]
         assert _config_lock_held(paths)
         with pytest.raises(sync.SyncInProgress), sync.SyncLock(paths):
             pass
-        return real_remove(cfg, conn, target)
+        return real_remove(cfg, conn, target, **kwargs)
 
     monkeypatch.setattr(cli, "_load", load_then_lose_the_race)
     monkeypatch.setattr(sources, "remove_source", remove_under_the_locks)
@@ -1095,12 +1131,19 @@ async def test_resolve_sources_skips_private_folder_peers_but_not_flood_waits(
 ) -> None:
     private = _client(entity_errors={GHOST_ID: errors.ChannelPrivateError(request=None)})
     with caplog.at_level(logging.WARNING, logger="grepogram.sources"):
-        rows = await sources.resolve_sources(_cfg(Source(folder="Argentina")), private, conn)
+        rows = await _resolve(_cfg(Source(folder="Argentina")), {"default": private}, conn)
     assert {r.id for r in rows} == {ARG_ID, NEWS_ID, OUTSIDE_ID}
     assert any("cannot resolve peer" in r.getMessage() for r in caplog.records)
     flooded = _client(entity_errors={GHOST_ID: errors.FloodWaitError(request=None, capture=30)})
-    with pytest.raises(errors.FloodWaitError):
-        await sources.resolve_sources(_cfg(Source(folder="Argentina")), flooded, conn)
+    stopped = await sources.resolve_sources(
+        _cfg(Source(folder="Argentina"), Source(chat="@news")), {"default": flooded}, conn
+    )
+    assert stopped.flooded == {"default": 30}, "the account stops, and says for how long"
+    assert {r.id for r in stopped.chats} == {ARG_ID, NEWS_ID, OUTSIDE_ID}, "kept, not re-read"
+    assert db.chat_source_ids(conn, OUTSIDE_ID) == ["folder:Argentina"]
+    assert [name for name, kw in flooded.calls if kw.get("key") == "@news"] == [], (
+        "the account's other sources are not asked about after its flood wait"
+    )
 
 
 async def test_username_targets_are_served_from_the_dialog_memo() -> None:
@@ -1174,7 +1217,7 @@ def _membership(
 
 async def test_folder_membership_lists_every_peer_a_folder_names() -> None:
     cfg = _cfg(Source(folder="Argentina"), Source(chat="@alice"))
-    membership = await sources.folder_membership(cfg, _catalog())
+    membership = await sources.folder_membership(cfg, {"default": _catalog()})
     # GHOST_ID has no entity to resolve, and is still listed by the folder: `folder_dialogs`
     # drops such a peer, and reading that as "it left" is what would delete a live chat
     assert membership.listed == {"folder:Argentina": {ARG_ID, NEWS_ID, OUTSIDE_ID, GHOST_ID}}
@@ -1189,21 +1232,35 @@ async def test_folder_membership_drops_a_peer_the_folder_also_excludes() -> None
     folder = make_folder(3, "Argentina", include=[ARG, GHOST_ID], pinned=[NEWS], exclude=[NEWS])
     client = FakeClient(dialogs=[make_dialog(ARG), make_dialog(NEWS)], folders=[folder])
     membership = await sources.folder_membership(
-        _cfg(Source(folder="Argentina")), DialogCatalog(client)
+        _cfg(Source(folder="Argentina")), {"default": DialogCatalog(client)}
     )
     assert membership.listed == {"folder:Argentina": {ARG_ID, GHOST_ID}}
 
 
 async def test_folder_membership_records_an_unresolvable_source_instead_of_skipping_it() -> None:
     cfg = _cfg(Source(folder="Xyz"), Source(folder="Argentina"))
-    membership = await sources.folder_membership(cfg, _catalog())
+    membership = await sources.folder_membership(cfg, {"default": _catalog()})
     assert set(membership.listed) == {"folder:Argentina"}
     assert "no folder named" in membership.failed["folder:Xyz"]
 
 
+async def test_folder_membership_reads_a_folder_through_its_own_account_only() -> None:
+    """A folder is one account's: one whose account has no catalog is unchecked — a prune then
+    stops — and never read through the default account's folder of the same name."""
+    cfg = _cfg(Source(folder="Argentina"), Source(folder="Argentina", account="work"))
+    membership = await sources.folder_membership(cfg, {"default": _catalog()})
+    assert set(membership.listed) == {"folder:Argentina"}
+    assert membership.failed == {"work/folder:Argentina": "account work is not signed in"}
+    only_work = await sources.folder_membership(cfg, {"work": _catalog()})
+    assert set(only_work.listed) == {"work/folder:Argentina"}
+    assert set(only_work.failed) == {"folder:Argentina"}
+
+
 async def test_folder_membership_records_a_transient_rpc_error() -> None:
     flooded = _catalog(entity_errors={GHOST_ID: errors.FloodWaitError(request=None, capture=30)})
-    membership = await sources.folder_membership(_cfg(Source(folder="Argentina")), flooded)
+    membership = await sources.folder_membership(
+        _cfg(Source(folder="Argentina")), {"default": flooded}
+    )
     assert membership.listed == {}
     assert "wait" in membership.failed["folder:Argentina"].casefold()
 
@@ -1218,7 +1275,7 @@ async def test_folder_membership_reraises_a_revoked_session() -> None:
     cfg = _cfg(Source(folder="Argentina"))
     with pytest.raises(tg.AuthRequired):
         async with tg.connected(client):
-            await sources.folder_membership(cfg, DialogCatalog(client))
+            await sources.folder_membership(cfg, {"default": DialogCatalog(client)})
 
 
 def test_prunable_offers_a_chat_the_folder_no_longer_lists(conn: sqlite3.Connection) -> None:
@@ -1401,7 +1458,7 @@ def _prune_home(tmp_home: Path, monkeypatch: pytest.MonkeyPatch, extra: str = ""
     _store(conn, _chat(ARG_ID, "folder:Argentina", title="Argentina chat", username="arg_chat"), 3)
     _store(conn, _left(), 4)
     conn.close()
-    monkeypatch.setattr(tg, "make_client", lambda cfg, paths: _client())
+    monkeypatch.setattr(tg, "make_client", lambda *_: _client())
     return paths
 
 
@@ -1459,6 +1516,24 @@ def test_cli_sources_prune_refuses_when_a_source_cannot_be_resolved(
     assert _indexed(paths) == sorted([ARG_ID, LEFT_ID])
 
 
+def test_cli_sources_prune_never_reads_folders_as_another_telegram_user(
+    tmp_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Another user's folders say nothing about the recorded user's: the folder is unchecked,
+    and an unchecked folder stops the prune."""
+    paths = _prune_home(tmp_home, monkeypatch)
+    conn = db.connect(paths)
+    try:
+        db.upsert_account(conn, AccountRow(name="default", user_id=99, display_name="Earlier"))
+    finally:
+        conn.close()
+    monkeypatch.setattr(tg, "make_client", lambda *_: _client(me=make_user(7, "Someone")))
+    result = runner.invoke(cli.app, ["sources", "prune"], input="y\n")
+    assert result.exit_code == 1
+    assert "not user 99" in result.stderr and "nothing was pruned" in result.stderr
+    assert sorted(_indexed(paths)) == sorted([ARG_ID, LEFT_ID])
+
+
 def test_cli_sources_prune_keeps_a_linked_discussion_group_and_says_why(
     tmp_home: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1499,11 +1574,11 @@ def test_cli_sources_prune_resolves_before_it_takes_the_sync_lock(
     order: list[str] = []
 
     async def membership_without_the_lock(
-        client: TelegramClient, cfg: Config
+        accounts: tg.Accounts, cfg: Config, conn: sqlite3.Connection
     ) -> sources.FolderMembership:
         with sync.SyncLock(paths):  # free while the network is being read
             order.append("resolved")
-        return await real_membership(client, cfg)
+        return await real_membership(accounts, cfg, conn)
 
     def prune_under_the_lock(
         conn: sqlite3.Connection, candidates: Sequence[sources.PruneCandidate]
@@ -1544,7 +1619,7 @@ def test_cli_sources_prune_maps_network_errors(
         raise ConnectionError("offline")
 
     monkeypatch.setattr(broken, "connect", failing_connect)
-    monkeypatch.setattr(tg, "make_client", lambda cfg, paths: broken)
+    monkeypatch.setattr(tg, "make_client", lambda *_: broken)
     result = runner.invoke(cli.app, ["sources", "prune"])
     assert result.exit_code == 1
     assert "telegram error: offline" in result.stderr
@@ -1755,7 +1830,7 @@ async def test_resolve_sources_leaves_an_imported_chat_under_its_import_tag(
     """
     sources.import_chats(conn, _export(_imported(ARG_ID, "Argentina chat"), messages=3))
     with caplog.at_level(logging.INFO, logger="grepogram.sources"):
-        rows = await sources.resolve_sources(_cfg(Source(folder="Argentina")), _client(), conn)
+        rows = await _resolve(_cfg(Source(folder="Argentina")), {"default": _client()}, conn)
     assert ARG_ID not in [row.id for row in rows], "an import is not a chat to sync"
     chat = db.get_chat(conn, ARG_ID)
     assert chat is not None and chat.source_id == "import:argentina-chat"
@@ -1781,7 +1856,7 @@ def _import_home(tmp_home: Path, monkeypatch: pytest.MonkeyPatch, chat_id: int) 
     db.migrate(conn)
     sources.import_chats(conn, _export(_imported(chat_id, "Argentina chat"), messages=2))
     conn.close()
-    monkeypatch.setattr(tg, "make_client", lambda cfg, paths: _client())
+    monkeypatch.setattr(tg, "make_client", lambda *_: _client())
     return paths
 
 
@@ -1829,3 +1904,528 @@ def test_cli_sources_rm_removes_an_imported_chat_by_its_source_id(
         assert db.list_chats(conn) == []
     finally:
         conn.close()
+
+
+# --- accounts --------------------------------------------------------------------------------
+
+WORK = "work"
+WORK_NEWS = make_channel(200, "News", username="news")
+WORK_NEWS.access_hash = 7200
+WORK_ALICE = make_user(1, "Alice", "Liddell", username="alice")
+WORK_ALICE.access_hash = 7001
+
+
+def _work_cfg(*entries: Source) -> Config:
+    """A config that lists the work account, as one a source of it can be added to must."""
+    return Config(accounts=[AccountCfg(name=WORK)], sources=list(entries))
+
+
+def _work_client() -> FakeClient:
+    """The second account: it reaches the same channel and the same person as the default one,
+    under access hashes of its own, and has no folders."""
+    return FakeClient(dialogs=[make_dialog(WORK_NEWS), make_dialog(WORK_ALICE)], folders=[])
+
+
+def _clients() -> dict[str, Any]:
+    return {"default": _client(), WORK: _work_client()}
+
+
+@pytest.mark.parametrize(
+    ("raw", "kind", "value", "account"),
+    [
+        ("work/chat:@news", "username", "news", WORK),
+        ("work/folder:Argentina", "folder", "Argentina", WORK),
+        ("WORK/chat:-1000000000200", "id", -1000000000200, WORK),
+        ("default/chat:@news", "username", "news", "default"),
+        ("chat:@news", "username", "news", None),
+        ("work/news", "fuzzy", "work/news", None),
+    ],
+)
+def test_parse_target_reads_the_account_prefix_of_a_source_id(
+    raw: str, kind: str, value: str | int, account: str | None
+) -> None:
+    target = sources.parse_target(raw)
+    assert (target.kind, target.value, target.account) == (kind, value, account)
+
+
+def test_split_source_id() -> None:
+    assert sources.split_source_id("work/chat:@x") == (WORK, "chat:@x")
+    assert sources.split_source_id("work/folder:A/B") == (WORK, "folder:A/B")
+    assert sources.split_source_id("folder:A/B") == ("default", "folder:A/B")
+    assert sources.split_source_id("import:x") == ("default", "import:x")
+
+
+async def test_add_source_for_another_account() -> None:
+    added = await sources.add_source(
+        _work_cfg(), sources.parse_target("@news"), DialogCatalog(_work_client()), account=WORK
+    )
+    assert added.source == Source(chat="@news", account=WORK)
+    assert added.source.id == "work/chat:@news"
+    prefixed = await sources.add_source(
+        _work_cfg(),
+        sources.parse_target("work/chat:@news"),
+        DialogCatalog(_work_client()),
+        account=WORK,
+    )
+    assert prefixed.source == added.source
+    with pytest.raises(InvalidTarget, match="account work"):
+        await sources.add_source(_cfg(), sources.parse_target("work/chat:@news"), _catalog())
+
+
+async def test_the_same_chat_is_a_duplicate_only_within_one_account() -> None:
+    cfg = _work_cfg(Source(chat="@news"))
+    news = dialog_info(NEWS)
+    both = sources.with_source(cfg, Source(chat=NEWS_ID, account=WORK), news)
+    assert [s.id for s in both.sources] == ["chat:@news", f"work/chat:{NEWS_ID}"]
+    with pytest.raises(DuplicateSource, match="already a source as work/chat"):
+        sources.with_source(both, Source(chat="@NEWS", account=WORK), news)
+    with pytest.raises(DuplicateSource):
+        sources.with_source(both, Source(chat=NEWS_ID), news)
+
+
+def test_a_source_of_an_account_the_config_no_longer_lists_is_refused() -> None:
+    """The config ``with_source`` is handed is the one read under the lock; an account
+    ``accounts rm`` dropped from it since the target resolved takes no source."""
+    with pytest.raises(sources.AccountRemoved, match="account 'work' was removed"):
+        sources.with_source(_cfg(), Source(chat="@news", account=WORK), dialog_info(NEWS))
+
+
+async def test_resolve_sources_stores_a_shared_channel_once_for_two_accounts(
+    conn: sqlite3.Connection,
+) -> None:
+    """One row, the first source its primary, both sources covering it and both accounts
+    reaching it — each with the access hash its own client addresses the channel by."""
+    cfg = _cfg(Source(chat="@news"), Source(chat="@news", account=WORK))
+    rows = await _resolve(cfg, _clients(), conn)
+    assert [(r.id, r.source_id) for r in rows] == [(NEWS_ID, "chat:@news")]
+    assert db.list_chats(conn) == rows
+    assert db.chat_source_ids(conn, NEWS_ID) == ["chat:@news", "work/chat:@news"]
+    assert db.chat_accounts(conn, NEWS_ID) == ["default", WORK]
+    assert db.access_hash(conn, NEWS_ID, "default") == 200
+    assert db.access_hash(conn, NEWS_ID, WORK) == 7200
+
+
+async def test_resolve_sources_keeps_the_private_chats_of_two_accounts_apart(
+    conn: sqlite3.Connection,
+) -> None:
+    """The same person seen from two accounts is two conversations: two rows of one peer, each
+    filed under the account whose source reached it — never under ``default`` by omission."""
+    cfg = _cfg(Source(chat="@alice", account=WORK), Source(chat="@alice"))
+    rows = await _resolve(cfg, _clients(), conn)
+    work, default = rows
+    assert (work.id, work.peer_id, work.scope, work.source_id) == (1, 1, WORK, "work/chat:@alice")
+    assert (default.id, default.peer_id, default.scope) == (db.SYNTHETIC_BASE, 1, "default")
+    assert db.chat_accounts(conn, work.id) == [WORK]
+    assert db.chat_accounts(conn, default.id) == ["default"]
+    assert db.access_hash(conn, work.id, WORK) == 7001
+    assert db.access_hash(conn, default.id, "default") == 1
+    assert db.chat_source_ids(conn, default.id) == ["chat:@alice"]
+
+
+async def test_resolve_sources_skips_an_account_without_a_client_and_keeps_its_coverage(
+    conn: sqlite3.Connection, caplog: pytest.LogCaptureFixture
+) -> None:
+    cfg = _cfg(Source(chat="@news"), Source(chat="@news", account=WORK))
+    await _resolve(cfg, _clients(), conn)
+    with caplog.at_level(logging.WARNING, logger="grepogram.sources"):
+        rows = await _resolve(cfg, {"default": _client()}, conn)
+    assert [r.id for r in rows] == [NEWS_ID]
+    assert "skipping source work/chat:@news: account work has no signed-in client" in caplog.text
+    assert db.chat_source_ids(conn, NEWS_ID) == ["chat:@news", "work/chat:@news"]
+
+
+async def test_a_source_that_does_not_resolve_stays_the_primary_of_its_chats(
+    conn: sqlite3.Connection,
+) -> None:
+    """The work source comes first, so the channel is its. With the work account signed out —
+    or its source not resolving — the default source covering the same channel does not take
+    it over for that run, only to hand it back once the work account is back."""
+    cfg = _cfg(Source(chat="@news", account=WORK), Source(chat="@news"))
+    await _resolve(cfg, _clients(), conn)
+    for clients in ({"default": _client()}, _clients()):
+        rows = await _resolve(cfg, clients, conn)
+        assert [(r.id, r.source_id) for r in rows] == [(NEWS_ID, "work/chat:@news")]
+        news = db.get_chat(conn, NEWS_ID)
+        assert news is not None and news.source_id == "work/chat:@news"
+    gone = _work_client()
+    gone.entity_errors["@news"] = errors.UsernameNotOccupiedError(request=None)
+    gone.dialogs = [d for d in gone.dialogs if d.id != NEWS_ID]
+    gone.entities.pop(NEWS_ID)
+    rows = await _resolve(cfg, {"default": _client(), WORK: gone}, conn)
+    assert [(r.id, r.source_id) for r in rows] == [(NEWS_ID, "work/chat:@news")]
+    assert db.chat_source_ids(conn, NEWS_ID) == ["chat:@news", "work/chat:@news"]
+
+
+async def test_a_handle_the_stored_chat_no_longer_holds_is_resolved_again(
+    conn: sqlite3.Connection,
+) -> None:
+    """Reading ``@name`` by its stored id is only a shortcut while the chat still holds the
+    handle: once it moved to another chat, the source follows the handle."""
+    public = make_channel(900, "Public", username="pubnews")
+    public_id = -1000000000900
+    cfg = _cfg(Source(chat="@pubnews"))
+    first = FakeClient(entities=[public], folders=[])
+    rows = await _resolve(cfg, {"default": first}, conn)
+    assert [r.id for r in rows] == [public_id]
+    renamed = make_channel(900, "Public", username="pubnews_old")
+    taker = make_channel(901, "Squatter", username="pubnews")
+    again = FakeClient(entities=[renamed, taker], folders=[])
+    rows = await _resolve(cfg, {"default": again}, conn)
+    assert ("get_entity", {"key": public_id}) in again.calls, "the stored id first"
+    assert ("get_entity", {"key": "@pubnews"}) in again.calls, "then the name"
+    assert [r.id for r in rows] == [-1000000000901]
+
+
+async def test_resolve_sources_replaces_what_a_source_covers(conn: sqlite3.Connection) -> None:
+    """A folder that stops listing a chat stops covering it; a peer it still names but that
+    will not resolve right now stays covered — it is listed, only unreachable this run."""
+    cfg = _cfg(Source(folder="Argentina"), Source(chat="@news"))
+    await _resolve(cfg, {"default": _client()}, conn)
+    assert db.chat_source_ids(conn, NEWS_ID) == ["chat:@news", "folder:Argentina"]
+    assert db.chat_source_ids(conn, OUTSIDE_ID) == ["folder:Argentina"]
+    # resolved outside the dialogs, by the access hash the folder's InputPeerChannel carries
+    assert db.access_hash(conn, OUTSIDE_ID, "default") == 300
+    unpinned = FakeClient(
+        dialogs=_client().dialogs,
+        folders=[make_folder(3, "Argentina", include=[ARG, OUTSIDE, GHOST_ID])],
+        entity_errors={OUTSIDE_ID: errors.ChannelPrivateError(request=None)},
+    )
+    await _resolve(cfg, {"default": unpinned}, conn)
+    assert db.chat_source_ids(conn, NEWS_ID) == ["chat:@news"]
+    assert db.chat_source_ids(conn, OUTSIDE_ID) == ["folder:Argentina"]
+    assert db.chat_source_ids(conn, ARG_ID) == ["folder:Argentina"]
+
+
+async def test_resolve_sources_leaves_an_import_alone_for_every_account(
+    conn: sqlite3.Connection,
+) -> None:
+    held = _chat(NEWS_ID, "import:news", type="channel", title="News", unavailable=True)
+    _store(conn, held, 1)
+    cfg = _cfg(Source(chat="@news", account=WORK))
+    assert await _resolve(cfg, _clients(), conn) == []
+    stored = db.get_chat(conn, NEWS_ID)
+    assert stored is not None and stored.source_id == "import:news"
+    assert db.chat_accounts(conn, NEWS_ID) == []
+    assert db.chat_source_ids(conn, NEWS_ID) == []
+
+
+async def test_removing_one_accounts_source_keeps_a_chat_the_other_still_covers(
+    conn: sqlite3.Connection,
+) -> None:
+    cfg = _cfg(Source(chat="@news"), Source(chat="@news", account=WORK))
+    await _resolve(cfg, _clients(), conn)
+    db.upsert_messages(conn, [MessageRow(chat_id=NEWS_ID, msg_id=1, date=1, text="post")])
+    first = sources.remove_source(cfg, conn, sources.parse_target("chat:@news"))
+    assert (first.source_id, first.chat_ids, first.kept_chat_ids) == ("chat:@news", [], [NEWS_ID])
+    assert [s.id for s in first.config.sources] == ["work/chat:@news"]
+    news = db.get_chat(conn, NEWS_ID)
+    assert news is not None and news.source_id == "work/chat:@news"
+    assert db.chat_source_ids(conn, NEWS_ID) == ["work/chat:@news"]
+    assert len(db.get_messages(conn, NEWS_ID)) == 1
+    last = sources.remove_source(first.config, conn, sources.parse_target("work/chat:@news"))
+    assert (last.chat_ids, last.kept_chat_ids) == ([NEWS_ID], [])
+    assert db.get_chat(conn, NEWS_ID) is None
+    assert db.get_messages(conn, NEWS_ID) == []
+
+
+@pytest.mark.parametrize("chat", ["@NEWS", "https://t.me/news", NEWS_ID])
+async def test_a_source_added_for_another_account_covers_the_chat_before_its_first_sync(
+    conn: sqlite3.Connection, chat: str | int
+) -> None:
+    """The work account's entry names the channel by any spelling but has never synced, so
+    nothing recorded its coverage: the config still says it covers the chat, which keeps it."""
+    await _resolve(_cfg(Source(chat="@news")), _clients(), conn)
+    db.upsert_messages(conn, [MessageRow(chat_id=NEWS_ID, msg_id=1, date=1, text="post")])
+    cfg = _cfg(Source(chat="@news"), Source(chat=chat, account=WORK))
+
+    removed = sources.remove_source(cfg, conn, sources.parse_target("chat:@news"))
+
+    assert (removed.chat_ids, removed.kept_chat_ids, removed.undecided_chat_ids) == (
+        [],
+        [NEWS_ID],
+        [],
+    )
+    news = db.get_chat(conn, NEWS_ID)
+    assert news is not None and news.source_id == Source(chat=chat, account=WORK).id
+    assert len(db.get_messages(conn, NEWS_ID)) == 1
+
+
+async def test_a_folder_not_synced_yet_keeps_a_chat_it_might_cover_undecided(
+    conn: sqlite3.Connection, caplog: pytest.LogCaptureFixture
+) -> None:
+    """What a folder lists is unknown until it resolves: the shared channel stays under it and
+    the removal says why, while a private chat of the other account — which that folder could
+    never mean — goes."""
+    await _resolve(_cfg(Source(chat="@news"), Source(chat="@alice")), _clients(), conn)
+    db.upsert_messages(conn, [MessageRow(chat_id=NEWS_ID, msg_id=1, date=1, text="post")])
+    folder = Source(folder="Argentina", account=WORK)
+    cfg = _cfg(Source(chat="@news"), Source(chat="@alice"), folder)
+
+    with caplog.at_level("WARNING", logger="grepogram.sources"):
+        news = sources.remove_source(
+            cfg, conn, sources.parse_target("chat:@news"), has_session=lambda a: a == WORK
+        )
+        alice = sources.remove_source(
+            news.config, conn, sources.parse_target("chat:@alice"), has_session=lambda a: True
+        )
+
+    assert (news.chat_ids, news.kept_chat_ids, news.undecided_chat_ids) == (
+        [],
+        [NEWS_ID],
+        [NEWS_ID],
+    )
+    kept = db.get_chat(conn, NEWS_ID)
+    assert kept is not None and kept.source_id == folder.id
+    assert "a source not synced yet may cover them" in caplog.text
+    assert alice.chat_ids == [1] and alice.undecided_chat_ids == [], "a user is private"
+
+
+async def test_a_folder_of_an_account_with_no_session_decides_nothing(
+    conn: sqlite3.Connection,
+) -> None:
+    """Nothing can ever read the folder of an account that is not signed in, so it cannot keep
+    a chat for a sync that will not come: the chat goes as if the folder were not there."""
+    await _resolve(_cfg(Source(chat="@news")), _clients(), conn)
+    cfg = _cfg(Source(chat="@news"), Source(folder="Argentina", account=WORK))
+
+    removed = sources.remove_source(
+        cfg, conn, sources.parse_target("chat:@news"), has_session=lambda a: a != WORK
+    )
+
+    assert (removed.chat_ids, removed.kept_chat_ids, removed.undecided_chat_ids) == (
+        [NEWS_ID],
+        [],
+        [],
+    )
+    assert db.get_chat(conn, NEWS_ID) is None
+
+
+async def test_prune_removes_an_undecided_chat_once_its_folder_syncs_without_it(
+    conn: sqlite3.Connection,
+) -> None:
+    await _resolve(_cfg(Source(chat="@news")), {"default": _client()}, conn)
+    folder = Source(folder="People")
+    cfg = _cfg(Source(chat="@news"), folder)
+    removed = sources.remove_source(
+        cfg, conn, sources.parse_target("chat:@news"), has_session=lambda a: True
+    )
+    assert removed.undecided_chat_ids == [NEWS_ID]
+
+    await _resolve(removed.config, {"default": _client()}, conn)
+    kept = db.get_chat(conn, NEWS_ID)
+    assert kept is not None and kept.source_id == folder.id, "People does not list the channel"
+    membership = await sources.folder_membership(removed.config, {"default": _catalog()})
+    scan = sources.prunable(removed.config, conn, membership)
+
+    assert [(c.chat.id, c.reason) for c in scan.prunable] == [
+        (NEWS_ID, "folder:People no longer lists it")
+    ]
+    assert sources.prune_chats(conn, scan.prunable) == [NEWS_ID]
+    assert db.get_chat(conn, NEWS_ID) is None
+
+
+@pytest.mark.parametrize("value", ["Argentina chat", "https://t.me/+AbCdEf123"])
+async def test_a_chat_entry_that_cannot_be_the_chat_decides_nothing(
+    conn: sqlite3.Connection, value: str
+) -> None:
+    """A fuzzy title that does not match the chat's, or an invite link, names exactly one other
+    chat: it cannot keep this one, which would otherwise wait under it for good."""
+    await _resolve(_cfg(Source(chat="@news")), {"default": _client()}, conn)
+    cfg = _cfg(Source(chat="@news"), Source(chat=value))
+
+    removed = sources.remove_source(
+        cfg, conn, sources.parse_target("chat:@news"), has_session=lambda a: True
+    )
+
+    assert (removed.chat_ids, removed.undecided_chat_ids) == ([NEWS_ID], [])
+    assert db.get_chat(conn, NEWS_ID) is None
+
+
+async def test_a_fuzzy_entry_matching_the_chats_title_keeps_it_undecided(
+    conn: sqlite3.Connection,
+) -> None:
+    await _resolve(_cfg(Source(chat="@news")), {"default": _client()}, conn)
+    title = Source(chat="news")
+    cfg = _cfg(Source(chat="@news"), title)
+
+    removed = sources.remove_source(
+        cfg, conn, sources.parse_target("chat:@news"), has_session=lambda a: True
+    )
+
+    assert (removed.chat_ids, removed.undecided_chat_ids) == ([], [NEWS_ID])
+    kept = db.get_chat(conn, NEWS_ID)
+    assert kept is not None and kept.source_id == title.id
+
+
+async def test_a_fuzzy_entry_of_an_account_with_no_session_decides_nothing(
+    conn: sqlite3.Connection,
+) -> None:
+    await _resolve(_cfg(Source(chat="@news")), {"default": _client()}, conn)
+    cfg = _cfg(Source(chat="@news"), Source(chat="news"))
+
+    removed = sources.remove_source(cfg, conn, sources.parse_target("chat:@news"))
+
+    assert (removed.chat_ids, removed.undecided_chat_ids) == ([NEWS_ID], [])
+
+
+async def test_a_chat_left_under_a_chat_entry_that_resolved_elsewhere_is_prunable(
+    conn: sqlite3.Connection,
+) -> None:
+    """A title entry kept a chat before its first sync and then resolved to another chat: the
+    chat is covered by nothing, so prune offers it and ``sources rm`` removes it alone."""
+    entry = Source(chat="Argentina chat")
+    cfg = _cfg(entry)
+    _store(conn, _left(entry.id), 2)
+    await _resolve(cfg, {"default": _client()}, conn)
+    assert db.source_chat_ids(conn, entry.id) == [ARG_ID]
+
+    scan = sources.prunable(cfg, conn, _membership())
+    assert [(c.chat.id, c.reason) for c in scan.prunable] == [
+        (LEFT_ID, f"{entry.id} resolved to another chat and does not cover it")
+    ]
+
+    for raw in (str(LEFT_ID), "Left chat"):
+        _store(conn, _left(entry.id), 2)
+        removed = sources.remove_source(cfg, conn, sources.parse_target(raw))
+        assert (removed.stray, removed.source, removed.source_id) == (True, None, entry.id)
+        assert removed.chat_ids == [LEFT_ID] and removed.config == cfg
+        assert db.get_chat(conn, LEFT_ID) is None
+        assert db.get_chat(conn, ARG_ID) is not None, "the unrelated source keeps its chat"
+
+
+async def test_a_group_under_a_channel_entry_with_comments_is_not_offered(
+    conn: sqlite3.Connection,
+) -> None:
+    """A group a channel was unlinked from keeps the channel's source until that source goes;
+    it looks like a stray chat and must not be offered."""
+    entry = Source(chat="@news", comments=True)
+    cfg = _cfg(entry)
+    await _resolve(cfg, {"default": _client()}, conn)
+    _store(conn, _left(entry.id), 2)
+    assert sources.prunable(cfg, conn, _membership()).prunable == []
+    plain = _cfg(Source(chat="@news"))
+    assert [c.chat.id for c in sources.prunable(plain, conn, _membership()).prunable] == [LEFT_ID]
+
+
+async def test_a_linked_discussion_group_follows_its_channel_to_the_remaining_source(
+    conn: sqlite3.Connection,
+) -> None:
+    cfg = _cfg(Source(chat="@news", comments=True), Source(chat="@news", account=WORK))
+    await _resolve(cfg, _clients(), conn)
+    group = db.upsert_chat(conn, _chat(ARG_ID, "chat:@news", title="News chat"))
+    db.set_discussion_chat(conn, NEWS_ID, group.id)
+    removed = sources.remove_source(cfg, conn, sources.parse_target("chat:@news"))
+    assert (removed.chat_ids, removed.kept_chat_ids) == ([], sorted([NEWS_ID, ARG_ID]))
+    moved = db.get_chat(conn, ARG_ID)
+    assert moved is not None and moved.source_id == "work/chat:@news"
+    assert moved.discussion_of == NEWS_ID
+
+
+async def test_removing_one_accounts_private_chat_leaves_the_others(
+    conn: sqlite3.Connection,
+) -> None:
+    """``@alice`` names the default account's source when it has one; the work account's
+    conversation with her is reached by its own source id and removed on its own."""
+    cfg = _cfg(Source(chat="@alice"), Source(chat="@alice", account=WORK))
+    rows = await _resolve(cfg, _clients(), conn)
+    default, work = rows
+    removed = sources.remove_source(cfg, conn, sources.parse_target("@alice"))
+    assert (removed.source_id, removed.chat_ids) == ("chat:@alice", [default.id])
+    assert db.get_chat(conn, work.id) is not None
+    gone = sources.remove_source(removed.config, conn, sources.parse_target("@alice"))
+    assert (gone.source_id, gone.chat_ids) == ("work/chat:@alice", [work.id])
+    assert db.list_chats(conn) == []
+
+
+def test_find_source_is_ambiguous_between_two_other_accounts(conn: sqlite3.Connection) -> None:
+    cfg = _cfg(
+        Source(folder="News", account=WORK),
+        Source(folder="News", account="home"),
+        Source(chat="@news", account=WORK),
+        Source(chat="@news", account="home"),
+    )
+    with pytest.raises(AmbiguousTarget) as folder:
+        sources.find_source(cfg, conn, sources.parse_target("folder:News"))
+    assert folder.value.candidates == ["work/folder:News", "home/folder:News"]
+    with pytest.raises(AmbiguousTarget):
+        sources.find_source(cfg, conn, sources.parse_target("@news"))
+    assert sources.find_source(cfg, conn, sources.parse_target("home/folder:news")) == (
+        "home/folder:News"
+    )
+    assert sources.find_source(cfg, conn, sources.parse_target("home/chat:@news")) == (
+        "home/chat:@news"
+    )
+    with pytest.raises(UnknownSource):
+        sources.find_source(cfg, conn, sources.parse_target("other/folder:News"))
+
+
+async def test_removing_a_source_leaves_an_import_it_never_covered(
+    conn: sqlite3.Connection,
+) -> None:
+    _store(conn, _chat(GEORGIA_ID, "import:georgia", title="Georgia", unavailable=True), 2)
+    cfg = _cfg(Source(chat="@news"), Source(chat="@news", account=WORK))
+    await _resolve(cfg, _clients(), conn)
+    sources.remove_source(cfg, conn, sources.parse_target("work/chat:@news"))
+    sources.remove_source(cfg, conn, sources.parse_target("chat:@news"))
+    stored = db.get_chat(conn, GEORGIA_ID)
+    assert stored is not None and stored.source_id == "import:georgia"
+    assert len(db.get_messages(conn, GEORGIA_ID)) == 2
+
+
+async def test_sources_status_lists_a_chat_under_every_source_with_its_account(
+    conn: sqlite3.Connection,
+) -> None:
+    cfg = _cfg(Source(chat="@news"), Source(chat="@news", account=WORK))
+    await _resolve(cfg, _clients(), conn)
+    _store(conn, _chat(GEORGIA_ID, "import:georgia", title="Georgia", unavailable=True))
+    statuses = sources.sources_status(cfg, conn)
+    assert [(s.source_id, s.account, [c.id for c in s.chats]) for s in statuses] == [
+        ("chat:@news", "default", [NEWS_ID]),
+        ("work/chat:@news", WORK, [NEWS_ID]),
+        ("import:georgia", None, [GEORGIA_ID]),
+    ]
+
+
+def test_prunable_does_not_let_one_accounts_folder_cover_anothers_private_chat(
+    conn: sqlite3.Connection,
+) -> None:
+    """Peer 1 listed by the work account's folder is the work account's conversation with
+    that person, not the default account's."""
+    _store(conn, _chat(1, "folder:People", type="user", title="Alice"))
+    cfg = _cfg(Source(folder="People"), Source(folder="People", account=WORK))
+    scan = sources.prunable(
+        cfg,
+        conn,
+        sources.FolderMembership(listed={"folder:People": set(), "work/folder:People": {1}}),
+    )
+    assert [candidate.chat.id for candidate in scan.prunable] == [1]
+
+
+def test_accounts_status_is_the_one_listing_both_front_ends_print(
+    tmp_home: Path, conn: sqlite3.Connection
+) -> None:
+    """``accounts ls`` and the ``accounts`` tool print this list; the session state comes from
+    the file and from what a run recorded, never from Telegram."""
+    paths = Paths.from_env()
+    cfg = Config(
+        accounts=[AccountCfg(name="work", label="work phone"), AccountCfg(name="spare")],
+        sources=[Source(chat="@news"), Source(chat="@news", account="work")],
+    )
+    tg.prepare_session(paths)
+    tg.prepare_session(paths, "work")
+    db.upsert_account(conn, AccountRow(name="work", user_id=43, display_name="Worker"))
+    news = db.upsert_chat(conn, ChatRow(id=-1001, type="channel", title="News"))
+    db.set_chat_access(conn, news.id, "work")
+    assert sources.accounts_status(cfg, paths, conn) == [
+        AccountStatus(name="default", session="present", sources=["chat:@news"]),
+        AccountStatus(
+            name="work",
+            label="work phone",
+            session="authorized",
+            user_id=43,
+            display_name="Worker",
+            sources=["work/chat:@news"],
+            chats=1,
+        ),
+        AccountStatus(name="spare", session="missing"),
+    ]

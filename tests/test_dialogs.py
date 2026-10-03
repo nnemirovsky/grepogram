@@ -404,15 +404,32 @@ async def test_catalog_list_folders_alone_loads_once() -> None:
 
 
 async def test_catalog_entity_lookup_falls_back_to_get_entity() -> None:
+    """A peer outside the dialog list resolves only once the session holds its access hash —
+    a bare id on a fresh client is Telethon's ``ValueError``, like the one never learned."""
     client = _client(entities=[make_channel(999, "Elsewhere")])
     catalog = DialogCatalog(client)
     assert (await catalog.entity(-1000000000100)) is ARG
     assert ("get_entity", {"key": -1000000000100}) not in client.calls
+    with pytest.raises(ValueError, match="Could not find the input entity"):
+        await catalog.entity(-1000000000999)
+    client.session.process_entities([types.InputPeerChannel(999, 999)])
     elsewhere = await catalog.entity(-1000000000999)
     assert elsewhere.title == "Elsewhere"
     assert ("get_entity", {"key": -1000000000999}) in client.calls
     with pytest.raises(ValueError):
         await catalog.entity(-1000000000998)
+
+
+async def test_fetch_folders_teaches_the_session_the_peers_a_folder_names() -> None:
+    """An explicit folder peer need not be a dialog; the filter carries its access hash, and
+    that is what makes it addressable by id afterwards."""
+    outside = make_channel(999, "Elsewhere")
+    client = FakeClient(
+        entities=[outside], folders=[make_folder(3, "Far", include=[outside, ALICE])]
+    )
+    await dialogs.fetch_folders(client)
+    assert client.seeded == {-1000000000999: 999, ALICE.id: ALICE.id}
+    assert (await client.get_entity(-1000000000999)) is outside
 
 
 # --- matching --------------------------------------------------------------------------------
@@ -519,7 +536,7 @@ def test_cli_dialogs_requires_a_session(tmp_home: Path) -> None:
 def test_cli_dialogs_prints_a_table(tmp_home: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     _signed_in(tmp_home)
     fake = _client()
-    monkeypatch.setattr(tg, "make_client", lambda cfg, paths: fake)
+    monkeypatch.setattr(tg, "make_client", lambda *_: fake)
     result = runner.invoke(cli.app, ["dialogs", "arg"])
     assert result.exit_code == 0, result.output
     lines = result.stdout.splitlines()
@@ -537,7 +554,7 @@ def test_cli_dialogs_honours_limit_and_reports_no_matches(
     tmp_home: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     _signed_in(tmp_home)
-    monkeypatch.setattr(tg, "make_client", lambda cfg, paths: _client())
+    monkeypatch.setattr(tg, "make_client", lambda *_: _client())
     limited = runner.invoke(cli.app, ["dialogs", "a", "-n", "1"])
     assert limited.exit_code == 0, limited.output
     assert len(limited.stdout.splitlines()) == 2
@@ -550,7 +567,7 @@ def test_cli_dialogs_maps_auth_and_network_errors(
     tmp_home: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     _signed_in(tmp_home)
-    monkeypatch.setattr(tg, "make_client", lambda cfg, paths: _client(authorized=False))
+    monkeypatch.setattr(tg, "make_client", lambda *_: _client(authorized=False))
     unauthorized = runner.invoke(cli.app, ["dialogs", "arg"])
     assert unauthorized.exit_code == 1
     assert "run: grepogram auth" in unauthorized.stderr
@@ -560,7 +577,7 @@ def test_cli_dialogs_maps_auth_and_network_errors(
         raise ConnectionError("no route to Telegram")
 
     monkeypatch.setattr(broken, "connect", failing_connect)
-    monkeypatch.setattr(tg, "make_client", lambda cfg, paths: broken)
+    monkeypatch.setattr(tg, "make_client", lambda *_: broken)
     offline = runner.invoke(cli.app, ["dialogs", "arg"])
     assert offline.exit_code == 1
     assert "telegram error: no route to Telegram" in offline.stderr
