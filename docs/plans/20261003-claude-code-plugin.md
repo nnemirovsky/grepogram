@@ -313,35 +313,35 @@ The marketplace serves `./plugin` from the default branch: merging to `main` pub
 - Create: `plugin/skills/search/SKILL.md`
 - Modify: `tests/test_plugin.py`
 
-- [ ] write the frontmatter: `name: search`, a trigger-rich `description` (what people say in the
+- [x] write the frontmatter: `name: search`, a trigger-rich `description` (what people say in the
       user's Telegram chats, "find in Telegram", a named chat or folder, RU and EN phrasing),
       `allowed-tools` for `grepogram --version`, `search`, `thread`, `context`, `sync`,
       `sources ls`, `dialogs`, `accounts ls`
-- [ ] write the preflight: `grepogram >= 0.3.0` stated once; `grepogram --version` missing → point
+- [x] write the preflight: `grepogram >= 0.3.0` stated once; `grepogram --version` missing → point
       to `/grepogram:setup`; below the floor → `uv tool upgrade grepogram` (or setup)
-- [ ] write the freshness rule: on the first `search --json` of a conversation, an
+- [x] write the freshness rule: on the first `search --json` of a conversation, an
       `index_age_min` above 60 (the default of the configurable `[search]
       auto_sync_after_min`) → one `grepogram sync --budget 60`, then search again; a null age →
       read `warnings`: no sources configured → point to `/grepogram:setup`, nothing synced yet →
       one sync or setup; sync at most once per conversation; say when a sync was skipped because
       another one runs
-- [ ] write the playbook from `mcp.py` `INSTRUCTIONS` in CLI terms: 2–3 RU/EN variants,
+- [x] write the playbook from `mcp.py` `INSTRUCTIONS` in CLI terms: 2–3 RU/EN variants,
       `--mode lexical`, `--since`, evidence dates (unix seconds → dates), `thread` / `context`
       with each message's own `chat_id`, **always options first and `--` before the positional
       ids** (`grepogram thread --json -- <chat_id> <msg_id>`), cite `url`, forwards are one
       origin, multi-account (`--account`, `account:<name>` chat specs), say "nothing found"
       plainly, the unindexed-chat path `sources ls` → `dialogs` → `sources add` → `sync`; errors
       and `hint`s
-- [ ] implement the drift check in `tests/test_plugin.py` per Technical Details, run over every
+- [x] implement the drift check in `tests/test_plugin.py` per Technical Details, run over every
       md file under `plugin/`
-- [ ] write drift tests on synthetic markdown: an unknown subcommand fails, an unknown flag
+- [x] write drift tests on synthetic markdown: an unknown subcommand fails, an unknown flag
       fails, a negative number before `--` fails, the same after `--` passes, `--flag=value`,
       `secondary_opts` (`--no-rerank`), short forms and root options pass, placeholders pass, an
       `allowed-tools` entry is checked in both list and comma-string form, a `shlex` error names
       the file and line
-- [ ] write the floor check: exactly one `grepogram >= X.Y.Z` per md file under `plugin/`, all
+- [x] write the floor check: exactly one `grepogram >= X.Y.Z` per md file under `plugin/`, all
       equal, and `<= __version__`
-- [ ] run the full checks — must pass before Task 4
+- [x] run the full checks — must pass before Task 4
 
 ### Task 4: Research skill
 
