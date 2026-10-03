@@ -289,23 +289,23 @@ The marketplace serves `./plugin` from the default branch: merging to `main` pub
 - Create: `plugin/scripts/consent-gate.sh` (executable)
 - Modify: `tests/test_plugin.py`
 
-- [ ] create `hooks.json` with the one `Bash` PreToolUse entry, the command quoted as
+- [x] create `hooks.json` with the one `Bash` PreToolUse entry, the command quoted as
       `"\"${CLAUDE_PLUGIN_ROOT}/scripts/consent-gate.sh\""`
-- [ ] write `consent-gate.sh` per Technical Details (`#!/bin/bash`, bash 3.2, cheap filter, one
+- [x] write `consent-gate.sh` per Technical Details (`#!/bin/bash`, bash 3.2, cheap filter, one
       regex, fixed ask JSON on stdout, silent exit 0 otherwise); `chmod +x` and commit the mode
-- [ ] write the hook matrix test, executing the script directly so the shebang (`/bin/bash`, 3.2
+- [x] write the hook matrix test, executing the script directly so the shebang (`/bin/bash`, 3.2
       on macOS) is honoured, payload on stdin: asks for `grepogram research approve 3 1:join
       --json --confirm abc`, `--confirm=abc`, `/Users/x/.local/bin/grepogram accounts rm work
       --confirm abc`, `uv run grepogram leave --confirm abc -- @chat`, `accounts  rm` with two
       spaces, a chained `cd x && grepogram leave … --confirm y`; the ask output parses as JSON
       with `permissionDecision == "ask"` and the exit code is 0
-- [ ] write the silent cases: the same commands without `--confirm`, `grepogram search …`,
+- [x] write the silent cases: the same commands without `--confirm`, `grepogram search …`,
       `ls`, a payload with no `grepogram` at all, an empty payload; record (and test) the chosen
-      behaviour for a search query whose text contains "leave --confirm" — over-asking is fine
-- [ ] write a test that every `command` in `hooks.json` is the quoted `${CLAUDE_PLUGIN_ROOT}`
+      behaviour for a search query whose text contains "leave --confirm" — over-asking is fine (result: it asks, tested; the pattern needs no trailing space after `--confirm`)
+- [x] write a test that every `command` in `hooks.json` is the quoted `${CLAUDE_PLUGIN_ROOT}`
       path of a file that exists and is executable, and a lint-style test that the script has
       no `source` / `. ` of another file, no `<<`, and no `uvx|npx|pip |npm |brew `
-- [ ] run the full checks — must pass before Task 3
+- [x] run the full checks — must pass before Task 3
 
 ### Task 3: Search skill, the drift check and the floor check
 
