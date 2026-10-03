@@ -107,9 +107,31 @@ def run_gate(command: str | None, raw: str | None = None) -> subprocess.Complete
         "grepogram leave '--confirm' abc -- @chat",
         "GREPOGRAM research approve 3 1 --json --confirm abc",
         "Grepogram Accounts RM work --Confirm abc",
+        # the summary-printing first calls: their `command` field already holds --confirm
+        "grepogram research approve 3 1:join --json",
+        "grepogram accounts rm work",
+        "grepogram leave --json -- @chat",
+        "grepogram research approve --json 3 1 | jq -r .command | sh",
+        'eval "$(grepogram research approve --json 3 1 | jq -r .command)"',
+        "grepogram accounts rm work --json | jq -r .command | bash",
+        "grepogram leave --json -- @chat | jq -r .command | bash",
+        "grepogram research \\\n  approve 3 1 --json",
+        "grepogram accounts \\\n  rm work --json",
+        "grepogram research\tapprove 3 1 --json",
+        "grepogram accounts\trm work",
+        "grepogram research 'approve' 3 1 --json",
+        'grepogram research "approve" 3 1 --json',
+        "grepogram 'accounts' rm work",
+        "Grepogram Accounts RM work",
+        "grepogram -v leave -- @chat",
+        "grepogram '--verbose' leave -- @chat",
+        "grepogram \\\n  leave -- @chat",
+        "grepogram\tLEAVE -- @chat",
+        '"grepogram" leave -- @chat',
+        "uv run grepogram leave -- -1001234567",
     ],
 )
-def test_gate_asks_on_a_confirming_call(command: str) -> None:
+def test_gate_asks_on_every_consent_call(command: str) -> None:
     result = run_gate(command)
     assert result.returncode == 0
     out = json.loads(result.stdout)["hookSpecificOutput"]
@@ -121,14 +143,16 @@ def test_gate_asks_on_a_confirming_call(command: str) -> None:
 @pytest.mark.parametrize(
     "command",
     [
-        "grepogram research approve 3 1:join --json",
-        "grepogram accounts rm work",
-        "grepogram leave --json -- @chat",
         "grepogram search --json 'hello'",
+        "grepogram search 'leave'",
+        "grepogram search --json -- 'how to leave a group'",
+        "grepogram research candidates --json 3",
+        "grepogram accounts ls",
+        "grepogram search 'accounts form'",
         "ls",
     ],
 )
-def test_gate_is_silent_without_a_confirm(command: str) -> None:
+def test_gate_is_silent_on_other_calls(command: str) -> None:
     result = run_gate(command)
     assert result.returncode == 0
     assert result.stdout == ""
@@ -141,9 +165,33 @@ def test_gate_is_silent_without_grepogram_or_payload() -> None:
         assert result.stdout == ""
 
 
-def test_gate_over_asks_on_a_search_query_naming_the_pattern() -> None:
-    # Documented behaviour: the raw payload is matched, so a query containing the words asks.
-    result = run_gate("grepogram search 'leave --confirm'")
+def test_gate_ignores_a_leave_outside_a_grepogram_call_in_a_grepogram_cwd() -> None:
+    raw = json.dumps(
+        {
+            "cwd": "/Users/x/grepogram",
+            "tool_name": "Bash",
+            "tool_input": {"command": "git commit -m 'leave the old path'"},
+        }
+    )
+    result = run_gate(None, raw=raw)
+    assert result.returncode == 0
+    assert result.stdout == ""
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "grepogram search 'leave --confirm'",
+        "grepogram search 'research approve'",
+        "grepogram search 'accounts rm'",
+    ],
+)
+def test_gate_over_asks_on_a_search_query_naming_the_pattern(command: str) -> None:
+    # The chosen trade-off: anything may sit between grepogram and --confirm, `research approve`
+    # or `accounts rm`, so a query holding those asks; the two words of a command must be
+    # adjacent and `leave` must be the subcommand, so `accounts form` or a search for the word
+    # leave stays silent (tested in test_gate_is_silent_on_other_calls).
+    result = run_gate(command)
     assert result.returncode == 0
     assert json.loads(result.stdout)["hookSpecificOutput"]["permissionDecision"] == "ask"
 
