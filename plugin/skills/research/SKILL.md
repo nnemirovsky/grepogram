@@ -39,7 +39,7 @@ Approving is the user's decision. Never approve on your own judgement, and never
 1. Run `grepogram research approve --json <session_id> <items>`, where an item is `<id>` (join and fetch), `<id>:fetch,add_source` (read a public chat without joining), `<id>:request`, `global_search` or `paid_search`. It always runs with `--json`, so it never reads a terminal.
 2. This first call exits with code 3. That is the expected "needs confirmation" result, not a failure: do not retry it. It prints `summary`, `confirm` (a token bound to that summary) and `command`.
 3. Show the user the `summary` verbatim, and wait for an explicit yes.
-4. Only then run the same command with `--confirm <token>` added. Expect a permission prompt on both calls; that prompt is the human gate.
+4. Only then run the same command with `--confirm <token>` added. Expect a permission prompt on both calls (the plugin's hook asks on every `research approve`); that prompt is the human gate. Never pipe or `eval` the printed `command`.
 5. A token that no longer matches (state changed, other items) comes back with `error` and a fresh `summary` and `confirm`, again with exit code 3. Show the new summary again and ask again.
 
 Approving a chat approves nothing found inside it, and a shared folder is approved chat by chat. Global and paid Telegram search need their own approvals (`global_search`, `paid_search`); the summary says that a query leaves this machine.

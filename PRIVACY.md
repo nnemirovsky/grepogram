@@ -67,7 +67,8 @@ With the `dense` extra, the embedding and rerank models (`BAAI/bge-m3` and
 outside grepogram's tree.
 
 The plugin itself stores nothing. Its only active component is a hook that asks for a permission
-prompt before a consent confirmation command runs; it makes no network request and writes no file.
+prompt before every `research approve`, `accounts rm` or `leave` call runs; it makes no network
+request and writes no file.
 `/grepogram:setup` runs other tools' commands only after you agree to each at its permission
 prompt: `uv tool install` writes the tool into uv's tool directory, `uv tool update-shell` edits
 your shell profile, and `claude mcp add` (offered once, default no) edits Claude Code's user
@@ -116,7 +117,8 @@ config: `search`, `thread`, `context`, `sync`, `dialogs`, `sources ls`, `account
 `candidates`, `status`, `skip`, `stop`). `sync`, `dialogs` and an online `discover` reach
 Telegram. Anything that changes the config, the install, an account or an approval keeps the
 normal permission prompt, and `research approve`, `run` and `exclude` are never pre-allowed. The
-hook adds a prompt on the confirming `--confirm` calls; it reads the command text, so it is
+hook adds a prompt on every `research approve`, `accounts rm` and `leave` call, the first one
+that prints the summary as well as the `--confirm` one; it reads the command text, so it is
 defence in depth, not a sandbox.
 
 Your Telegram `api_id`, `api_hash`, login code and 2FA password never go to Claude:

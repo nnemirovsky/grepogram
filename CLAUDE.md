@@ -239,10 +239,12 @@ checked by `tests/test_plugin.py`:
   an install or the MCP registration. The hook is a second layer, not the gate: a hook that fails
   or times out does not block;
 - the hook is one self-contained `/bin/bash` 3.2 script: no sourcing, no heredocs, no installers,
-  nothing on stdout but the hook's JSON decision. It asks for a permission prompt on any payload
-  naming `grepogram` and `--confirm`, in any case, and never under-asks on an honest call; a
-  regex cannot stop deliberate obfuscation, so it is defence in depth. `PRIVACY.md` covers what
-  the plugin reads;
+  nothing on stdout but the hook's JSON decision. It asks for a permission prompt on every
+  `research approve`, `accounts rm` and `leave` call — the summary-printing first call too, since
+  its `command` field already holds `--confirm <token>` and piping it to `sh` would otherwise
+  confirm unseen — and on any `grepogram … --confirm`, in any case, and never under-asks on an
+  honest call; a regex cannot stop deliberate obfuscation, so it is defence in depth.
+  `PRIVACY.md` covers what the plugin reads;
 - the drift check catches names, not meaning: the skills restate `mcp.INSTRUCTIONS` and depend on
   CLI JSON shapes (`index_age_min`, the hit and candidate fields, `summary` / `confirm` /
   `command` with exit 3), and a change to any of them is mirrored in `plugin/skills/*` (a test

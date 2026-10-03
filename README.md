@@ -117,8 +117,8 @@ the research steps that find, list or set aside candidates (`start`, `discover`,
 `status`, `skip`, `stop`). `sync`, `dialogs` and an online `discover` do reach Telegram. Anything
 that changes the config, the install, an account or an approval keeps the normal permission prompt,
 and `research approve`, `run` and `exclude` are never pre-allowed. The plugin also installs a
-`PreToolUse` hook that asks for a permission prompt on the calls that confirm a consent summary
-(see [Research](#research-finding-chats-you-do-not-index-yet)).
+`PreToolUse` hook that asks for a permission prompt on every `research approve`, `accounts rm` and
+`leave` call (see [Research](#research-finding-chats-you-do-not-index-yet)).
 
 The MCP server is optional with the plugin and off unless `/grepogram:setup` registers it, which
 it offers once and only on a yes. The steps below are the same setup by hand, and the way in for
@@ -650,10 +650,11 @@ grepogram research stop 1            # explores no further; the sources it added
 The token is not proof that a person agreed — an agent that runs the first step can read it. The
 human gate for an agent is the agent's own permission prompt, so keep these commands behind one.
 The Claude Code plugin installs this gate: a `PreToolUse` hook asks for a permission prompt on
-the `--confirm` calls of `research approve`, `accounts rm` and `leave`. It reads the command text,
-so it is defence in depth rather than a sandbox: a deliberately obfuscated call gets past it, and
-a hook that fails or times out does not block. Without the plugin, or as a second layer beside
-it, add the "ask" rules yourself to `~/.claude/settings.json`:
+every call of `research approve`, `accounts rm` and `leave`, the one that prints the summary as
+well as the `--confirm` one, since the printed command already holds the token. It reads the
+command text, so it is defence in depth rather than a sandbox: a deliberately obfuscated call
+gets past it, and a hook that fails or times out does not block. Without the plugin, or as a
+second layer beside it, add the "ask" rules yourself to `~/.claude/settings.json`:
 
 ```json
 {

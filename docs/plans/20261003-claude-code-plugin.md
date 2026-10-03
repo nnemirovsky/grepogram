@@ -156,9 +156,9 @@ tests/test_plugin.py
   puts its options first and `--` before the positionals (`grepogram context --json -- <chat_id>
   <msg_id>`); the drift check enforces it.
 - **Consent hook.** The CLI's token handshake guarantees *what* is confirmed; the human gate is
-  the harness prompt. With `approve` un-allowed, the summary-only call gets the normal prompt and
-  the `--confirm` call gets a hook-forced `ask` that holds even under auto mode or an allow rule
-  the user added.
+  the harness prompt. With `approve` un-allowed, every `research approve`, `accounts rm` and
+  `leave` call — the summary-only one and the `--confirm` one — gets a hook-forced `ask` that
+  holds even under auto mode or an allow rule the user added.
 - **Directory constraints** (from the session that submitted resume-watchdog, ticktock and
   iwdp-mcp): hook commands point at one self-contained script by a quoted literal path under
   `${CLAUDE_PLUGIN_ROOT}`; the script sources and runs no other plugin file, uses no heredocs or
@@ -237,8 +237,17 @@ The marketplace serves `./plugin` from the default branch: merging to `main` pub
   review: the first pattern required the subcommand words to be adjacent and missed those
   forms.) Deliberate obfuscation (`grepogra""m`) still gets past a regex; the hook is defence in
   depth and the docs say so.
+- Also ask on every `research approve`, `accounts rm` and `leave` call, not only the `--confirm`
+  one (changed after the critical re-check: the first call prints a `command` that already holds
+  `--confirm <token>`, so `… --json | jq -r .command | sh` or an `eval` of it confirmed in one
+  call the hook never saw). Final pattern, `sep` being whitespace, quotes and JSON escapes
+  (`\t`, `\n`, `\r`, `\"`, `\\`):
+  `grepogram.*(--confirm|research${sep}approve|accounts${sep}rm)|grepogram(${sep}-[-[:alnum:]]*)*${sep}leave`.
+  The two words of a command must be adjacent and `leave` must be the subcommand (after `-v` /
+  `--verbose` at most), so a search for the word leave or for `accounts form` stays silent; a
+  query holding `research approve`, `accounts rm` or `--confirm` still asks.
 - **Ask output** on stdout, exit 0 (not stderr — the plugin-dev examples get this wrong):
-  `{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"ask","permissionDecisionReason":"grepogram: this confirms a consent summary (research approval, account removal or leaving a chat); check it matches what you agreed to"}}`
+  `{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"ask","permissionDecisionReason":"grepogram: this approves research, removes an account or leaves a chat, or prints the command that does; check it matches what you agreed to"}}`
 - **Otherwise:** no output, exit 0 — the normal permission rules decide.
 - No sourcing, no heredocs, no here-strings, one file.
 
