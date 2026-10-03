@@ -2022,7 +2022,8 @@ def move_media_state(conn: sqlite3.Connection, kinds: Collection[str], *, frm: i
     alone, so tens of thousands of rows are parked without a single Telegram request. Like
     :func:`set_media_state` it never touches ``indexed``, for the same reason and more so — most
     kinds (``video``, ``sticker``, ``audio``, ``webpage``, ``poll``, ``contact``, ``location``,
-    ``other`` and, until v0.3.0, ``voice`` and ``video_note``) have no extractor at all.
+    ``other`` and, until whisper.cpp lands, ``voice`` and ``video_note``) have no extractor at
+    all.
     """
     listed = list(dict.fromkeys(kinds))
     if not listed:
