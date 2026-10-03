@@ -92,6 +92,30 @@ in a second one beside it.
 
 ## Setup in Five Minutes
 
+**With Claude Code, the plugin is the shortest path.** It ships two skills and a setup command,
+and works through the `grepogram` CLI rather than an MCP server:
+
+```
+/plugin marketplace add nnemirovsky/grepogram
+/plugin install grepogram@grepogram
+/grepogram:setup
+```
+
+`/grepogram:setup` walks from nothing to a first sync: it checks for `uv`, installs the
+`grepogram` tool (showing the command first and running it under the normal permission prompt),
+writes the config, waits while you paste the Telegram keys and sign in yourself in a separate
+terminal (it never reads the keys and never asks for a code), helps you pick sources and runs
+the first sync. Run it again at any point; it skips what is already done. The `search` skill then
+answers "what did they say in the chat about ..." by running `grepogram search`, `thread` and
+`context` and citing the links; the `research` skill drives the research workflow below, with
+every approval still yours. The plugin also installs a `PreToolUse` hook that forces a permission
+prompt on the calls that confirm a consent summary (see
+[Research](#research-finding-chats-you-do-not-index-yet)).
+
+The MCP server is optional with the plugin and off unless `/grepogram:setup` registers it, which
+it offers once and only on a yes. The steps below are the same setup by hand, and the way in for
+other MCP clients or for anyone who wants the MCP tools.
+
 1. Create an application at https://my.telegram.org/apps and note the `api_id` and `api_hash`.
 
 2. Install as a tool — no checkout needed:
@@ -167,7 +191,7 @@ in a second one beside it.
    grepogram search "открыть счёт без DNI"
    ```
 
-7. Connect your agent. `grepogram-mcp` speaks MCP over stdio, so any client that launches a
+7. Connect your agent over MCP (the Claude Code plugin does not need this step). `grepogram-mcp` speaks MCP over stdio, so any client that launches a
    command works. In Claude Code, with a checkout at `<path>`:
 
    ```sh
@@ -616,7 +640,9 @@ grepogram research stop 1            # explores no further; the sources it added
 
 The token is not proof that a person agreed — an agent that runs the first step can read it. The
 human gate for an agent is the agent's own permission prompt, so keep these commands behind one.
-For Claude Code, add "ask" rules to `~/.claude/settings.json`:
+The Claude Code plugin installs this gate: a `PreToolUse` hook forces a permission prompt on the
+`--confirm` calls of `research approve`, `accounts rm` and `leave`. Without the plugin, add the
+"ask" rules yourself to `~/.claude/settings.json`:
 
 ```json
 {
