@@ -229,23 +229,28 @@ The marketplace serves `./plugin` from the default branch: merging to `main` pub
 - Reads the hook payload from stdin once (`payload=$(cat)`). No `jq`: the raw payload is matched
   directly, which over-asks slightly (a `cwd` or description naming grepogram can satisfy part of
   a match) — acceptable; missing a confirmation is not.
-- Ask when the payload matches `grepogram.*--confirm` under `shopt -s nocasematch`
-  (`--confirm TOKEN` or `--confirm=TOKEN`). `--confirm` exists only on `research approve`,
-  `accounts rm` and `leave`, so the words between are not matched: a line continuation or a tab
-  (both JSON-escaped in the payload), a quoted word or another case cannot slip past. That covers
-  a bare `grepogram`, an absolute path, `uv run grepogram` and chained commands. (Changed after
-  review: the first pattern required the subcommand words to be adjacent and missed those
-  forms.) Deliberate obfuscation (`grepogra""m`) still gets past a regex; the hook is defence in
-  depth and the docs say so.
-- Also ask on every `research approve`, `accounts rm` and `leave` call, not only the `--confirm`
-  one (changed after the critical re-check: the first call prints a `command` that already holds
-  `--confirm <token>`, so `… --json | jq -r .command | sh` or an `eval` of it confirmed in one
-  call the hook never saw). Final pattern, `sep` being whitespace, quotes and JSON escapes
+- Ask under `shopt -s nocasematch` on every `research approve`, `accounts rm` and `leave` call and
+  on any `grepogram … --confirm` (`--confirm TOKEN` or `--confirm=TOKEN`), the first,
+  summary-printing call as well as the confirming one: that first call prints a `command` that
+  already holds `--confirm <token>`, so `… --json | jq -r .command | sh` or an `eval` of it would
+  confirm in one call the hook never saw. A line continuation or a tab (both JSON-escaped in the
+  payload), a quoted word or another case cannot slip past; a bare `grepogram`, an absolute
+  path, `uv run grepogram` and chained commands are covered. (History: the first pattern was
+  `grepogram.*--confirm` alone, then required the subcommand words to be adjacent and missed
+  those forms; the final pattern below replaced both.) Deliberate obfuscation (`grepogra""m`)
+  still gets past a regex; the hook is defence in depth and the docs say so. Final pattern, `sep` being whitespace, quotes and JSON escapes
   (`\t`, `\n`, `\r`, `\"`, `\\`):
   `grepogram.*(--confirm|research${sep}approve|accounts${sep}rm)|grepogram(${sep}-[-[:alnum:]]*)*${sep}leave`.
   The two words of a command must be adjacent and `leave` must be the subcommand (after `-v` /
   `--verbose` at most), so a search for the word leave or for `accounts form` stays silent; a
   query holding `research approve`, `accounts rm` or `--confirm` still asks.
+- **Accepted over-asks** (decided in review 2, the script left alone): the gate matches the raw
+  payload, so the Bash `description` field (or a `cwd`) naming `research approve` or `grepogram
+  leave …` forces a prompt on a pre-allowed call, and `accounts${sep}rm` has no right boundary, so
+  a search query such as "accounts RMB" asks. Extracting only `.tool_input.command` without `jq`
+  needs a JSON string scanner in bash 3.2 that must handle escaped quotes, and a boundary after
+  `rm` must cope with quotes, JSON escapes and the end of the string; a slip in either opens an
+  under-ask, which the consent history rules out, while an over-ask costs one extra prompt.
 - **Ask output** on stdout, exit 0 (not stderr — the plugin-dev examples get this wrong):
   `{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"ask","permissionDecisionReason":"grepogram: this approves research, removes an account or leaves a chat, or prints the command that does; check it matches what you agreed to"}}`
 - **Otherwise:** no output, exit 0 — the normal permission rules decide.
@@ -315,7 +320,7 @@ The marketplace serves `./plugin` from the default branch: merging to `main` pub
 
 - [x] create `hooks.json` with the one `Bash` PreToolUse entry, the command quoted as
       `"\"${CLAUDE_PLUGIN_ROOT}/scripts/consent-gate.sh\""`
-- [x] write `consent-gate.sh` per Technical Details (`#!/bin/bash`, bash 3.2, cheap filter, one
+- [x] write `consent-gate.sh` per Technical Details (`#!/bin/bash`, bash 3.2, one
       regex, fixed ask JSON on stdout, silent exit 0 otherwise); `chmod +x` and commit the mode
 - [x] write the hook matrix test, executing the script directly so the shebang (`/bin/bash`, 3.2
       on macOS) is honoured, payload on stdin: asks for `grepogram research approve 3 1:join
@@ -323,7 +328,7 @@ The marketplace serves `./plugin` from the default branch: merging to `main` pub
       --confirm abc`, `uv run grepogram leave --confirm abc -- @chat`, `accounts  rm` with two
       spaces, a chained `cd x && grepogram leave … --confirm y`; the ask output parses as JSON
       with `permissionDecision == "ask"` and the exit code is 0
-- [x] write the silent cases: the same commands without `--confirm`, `grepogram search …`,
+- [x] write the silent cases: `grepogram search …`, `accounts ls`, `research candidates`,
       `ls`, a payload with no `grepogram` at all, an empty payload; record (and test) the chosen
       behaviour for a search query whose text contains "leave --confirm" — over-asking is fine (result: it asks, tested; the pattern needs no trailing space after `--confirm`)
 - [x] write a test that every `command` in `hooks.json` is the quoted `${CLAUDE_PLUGIN_ROOT}`
@@ -467,7 +472,7 @@ The marketplace serves `./plugin` from the default branch: merging to `main` pub
       once more; record any warning left on purpose (result: both print "Validation passed" with no warnings, so none is left; the UNKNOWN_KEY warnings Technical Details expected for `documentationUrl`, `supportUrl` and `privacyPolicyUrl` did not appear)
 - [x] run full test suite: `uv run pytest`, `uv run ruff check .`, `uv run ruff format --check .`,
       `uv run mypy` (result: 2526 passed, 11 deselected; ruff, format and mypy clean)
-- [x] verify each rule in the hook script has a matrix row (pytest-cov does not measure bash) (result: filter without `grepogram`, each of the three alternatives, both `--confirm` forms, absolute path, `uv run`, chaining, double space, no-confirm silence and empty payload all have rows; no gap)
+- [x] verify each rule in the hook script has a matrix row (pytest-cov does not measure bash) (result: filter without `grepogram`, each of the three alternatives, both `--confirm` forms, absolute path, `uv run`, chaining, double space, the first calls without `--confirm` (which now ask) and empty payload all have rows; no gap)
 
 ### Task 9: [Final] Update documentation
 
@@ -497,7 +502,7 @@ The marketplace serves `./plugin` from the default branch: merging to `main` pub
   the CLI present and with it absent
 - ask a real question; check the skill triggers, pre-allowed calls do not prompt, `sources add`
   does, the stale-index sync runs once, a negative chat id reaches `thread` / `context`
-- a research approve round: both calls prompt, the `--confirm` one through the hook; check the
+- a research approve round: both calls prompt through the hook; check the
   hook still prompts under auto mode and under `bypassPermissions` (a local Claude Code source
   copy suggests a hook "ask" is forced through both and becomes a denial under `-p`; record what
   actually happens)
