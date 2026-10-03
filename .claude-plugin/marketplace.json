@@ -1,6 +1,6 @@
 {
   "name": "grepogram",
-  "description": "Claude Code plugins for searching your own Telegram chats locally",
+  "description": "A Claude Code plugin for searching your own Telegram chats locally",
   "owner": {"name": "Nikita Nemirovsky", "url": "https://github.com/nnemirovsky"},
   "plugins": [
     {
