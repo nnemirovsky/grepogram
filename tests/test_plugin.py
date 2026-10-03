@@ -4,6 +4,7 @@ import json
 import os
 import re
 import shlex
+import struct
 import subprocess
 from pathlib import Path
 from typing import Any
@@ -355,3 +356,44 @@ def test_privacy_policy_exists_and_the_manifest_names_it() -> None:
     assert "huggingface.co" in text
     assert "telemetry" in text
     assert not re.search(r"\.(png|jpe?g|svg|ico)\b", text, re.IGNORECASE)
+
+
+ICON_DIR = PLUGIN_DIR / ".claude-plugin"
+SKIPPED_DIRS = {
+    ".git",
+    ".venv",
+    ".mypy_cache",
+    ".ruff_cache",
+    ".pytest_cache",
+    "__pycache__",
+    "htmlcov",
+    "dist",
+    "build",
+}
+
+
+def test_icon_is_one_square_png_of_a_sane_size() -> None:
+    icons = list(ICON_DIR.glob("*.png"))
+    assert len(icons) == 1
+    data = icons[0].read_bytes()
+    assert len(data) < 2 * 1024 * 1024
+    assert data[:8] == b"\x89PNG\r\n\x1a\n"
+    length, chunk = struct.unpack(">I4s", data[8:16])
+    assert (length, chunk) == (13, b"IHDR")
+    width, height = struct.unpack(">II", data[16:24])
+    assert width == height
+    assert 512 <= width <= 2048
+
+
+def test_no_text_file_names_the_icon() -> None:
+    name = next(ICON_DIR.glob("*.png")).name.encode()
+    offenders: list[str] = []
+    for dirpath, dirnames, filenames in os.walk(ROOT):
+        dirnames[:] = [d for d in dirnames if d not in SKIPPED_DIRS and not d.endswith(".egg-info")]
+        for filename in filenames:
+            raw = (Path(dirpath) / filename).read_bytes()
+            if b"\0" in raw:
+                continue
+            if name in raw:
+                offenders.append(str((Path(dirpath) / filename).relative_to(ROOT)))
+    assert offenders == []

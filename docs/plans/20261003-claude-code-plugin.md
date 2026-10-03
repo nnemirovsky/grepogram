@@ -422,15 +422,15 @@ The marketplace serves `./plugin` from the default branch: merging to `main` pub
 **Files:**
 - Create: `plugin/.claude-plugin/` icon PNG (the user's pick)
 
-- [ ] ⚠️ needs the user: render 3–4 square PNG options (512–2048 px, < 2 MB) in the scratchpad
-- [ ] send the user a contact sheet and wait for the choice
-- [ ] copy the chosen PNG into `plugin/.claude-plugin/`; grep every text file in the repo to
+- [x] ⚠️ needs the user: render 3–4 square PNG options (512–2048 px, < 2 MB) in the scratchpad (user picked option 3, the terminal tile)
+- [x] send the user a contact sheet and wait for the choice (user picked option 3, the terminal tile)
+- [x] copy the chosen PNG into `plugin/.claude-plugin/`; grep every text file in the repo to
       confirm none names the file
-- [ ] write a test: exactly one PNG in `plugin/.claude-plugin/`, square, 512–2048 px, < 2 MB
+- [x] write a test: exactly one PNG in `plugin/.claude-plugin/`, square, 512–2048 px, < 2 MB
       (read the IHDR chunk with `struct`, no new dependency), and no text file in the tree
       (walked from the repo root, skipping gitignored and binary files — not `git ls-files`,
       which breaks in an sdist) contains its basename
-- [ ] run the full checks — must pass before Task 8
+- [x] run the full checks — must pass before Task 8
 
 ### Task 8: Verify acceptance criteria
 
