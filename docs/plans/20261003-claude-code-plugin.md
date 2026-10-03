@@ -434,14 +434,14 @@ The marketplace serves `./plugin` from the default branch: merging to `main` pub
 
 ### Task 8: Verify acceptance criteria
 
-- [ ] verify all requirements from Overview are implemented
-- [ ] verify no `.mcp.json`, no top-level `bin/`, no `uvx|npx|pip install|brew install|curl … | sh`
+- [x] verify all requirements from Overview are implemented (result: one-step install via root marketplace with source `./plugin`; `/grepogram:setup` (`disable-model-invocation`); `search` and `research` skills with read-only `allowed-tools`, `research approve` not pre-allowed; consent hook as a PreToolUse(Bash) entry; version 0.3.0 in `__init__` and `plugin.json`; no `.mcp.json`)
+- [x] verify no `.mcp.json`, no top-level `bin/`, no `uvx|npx|pip install|brew install|curl … | sh`
       under `plugin/`
-- [ ] run `claude plugin validate .` and `claude plugin validate plugin/.claude-plugin/plugin.json`
-      once more; record any warning left on purpose
-- [ ] run full test suite: `uv run pytest`, `uv run ruff check .`, `uv run ruff format --check .`,
-      `uv run mypy`
-- [ ] verify each rule in the hook script has a matrix row (pytest-cov does not measure bash)
+- [x] run `claude plugin validate .` and `claude plugin validate plugin/.claude-plugin/plugin.json`
+      once more; record any warning left on purpose (result: both print "Validation passed" with no warnings, so none is left; the UNKNOWN_KEY warnings Technical Details expected for `documentationUrl`, `supportUrl` and `privacyPolicyUrl` did not appear)
+- [x] run full test suite: `uv run pytest`, `uv run ruff check .`, `uv run ruff format --check .`,
+      `uv run mypy` (result: 2526 passed, 11 deselected; ruff, format and mypy clean)
+- [x] verify each rule in the hook script has a matrix row (pytest-cov does not measure bash) (result: filter without `grepogram`, each of the three alternatives, both `--confirm` forms, absolute path, `uv run`, chaining, double space, no-confirm silence and empty payload all have rows; no gap)
 
 ### Task 9: [Final] Update documentation
 
