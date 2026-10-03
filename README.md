@@ -64,7 +64,9 @@ screenshotted announcement is searchable as words rather than as `[photo]`. It r
 never inside one; see [Reading Text Out of Media](#reading-text-out-of-media).
 
 Two front ends share that index: `grepogram-mcp`, a stdio MCP server for Claude Code, Cursor,
-Codex or any other MCP client, and the `grepogram` CLI for the same searches in a terminal.
+Codex or any other MCP client, and the `grepogram` CLI for the same searches in a terminal. The
+Claude Code plugin drives the CLI.
+
 The whole index lives in one SQLite file; research, once you switch it on, keeps your decisions
 in a second one beside it.
 
@@ -91,6 +93,35 @@ in a second one beside it.
   from the cache then degrades the search instead of downloading.
 
 ## Setup in Five Minutes
+
+**With Claude Code, the plugin is the shortest path.** It ships two skills and a setup command,
+and works through the `grepogram` CLI rather than an MCP server:
+
+```
+/plugin marketplace add nnemirovsky/grepogram
+/plugin install grepogram@grepogram
+/grepogram:setup
+```
+
+`/grepogram:setup` walks from nothing to a first sync: it checks for `uv`, installs the
+`grepogram` tool (showing the command first and running it under the normal permission prompt),
+writes the config, waits while you paste the Telegram keys and sign in yourself in a separate
+terminal (it never shows the keys in the conversation and never asks for a code), helps you pick
+sources and runs the first sync. Run it again at any point; it skips what is already done. The
+`search` skill then answers "what did they say in the chat about ..." by running
+`grepogram search`, `thread` and `context` and citing the links; the `research` skill drives the
+research workflow below, with every approval still yours.
+
+The skills and the setup command pre-allow only commands that change nothing on your account or
+in your config (the full list is in [PRIVACY.md](PRIVACY.md#what-reaches-claude)); anything that
+changes the config, the install, an account or an approval keeps the normal permission prompt, and
+`research approve`, `run` and `exclude` are never pre-allowed. The plugin also installs a
+`PreToolUse` hook that asks for a permission prompt on every `research approve`, `accounts rm` and
+`leave` call (see [Research](#research-finding-chats-you-do-not-index-yet)).
+
+The MCP server is optional with the plugin and off unless `/grepogram:setup` registers it, which
+it offers once and only on a yes. The steps below are the same setup by hand, and the way in for
+other MCP clients or for anyone who wants the MCP tools.
 
 1. Create an application at https://my.telegram.org/apps and note the `api_id` and `api_hash`.
 
@@ -167,8 +198,9 @@ in a second one beside it.
    grepogram search "открыть счёт без DNI"
    ```
 
-7. Connect your agent. `grepogram-mcp` speaks MCP over stdio, so any client that launches a
-   command works. In Claude Code, with a checkout at `<path>`:
+7. Connect your agent over MCP (the Claude Code plugin does not need this step).
+   `grepogram-mcp` speaks MCP over stdio, so any client that launches a command works. In Claude
+   Code, with a checkout at `<path>`:
 
    ```sh
    claude mcp add grepogram -s user -- uv run --project <path> grepogram-mcp
@@ -387,7 +419,7 @@ Every message with media carries a state, and `grepogram extract` reports them:
 |---|---|---|
 | pending | not looked at yet | `grepogram extract` — except in an imported or unavailable chat, where nothing can be fetched and the media stays pending for good; those rows are counted apart, as `in chats nothing can re-fetch`, so `media pending` only ever names work another run could do |
 | read | the file was read; the text may still be empty, which is what a photo holding no text looks like | nothing |
-| no extractor here | this build cannot read that kind: a video, sticker or poll (which nothing reads), an attachment that is neither PDF nor DOCX (a `.xlsx`, a `.zip`, an `.apk` — decided from the file name, never downloaded), a document without the `media` extra, a photo off macOS or without the extra, or a voice message or video note — those wait for whisper in v0.3.0 | install the `media` extra if it applies, then `grepogram extract --retry-failed` |
+| no extractor here | this build cannot read that kind: a video, sticker or poll (which nothing reads), an attachment that is neither PDF nor DOCX (a `.xlsx`, a `.zip`, an `.apk` — decided from the file name, never downloaded), a document without the `media` extra, a photo off macOS or without the extra, or a voice message or video note — those are not transcribed yet; whisper.cpp is on the roadmap | install the `media` extra if it applies, then `grepogram extract --retry-failed` |
 | could not be read | a corrupt file, a mislabelled one (a `.docx` holding a PDF), a download that failed | `grepogram extract --retry-failed` |
 | too large to download | Telegram reported it larger than `media.max_download_mb`, so it was never fetched | raising the cap does not queue it again; nothing re-reads a skipped file |
 | switched off in `[media]` | `enabled`, `ocr` or `documents` is `false` for that kind | switch it back on — the next `extract` queues it again by itself |
@@ -616,7 +648,12 @@ grepogram research stop 1            # explores no further; the sources it added
 
 The token is not proof that a person agreed — an agent that runs the first step can read it. The
 human gate for an agent is the agent's own permission prompt, so keep these commands behind one.
-For Claude Code, add "ask" rules to `~/.claude/settings.json`:
+The Claude Code plugin installs this gate: a `PreToolUse` hook asks for a permission prompt on
+every call of `research approve`, `accounts rm` and `leave`, the one that prints the summary as
+well as the `--confirm` one, since the printed command already holds the token. It reads the
+command text, so it is defence in depth rather than a sandbox: a deliberately obfuscated call
+gets past it, and a hook that fails or times out does not block. Without the plugin, or as a
+second layer beside it, add the "ask" rules yourself to `~/.claude/settings.json`:
 
 ```json
 {
@@ -1080,8 +1117,9 @@ approved — and a single download per model from `huggingface.co` the first tim
 needs one. A research question reaches Telegram only as a global search a session was approved
 for, and the approval says so before it does. OCR is no exception to any of this: macOS Vision reads the image on the machine,
 through a framework already installed on it, and sends nothing anywhere. Message text, extracted
-text, embeddings, queries and results stay in the SQLite file and in the conversation with your
-agent, both on your machine.
+text, embeddings, queries and results stay in the SQLite file and in your agent's conversation,
+which for a hosted model such as Claude leaves the machine with each request; see
+[PRIVACY.md](PRIVACY.md).
 Embedding and reranking run locally, so a search costs a Telegram round trip at most; the language
 model is whichever agent you connect, and grepogram itself needs only your Telegram credentials.
 Logs keep message text below DEBUG level, where it is replaced by its length and a short digest.
@@ -1151,11 +1189,11 @@ connections are held open rather than refused — a firewall prompt nobody answe
   channel post are picked up the same way — for the newest `edit_refetch` posts, when Telegram
   reports more replies than are stored; edited comments are not.
 - Text is read out of media only when you run `grepogram extract`, never by a sync, and only for
-  photos, PDFs and DOCX files. Voice messages and video notes are not transcribed — whisper.cpp is
-  the v0.3.0 plan — and OCR needs macOS with the `media` extra, with Russian recognition needing
-  macOS 15. Everything a build cannot read is parked rather than retried, and `--retry-failed`
-  queues it again once that changes. A file over `media.max_download_mb` is skipped for good:
-  raising the cap later does not queue it again.
+  photos, PDFs and DOCX files. Voice messages and video notes are not transcribed yet —
+  whisper.cpp is on the roadmap — and OCR needs macOS with the `media` extra, with Russian
+  recognition needing macOS 15. Everything a build cannot read is parked rather than retried,
+  and `--retry-failed` queues it again once that changes. A file over `media.max_download_mb` is
+  skipped for good: raising the cap later does not queue it again.
 - `grepogram import` reads the whole export file into memory at once — the decoded text, the
   parsed object graph, and, when the file was cut short, one more pass over that same text to
   recover it — so expect a few times the file's size in RAM. That is fine for the exports people

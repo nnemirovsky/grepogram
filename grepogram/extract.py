@@ -15,7 +15,8 @@ maps them together), so the document entry is itself a dispatcher: the extension
 downloaded file picks the format and the file's magic bytes confirm it, because a ``.docx``
 holding a PDF is a mislabelled file, not a DOCX to feed to ``python-docx``.
 
-``voice`` and ``video_note`` are deliberately unmapped — whisper.cpp transcription is v0.3.0.
+``voice`` and ``video_note`` are deliberately unmapped: they are not transcribed yet, and
+whisper.cpp transcription is on the roadmap.
 """
 
 import importlib.util
@@ -94,7 +95,7 @@ def registry() -> dict[MediaKind, Extractor]:
         built["photo"] = ocr_image
     else:
         log.debug("no OCR extractor: %s", reason)
-    # "voice" and "video_note" stay unmapped on purpose: whisper.cpp transcription is v0.3.0.
+    # "voice" and "video_note" stay unmapped on purpose: whisper.cpp is on the roadmap.
     return built
 
 

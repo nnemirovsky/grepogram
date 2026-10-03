@@ -20,13 +20,18 @@ jobs:
           python-version: "3.12"
 
       # the tag is the release: refuse to publish one that disagrees with the
-      # version the package would install as
-      - name: check the tag matches the package version
+      # version the package would install as or with the plugin manifest's version
+      - name: check the tag, package and plugin versions agree
         run: |
           tag="${GITHUB_REF_NAME#v}"
           version="$(grep -oE '__version__ = "[^"]+"' grepogram/__init__.py | cut -d'"' -f2)"
           if [ "$tag" != "$version" ]; then
             echo "tag $GITHUB_REF_NAME does not match grepogram/__init__.py version $version" >&2
+            exit 1
+          fi
+          plugin_version="$(jq -r .version plugin/.claude-plugin/plugin.json)"
+          if [ "$plugin_version" != "$version" ]; then
+            echo "plugin/.claude-plugin/plugin.json version $plugin_version does not match grepogram/__init__.py version $version" >&2
             exit 1
           fi
 

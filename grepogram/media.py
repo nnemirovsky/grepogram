@@ -13,7 +13,7 @@ and which are switched off in ``[media]`` follows from the stored ``media_kind``
 attachments the document extractor could read follows from the stored ``media_filename``, so bulk
 ``UPDATE``s park them — and none of them flags ``indexed``. Most kinds have no extractor
 (``video``, ``sticker``, ``audio``, ``webpage``, ``poll``, ``contact``, ``location``, ``other``,
-plus ``voice`` and ``video_note`` until whisper lands in v0.3.0), so flagging would mark tens of
+plus ``voice`` and ``video_note``, not transcribed yet), so flagging would mark tens of
 thousands of rows across every chat and hand the unbudgeted deferred ``index_pending`` loop
 :func:`grepogram.sync._sync_chats` ends with a whole-index backlog — which the next 20-second
 auto-sync inside a ``search`` would then rebuild and re-embed in full. That is why
