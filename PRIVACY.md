@@ -69,6 +69,7 @@ outside grepogram's tree.
 The plugin itself stores nothing. Its only active component is a hook that asks for a permission
 prompt before every `research approve`, `accounts rm` or `leave` call runs; it makes no network
 request and writes no file.
+
 `/grepogram:setup` runs other tools' commands only after you agree to each at its permission
 prompt: `uv tool install` writes the tool into uv's tool directory, `uv tool update-shell` edits
 your shell profile, and `claude mcp add` (offered once, default no) edits Claude Code's user
@@ -111,7 +112,7 @@ part of that conversation, under your agreement with Anthropic, and only for wha
 returned. grepogram does not push the index anywhere. The tools search and read; they do not send
 messages.
 
-The plugin's skills pre-allow only the commands that change nothing on your account or in your
+The plugin's skills and its setup command pre-allow only the commands that change nothing on your account or in your
 config: `search`, `thread`, `context`, `sync`, `dialogs`, `sources ls`, `accounts ls`,
 `config path` and the research steps that find, list or set aside candidates (`start`, `discover`,
 `candidates`, `status`, `skip`, `stop`). `sync`, `dialogs` and an online `discover` reach

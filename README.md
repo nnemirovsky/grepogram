@@ -66,6 +66,7 @@ never inside one; see [Reading Text Out of Media](#reading-text-out-of-media).
 Two front ends share that index: `grepogram-mcp`, a stdio MCP server for Claude Code, Cursor,
 Codex or any other MCP client, and the `grepogram` CLI for the same searches in a terminal. The
 Claude Code plugin drives the CLI.
+
 The whole index lives in one SQLite file; research, once you switch it on, keeps your decisions
 in a second one beside it.
 
@@ -111,12 +112,10 @@ sources and runs the first sync. Run it again at any point; it skips what is alr
 `grepogram search`, `thread` and `context` and citing the links; the `research` skill drives the
 research workflow below, with every approval still yours.
 
-The skills pre-allow only the commands that change nothing on your account or in your config:
-`search`, `thread`, `context`, `sync`, `dialogs`, `sources ls`, `accounts ls`, `config path` and
-the research steps that find, list or set aside candidates (`start`, `discover`, `candidates`,
-`status`, `skip`, `stop`). `sync`, `dialogs` and an online `discover` do reach Telegram. Anything
-that changes the config, the install, an account or an approval keeps the normal permission prompt,
-and `research approve`, `run` and `exclude` are never pre-allowed. The plugin also installs a
+The skills and the setup command pre-allow only commands that change nothing on your account or
+in your config (the full list is in [PRIVACY.md](PRIVACY.md#what-reaches-claude)); anything that
+changes the config, the install, an account or an approval keeps the normal permission prompt, and
+`research approve`, `run` and `exclude` are never pre-allowed. The plugin also installs a
 `PreToolUse` hook that asks for a permission prompt on every `research approve`, `accounts rm` and
 `leave` call (see [Research](#research-finding-chats-you-do-not-index-yet)).
 
