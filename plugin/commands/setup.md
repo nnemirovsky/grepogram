@@ -18,9 +18,9 @@ Rules that hold throughout:
 
 1. Run `uv --version`. Without `uv`, tell the user to install it from https://docs.astral.sh/uv/ themselves, then stop. Run no installer for it.
 2. Run `grepogram --version`.
-   - Found and at or above the floor: go to step 2.
+   - Found and at or above the floor: go to section 2.
    - Not found: ask which extras they want. `dense` adds the embedding and rerank models (about 4.5 GB) for semantic search; without it search is lexical only. `media` adds OCR and PDF/DOCX text extraction. Default to `dense`.
-   - Below the floor: go to item 3 and upgrade; the upgrade keeps the extras of the existing install.
+   - Below the floor: go to item 3 of this section and upgrade; the upgrade keeps the extras of the existing install.
 3. Show the exact command, then run it: `uv tool install --managed-python --python 3.12 'grepogram[dense]'` for a new install (use `[dense,media]` or no extras to match the answer), `uv tool upgrade grepogram` for an install below the floor.
 4. Run `grepogram --version` again.
    - Not found: `uv tool update-shell` puts uv's tool directory on PATH. Run it, then tell the user to restart the shell and Claude Code and run `/grepogram:setup` again, then stop. The pre-allowed rules match the bare `grepogram` command only.
@@ -30,12 +30,12 @@ Rules that hold throughout:
 
 1. Run `grepogram config path`. The `config` line is the config file's location.
 2. If that file does not exist, run `grepogram config init`. It refuses to overwrite an existing file.
-3. Check that the keys are set without showing them, with `grep -cE '^[[:space:]]*api_id[[:space:]]*=[[:space:]]*[1-9]' "<config file>"` and `grep -cE "^[[:space:]]*api_hash[[:space:]]*=[[:space:]]*[\"'][^\"']+" "<config file>"`, replacing `<config file>` with the path from step 1 and keeping the double quotes around it. Each prints only a count; `1` means set, `0` means still the template default. Never run grep without `-c`. If a check reads `0` although the user says the key is set, run `grepogram dialogs -- x`: it refuses with a missing-keys error only when the keys really are unset.
+3. Check that the keys are set without showing them, with `grep -cE '^[[:space:]]*api_id[[:space:]]*=[[:space:]]*[1-9]' "<config file>"` and `grep -cE "^[[:space:]]*api_hash[[:space:]]*=[[:space:]]*[\"'][^\"']+" "<config file>"`, replacing `<config file>` with the path from item 1 and keeping the double quotes around it. Each prints only a count; `1` means set, `0` means still the template default. Never run grep without `-c`. If a check reads `0` although the user says the key is set, run `grepogram dialogs -- x`: it refuses with a missing-keys error only when the keys really are unset.
 4. If either is `0`, tell the user to create an app at https://my.telegram.org/apps and paste its `api_id` and `api_hash` into the `[telegram]` section of that file themselves, then wait for them to say they are done and run the two checks again.
 
 ## 3. Sign in
 
-1. Run `grepogram accounts ls`. An account with session `authorized` is signed in; go to step 4.
+1. Run `grepogram accounts ls`. An account with session `authorized` is signed in; go to section 4.
 2. Otherwise tell the user to run `grepogram auth` in a separate terminal, because it asks for the phone number, the login code and the 2FA password and they must type those themselves. A second account is `grepogram auth --account <name>`. Never ask for a code or a password in the chat.
 3. When the user says they finished, run `grepogram accounts ls` to confirm.
 

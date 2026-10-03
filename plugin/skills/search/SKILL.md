@@ -17,7 +17,7 @@ This skill needs grepogram >= 0.3.0. On the first search of a conversation run `
 
 ## Search
 
-Run `grepogram search --json -- "<query>"`. Options go before `--` and the query after it, so a query that starts with `-` is not read as an option. Useful options:
+Run `grepogram search --json -- "<query>"`. Options go before `--` and the query after it, so a query that starts with `-` is not read as an option. The same holds for the positional ids of `thread` and `context`: a channel id is negative (`-100...`) and the CLI would read it as an option. Useful options:
 
 - `--mode lexical` for exact tokens: bank names, ids, prices. The default is `hybrid`.
 - `--since 6m` (also `2025-06`, `2025-06-01`, `7d`, `3w`, `1y`) and `--until` to bound the dates.
@@ -47,7 +47,6 @@ Each hit carries `url`, `snippet`, `chat` (with `id` and `title`), `anchor_msg_i
 - Chat knowledge is time-sensitive. Prefer recent hits for anything regulatory, procedural or about prices, filter with `--since` when it matters, and state the date of the evidence. Convert `date_start` and `date_end` to calendar dates, never print raw seconds.
 - Read a hit before drawing a conclusion from its snippet; the answer usually sits in the replies. Run `grepogram thread --json -- <chat_id> <msg_id>` for the reply thread, or `grepogram context --json --before 15 --after 15 -- <chat_id> <msg_id>` for the neighbouring messages.
 - Pass each message's own `chat_id` back with its `msg_id`: a channel post's comments come from the discussion group, and both chats number their messages from 1. Take `chat.id` and `anchor_msg_id` from a hit, `chat_id` and `msg_id` from a message in a thread.
-- Options first and `--` before the positional ids: a channel id is negative (`-100...`) and the CLI would read it as an option.
 - Cite the hit's `url` for every claim; it opens the message in Telegram.
 - Corroboration counts distinct origins. Forwards and copies of one post are one source however many chats repeat them. Say so when a claim rests on one forwarded post and prefer independent chats.
 - Several accounts may be signed in. Name the account a claim came through when the accounts differ (`accounts` on the hit).
