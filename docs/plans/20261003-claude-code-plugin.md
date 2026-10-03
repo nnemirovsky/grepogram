@@ -269,18 +269,18 @@ The marketplace serves `./plugin` from the default branch: merging to `main` pub
 - Create: `tests/test_plugin.py`
 - Modify: `.github/workflows/release.yml`
 
-- [ ] bump `__version__` to `0.3.0` (its own `chore(release): …` commit); check nothing else
+- [x] bump `__version__` to `0.3.0` (its own `chore(release): …` commit); check nothing else
       pins the old number (tests, README)
-- [ ] create `plugin/.claude-plugin/plugin.json` as in Technical Details, `version` `0.3.0`
-- [ ] create the root `.claude-plugin/marketplace.json` pointing at `./plugin`
-- [ ] run `claude plugin validate .` and `claude plugin validate plugin/.claude-plugin/plugin.json`;
+- [x] create `plugin/.claude-plugin/plugin.json` as in Technical Details, `version` `0.3.0`
+- [x] create the root `.claude-plugin/marketplace.json` pointing at `./plugin`
+- [x] run `claude plugin validate .` and `claude plugin validate plugin/.claude-plugin/plugin.json`; (result: both pass; marketplace description warning fixed by adding a top-level `description`; no warnings left)
       fix what they report (record any warning left on purpose in this plan)
-- [ ] extend the tag check in `release.yml` to also refuse a tag whose
+- [x] extend the tag check in `release.yml` to also refuse a tag whose
       `plugin/.claude-plugin/plugin.json` `version` differs (one `jq -r .version` line beside the
       existing grep)
-- [ ] write tests: `plugin.json` parses, has the required keys, `version == grepogram.__version__`;
+- [x] write tests: `plugin.json` parses, has the required keys, `version == grepogram.__version__`;
       `marketplace.json` lists exactly one plugin whose `source` directory holds that manifest
-- [ ] run the full checks — must pass before Task 2
+- [x] run the full checks — must pass before Task 2
 
 ### Task 2: Consent gate hook
 

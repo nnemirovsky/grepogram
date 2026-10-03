@@ -1,0 +1,12 @@
+{
+  "name": "grepogram",
+  "description": "Claude Code plugins for searching your own Telegram chats locally",
+  "owner": {"name": "Nikita Nemirovsky", "url": "https://github.com/nnemirovsky"},
+  "plugins": [
+    {
+      "name": "grepogram",
+      "source": "./plugin",
+      "description": "Search your opt-in Telegram chats locally with hybrid BM25 + embedding retrieval, from Claude Code through the grepogram CLI"
+    }
+  ]
+}

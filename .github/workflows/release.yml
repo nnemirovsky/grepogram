@@ -29,6 +29,11 @@ jobs:
             echo "tag $GITHUB_REF_NAME does not match grepogram/__init__.py version $version" >&2
             exit 1
           fi
+          plugin_version="$(jq -r .version plugin/.claude-plugin/plugin.json)"
+          if [ "$plugin_version" != "$version" ]; then
+            echo "plugin/.claude-plugin/plugin.json version $plugin_version does not match grepogram/__init__.py version $version" >&2
+            exit 1
+          fi
 
       - run: uv build
 

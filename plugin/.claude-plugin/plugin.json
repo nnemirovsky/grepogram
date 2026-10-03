@@ -1,0 +1,14 @@
+{
+  "name": "grepogram",
+  "displayName": "grepogram",
+  "version": "0.3.0",
+  "description": "Search your opt-in Telegram chats locally with hybrid BM25 + embedding retrieval, from Claude Code through the grepogram CLI",
+  "author": {"name": "Nikita Nemirovsky", "url": "https://github.com/nnemirovsky"},
+  "homepage": "https://github.com/nnemirovsky/grepogram",
+  "repository": "https://github.com/nnemirovsky/grepogram",
+  "documentationUrl": "https://github.com/nnemirovsky/grepogram#readme",
+  "supportUrl": "https://github.com/nnemirovsky/grepogram/issues",
+  "privacyPolicyUrl": "https://github.com/nnemirovsky/grepogram/blob/main/PRIVACY.md",
+  "license": "MIT",
+  "keywords": ["telegram", "search", "local", "rag", "embeddings", "chats"]
+}
