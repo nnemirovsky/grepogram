@@ -16,3 +16,6 @@ htmlcov/
 
 # os
 .DS_Store
+
+# revmux run archive (per-round agent transcripts; local only)
+.revmux/tasks/
