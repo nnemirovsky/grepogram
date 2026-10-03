@@ -187,14 +187,16 @@ tests/test_plugin.py
 }
 ```
 
-`documentationUrl`, `supportUrl` and `privacyPolicyUrl` draw UNKNOWN_KEY warnings ("no action
-needed"); keep them. Components are auto-discovered; no paths in the manifest.
+`documentationUrl`, `supportUrl` and `privacyPolicyUrl` were expected to draw UNKNOWN_KEY
+warnings; the validator raised none (Task 8). Components are auto-discovered; no paths in the
+manifest.
 
 ### `.claude-plugin/marketplace.json` (repo root)
 
 ```json
 {
   "name": "grepogram",
+  "description": "Claude Code plugins for searching your own Telegram chats locally",
   "owner": {"name": "Nikita Nemirovsky", "url": "https://github.com/nnemirovsky"},
   "plugins": [
     {"name": "grepogram", "source": "./plugin", "description": "…same as plugin.json…"}
@@ -227,10 +229,14 @@ The marketplace serves `./plugin` from the default branch: merging to `main` pub
 - Reads the hook payload from stdin once (`payload=$(cat)`). No `jq`: the raw payload is matched
   directly, which over-asks slightly (a `cwd` or description naming grepogram can satisfy part of
   a match) — acceptable; missing a confirmation is not.
-- Cheap filter first: no `grepogram` in the payload → exit 0 silently.
-- Ask when the payload matches `grepogram` … `(research[[:space:]]+approve|accounts[[:space:]]+rm|leave)`
-  … `--confirm` (`--confirm TOKEN` or `--confirm=TOKEN`). That covers a bare `grepogram`, an
-  absolute path, `uv run grepogram` and chained commands.
+- Ask when the payload matches `grepogram.*--confirm` under `shopt -s nocasematch`
+  (`--confirm TOKEN` or `--confirm=TOKEN`). `--confirm` exists only on `research approve`,
+  `accounts rm` and `leave`, so the words between are not matched: a line continuation or a tab
+  (both JSON-escaped in the payload), a quoted word or another case cannot slip past. That covers
+  a bare `grepogram`, an absolute path, `uv run grepogram` and chained commands. (Changed after
+  review: the first pattern required the subcommand words to be adjacent and missed those
+  forms.) Deliberate obfuscation (`grepogra""m`) still gets past a regex; the hook is defence in
+  depth and the docs say so.
 - **Ask output** on stdout, exit 0 (not stderr — the plugin-dev examples get this wrong):
   `{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"ask","permissionDecisionReason":"grepogram: this confirms a consent summary (research approval, account removal or leaving a chat); check it matches what you agreed to"}}`
 - **Otherwise:** no output, exit 0 — the normal permission rules decide.
@@ -250,6 +256,12 @@ The marketplace serves `./plugin` from the default branch: merging to `main` pub
   skipped.
 - A line naming a subcommand the app lacks, or a flag the command lacks, fails with the file and
   the line.
+- Added after review: an option's value is skipped (so `--chat -100…` passes), `=value` on a flag
+  fails, square brackets are dropped, `~~~` fences count, an option named on its own in an inline
+  span must exist on some command, and every command with a string positional (a query, a
+  question, a chat) needs `--` before it, `research approve` excepted. A separate test holds every
+  `allowed-tools` entry to a fixed set of commands that change nothing, and another pins the CLI
+  constants and JSON field names the skills quote.
 
 ## What Goes Where
 
@@ -281,6 +293,9 @@ The marketplace serves `./plugin` from the default branch: merging to `main` pub
 - [x] write tests: `plugin.json` parses, has the required keys, `version == grepogram.__version__`;
       `marketplace.json` lists exactly one plugin whose `source` directory holds that manifest
 - [x] run the full checks — must pass before Task 2
+- ⚠️ missed here and fixed after review: README and code comments still promised whisper.cpp
+  transcription in 0.3.0, which this release does not ship; they now say voice messages and
+  video notes are not transcribed yet and whisper.cpp is on the roadmap
 
 ### Task 2: Consent gate hook
 
@@ -391,7 +406,7 @@ The marketplace serves `./plugin` from the default branch: merging to `main` pub
 - [x] steps 4–6: ask what to index, `dialogs <query>`, `sources add` per pick; first
       `grepogram sync --budget 600` in the background, progress reported, resumable; mention
       research exists and is off, do not enable it
-- [x] step 7: offer MCP (default no): `claude mcp get grepogram` first (README users may already
+- [x] step 6: offer MCP (default no): `claude mcp get grepogram` first (README users may already
       have it) → `claude mcp add grepogram -s user -- "$(uv tool dir --bin)/grepogram-mcp"`; say
       a restart or `/mcp` reconnect picks it up; name the undo `claude mcp remove grepogram -s
       user`; every step re-checks its state first so re-running setup is safe
@@ -428,8 +443,10 @@ The marketplace serves `./plugin` from the default branch: merging to `main` pub
       confirm none names the file
 - [x] write a test: exactly one PNG in `plugin/.claude-plugin/`, square, 512–2048 px, < 2 MB
       (read the IHDR chunk with `struct`, no new dependency), and no text file in the tree
-      (walked from the repo root, skipping gitignored and binary files — not `git ls-files`,
-      which breaks in an sdist) contains its basename
+      (the top-level files plus `plugin/`, `docs/`, `grepogram/`, `tests/`, `.github/`,
+      `.claude-plugin/` and `.claude/rules/`, binary files skipped — not `git ls-files`, which
+      breaks in an sdist, and not a whole-tree walk, which read gitignored local archives)
+      contains its basename
 - [x] run the full checks — must pass before Task 8
 
 ### Task 8: Verify acceptance criteria
