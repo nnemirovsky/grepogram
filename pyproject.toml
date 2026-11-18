@@ -19,7 +19,7 @@ classifiers = [
 ]
 dependencies = [
     "telethon>=1.45",
-    "mcp>=1.2,<2",
+    "mcp>=1.2,<3",
     "sqlite-vec",
     "snowballstemmer",
     "typer",
