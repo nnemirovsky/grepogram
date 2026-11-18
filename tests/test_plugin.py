@@ -336,7 +336,8 @@ def _needs_dashdash(cmd: _Node, path: list[str]) -> bool:
     approve`` is the exception: its items are candidate ids and grant names, never dash-led, and
     its confirming call appends ``--confirm`` at the end."""
     return path != ["research", "approve"] and any(
-        p.param_type_name == "argument" and p.type.name == "str" for p in cmd.params
+        isinstance(p, typer.core.TyperArgument) and p.bare_type() in ("str", "list[str]")
+        for p in cmd.params
     )
 
 

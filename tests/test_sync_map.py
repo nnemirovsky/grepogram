@@ -502,10 +502,18 @@ def test_links_are_distinct_and_sorted_across_sources() -> None:
 
 def test_links_ignore_keyboards_without_urls() -> None:
     keyboard = types.ReplyKeyboardMarkup(
-        rows=[types.KeyboardButtonRow(buttons=[types.KeyboardButton(text="t.me/news")])]
+        rows=[
+            types.KeyboardButtonRow(
+                buttons=[types.KeyboardButton(text="t.me/news", type=types.ButtonTypeDefault())]
+            )
+        ]
     )
     callback = types.ReplyInlineMarkup(
-        rows=[types.KeyboardButtonRow(buttons=[types.KeyboardButtonCallback("go", b"x")])]
+        rows=[
+            types.KeyboardInlineButtonRow(
+                buttons=[types.KeyboardInlineButton("go", types.InlineButtonTypeCallback(b"x"))]
+            )
+        ]
     )
     assert _map(tl.message(ARG.id, 58, "x", reply_markup=keyboard)).links == ()
     assert _map(tl.message(ARG.id, 59, "x", reply_markup=callback)).links == ()

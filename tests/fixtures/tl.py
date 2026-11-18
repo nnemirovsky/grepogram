@@ -139,8 +139,11 @@ def url_buttons(*rows: Mapping[str, str]) -> types.ReplyInlineMarkup:
     """An inline keyboard of URL buttons, one ``{label: url}`` mapping per row."""
     return types.ReplyInlineMarkup(
         rows=[
-            types.KeyboardButtonRow(
-                buttons=[types.KeyboardButtonUrl(text=label, url=url) for label, url in row.items()]
+            types.KeyboardInlineButtonRow(
+                buttons=[
+                    types.KeyboardInlineButton(text=label, type=types.InlineButtonTypeUrl(url=url))
+                    for label, url in row.items()
+                ]
             )
             for row in rows
         ]

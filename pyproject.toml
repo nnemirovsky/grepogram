@@ -18,7 +18,7 @@ classifiers = [
     "Topic :: Text Processing :: Indexing",
 ]
 dependencies = [
-    "telethon",
+    "telethon>=1.45",
     "mcp>=1.2,<2",
     "sqlite-vec",
     "snowballstemmer",
@@ -65,7 +65,7 @@ strict = true
 module = [
     "sqlite_vec",
     "snowballstemmer",
-    "telethon",
+    "telethon>=1.45",
     "telethon.*",
     "sentence_transformers",
     "sentence_transformers.*",
