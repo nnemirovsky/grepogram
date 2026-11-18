@@ -420,7 +420,9 @@ def links_of(msg: Any) -> tuple[tuple[LinkKind, str], ...]:
     if isinstance(markup, types.ReplyInlineMarkup):
         for row in markup.rows:
             for button in row.buttons:
-                add("button", getattr(button, "url", None))
+                # Since Telegram layer 220 (telethon 1.45) a button's kind and URL sit in
+                # its ``type``: InlineButtonTypeUrl, ...WebView, ...UrlAuth carry ``url``.
+                add("button", getattr(button.type, "url", None))
     if isinstance(msg.media, types.MessageMediaWebPage):
         add("webpage", getattr(msg.media.webpage, "url", None))
     return tuple(sorted(found))
